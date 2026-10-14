@@ -223,6 +223,9 @@ impl Fetches {
             After::Placed => Fetch::NewRun,
             After::Run => match last {
                 Some((_, end)) if (from - end).abs() > CONTIGUOUS_S => Fetch::Jump,
+                // an item's first fetch past its playlist's start: the TV started there (a
+                // full-length playlist's `EXT-X-START`, §8.5), its playhead in that segment
+                None if from > CONTIGUOUS_S => Fetch::Jump,
                 _ => Fetch::Next,
             },
         }
@@ -309,6 +312,21 @@ mod tests {
         e.rebound(304.0);
         assert_eq!(e.at(t0 + secs(52)), 302.0);
         assert_eq!(e.at(t0 + secs(90)), 304.0);
+    }
+
+    /// A full-length playlist started at 1:10:00 (`EXT-X-START`): the TV's first fetch is the
+    /// segment there, which places the estimate (behind the playhead, never ahead); one from 0
+    /// is a run's start as before.
+    #[test]
+    fn a_first_fetch_past_the_start_places_the_estimate() {
+        let mut f = Fetches::default();
+        assert_eq!(f.saw(4198.0, 4204.0), Fetch::Jump);
+        assert_eq!(f.saw(4204.0, 4210.0), Fetch::Next);
+        let mut f = Fetches::default();
+        assert_eq!(f.saw(0.0, 6.0), Fetch::Next);
+        let mut f = Fetches::default();
+        f.placed();
+        assert_eq!(f.saw(4198.0, 4204.0), Fetch::NewRun, "timeJumped placed it already");
     }
 
     fn cmtime(value: i64, timescale: i64, flags: i64) -> Value {

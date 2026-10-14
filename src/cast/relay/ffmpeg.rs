@@ -1,7 +1,9 @@
 //! The ffmpeg supervisor (DESIGN §40 §8.1.3, §8.4): `tokio::process` with `kill_on_drop` and
 //! `PR_SET_PDEATHSIG` (spawned from a runtime worker, never the blocking pool), environment
 //! cleared but `LC_ALL=C`, argv with only the loopback URL and the output directory, stderr
-//! redacted at debug, `-progress pipe:1` speed → `CpuTooSlow`, encoder check once per run.
+//! redacted at debug, `-progress pipe:1` speed → `CpuTooSlow`, encoder check once per run. A
+//! child that exits with an error leaves its reason ([`Child::failure`]: the status, the last
+//! meaningful stderr lines, the media time reached), so the log says why, not only that.
 //! OWNER: CAST-4.
 //!
 //! **One timeline** (DESIGN §40 §8.4; Apple's HLS authoring spec: alternate audio renditions
@@ -41,10 +43,11 @@
 //! spawned from `async` code on a worker (§5.6), and the pre-exec hook also catches the race where
 //! Tuner died between `fork` and `prctl`.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -72,6 +75,14 @@ pub const SLOW_SPEED: f64 = 0.98;
 pub const SLOW_FOR: Duration = Duration::from_secs(20);
 /// stderr lines logged per child (then one summary line).
 const STDERR_LINES: usize = 64;
+/// Meaningful stderr lines kept per child for the failure report ([`Tail`]), whatever
+/// [`STDERR_LINES`] let through to the debug log.
+const TAIL_LINES: usize = 8;
+/// A kept line is cut at this many characters (ffmpeg's `Last message repeated` lines and
+/// demuxer dumps can be long).
+const TAIL_CHARS: usize = 240;
+/// How long the exit waits for stderr to drain, so the report holds ffmpeg's last words.
+const STDERR_DRAIN: Duration = Duration::from_millis(500);
 /// The test card (§8.5): 15 s of `testsrc2` and a 440 Hz tone.
 const TEST_CARD_S: u32 = 15;
 /// EVENT playlists (VOD, catch-up): ffmpeg reads the first minute as fast as the provider sends
@@ -79,6 +90,8 @@ const TEST_CARD_S: u32 = 15;
 /// catch-up, so production runs about a minute ahead of playback instead of pulling the whole
 /// film at 4× (§8.4; the relay's lead cap stops it while the TV is paused).
 const READ_BURST_S: &str = "60";
+/// [`READ_BURST_S`] as a number: a full-length run's pace (vod.rs, "On demand").
+pub const READ_BURST: f64 = 60.0;
 
 /// `hls_time` override for the loopback tests (`-hls_time 1`, DESIGN §40 §14.2), in ms; 0 = the
 /// default [`SEGMENT_S`].
@@ -92,9 +105,14 @@ pub fn set_segment_seconds_for_tests(s: f64) {
 
 /// The configured segment length (4 s, or the tests' override).
 pub fn segment_s() -> f64 {
+    segment_override().unwrap_or(SEGMENT_S)
+}
+
+/// The tests' segment length, when set (full-length items use it instead of their 6 s too).
+pub fn segment_override() -> Option<f64> {
     match SEGMENT_MS_OVERRIDE.load(Ordering::Relaxed) {
-        0 => SEGMENT_S,
-        ms => ms as f64 / 1000.0,
+        0 => None,
+        ms => Some(ms as f64 / 1000.0),
     }
 }
 
@@ -241,74 +259,20 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
             push(&["-t", &TEST_CARD_S.to_string()]);
         }
     }
-    if plan.video != Video::None {
-        push(&["-map", "0:v:0"]);
-    }
-    match (plan.audio, input) {
-        (Audio::None, _) => {}
-        (_, Input::TestCard { .. }) => push(&["-map", "1:a:0"]),
-        (_, Input::Proxy { .. }) => {
-            let map = out.audio_index.map_or_else(|| "0:a:0?".to_owned(), |n| format!("0:a:{n}"));
-            // a surround output maps the sound twice: the stereo rendition, then the surround one
-            for _ in 0..if plan.surround.is_some() { 2 } else { 1 } {
-                push(&["-map", &map]);
-            }
-        }
-    }
-    match plan.video {
-        Video::None => push(&["-vn"]),
-        Video::Copy => {
-            push(&["-c:v", "copy"]);
-            if plan.segments == Segments::Fmp4 {
-                push(&["-tag:v", "hvc1"]);
-            }
-        }
-        Video::Encode { deinterlace } => {
-            let gop = (2.0 * out.fps.filter(|f| *f > 0.0).unwrap_or(25.0)).round().max(1.0) as u32;
-            push(&["-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level", "4.1", "-crf", "21"]);
-            push(&["-maxrate", "8M", "-bufsize", "16M", "-g", &gop.to_string(), "-sc_threshold", "0"]);
-            let mut vf = Vec::new();
-            if deinterlace {
-                vf.push("yadif=deint=interlaced".to_owned());
-            }
-            vf.push("scale=-2:'min(1080,ih)'".to_owned());
-            // High profile is 8-bit 4:2:0 (a 10-bit HEVC source would make x264 pick High 10)
-            vf.push("format=yuv420p".to_owned());
-            if matches!(input, Input::TestCard { label: true }) {
-                vf.push("drawtext=text=Tuner:fontsize=120:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=24:x=(w-tw)/2:y=(h-th)/2".to_owned());
-            }
-            push(&["-vf", &vf.join(",")]);
-            // converted video starts exactly at the seek point: so does copied sound (else it
-            // keeps the packets back to the demuxer's seek position, a GOP early)
-            if matches!(input, Input::Proxy { seek_s, .. } if *seek_s > 0.0) {
-                push(&["-copypriorss:a", "0"]);
-            }
-        }
-    }
-    match (plan.audio, plan.surround) {
-        (_, Some(surround)) => {
-            push(&["-c:a:0", "aac", "-ac:a:0", "2", "-b:a:0", "160k"]);
-            match surround {
-                // the mp4 muxer wants an AudioSpecificConfig, MPEG-TS carries ADTS (see below)
-                Surround::Copy { aac: true } => push(&["-c:a:1", "copy", "-bsf:a:1", "aac_adtstoasc"]),
-                Surround::Copy { aac: false } => push(&["-c:a:1", "copy"]),
-                // 7.1 is folded to 5.1, AC-3's most
-                Surround::Ac3 => push(&["-c:a:1", "ac3", "-ac:a:1", "6", "-b:a:1", "448k"]),
-            }
-        }
-        (Audio::None, None) => push(&["-an"]),
-        (Audio::Copy, None) => {
-            push(&["-c:a", "copy"]);
-            // copied audio is AAC (plan.rs): the mp4 muxer behind fMP4 segments refuses ADTS
-            // ("Malformed AAC bitstream detected", ffmpeg exits at the first audio packet), and
-            // MPEG-TS sources carry ADTS; the filter turns it into an AudioSpecificConfig and
-            // passes MP4/MKV audio (already ASC) through unchanged
-            if plan.segments == Segments::Fmp4 {
-                push(&["-bsf:a", "aac_adtstoasc"]);
-            }
-        }
-        (Audio::Aac, None) => push(&["-c:a", "aac", "-ac", "2", "-b:a", "160k"]),
-    }
+    let seeking = matches!(input, Input::Proxy { seek_s, .. } if *seek_s > 0.0);
+    let gop = (2.0 * out.fps.filter(|f| *f > 0.0).unwrap_or(25.0)).round().max(1.0) as u32;
+    let codecs = Codecs {
+        test_card: matches!(input, Input::TestCard { .. }),
+        label: matches!(input, Input::TestCard { label: true }),
+        audio_index: out.audio_index,
+        // Phase 1's HLS outputs tag every fMP4 picture (hlsenc passes it over for H.264)
+        hvc1: plan.segments == Segments::Fmp4,
+        gop,
+        forced: None,
+        seeking,
+    };
+    codecs.push(&mut a, plan);
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
     // subtitles and teletext are dropped in Phase 1
     push(&["-sn", "-dn", "-f", "hls", "-hls_time", &fmt_secs(out.hls_time)]);
     if out.live {
@@ -345,6 +309,189 @@ pub fn argv(input: &Input<'_>, plan: &Plan, out: &Output<'_>) -> Vec<String> {
         let start = out.dir.join(START_FILE);
         push(&["-map", "0:v:0", "-c:v", "copy", "-frames:v", "1", "-flush_packets", "1", "-f", "framecrc", &start.to_string_lossy()]);
     }
+    a
+}
+
+/// The maps and codecs of an output (shared by the HLS outputs and the full-length runs).
+struct Codecs<'a> {
+    test_card: bool,
+    /// The test card's "Tuner" label.
+    label: bool,
+    audio_index: Option<usize>,
+    /// Copied video gets the `hvc1` tag (Apple rule 1.5).
+    hvc1: bool,
+    /// Converted video's keyframe interval (frames).
+    gop: u32,
+    /// Converted video's forced keyframes (`-force_key_frames` times), full-length runs.
+    forced: Option<&'a str>,
+    /// The input starts past 0 (`-ss`): converted video drops copied sound before it.
+    seeking: bool,
+}
+
+impl Codecs<'_> {
+    fn push(&self, a: &mut Vec<String>, plan: &Plan) {
+        let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
+        if plan.video != Video::None {
+            push(&["-map", "0:v:0"]);
+        }
+        match plan.audio {
+            Audio::None => {}
+            _ if self.test_card => push(&["-map", "1:a:0"]),
+            _ => {
+                let map = self.audio_index.map_or_else(|| "0:a:0?".to_owned(), |n| format!("0:a:{n}"));
+                // a surround output maps the sound twice: the stereo rendition, then the surround one
+                for _ in 0..if plan.surround.is_some() { 2 } else { 1 } {
+                    push(&["-map", &map]);
+                }
+            }
+        }
+        match plan.video {
+            Video::None => push(&["-vn"]),
+            Video::Copy => {
+                push(&["-c:v", "copy"]);
+                if self.hvc1 {
+                    push(&["-tag:v", "hvc1"]);
+                }
+            }
+            Video::Encode { deinterlace } => {
+                push(&["-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level", "4.1", "-crf", "21"]);
+                push(&["-maxrate", "8M", "-bufsize", "16M", "-g", &self.gop.to_string(), "-sc_threshold", "0"]);
+                if let Some(times) = self.forced {
+                    push(&["-force_key_frames", times]);
+                }
+                let mut vf = Vec::new();
+                if deinterlace {
+                    vf.push("yadif=deint=interlaced".to_owned());
+                }
+                vf.push("scale=-2:'min(1080,ih)'".to_owned());
+                // High profile is 8-bit 4:2:0 (a 10-bit HEVC source would make x264 pick High 10)
+                vf.push("format=yuv420p".to_owned());
+                if self.label {
+                    vf.push(
+                        "drawtext=text=Tuner:fontsize=120:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=24:x=(w-tw)/2:y=(h-th)/2".to_owned(),
+                    );
+                }
+                push(&["-vf", &vf.join(",")]);
+                // converted video starts exactly at the seek point: so does copied sound (else it
+                // keeps the packets back to the demuxer's seek position, a GOP early)
+                if self.seeking {
+                    push(&["-copypriorss:a", "0"]);
+                }
+            }
+        }
+        match (plan.audio, plan.surround) {
+            (_, Some(surround)) => {
+                push(&["-c:a:0", "aac", "-ac:a:0", "2", "-b:a:0", "160k"]);
+                match surround {
+                    // the mp4 muxer wants an AudioSpecificConfig, MPEG-TS carries ADTS (see below)
+                    Surround::Copy { aac: true } => push(&["-c:a:1", "copy", "-bsf:a:1", "aac_adtstoasc"]),
+                    Surround::Copy { aac: false } => push(&["-c:a:1", "copy"]),
+                    // 7.1 is folded to 5.1, AC-3's most
+                    Surround::Ac3 => push(&["-c:a:1", "ac3", "-ac:a:1", "6", "-b:a:1", "448k"]),
+                }
+            }
+            (Audio::None, None) => push(&["-an"]),
+            (Audio::Copy, None) => {
+                push(&["-c:a", "copy"]);
+                // copied audio is AAC (plan.rs): the mp4 muxer behind fMP4 segments refuses ADTS
+                // ("Malformed AAC bitstream detected", ffmpeg exits at the first audio packet), and
+                // MPEG-TS sources carry ADTS; the filter turns it into an AudioSpecificConfig and
+                // passes MP4/MKV audio (already ASC) through unchanged
+                if plan.segments == Segments::Fmp4 {
+                    push(&["-bsf:a", "aac_adtstoasc"]);
+                }
+            }
+            (Audio::Aac, None) => push(&["-c:a", "aac", "-ac", "2", "-b:a", "160k"]),
+        }
+    }
+}
+
+/// The constant every full-length run adds to its timestamps (`-output_ts_offset`): a run from 0
+/// would otherwise start one B-frame delay (and AAC priming) later than a run restarted later,
+/// whose first timestamps aren't negative (Phase 2 design §29.6, measured 2026-10-13); it also
+/// keeps the sound's priming off negative `tfdt`s.
+pub const RUN_OFFSET_S: f64 = 10.0;
+/// The segment list a full-length run writes beside its segments (`name,start,end` per segment
+/// once it is closed: the relay publishes from it).
+pub const RUN_LIST: &str = "list.csv";
+/// The movie fragment flags of a full-length run's fMP4 segments (vod.rs module docs): each
+/// segment is a whole fragmented file (`-individual_header_trailer 1`) whose init section is
+/// written with its first fragment (`delay_moov`: AC-3 and E-AC-3 need their first packet; with
+/// one muxer for the run, its first flush wrote only the `moov` and a one-GOP first segment's
+/// pictures landed in the next file), fragments start at picture keyframes, decode times are
+/// absolute (`frag_discont`), the first picture's presentation time is its decode time
+/// (`negative_cts_offsets`, Phase 1's "One timeline"), and no index or trailer boxes.
+const RUN_MOVFLAGS: &str = "movflags=+frag_keyframe+empty_moov+delay_moov+default_base_moof+frag_discont+skip_sidx+skip_trailer+negative_cts_offsets";
+
+/// One full-length run (vod.rs): the item from segment `first` on, cut where the segment map
+/// says, into `dir`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Run<'a> {
+    pub url: &'a str,
+    /// `-ss` (copied video: where the demuxer lands on segment `first`'s keyframe; converted:
+    /// the segment's start). `None` from the start.
+    pub seek_s: Option<f64>,
+    /// The run's directory (`s<n>.<ext>` and [`RUN_LIST`]).
+    pub dir: &'a Path,
+    pub first: u64,
+    /// `-segment_times`: the cut points after the first, relative to the run's first picture.
+    pub cuts: &'a str,
+    /// The segment muxer's tolerance (a cut lands on the first keyframe at or after point − it).
+    pub delta: f64,
+    /// Converted video: `-force_key_frames` (the cut points on the item's clock).
+    pub forced: Option<&'a str>,
+    /// Copied HEVC (`-tag:v hvc1`; never on H.264, which the mp4 muxer refuses).
+    pub hevc: bool,
+    pub fps: Option<f64>,
+    pub audio_index: Option<usize>,
+}
+
+/// A full-length run's argv (pure: tested). Holds only the loopback URL and paths under
+/// `run.dir`.
+pub fn run_argv(run: &Run<'_>, plan: &Plan) -> Vec<String> {
+    let mut a: Vec<String> = Vec::with_capacity(80);
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
+    push(&["-nostdin", "-hide_banner", "-nostats", "-loglevel", "warning", "-progress", "pipe:1"]);
+    push(&["-reconnect", "0", "-readrate", "1", "-readrate_initial_burst", READ_BURST_S]);
+    if let Some(at) = run.seek_s.filter(|s| *s > 0.0) {
+        // copied video: the demuxer lands on the keyframe and every stream starts there;
+        // converted: decoded from the keyframe before, shown from the point
+        if plan.video == Video::Copy {
+            push(&["-noaccurate_seek"]);
+        }
+        push(&["-ss", &format!("{at:.6}")]);
+    }
+    // the item's own clock (from the file's start) in every run: cut points, seeks and the
+    // forced keyframes all count on it
+    push(&["-copyts", "-start_at_zero", "-i", run.url]);
+    let fps = run.fps.filter(|f| *f > 0.0).unwrap_or(25.0);
+    let codecs = Codecs {
+        test_card: false,
+        label: false,
+        audio_index: run.audio_index,
+        hvc1: run.hevc,
+        // only the forced keyframes: the encoder's own interval never comes first
+        gop: (fps * 60.0).round().max(1.0) as u32,
+        forced: run.forced,
+        seeking: run.seek_s.is_some_and(|s| s > 0.0),
+    };
+    codecs.push(&mut a, plan);
+    let mut push = |items: &[&str]| a.extend(items.iter().map(|s| (*s).to_owned()));
+    push(&["-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1", "-fflags", "+bitexact"]);
+    push(&["-output_ts_offset", &fmt_secs(RUN_OFFSET_S), "-avoid_negative_ts", "disabled", "-f", "segment"]);
+    match plan.segments {
+        Segments::Ts => push(&["-segment_format", "mpegts"]),
+        Segments::Fmp4 => push(&["-segment_format", "mp4", "-segment_format_options", RUN_MOVFLAGS]),
+    }
+    // no cut after the first (a run of the last segment): one point past any item
+    let cuts = if run.cuts.is_empty() { "100000000" } else { run.cuts };
+    push(&["-segment_times", cuts, "-segment_time_delta", &format!("{:.6}", run.delta)]);
+    // MPEG-TS: one muxer for the run (PAT and PMT at each segment's start); fMP4: one per segment
+    let individual = if plan.segments == Segments::Fmp4 { "1" } else { "0" };
+    push(&["-segment_start_number", &run.first.to_string(), "-individual_header_trailer", individual]);
+    let list = run.dir.join(RUN_LIST);
+    let seg = run.dir.join(format!("s%d.{}", plan.segments.ext()));
+    push(&["-segment_list", &list.to_string_lossy(), "-segment_list_type", "csv", &seg.to_string_lossy()]);
     a
 }
 
@@ -404,10 +551,136 @@ pub struct Child {
     exit: watch::Receiver<Option<Exit>>,
     pid: Option<u32>,
     started: Instant,
+    seen: Arc<Seen>,
+}
+
+/// What the child's pipes and exit told: shared with the tasks that read them.
+#[derive(Debug, Default)]
+struct Seen {
+    tail: Mutex<Tail>,
+    /// `out_time_us` of the last progress block, in seconds.
+    media_s: Mutex<Option<f64>>,
+    /// The exit status as the OS words it (`exit status: 1`, `signal: 9 (SIGKILL)`).
+    status: Mutex<Option<String>>,
+}
+
+/// Why a child ended with an error: what [`Child::failure`] collected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    /// `exit status: 1`, `signal: 11 (SIGSEGV)`; empty when the OS gave none.
+    pub status: String,
+    /// The last meaningful stderr lines, oldest first, redacted ([`Tail`]).
+    pub lines: Vec<String>,
+    /// Seconds into the item the output had reached (the last progress block plus the input's
+    /// seek), if ffmpeg got far enough to say.
+    pub media_s: Option<f64>,
+}
+
+/// Does `line` say nothing about why ffmpeg stopped? Blank lines, progress (`frame=…`,
+/// `size=…`, `speed=…`), the `-readrate` pacing note and repeat counts.
+pub fn is_noise(line: &str) -> bool {
+    let l = line.trim();
+    l.is_empty()
+        || l.starts_with("frame=")
+        || l.starts_with("size=")
+        || l.starts_with("video:")
+        || l.starts_with("speed=")
+        || l.starts_with("progress=")
+        || l.contains("Resumed reading")
+        || l.contains("Last message repeated")
+}
+
+/// Keep a stderr line out of the log's reach of credentials: the repo's redaction, plus the
+/// loopback URL's bearer token (`http://127.0.0.1:P/u/<token>`), which `redact` can't know.
+fn scrub(line: &str) -> String {
+    let line = redact(line);
+    let mut out = String::with_capacity(line.len());
+    let mut rest: &str = &line;
+    while let Some(i) = rest.find("/u/") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail.find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace() || c == '"' || c == '\'').unwrap_or(tail.len());
+        out.push_str(if end > 0 { "***" } else { "" });
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The last few meaningful stderr lines of one child: bounded by count ([`TAIL_LINES`]) and by
+/// line length, each line scrubbed on the way in ([`scrub`]), so what is held is safe to log.
+#[derive(Debug, Default)]
+pub struct Tail {
+    lines: VecDeque<String>,
+}
+
+impl Tail {
+    /// Keep `line` unless it is noise ([`is_noise`]); the oldest line goes when full.
+    pub fn push(&mut self, line: &str) {
+        if is_noise(line) {
+            return;
+        }
+        let mut kept = scrub(line.trim());
+        if let Some((i, _)) = kept.char_indices().nth(TAIL_CHARS) {
+            kept.truncate(i);
+            kept.push('…');
+        }
+        if self.lines.len() == TAIL_LINES {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(kept);
+    }
+
+    /// Oldest first.
+    pub fn lines(&self) -> Vec<String> {
+        self.lines.iter().cloned().collect()
+    }
+}
+
+/// What ffmpeg's last words say about the input (§8.1): the loopback proxy closing the
+/// connection or the provider dropping it. `resumed`: the proxy had already resumed a broken
+/// provider stream for this feed, which is what makes a bare `Invalid data found` (a cut-off
+/// container) the upstream's doing and not a damaged file.
+pub fn upstream_hint(lines: &[String], resumed: bool) -> Option<&'static str> {
+    const DROPS: [&str; 7] =
+        ["connection reset", "end of file", "i/o error", "broken pipe", "connection timed out", "connection refused", "server returned 5"];
+    let hit = lines.iter().rev().any(|l| {
+        let l = l.to_ascii_lowercase();
+        DROPS.iter().any(|d| l.contains(d)) || (resumed && l.contains("invalid data found"))
+    });
+    hit.then_some("the input stream broke: the provider dropped the connection or the relay's proxy closed it")
+}
+
+impl Failure {
+    /// The text of the WARN line after `ffmpeg stopped with an error`: the status, the upstream
+    /// finding in plain words if the lines show one, and the last stderr lines.
+    pub fn text(&self, resumed: bool) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.status.is_empty() {
+            parts.push(self.status.clone());
+        }
+        if let Some(h) = upstream_hint(&self.lines, resumed) {
+            parts.push(h.to_owned());
+        }
+        if self.lines.is_empty() {
+            parts.push("no stderr".to_owned());
+        } else {
+            parts.push(format!("last stderr: {}", self.lines.join(" | ")));
+        }
+        parts.join("; ")
+    }
+
+    /// `"3652.4 s"` for the INFO line; `None` when ffmpeg never reported progress.
+    pub fn at(&self) -> Option<String> {
+        self.media_s.map(|s| format!("{s:.1} s"))
+    }
 }
 
 /// Progress callbacks (from the supervisor task).
 pub struct Progress {
+    /// Seconds into the item the output starts at (the input's `-ss`): added to the progress
+    /// pipe's `out_time_us` for [`Failure::media_s`].
+    pub base_s: f64,
     /// Watch `speed=` against [`SLOW_SPEED`] (a live conversion).
     pub watch_speed: bool,
     /// Called once when converting stays too slow for [`SLOW_FOR`].
@@ -422,29 +695,36 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
     let pid = child.id();
     let (tx, rx) = watch::channel(None);
     let kill = CancellationToken::new();
-    if let Some(err) = child.stderr.take() {
+    let seen = Arc::new(Seen::default());
+    let drained = child.stderr.take().map(|err| {
         let label = label.clone();
+        let seen = seen.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(err).lines();
             let mut n = 0usize;
             while let Ok(Some(line)) = lines.next_line().await {
                 n += 1;
                 if n <= STDERR_LINES {
-                    tracing::debug!("{label}: ffmpeg: {}", redact(line.trim_end()));
+                    tracing::debug!("{label}: ffmpeg: {}", scrub(line.trim_end()));
                 }
+                seen.tail.lock().unwrap_or_else(|e| e.into_inner()).push(&line);
             }
             if n > STDERR_LINES {
                 tracing::debug!("{label}: ffmpeg: {} more stderr lines not logged", n - STDERR_LINES);
             }
-        });
-    }
+        })
+    });
+    let Progress { base_s, watch_speed, on_slow } = progress;
     if let Some(out) = child.stdout.take() {
-        let Progress { watch_speed, on_slow } = progress;
+        let seen = seen.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(out).lines();
             let mut slow = SpeedWatch::default();
             let mut on_slow = Some(on_slow);
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(s) = line.strip_prefix("out_time_us=").and_then(parse_out_time) {
+                    *seen.media_s.lock().unwrap_or_else(|e| e.into_inner()) = Some(base_s + s);
+                }
                 if !watch_speed {
                     continue;
                 }
@@ -458,16 +738,20 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
         });
     }
     let stop = kill.clone();
+    let shared = seen.clone();
     tokio::spawn(async move {
+        let seen = shared;
         let exit = tokio::select! {
             status = child.wait() => match status {
                 Ok(s) if s.success() => Exit::Done,
                 Ok(s) => {
                     tracing::debug!("{label}: ffmpeg exited: {s}");
+                    *seen.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(s.to_string());
                     Exit::Failed
                 }
                 Err(e) => {
                     tracing::debug!("{label}: ffmpeg wait: {e}");
+                    *seen.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("wait failed: {e}"));
                     Exit::Failed
                 }
             },
@@ -477,9 +761,13 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
                 Exit::Killed
             }
         };
+        // stderr ends with the process: let its last lines land before anyone asks why
+        if let Some(d) = drained {
+            let _ = tokio::time::timeout(STDERR_DRAIN, d).await;
+        }
         let _ = tx.send(Some(exit));
     });
-    Ok(Child { kill, exit: rx, pid, started: Instant::now() })
+    Ok(Child { kill, exit: rx, pid, started: Instant::now(), seen })
 }
 
 impl Child {
@@ -507,6 +795,15 @@ impl Child {
         }
     }
 
+    /// Why it ended with an error (call after [`Child::wait`] returned [`Exit::Failed`]).
+    pub fn failure(&self) -> Failure {
+        Failure {
+            status: self.seen.status.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default(),
+            lines: self.seen.tail.lock().unwrap_or_else(|e| e.into_inner()).lines(),
+            media_s: *self.seen.media_s.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -527,6 +824,11 @@ impl Child {
             }
         }
     }
+}
+
+/// `-progress` `out_time_us=` values (microseconds; `N/A` before the first packet).
+fn parse_out_time(v: &str) -> Option<f64> {
+    v.trim().parse::<i64>().ok().filter(|us| *us >= 0).map(|us| us as f64 / 1e6)
 }
 
 /// `-progress` `speed=` values: `" 0.97x"`, `"1.02x"`, `"N/A"`.
@@ -657,6 +959,55 @@ mod tests {
         assert!(a.contains("-map 0:a:0? -map 0:a:0? ") && a.contains("-c:a:1 ac3 -ac:a:1 6 -b:a:1 448k"), "{a}");
     }
 
+    /// A full-length run (vod.rs): the item's own clock (`-copyts -start_at_zero`) with the
+    /// constant offset, the segment muxer with cut points relative to the run's first picture
+    /// and its CSV list; copied video lands on its keyframe (`-noaccurate_seek`), converted video
+    /// starts at the point with its keyframes forced on the item's clock; fMP4 is one muxer per
+    /// segment, `hvc1` only on HEVC.
+    #[test]
+    fn full_length_runs_cut_where_the_map_says() {
+        let dir = Path::new("/c/p3/r2");
+        let copy = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Copy, Segments::Ts);
+        let run = Run {
+            url: "http://127.0.0.1:1/u/t",
+            seek_s: Some(4210.5),
+            dir,
+            first: 701,
+            cuts: "6.000000,12.040000",
+            delta: 0.001,
+            forced: None,
+            hevc: false,
+            fps: None,
+            audio_index: Some(1),
+        };
+        let a = run_argv(&run, &copy).join(" ");
+        for want in [
+            "-reconnect 0 -readrate 1 -readrate_initial_burst 60 -noaccurate_seek -ss 4210.500000 -copyts -start_at_zero -i http://127.0.0.1:1/u/t",
+            "-map 0:v:0 -map 0:a:1 -c:v copy -c:a copy -sn -dn -map_metadata -1 -map_chapters -1 -fflags +bitexact",
+            "-output_ts_offset 10 -avoid_negative_ts disabled -f segment -segment_format mpegts -segment_times 6.000000,12.040000",
+            "-segment_time_delta 0.001000 -segment_start_number 701 -individual_header_trailer 0",
+            "-segment_list /c/p3/r2/list.csv -segment_list_type csv /c/p3/r2/s%d.ts",
+        ] {
+            assert!(a.contains(want), "{want:?} missing from {a}");
+        }
+        assert_eq!(a.matches("://").count(), 1, "only the loopback URL: {a}");
+        assert!(!a.contains("-tag:v") && !a.contains("-force_key_frames") && !a.contains("-copypriorss"), "{a}");
+
+        let mut hevc = plan(crate::model::CastLevel::Repackaged, Video::Copy, Audio::Aac, Segments::Fmp4);
+        hevc.surround = Some(Surround::Ac3);
+        let a = run_argv(&Run { seek_s: None, cuts: "", hevc: true, ..run.clone() }, &hevc).join(" ");
+        assert!(a.contains("-copyts -start_at_zero -i ") && !a.contains("-ss "), "from 0: {a}");
+        assert!(a.contains("-c:v copy -tag:v hvc1 -c:a:0 aac -ac:a:0 2 -b:a:0 160k -c:a:1 ac3"), "{a}");
+        assert!(a.contains(&format!("-segment_format mp4 -segment_format_options {RUN_MOVFLAGS} -segment_times 100000000 ")), "{a}");
+        assert!(a.contains("-individual_header_trailer 1 ") && a.ends_with("/c/p3/r2/s%d.m4s"), "{a}");
+
+        let l3 = plan(crate::model::CastLevel::Converted, Video::Encode { deinterlace: false }, Audio::Aac, Segments::Ts);
+        let a = run_argv(&Run { seek_s: Some(42.0), forced: Some("42.000000,48.000000"), fps: Some(25.0), delta: 1.0, ..run }, &l3).join(" ");
+        assert!(a.contains("-ss 42.000000 -copyts") && !a.contains("-noaccurate_seek"), "converted: from the point: {a}");
+        assert!(a.contains("-g 1500 -sc_threshold 0 -force_key_frames 42.000000,48.000000 -vf scale"), "{a}");
+        assert!(a.contains("format=yuv420p -copypriorss:a 0 -c:a aac"), "{a}");
+    }
+
     /// A copied resume starts at its keyframe (from the side output's line), never later than
     /// asked; without the line, a whole first segment earlier.
     #[test]
@@ -694,5 +1045,76 @@ mod tests {
         assert!(!w.feed(0.5, s(60)), "once");
         assert_eq!(parse_speed(" 0.97x"), Some(0.97));
         assert_eq!(parse_speed("N/A"), None);
+    }
+
+    #[test]
+    fn the_read_bursts_number_is_the_arguments() {
+        assert_eq!(READ_BURST_S.parse::<f64>(), Ok(READ_BURST));
+    }
+
+    #[test]
+    fn the_tail_drops_noise_stays_bounded_and_hides_credentials() {
+        let mut t = Tail::default();
+        for noise in [
+            "",
+            "   ",
+            "frame= 1200 fps= 30 q=-1.0 size=N/A time=00:00:40.00 bitrate=N/A speed=1.0x",
+            "size=    1024kB time=00:00:10.00",
+            "[http @ 0x55] Resumed reading at pos 1048576",
+            "    Last message repeated 14 times",
+        ] {
+            assert!(is_noise(noise), "{noise:?}");
+            t.push(noise);
+        }
+        assert!(t.lines().is_empty());
+        assert!(!is_noise("[mov,mp4 @ 0x1] Invalid data found when processing input"));
+        t.push("http://user:hunter2@provider.example/movie/u/p/443235.mp4: Connection reset by peer");
+        t.push("[tcp @ 0x2] Failed to open http://127.0.0.1:41234/u/abcdefghijklmnop?x=1: End of file");
+        let lines = t.lines();
+        let all = lines.join("\n");
+        assert!(!all.contains("hunter2") && !all.contains("abcdefghijklmnop"), "{all}");
+        assert!(lines[0].contains("***@provider.example"), "{}", lines[0]);
+        assert!(lines[1].contains("/u/***?x=1: End of file"), "{}", lines[1]);
+        for i in 0..100 {
+            t.push(&format!("line {i}"));
+        }
+        let kept = t.lines();
+        assert_eq!(kept.len(), TAIL_LINES);
+        assert_eq!(kept.first().map(String::as_str), Some("line 92"));
+        assert_eq!(kept.last().map(String::as_str), Some("line 99"));
+        t.push(&"x".repeat(5 * TAIL_CHARS));
+        assert_eq!(t.lines().last().map(|l| l.chars().count()), Some(TAIL_CHARS + 1));
+    }
+
+    #[test]
+    fn the_failure_text_names_the_status_the_upstream_and_the_last_lines() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let dropped = Failure {
+            status: "exit status: 1".into(),
+            lines: lines(&["[tcp @ 0x2] Connection reset by peer", "pipe:: Input/output error"]),
+            media_s: Some(722.4),
+        };
+        assert_eq!(
+            dropped.text(false),
+            "exit status: 1; the input stream broke: the provider dropped the connection or the relay's proxy closed it; \
+             last stderr: [tcp @ 0x2] Connection reset by peer | pipe:: Input/output error"
+        );
+        assert_eq!(dropped.at().as_deref(), Some("722.4 s"));
+
+        let bad =
+            Failure { status: "signal: 11 (SIGSEGV)".into(), lines: lines(&["[mov @ 0x1] Invalid data found when processing input"]), media_s: None };
+        assert_eq!(bad.text(false), "signal: 11 (SIGSEGV); last stderr: [mov @ 0x1] Invalid data found when processing input");
+        assert!(bad.text(true).contains("the input stream broke"), "after a resume it is the upstream's doing");
+        assert_eq!(bad.at(), None);
+
+        let silent = Failure { status: String::new(), lines: Vec::new(), media_s: None };
+        assert_eq!(silent.text(true), "no stderr");
+    }
+
+    #[test]
+    fn progress_time_is_microseconds() {
+        assert_eq!(parse_out_time("1500000"), Some(1.5));
+        assert_eq!(parse_out_time("N/A"), None);
+        assert_eq!(parse_out_time("-9223372036854775807"), None);
     }
 }

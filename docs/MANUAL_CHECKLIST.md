@@ -1795,12 +1795,37 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
     `itemPlayedToEnd` arrives, Up next continues on the TV, and the progress shown matches the
     TV. Seeking a catch-up programme past what has loaded clamps with the toast "Catch-up can
     only seek as far as it has loaded".
-- [ ] **8. VOD EVENT playlist:** the TV starts before `ENDLIST`, at the resume point (not 10 s
-  later); resume a film at 1:10:00. The TV's scrubber shows about a minute ahead, not the whole
-  film. Pause the TV for 5 minutes: the log says "pausing production … ahead of the TV", and it
-  resumes cleanly. A provider drop logs "resuming the provider's stream at byte …" and the TV
-  doesn't jump; *Convert this channel* 10 minutes into a film resumes within seconds of where
-  the TV was, never at the cast's start. The session's end is in the log with why.
+- [ ] **8. Full-length films (cast design §8.5):**
+  - **Do:** cast an MP4 film (most VOD) and an MKV film from the start.
+  - **Expect:** the log says `… full length: <length> in <n> segments, target <t> s, from the MP4
+    index` (or `the Matroska cues`); the TV shows the film's **real length** at once, not "LIVE"
+    nor a minute.
+  - **Do:** scrub with the **TV remote**: far forward (an hour), far back (to the start), and a
+    few seconds; note the time to the picture after each.
+  - **Expect:** each lands where asked; the log says "making segment … on demand" for the far
+    ones; picture and sound start together (no lip-sync drift, no gap or click longer than a
+    frame); no "segment outgrew the target" line ever.
+  - **Do:** resume a film at **1:10:00** (Play on the TV from a film with progress).
+  - **Expect:** the TV starts at 1:10:00 and its scrubber still reaches the start. If the log
+    says "the TV doesn't start where the playlist says", it plays from 1:10:00 with a scrubber
+    from there (note which, for the Apple TV and the Hisense).
+  - **Do:** a **surround** film (the AAC 5.1 one, `xt:vod:346970`): scrub twice.
+  - **Expect:** the AVR (or Settings ▸ Video and Audio ▸ Audio Format) shows 5.1 after each
+    scrub; the TV's audio menu shows one track.
+  - **Do:** pause the TV for 5 minutes on a full-length film, then play.
+  - **Expect:** "pausing production … ahead of the TV", and it resumes cleanly.
+  - **Do:** after scrubbing, *Stop casting* then play on the computer.
+  - **Expect:** it resumes where the TV was, never later.
+  - **Do:** a **catch-up** programme, from the start and from the middle.
+  - **Expect:** note what the log says for your provider: `full length` (the TV scrubs anywhere)
+    or `a growing playlist: …` (MPEG-TS catch-up: item 8b's behaviour).
+- [ ] **8b. VOD EVENT playlist** (a film the log calls "a growing playlist": an `.ts` or `.avi`
+  film): the TV starts before `ENDLIST`, at the resume point (not 10 s later); resume a film at
+  1:10:00. The TV's scrubber shows about a minute ahead, not the whole film. Pause the TV for 5
+  minutes: the log says "pausing production … ahead of the TV", and it resumes cleanly. A
+  provider drop logs "resuming the provider's stream at byte …" and the TV doesn't jump;
+  *Convert this channel* 10 minutes into a film resumes within seconds of where the TV was,
+  never at the cast's start. The session's end is in the log with why.
 - [ ] **9. Stray requests:** does the TV fetch anything besides the playlist and segments
   (`/favicon.ico`, `HEAD`, `Range`)? The 404s are harmless.
 - [ ] **10. Volume:** confirm there is no working path (expected), so the "TV remote" copy is

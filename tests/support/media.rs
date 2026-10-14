@@ -29,7 +29,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 /// Bump when the script's outputs change (forces regeneration of an existing directory).
-const MEDIA_VERSION: &str = "5";
+const MEDIA_VERSION: &str = "10";
 const STAMP: &str = ".complete";
 
 /// Directory with `testsrc.mp4` (10 s 640×360 25 fps + 1 kHz sine), `bars.ts` (MPEG-TS),
@@ -172,11 +172,28 @@ struct Shared {
     /// Paths answered 200 with this text.
     bodies: Mutex<HashMap<String, String>>,
     limit: Mutex<Option<SessionLimit>>,
+    /// `Range` is ignored: every answer is the whole file, without `Accept-Ranges`.
+    no_ranges: AtomicBool,
     /// Stream key → (open connections, last close).
     sessions: Mutex<HashMap<String, (usize, Option<Instant>)>>,
+    /// `(path, from, status, times)`: the next `times` requests for `path` whose `Range` starts at
+    /// or after `from` are answered `status`.
+    range_faults: Mutex<Vec<(String, u64, u16, u32)>>,
 }
 
 impl Shared {
+    /// A [`TestServer::fail_ranges_from`] answer for this request (counted), if one is due.
+    fn range_fault(&self, path: &str, headers: &[(String, String)]) -> Option<u16> {
+        let from = headers
+            .iter()
+            .find(|(k, _)| k == "range")
+            .and_then(|(_, v)| v.trim().strip_prefix("bytes=")?.split('-').next()?.trim().parse::<u64>().ok())?;
+        let mut faults = self.range_faults.lock().unwrap();
+        let (_, _, status, times) = faults.iter_mut().find(|(p, at, _, times)| p == path && from >= *at && *times > 0)?;
+        *times -= 1;
+        Some(*status)
+    }
+
     /// The forced status of `path`: its own, else the longest matching `prefix*`.
     fn forced_status(&self, path: &str) -> Option<u16> {
         let m = self.status.lock().unwrap();
@@ -287,6 +304,13 @@ impl TestServer {
         }
     }
 
+    /// Answer the next `times` requests for `path` whose `Range` starts at or after byte `from`
+    /// with `status`: a provider refusing a connection made right after the previous one closed,
+    /// for a read of the file's end (a keyframe index).
+    pub fn fail_ranges_from(&self, path: &str, from: u64, status: u16, times: u32) {
+        self.shared.range_faults.lock().unwrap().push((path.to_owned(), from, status, times));
+    }
+
     /// Keep connections open between requests ([`KeepAlive`]); applies to new requests.
     pub fn set_keep_alive(&self, k: KeepAlive) {
         *self.shared.keep_alive.lock().unwrap() = k;
@@ -306,6 +330,11 @@ impl TestServer {
     /// ago (`None` = no limit). A stream is a directory (`/live`) or a top-level file.
     pub fn set_session_limit(&self, limit: Option<SessionLimit>) {
         *self.shared.limit.lock().unwrap() = limit;
+    }
+
+    /// Answer `Range` requests (`true`, the default) or ignore them, as some providers do.
+    pub fn set_ranges(&self, on: bool) {
+        self.shared.no_ranges.store(!on, Ordering::SeqCst);
     }
 
     /// Limit every response body to `bps` bytes per second (`None` = unlimited).
@@ -649,7 +678,7 @@ async fn respond(
         }
     };
 
-    if let Some(code) = shared.forced_status(path) {
+    if let Some(code) = shared.forced_status(path).or_else(|| shared.range_fault(path, headers)) {
         set_status(code);
         let _ = respond_error(stream, code).await;
         return After::Closed;
@@ -687,15 +716,17 @@ async fn respond(
     };
 
     let total = body.len() as u64;
-    let range = headers.iter().find(|(k, _)| k == "range").and_then(|(_, v)| parse_range(v, total));
+    let ranges = !shared.no_ranges.load(Ordering::SeqCst);
+    let range = headers.iter().find(|(k, _)| k == "range").filter(|_| ranges).and_then(|(_, v)| parse_range(v, total));
     let (start, end) = range.unwrap_or((0, total.saturating_sub(1)));
     let status = if range.is_some() { 206 } else { 200 };
     set_status(status);
     let len = if total == 0 { 0 } else { end - start + 1 };
     let mut head = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: {}\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {}\r\nContent-Length: {len}\r\n{}Connection: {}\r\n",
         reason(status),
         content_type(path),
+        if ranges { "Accept-Ranges: bytes\r\n" } else { "" },
         if persist { "keep-alive" } else { "close" }
     );
     if range.is_some() {

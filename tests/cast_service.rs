@@ -549,6 +549,40 @@ fn a_catch_up_seek_past_what_is_loaded_clamps_to_the_edge() {
     assert_eq!(loads, 1, "no restart: catch-up keeps its one upstream");
 }
 
+/// A full-length film (§8.5) on a TV that ignored where its playlist starts: the relay says so
+/// (`StartIgnored`) and the session replaces the item with the relay's view from there, whose
+/// start is the positions' offset; a film whose keyframe index didn't hold (`Unindexed`) is
+/// loaded again where the TV is, at the same level (the relay makes it a growing playlist).
+#[test]
+fn a_full_length_film_falls_back_where_the_tv_or_the_index_needs_it() {
+    let r = rig("tuner-cast-service-full-length", calm());
+    let tv = r.links.receiver();
+    let relay = r.links.relay();
+    relay.with(|s| s.produced_s = 1e9);
+    let out = r.cast.open(tv_id()).unwrap();
+    load(&out, 1, film(Some(4200.0)));
+    until("the insert", || calls(&tv).len() == 1);
+    relay.emit(RelayEvent::UpstreamOpened { generation: 1 });
+    relay.emit(RelayEvent::StartIgnored { generation: 1, at_s: 4200.0 });
+    until("the view's replace", || calls(&tv).len() == 2);
+    assert!(relay.with(|s| s.calls.contains(&RelayCall::View { generation: 1, at_s: 4200.0 })));
+    assert!(matches!(&calls(&tv)[1], Call::Replace(req) if req.offset_s == 4200.0), "{:?}", calls(&tv));
+    tv.emit(ReceiverEvent::Playing);
+    tv.emit(ReceiverEvent::Position { pos: 10.0, dur: None });
+    wait_event(&out.events, "the report", |e| matches!(e, RemoteEvent::Position { pos, .. } if *pos == 4210.0));
+
+    tv.with(|s| s.position = Some(25.0));
+    relay.emit(RelayEvent::Unindexed { generation: 1 });
+    until("the reload's replace", || calls(&tv).len() == 3);
+    let reload = relay.with(|s| {
+        s.calls.iter().rev().find_map(|c| match c {
+            RelayCall::Load { generation, force, start_at, .. } => Some((*generation, *force, *start_at)),
+            _ => None,
+        })
+    });
+    assert_eq!(reload, Some((1, Some(CastLevel::Repackaged), Some(4225.0))), "where the TV is, the same level");
+}
+
 /// Discovery lists a new TV as "Pair first" (and the store remembers it); casting to it is
 /// refused until it is paired.
 #[test]

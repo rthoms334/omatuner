@@ -8,11 +8,13 @@
 > - casting that respects workspaces (§3.8);
 > - the doc's recommendation for every other question.
 >
-> §17 lists the decisions. The user checks the result on the real TV once, at the end (§18).
+> §17 lists the decisions. The user checks the result on the real TV once, at the end (§18). Once approved this becomes DESIGN **§40 Casting**, the next free number after §39. Code comments cite it as "DESIGN §40 §x.y". Appendix B lists what changed from revision 1.
+>
+> Revision 4, 2026-10-13: films, episodes and catch-up reach the TV **full length** (§8.5), the Phase 2 design's §29.6 applied to the AirPlay path; Appendix D lists what changed.
 >
 > Addendum, 2026-10-13 (after 0.3.0 in real use): "Cast to…" on every playable item and the
 > **Play on** switch (§3.1, §3.9, the keys in §3.7), and the info panel while casting says what
-> the TV is fed (§11.3). Once approved this becomes DESIGN **§40 Casting**, the next free number after §39. Code comments cite it as "DESIGN §40 §x.y". Appendix B lists what changed from revision 1.
+> the TV is fed (§11.3).
 
 This design is based on `main` at 17f9986. It was built from:
 - four codebase maps: playback, UI, services and tests;
@@ -653,7 +655,9 @@ src/cast/airplay/            features.rs (TXT/`/info` decode, versions), tlv8.rs
 src/cast/relay/              mod.rs (Relay API), server.rs (LAN, axum), token.rs, upstream.rs (loopback proxy, head buffer,
                              playlist rewrite, single upstream connection), probe.rs (ffprobe JSON), plan.rs (pure ladder),
                              ffmpeg.rs (args + supervisor + progress), playlist.rs (served-playlist guard, IDR check,
-                             playlist views), renditions.rs (the surround multivariant playlist)
+                             playlist views), renditions.rs (the surround multivariant playlist),
+                             vod.rs (full-length items: the map, runs, on-demand segments, §8.5),
+                             vod/keyframes.rs (MP4 and Matroska indexes), vod/fmp4.rs (init and track split)
 src/cast/firewall/           mod.rs (FirewallState, detect, rule and command text), ufw.rs (user.rules parser),
                              allow.rs (pkexec runner, outcomes)
 src/bin/tuner-firewall.rs    the root helper (std only): validates, runs one fixed ufw command
@@ -1287,7 +1291,7 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 - Spawned through `tokio::process` with `kill_on_drop` and `PR_SET_PDEATHSIG`.
 - Its environment is cleared except `LC_ALL=C`.
 - Its argv holds only the loopback URL and the output directory.
-- stderr is redacted and logged at debug, capped.
+- stderr is redacted and logged at debug, capped. Independently of that cap, the last 8 meaningful lines (no progress or `Resumed reading` noise) are kept per child; when ffmpeg exits with an error the WARN carries its status, those lines and, if they show the input broke (`Connection reset`, `End of file`, `Invalid data found` after a mid-body resume), the upstream named in plain words; INFO adds the media time it reached.
 - `-progress pipe:1` gives `speed=`. A live speed below 0.98× for 20 s gives `CpuTooSlow`.
 - Capabilities are checked once per run (`ffmpeg -hide_banner -encoders` for `libx264` and `aac`). If either is missing, L3 is off and the UI says so.
 
@@ -1307,6 +1311,8 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 - it is served under the new generation's token, while the segment files are shared on disk;
 - a seek inside what's produced becomes a replace (§7.3) with such a view. The TV starts at 0 of it, and the session adds segment *k*'s start time to the positions it reports;
 - the playlist only ever grows at the end, as RFC 8216 requires for EVENT playlists.
+
+**6. Full length (`vod.rs`, `vod/keyframes.rs`, `vod/fmp4.rs`).** A film, an episode or a catch-up programme whose segments can be known before anything is made gets a complete VOD playlist and its segments are made when the TV asks for them (§8.5). The playlist guard and views above are for everything else: live channels, and the items of §8.5's fallback matrix.
 
 ### 8.2 Hints, in priority order
 
@@ -1410,7 +1416,7 @@ v/index.m3u8
 - A view (a seek inside what's produced) starts each audio rendition at its segment holding the video's first.
 - **Not verified on the TV yet** (§18 item 5): that tvOS 27 picks the surround group, and plays the renditions over AirPlay's URL playback. If it doesn't play them, the session's stereo retry keeps the cast going.
 
-**Catch-up and VOD**
+**Catch-up and VOD** (full length when they can be, §8.5; otherwise, as follows)
 - They use `-hls_playlist_type event` (rule 8.8), with no `delete_segments` and with `ENDLIST` at the end.
 - Output goes to `paths.cache_dir/cast/<session>/` on disk, because a film doesn't fit in tmpfs. It is capped at 8 GiB, wiped on stop and swept at startup.
 - **Production stays about a minute ahead of the TV.** ffmpeg reads the first 60 s as fast as the provider sends them (a quick start, room for the TV's first buffer), then at real time with its 5 % catch-up (`-readrate 1 -readrate_initial_burst 60`). Revision 2 read at 4× after a 30 s burst: the film ran minutes ahead and the TV's scrubber showed it all as loaded.
@@ -1430,23 +1436,55 @@ v/index.m3u8
 - **Live reconnect.** Same as a zap, with the same channel.
 - **Phase 2 experiment:** one continuous playlist across zaps and reconnects (`append_list` plus `#EXT-X-DISCONTINUITY`), so the TV doesn't reinitialise.
 
-**Catch-up**
+**Full-length VOD and catch-up** (revision 4; `relay/vod.rs`; the Phase 2 design's §29.6 for AirPlay)
+
+The TV gets a film, an episode or a catch-up programme whole: a VOD playlist (`#EXT-X-PLAYLIST-TYPE:VOD`, every segment, `#EXT-X-ENDLIST`), so it shows the item's real length and its own scrubber, and the remote's, reach anywhere. Each segment is made when the TV asks for it. Jellyfin's `DynamicHlsController` serves Apple TVs this way (GPL-3, read at `61f9a9df` for facts only); Tuner differs in handing ffmpeg absolute cut points, so a segment is the same media whichever ffmpeg run made it, and in validating each segment against them.
+
+- **When** (§8.5's fallback matrix below): a provider that serves the file by `Range` (`Feed::sized`: a 206 or `Accept-Ranges`, and a length), not HLS, a picture, and a keyframe index read through the proxy (`vod/keyframes.rs`). Films and catch-up are always probed (the file's `format.start_time` and `duration`). The INFO line says `… full length: 1:52:03 in 1119 segments, target 7 s, from the MP4 index`, or `a growing playlist: <why>`.
+- **The index.** MP4: the top-level boxes are walked by their sizes (the `moov` at the start, or after the `mdat`: one `Range` request), then the first `vide` track with more than one sample: `stts`, `ctts` (signed, as ffmpeg reads it), `stss` (none: every sample is a sync sample) and `elst` (leading empty edits, one media edit; anything more, a fragmented file or a damaged box is no index), normalised as ffmpeg's `mov_fix_index` does: with an edit the first presented picture is time 0; without one the tables' own times, as ffmpeg keeps them (a `-use_editlist 0` film's picture starts one B-frame delay, 0.08 s, after its sound). The index is read by `Range` requests the proxy marks optional: a provider refusing one (a one-connection panel answering a connection made right after the previous one closed) costs the full-length playlist, not the feed. A `moov` or Matroska element larger than the proxy's 16 MiB head buffer (less 1 MiB) is no index at once, and a sample table bigger than its `moov` could hold is a damaged one; the tables are walked on the blocking pool, so the 15 s index budget holds whatever they say. Matroska: `SeekHead` → `Info` (`TimestampScale`, `Duration`), `Tracks` (the first video track) and `Cues`; every `CuePoint` of the video track is a keyframe. Each keyframe gets a `-ss` time that lands ffmpeg's demuxer on it: at or after its presentation time and before the next keyframe's decode time (MP4: `mov_seek_stream` searches decode times) or the next cue (Matroska): pts + min(0.5 s, half the gap), Jellyfin's "+0.5 s" made exact; a keyframe without such a window is no cut point.
+- **The map** (`vod::Map`, fixed for the item). Copied video: whole keyframe runs merged into segments of at most 6 s + 0.5 s (Apple rule 7.5); a GOP longer than that is a segment of its own; no sliver at the end; EXTINF exact. Converted video (L3): a 6 s grid where `-force_key_frames` puts the keyframes. `#EXT-X-TARGETDURATION` is the longest segment, rounded, known before anything is made: one target for every rendition, and no segment can outgrow it (the "segment outgrew the target: restarting" of an EVENT playlist, seen on a film on 2026-10-13, can't happen). A gap between keyframes over 30 s is no map (§8.1.4: such a source is converted).
+- **A run** (one ffmpeg, one provider request at a time, every rendition) makes the item from segment *k* on: `-readrate 1 -readrate_initial_burst 60`, `-noaccurate_seek -ss <k's seek>` (copied) or `-ss <k's start>` (converted, `-copypriorss:a 0`), `-copyts -start_at_zero` (the item's own clock: the file's start is 0, as `-ss` counts and the TV's playlist time), the plan's codecs, `-map_metadata -1 -map_chapters -1 -fflags +bitexact`, `-output_ts_offset 10 -avoid_negative_ts disabled`, ffmpeg's `segment` muxer with `-segment_times` relative to the run's first picture (*k*'s keyframe, or in a run from 0 where the picture starts: after the file's start when the sound leads it, as in a remux of a broadcast; no cut point comes before it), `-segment_time_delta` (1 ms copied, half a step converted), `-segment_start_number k` and a CSV `-segment_list`. MPEG-TS as before for H.264 in stereo; fMP4 (`frag_keyframe+empty_moov+delay_moov+default_base_moof+frag_discont+skip_sidx+skip_trailer+negative_cts_offsets`, one muxer per segment) for HEVC and surround. Measured with ffmpeg n9.0.2 on 2026-10-13 (`segment.c`, `mov.c`, `movenc.c` read at that tag):
+  - `-segment_times` count from the *reference stream's* first timestamp: the picture's;
+  - without the constant offset, a run from 0 starts one B-frame delay later than one restarted later (whose first timestamps aren't negative); with it, the two runs' segments carry identical TS timestamps and identical fMP4 `tfdt`s and init sections;
+  - with one fMP4 muxer per run, `delay_moov` (which AC-3 and E-AC-3 need) writes only the `moov` at the first flush: a run whose first segment was one GOP put that GOP's pictures into the next file. One muxer per segment (`-individual_header_trailer 1`) writes each segment whole, with the same init section every time;
+  - in MPEG-TS, `-ss` lands between keyframes and the pictures up to the next one are lost: a converted run restarted from an MPEG-TS film started up to a GOP late. So converted items need an index too (it says the container seeks to keyframes).
+- **Surround** (§8.4) is made as one muxed fMP4 output (picture, stereo AAC, surround) and each finished segment is split into the `v/`, `a/`, `s/` renditions (`vod/fmp4.rs`: the `moov` keeps `mvhd`, one `trak` and its `trex`; each `moof` keeps `mfhd` and one `traf`, its `trun` offsets moved onto an `mdat` of that track's samples). So every track is cut where the picture is, by ffmpeg's interleaving, the same in every run: separate audio outputs would be cut relative to their own first packet, which differs between runs.
+- **Publishing.** A segment is complete once the CSV lists it and its successor's file exists (`segment.c` lists a segment before it closes it) or the run ended; only then is it moved (or written) into the served directory under its served name, atomically, so the LAN server only sees whole segments and a newer run's copy replaces an older one in place. fMP4 segments lose their init section, published once. Each segment is checked against the map: its start (but a run's first, which the list doesn't time) within 50 ms (converted: 100 ms), and its end no later than the next cut point (a missed cut would make it two; open GOPs end a little early, their leading pictures belong to the next segment). A map that doesn't hold sends `Unindexed`: the relay remembers the item for the session and the session reloads it where the TV is, at the same level, as an EVENT playlist. Found on the load's first run (before the TV has anything), the load itself falls back to the EVENT playlist, with no `Unindexed`. Copied pictures keep the IDR check (two misses: `Irregular`, L3 next time). A segment that can't be published (a write that failed, a muxed segment that can't be split) is lost for the generation: requests for it get the 404 at once and the run goes on, rather than a run restarted for each request. A track without samples in a segment (a film's sound ending before its picture) is one fragment without samples in that rendition.
+- **On demand** (`OnDemand::segment`, Jellyfin's rule): a published segment is served at once; one the running run will reach within 24 s of what it has made is waited for (polled every 100 ms, at most 30 s, the load budget; the lead cap is lifted while anyone waits), when the run's pace gets it there within 8 s of media of where `-readrate` lets it be by now (its 60 s burst from where it started, then real time: Jellyfin's rule assumes production faster than real time, and a run past its burst would take up to 30 s to reach a segment 24 s ahead); anything else (behind the run, further ahead, or deleted by the 8 GiB cap) stops the run (ffmpeg killed and gone) and starts one there. The new ffmpeg's request reaches the provider only after the old connection has closed (the proxy's one wire, §10). Every rendition's request for segment *k* follows the same rule. A run that dies before publishing anything twice in a row ends the item (`Failed`); one that reaches the input's end before the map does marks the rest as missing (404s).
+- **Production stays capped.** A run reads its first minute as fast as the provider sends it, then at real time; it pauses (SIGSTOP) while more than 180 s ahead of the segment the TV fetched last, until under 120 s, never while a request waits. The 8 GiB cap deletes the published segments furthest from the TV first (a scrub back to them makes them again). Otherwise segments stay for the generation, so scrubbing back is free; the directory goes with the generation (zap, stop, session end).
+- **The token** of a whole playlist lives as long as its generation (§9.2's 60 s after the end doesn't apply: having fetched the last segment, the TV may still scrub back).
+- **The provider connection** is the generation's: a run ending (the item's end, a stop for a scrub) closes the provider's request, not the feed, and sends no `UpstreamEof` (the TV may still scrub anywhere; the controller ends the item at the TV's `Ended`). `UpstreamClosed` comes when the generation ends, or at once when the provider fails, so the controller's reconnect policy reloads where the TV is.
+- **Starting somewhere** (a resume, Tuner's seek bar, a reload): the whole playlist under a new token with `#EXT-X-START:TIME-OFFSET=<t>,PRECISE=YES` (RFC 8216 §4.4.2.2); the TV starts there and its scrubber covers the whole item. tvOS honours `TIME-OFFSET=0` (§8.4, 2026-10-13); a positive offset is unverified on this TV, and third-party TVs may ignore it. So the LAN server checks the first picture segment fetched under such a token: one more than a segment before where it should start means the TV started from the beginning, and the relay reports `StartIgnored` (once per session). The session then replaces the item with a *view* from there (a VOD playlist from segment *k*, `MEDIA-SEQUENCE:k`, its start the positions' offset, as Phase 1's views), and every later start in the session is one: the TV's scrubber then covers the rest of the item.
+- **Positions and progress.** A whole playlist is the item's own time (offset 0), so `RemoteEvent::Position`, progress and `finished` need nothing more: `playbackInfo` answers are the TV's own; `timeJumped` places the estimate; a fetch run that breaks (a scrub on the TV) rebases it at that segment's start (behind, never ahead); an item's first fetch past its playlist's start (an `EXT-X-START`) places it there too. The catch-up clamp (`produced_s`) doesn't apply: the whole item is reachable.
+- **Not verified on the TV yet** (§18 item 8): that tvOS starts at a positive `EXT-X-START`, plays the split surround renditions of a full-length film, and how long a scrub takes to the first picture (a run's start: the provider's seek plus a segment).
+
+**Fallback matrix** (what keeps the EVENT playlist of §8.4, and why):
+
+| Item | Copied (L2) | Converted (L3) |
+|---|---|---|
+| MP4 with a readable `moov` (`stss`, or every sample a sync sample) | full length, cut at its keyframes | full length, 6 s grid |
+| Matroska with cues for the picture | full length, cut at the cued keyframes | full length, 6 s grid |
+| Matroska without cues (a file written to a pipe) | EVENT: no keyframe times | EVENT: ffmpeg would read up to every seek point |
+| MPEG-TS (films, most catch-up), and anything else | EVENT: no index | EVENT: `-ss` lands between keyframes, a restart's first segment would start late |
+| Fragmented MP4, several edits, a damaged `moov`, keyframes over 30 s apart | EVENT (§8.1.4's guard as before) | grid only with a readable index; else EVENT |
+| A provider that ignores `Range`, an HLS upstream, no length known | EVENT | EVENT |
+| A map that didn't hold (`Unindexed`; on the first run, the load's own fallback) | EVENT for the rest of the session | EVENT for the rest of the session |
+| The provider refuses the index read, or the `moov`/cues pass 15 MiB | EVENT | EVENT |
+| Live | sliding window (unchanged) | sliding window (unchanged) |
+
+An EVENT item works as before: the TV's scrubber shows what is produced, about a minute past where it plays; Tuner's seek bar reaches the whole film (views inside what's produced, `-ss` restarts beyond); catch-up clamps to what has loaded (below).
+
+**Catch-up** (an EVENT playlist)
 - Uses an L2 EVENT playlist, with `duration_hint` as the duration.
 - A seek inside what's already produced is a replace with a playlist view starting at the target's segment (§8.1). It costs no new upstream.
 - A seek beyond that clamps to the produced edge, with the banner "Catch-up can only seek as far as it has loaded". Phase 2 re-resolves `MediaRef::Catchup` with a later start through the existing timeshift builder.
 
-**VOD (film or episode)**
+**VOD (film or episode)** (an EVENT playlist)
 - Uses an L2 EVENT playlist.
 - **Resume, or seek beyond the produced edge**, restarts ffmpeg with `-ss <t>`. That turns into a `Range` request through the proxy, so there is still one upstream connection. The new playlist starts at `t`, so the TV starts at its 0.
 - The session adds `t` (or the view's first segment time) to the positions the TV reports, so the snapshot, progress and `finished` stay true to the film.
 - A seek inside the produced part is a replace with a playlist view.
 - **The TV's own scrubber** shows what is produced: the position plus about a minute (§8.4), growing as it plays. Seeking with the TV's remote works inside that; Tuner's seek bar (and the agent) reach the whole film.
-
-**Why not a complete VOD playlist (the film's real length on the TV, every segment listed, made on demand)?** That is how Jellyfin serves Apple TVs (facts: its `DynamicHlsController` lists every segment up front and restarts ffmpeg at the segment the client asks for). It needs the segment boundaries before anything is produced, and that holds only where the relay chooses them:
-- **Copied video (L2, almost every film)** can only cut at the source's keyframes, and ffmpeg's HLS muxer decides where (the first keyframe past each `hls_time` step, counted from where that ffmpeg started), so a restart at segment k cuts differently from a run that reached k. A precomputed list needs every keyframe time (an MP4's `stss`; an MKV's `Cues` may list only some), `hls_time` below the shortest GOP so ffmpeg cuts at each one (segments as short as a scene cut), restarts on exact keyframes with `-copyts` (ffmpeg drops copied packets before `-ss`), and audio renditions cut at those same times (the muxer cuts audio-only renditions every `hls_time`, so surround would break it). MPEG-TS films and catch-up have no index at all, and catch-up can't restart at an arbitrary point (§8.5 "Catch-up").
-- **Converted video (L3)** has fixed 4 s segments, so it could; it is the rare path (MPEG-2, VC-1, VP9 films, or Convert this channel), runs near real time on this M2, and a scrub would restart the encoder anyway.
-
-So Phase 1 keeps the EVENT playlist with the lead and start fixes above. The complete playlist is the Phase 2 item "Full-length VOD on the TV" (§15.3): MP4 `stss` and MKV `Cues` read through the proxy by `Range`, one segment per keyframe run, on-demand restarts, L3 first.
 
 **Test on TV**
 - The input is `-f lavfi -i testsrc2=s=1280x720:r=25 -f lavfi -i sine=f=440 -t 15`, plus a drawn "Tuner" label, through L3 into the same server.
@@ -1885,6 +1923,13 @@ Not needed: protobuf/prost, `plist`, dalek/RustCrypto, `srp`, `rust_cast`, `rupn
 - **No leaks:**
   - no provider host, path or credential string in any served byte, header or log line (the `tests/redact.rs` pattern);
   - `/proc/<ffmpeg pid>/cmdline` holds no upstream host.
+- **Full length (§8.5):**
+  - the index readers on synthetic boxes and EBML (unit): `stss`/`stts`/`ctts`/`elst`, no `stss`, empty edits, several edits, fragmented and damaged files (a `ctts` count past the samples, a few bytes declaring millions of samples), no edit list with B-frames, the `moov` at either end; the picture's cues among the sound's, a 100 µs timestamp scale, no cues; the seek windows;
+  - the map (unit): keyframe runs merged, a long GOP alone, the target, the file's start, keyframes over 30 s apart, the grid, a run's cut points and forced keyframes, the VOD playlist with `EXT-X-START`, `EXT-X-MAP` and views; a picture starting after the sound (a run from 0 counts from it); the paced look-ahead (a run past its burst isn't waited for far ahead); the fMP4 split of one track's init and fragments, and of a track without samples;
+  - `vod.mp4` (moov at the end), `vod.mkv`, `vod_hevc.mp4` (fMP4), `vod_late.mkv`/`vod_late.mp4` (the picture 0.5 s after the sound) and `vod_noelst.mp4` (no edit list) from a real relay: the playlist lists the whole film at once, every cut a keyframe ffprobe sees, the target the longest segment; resumed at 25 s (`EXT-X-START`, offset 0), then scrubbed back by fetching segment *n* directly: its pictures equal the same segment of a run from the start (timestamps, sizes, flags), the sound within one frame, the init section the same; one provider connection throughout; the directory gone after `stop`;
+  - the marker film full length (from 0, resumed, converted on the grid, in stereo, a scrub back that joins two runs) and as EVENT (without cues, a provider without `Range`): every rendition's sound within 40 ms of the picture, and the TV's first picture where the session counts from (`every_rendition_shares_the_pictures_timeline`);
+  - a TV that ignores `EXT-X-START` (it fetches segment 0 first): `StartIgnored` once, views from then on; the fallback matrix on MPEG-TS, Matroska without cues and a provider without `Range`, copied and converted; the session's `StartIgnored` view and `Unindexed` reload (`tests/cast_service.rs`);
+  - a film whose cues ffmpeg doesn't cut at: the load falls back to EVENT at once (no `Unindexed`, no failure), and so does the next load; a surround film whose sound ends 4 s early: every segment of every rendition served, by one run; a provider refusing the index read of a 20 MB film (503): EVENT, the feed not failed.
 - Skipped through `ensure_media()` when ffmpeg is missing locally; fails loudly in CI.
 
 ### 14.3 Fake receiver (`tests/support/fake_airplay.rs`, via `#[path]`)
@@ -2234,7 +2279,7 @@ The skeleton is commit "Cast skeleton (CAST-0)" on `feat/cast`, based on `main` 
 - **Seamless zap and reconnect** (`append_list` + DISCONTINUITY).
 - **Catch-up seek** by re-resolving.
 - **Audio-track choice** (`-map`).
-- **Full-length VOD on the TV:** a complete playlist with the film's real length, every segment made on demand (§8.5: MP4 `stss` and MKV `Cues` read by `Range`, one segment per keyframe run, exact-keyframe restarts; L3 first).
+- **Full-length VOD on the TV:** built in revision 4 for AirPlay (§8.5). Phase 2 adds Google Cast's and DLNA's sides (the Phase 2 design's §29.6), and catch-up without `Range` through a re-resolved source.
 - **Guide and browse "Play on <device>"** menus.
 - **Local files and ad-hoc URLs.**
 - **Trace replay:** the fake replays the user's real-TV transcripts (§14.3 anchor 4).
@@ -2354,7 +2399,10 @@ Run these against "Living Room" (192.168.1.5) once the gate has passed.
    - Stop really stops the TV.
    - Stopping from the Apple TV remote gives "Living Room stopped playing".
    - For VOD, `itemPlayedToEnd` arrives, Up next continues on the TV, and the progress shown matches the TV.
-8. **VOD EVENT playlist:** the TV starts before `ENDLIST`, at the resume point (not 10 s later); resume a film at 1:10:00. Pause the TV for 5 minutes: the log says "pausing production … ahead of the TV", and playback resumes cleanly. The TV's scrubber shows about a minute ahead, not the whole film.
+8. **Full-length VOD (§8.5):** cast an MP4 film and an MKV film. The log says `… full length: <length> in <n> segments, target <t> s, from the MP4 index` (or the Matroska cues). The TV shows the film's real length at once; scrub with the TV remote far forward, far back and a little (note the time to the picture after each; the log says "making segment … on demand"); the picture and sound start together. Resume a film at 1:10:00: does the TV start there (the log has no "the TV started at segment 0"), and its scrubber still reaches the start? If not, the log says "the TV doesn't start where the playlist says" and the film plays from 1:10:00 with a scrubber from there. A surround film the same way (the AVR shows 5.1 after each scrub). A film the log calls "a growing playlist" (an `.ts` or `.avi` film) keeps item 8b. Pause the TV for 5 minutes on a full-length film: "pausing production … ahead of the TV", and it resumes cleanly.
+   - **Catch-up:** a catch-up programme (usually an MPEG-TS stream: a growing playlist, item 8b; note what the log says for your provider).
+   - **Progress:** stop casting after a scrub; the computer resumes where the TV was, never later.
+8b. **VOD EVENT playlist:** the TV starts before `ENDLIST`, at the resume point (not 10 s later); resume a film at 1:10:00. Pause the TV for 5 minutes: the log says "pausing production … ahead of the TV", and playback resumes cleanly. The TV's scrubber shows about a minute ahead, not the whole film.
    - **A reload keeps the place:** when the provider drops a film's connection, the log says "resuming the provider's stream at byte …" and the TV doesn't jump. Convert this channel 10 minutes into a film resumes within a few seconds of where the TV was, never at the cast's start; so does a reconnect.
    - The session's end is in the log at INFO with why (Play here, Stop casting, stopped on the TV…).
 9. **Stray requests:** does the TV fetch anything besides the playlist and segments (`/favicon.ico`, `HEAD`, `Range`)? Check that the 404s are harmless.
@@ -2490,3 +2538,13 @@ The first cast of a film to "Living Room" (AppleTV14,1, tvOS 27.0 24J361, hkp3, 
 - **Third-party AirPlay TVs** are listed and offered like the Apple TV, with no experimental tier (§17 decision 9).
 - **"The TV" for an agent** is the one paired TV, when there is exactly one (§12, §17 decision 12).
 - The 09:34 "live cast" in that log was Test on TV (the 15 s card); its session end now logs.
+
+## Appendix D. Revision 4 (2026-10-13): full-length VOD
+
+The user asked for the film's real length on the TV and scrubbing anywhere with its remote, as Jellyfin's Apple TV support does: the Phase 2 design's §29.6, applied to Phase 1's AirPlay path.
+- **§8.5** "Full-length VOD and catch-up" replaces "Why not a complete VOD playlist": the index readers, the map, runs with absolute cut points, publishing with validation, the on-demand rule, the caps, `EXT-X-START` with the `StartIgnored` fallback, positions, and the fallback matrix. §8.1 item 6 and §8.4 point to it.
+- **What changed from §29.6** (measured 2026-10-13): fMP4 runs use one muxer per segment (with one per run, `delay_moov` put a one-GOP first segment's pictures in the next file); surround is one muxed output split per track (audio-only outputs would cut relative to their own first packet); converted items need an index too (MPEG-TS `-ss` lands between keyframes); every segment is checked against the map (`Unindexed`); the 6 s grid replaces converted video's 2 s GOPs for full-length items only.
+- **New events:** `RelayEvent::StartIgnored` (the session replaces with a view) and `RelayEvent::Unindexed` (the session reloads where the TV is).
+- **Positions (§7.3):** an item's first fetch past its playlist's start places the estimate there.
+- **Probing:** films and catch-up are always probed (the file's start and length).
+- **Tests (§14.2)** and **the TV checklist (§18 item 8, 8b)**.
