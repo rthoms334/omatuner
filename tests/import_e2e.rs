@@ -756,8 +756,23 @@ async fn maintenance_backup_and_restore_jobs() {
 
     h.jobs.submit(JobKind::RematchEpg);
     assert!(h.finished(|k| *k == JobKind::RematchEpg).await.1.is_ok());
+    // rows freed since the last refresh (a guide's worth, here 8 MB) leave free pages …
+    h.store
+        .writer()
+        .run(|c| {
+            c.execute_batch("CREATE TABLE filler(x BLOB);")?;
+            for _ in 0..2000 {
+                c.execute("INSERT INTO filler VALUES (zeroblob(4000))", [])?;
+            }
+            Ok(c.execute_batch("DROP TABLE filler;")?)
+        })
+        .await
+        .unwrap();
     h.jobs.submit(JobKind::Maintenance);
     assert!(h.finished(|k| *k == JobKind::Maintenance).await.1.is_ok());
+    // … which maintenance gives back to the file system (DESIGN §7.4)
+    let free: i64 = h.store.writer().run(|c| Ok(c.query_row("PRAGMA freelist_count", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(free, 0);
     let store = h.store.clone();
     let stamp: Option<String> = tokio::task::spawn_blocking(move || {
         use rusqlite::OptionalExtension;

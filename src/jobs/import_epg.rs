@@ -5,8 +5,8 @@
 //! async consumer submits `write_epg_channels` / `write_programmes` batches of 5 000 to the
 //! writer → re-match this EPG source against all playlist sources (`epg_match::match_all` +
 //! `replace_auto_mappings`) → `finish_epg_import` (flip + `resolve_mappings`) →
-//! `sweep_old_generations` in chunks → FTS compaction (`merge_fts_step` until done) →
-//! `DataScope::Epg`.
+//! `sweep_old_generations` in chunks → FTS compaction (`merge_fts_step` until done) → free
+//! pages given back (`release_free_pages` until none) → `DataScope::Epg`.
 //! Back-pressure: the parser blocks when the channel is full, so memory stays bounded
 //! (~4 × 5 000 programmes) regardless of file size. Target: 415k programmes < 8 s total.
 //!
@@ -324,8 +324,21 @@ async fn sweep_old(ctx: &JobContext, id: EpgSourceId, cancel: &CancellationToken
     }
     if deleted > 0 {
         compact_fts(ctx, cancel).await?;
+        release_free_space(ctx, cancel).await?;
     }
     Ok(())
+}
+
+/// Give the pages a sweep or prune freed back to the file system, in short transactions
+/// (DESIGN §7.4): the old guide is as big as the new one, so without this the file stays at
+/// two guides' size. A cancellation leaves the rest for the next sweep or `Maintenance`.
+pub(super) async fn release_free_space(ctx: &JobContext, cancel: &CancellationToken) -> Result<()> {
+    loop {
+        check(cancel)?;
+        if write(ctx, |c| crate::store::release_free_pages(c, crate::store::FREE_PAGES_CHUNK)).await? == 0 {
+            return Ok(());
+        }
+    }
 }
 
 /// Drop deleted entries from the programme search index in short transactions (sweeps leave

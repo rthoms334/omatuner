@@ -1016,7 +1016,16 @@ resolution already ignores them). An aborted import deletes its own generation, 
 ### 7.4 Pruning
 Daily `Maintenance`: programmes with `stop < now − max(epg_keep_past_days, max catch-up days)`
 (chunked, FTS first); `epg::fts_cleanup`; history beyond 500 rows; image cache over 500 MB
-(LRM); `PRAGMA optimize`; `wal_checkpoint(TRUNCATE)`.
+(LRM); free pages given back; `PRAGMA optimize`; `wal_checkpoint(TRUNCATE)`.
+
+**Free space.** The database uses `auto_vacuum=INCREMENTAL`. A guide refresh writes the new
+generation beside the old one, so the file briefly holds two guides; with `auto_vacuum=NONE`
+it never shrank back (a user's 690 MB file was 270 MB free pages). After every generation sweep
+and in `Maintenance`, `store::release_free_pages` runs `PRAGMA incremental_vacuum` in 8 MiB
+steps (one short write transaction each) until nothing is free. A database from before this is
+converted once by `Store::open` (one `VACUUM`, its scratch copy in a temp file rather than
+memory: 2.2 s for that 690 MB file, leaving 390 MB). A failed conversion is logged and tried
+again on the next start.
 
 ---
 
