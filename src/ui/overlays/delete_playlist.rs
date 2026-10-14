@@ -154,7 +154,12 @@ impl DeletePlaylistOverlay {
 /// "3 favourites and 2 progress marks".
 fn moved_text(m: crate::store::copies::Moved) -> String {
     let n = |k: usize, one: &str, many: &str| if k == 1 { format!("1 {one}") } else { format!("{k} {many}") };
-    format!("{} and {}", n(m.favourites, "favourite", "favourites"), n(m.progress, "progress mark", "progress marks"))
+    format!(
+        "{}, {} and {}",
+        n(m.favourites, "favourite", "favourites"),
+        n(m.watchlists, "watchlist entry", "watchlist entries"),
+        n(m.progress, "progress mark", "progress marks")
+    )
 }
 
 /// "Dune (2021) → TV 2 · ★ · 41:20" ("… → TV 2: Dune: Part One (2021) · ★" when the copy
@@ -167,6 +172,9 @@ fn item_line(ctx: &UiCtx<'_>, m: &MoveItem) -> String {
     }];
     if !m.lists.is_empty() {
         parts.push("★".to_owned());
+    }
+    if !m.watchlists.is_empty() {
+        parts.push("Watchlists".to_owned());
     }
     match &m.progress {
         Some(p) if p.finished => parts.push("✓ watched".to_owned()),
@@ -253,7 +261,7 @@ impl Overlay for DeletePlaylistOverlay {
                 theme,
                 &format!("Delete {name}?"),
                 Some(
-                    "Its channels, movies, series and guide are removed — and with them its favourites, progress and watched marks. This can't be undone.",
+                    "Its channels, movies, series and guide are removed, with its favourites, progress and watched marks. Watchlist entries stay as ‘Not in your playlists’ until another copy is found. This can't be undone.",
                 ),
             );
             if let Some(plan) = self.plan.as_ref().filter(|_| offers) {
@@ -265,7 +273,7 @@ impl Overlay for DeletePlaylistOverlay {
                 let unnamed = plan.items.len() - items.len() + plan.cannot.len() - cannot.len();
                 ui.add_space(theme.space(SpaceToken::Lg));
                 if self.can_move() {
-                    let label = "Move favourites, progress and watched marks to the same titles in other playlists";
+                    let label = "Move favourites, watchlist entries, progress and watched marks to the same titles in other playlists";
                     tick_clicked = toggle(ui, theme, &mut tick, label, self.focus == Focus::Move).clicked();
                 }
                 let small = |ui: &mut egui::Ui, text: String, color| {
@@ -376,8 +384,8 @@ mod tests {
             testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
             let list = crate::store::user::default_fav_list(c)?;
             let r = |i: usize| ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
-            crate::store::user::set_favourite(c, list, &r(0), true, 1)?;
-            crate::store::user::set_favourite(c, list, &r(1), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &r(0), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &r(1), true, 1)?;
             let p = WatchProgress {
                 item: r(0),
                 position_s: 2480.0,
@@ -393,9 +401,9 @@ mod tests {
         let mut h = overlay_harness(t, one, DeletePlaylistOverlay::new(a, 7), egui::vec2(1200.0, 900.0));
         until_ov(&mut h, "the plan", |h| h.state().o.plan.is_some());
         h.run_steps(1);
-        assert!(has_label(&h, "Move favourites, progress and watched marks to the same titles in other playlists"));
+        assert!(has_label(&h, "Move favourites, watchlist entries, progress and watched marks to the same titles in other playlists"));
         assert!(!h.state().o.tick, "unticked by default");
-        assert!(has_label(&h, "  Dune (2021) → TV 2 · ★ · 41:20"));
+        assert!(has_label(&h, "  Dune (2021) → TV 2 · Watchlists · 41:20"));
         assert!(has_label_containing(&h, "Gold (2022) — no copy in another playlist"));
         // tick it (keyboard: ↑ from Cancel to the box, Enter), then Delete
         assert_eq!(h.state_mut().act(Action::Up), "Keep");
@@ -406,9 +414,11 @@ mod tests {
         assert_eq!(h.state_mut().act(Action::Activate), "CloseWith(Confirmed(7))");
         let r = h.state().t.services().store.reader().unwrap();
         let _ = h.state().t.services().store.writer().blocking(|_| Ok(()));
-        let favs: Vec<(crate::model::SourceId, String)> =
-            crate::store::user::fav_items(&r, list).unwrap().into_iter().map(|e| (e.item.source, e.item.key.0)).collect();
-        assert_eq!(favs, [(b, "m3u:named0000".to_owned())], "Dune's favourite on TV 2's copy; TV is gone with Gold's");
+        assert!(crate::store::user::fav_items(&r, list).unwrap().is_empty(), "Favourites stays channel-only");
+        let mine = crate::store::watchlist::default_list(&r).unwrap();
+        let entries = crate::store::watchlist::entries(&r, mine).unwrap();
+        assert!(entries.iter().any(|e| e.item.as_ref().is_some_and(|i| i.source == b && i.key.as_str() == "m3u:named0000")), "Dune moves to TV 2");
+        assert!(entries.iter().any(|e| e.title.contains("Gold") && e.item.is_none()), "Gold stays as a placeholder");
         let moved = ItemRef { source: b, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
         assert_eq!(crate::store::user::progress(&r, &moved).unwrap().map(|p| p.position_s), Some(2480.0));
         let left: i64 = r.query_row("SELECT count(*) FROM source WHERE id = ?1", [a.0], |x| x.get(0)).unwrap();
@@ -478,7 +488,13 @@ mod tests {
             testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune")])?;
             testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) }, true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(
+                c,
+                list,
+                &ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) },
+                true,
+                1,
+            )?;
             Ok(a)
         });
         let mut h = overlay_harness(t, one, DeletePlaylistOverlay::new(a, 4), egui::vec2(1200.0, 900.0));
@@ -513,7 +529,7 @@ mod tests {
             let list = crate::store::user::default_fav_list(c)?;
             for i in 0..3 {
                 let r = ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
-                crate::store::user::set_favourite(c, list, &r, true, 1)?;
+                crate::ui::screens::home::testkit::save_favourite(c, list, &r, true, 1)?;
             }
             Ok(a)
         });
@@ -524,7 +540,7 @@ mod tests {
         until_ov(&mut h, "the plan", |h| h.state().o.plan.is_some());
         h.run_steps(1);
         assert_eq!(h.state().o.plan.as_ref().map(|p| (p.items.len(), p.cannot.len())), Some((2, 1)), "they still move");
-        assert!(has_label(&h, "  Dune (2021) → TV 2 · ★"));
+        assert!(has_label(&h, "  Dune (2021) → TV 2 · Watchlists"));
         assert!(!has_label_containing(&h, "Blue Film") && !has_label_containing(&h, "Red Film"), "never named");
         assert!(has_label(&h, "And 2 hidden titles (unlock to see them)"));
     }
@@ -539,7 +555,13 @@ mod tests {
             testkit::named_movies(c, a, &[("EN ★ Dune - 2021", "Dune")])?;
             testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?;
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) }, true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(
+                c,
+                list,
+                &ItemRef { source: a, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) },
+                true,
+                1,
+            )?;
             Ok((a, b))
         });
         let mut h = overlay_harness(t, one, DeletePlaylistOverlay::new(a, 3), egui::vec2(1200.0, 900.0));

@@ -61,6 +61,7 @@ pub(crate) fn resume_or_play(ctx: &mut UiCtx<'_>, media: MediaRef, item: &ItemRe
                 duration_s: p.duration_s,
                 copy: None,
                 queue: None,
+                watchlist: None,
             }));
         }
         _ => kit::play_media(ctx, media, true, origin),
@@ -281,8 +282,8 @@ impl MovieDetailScreen {
                     items.push(MenuItem { shortcut: None, ..mi(glyphs::PLAYLIST, "Same title as…", Action::Digit(super::copies::SAME_TITLE), "") });
                 }
                 items.extend([
-                    mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"),
-                    mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"),
+                    mi(glyphs::FAVOURITE, if fav { "Remove from My list" } else { "Save to My list" }, Action::ToggleFavourite, "Ctrl+F"),
+                    mi(glyphs::FAV_LIST, "Watchlists…", Action::AddToList, "Ctrl+Shift+F"),
                     mi(glyphs::CHECK, if self.watched() { "Mark unwatched" } else { "Mark watched" }, Action::MarkWatched, "Ctrl+W"),
                     mi(glyphs::TAG, if every { "Rename every copy…" } else { "Rename…" }, Action::Rename, "F2"),
                     mi(glyphs::LOCK, if every { "Lock / unlock every copy" } else { "Lock / unlock" }, Action::ToggleLock, "Ctrl+L"),
@@ -630,7 +631,7 @@ impl Screen for MovieDetailScreen {
                             Btn::PlayFrom => (Some(glyphs::PLAYLIST), "Play from ▾".into(), false),
                             Btn::Favourite => (
                                 Some(if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF }),
-                                if fav { "Favourite".into() } else { "Add to Favourites".into() },
+                                if fav { "My list".into() } else { "Save to My list".into() },
                                 false,
                             ),
                             Btn::Watched => (Some(glyphs::CHECK), if watched { "Watched".into() } else { "Mark watched".into() }, false),
@@ -647,6 +648,14 @@ impl Screen for MovieDetailScreen {
                         }
                     }
                 });
+                if let Some(item) = self.item(ctx) {
+                    if button(ui, ctx.theme, Some(glyphs::ADD), "Watchlist ▾", ButtonStyle { bordered: true, ..Default::default() }).clicked() {
+                        kit::list_picker(ctx, &item, &title);
+                    }
+                    if let Some(line) = crate::ui::watchlists::membership_line(ctx, &item) {
+                        ui.label(line);
+                    }
+                }
             });
             copy_click = self.copies.show(ui, ctx);
         });
@@ -875,7 +884,7 @@ pub(crate) mod tests {
         h.state_mut().enter(Route::MovieDetail(ids[0]));
         until(&mut h, "the details", |h| has_label(h, "Plot of movie 0."));
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Detail]);
-        assert!(has_label(&h, "Resume 10:00") && has_label(&h, "Start over") && has_label(&h, "Add to Favourites") && has_label(&h, "Mark watched"));
+        assert!(has_label(&h, "Resume 10:00") && has_label(&h, "Start over") && has_label(&h, "Save to My list") && has_label(&h, "Mark watched"));
         // → to "Mark watched", Enter: stored as finished
         for _ in 0..3 {
             h.state_mut().act(Action::Right);
@@ -889,7 +898,7 @@ pub(crate) mod tests {
         // Ctrl+F: favourite
         h.state_mut().act(Action::ToggleFavourite);
         h.run_steps(1);
-        assert!(has_label(&h, "Favourite"));
+        assert!(has_label(&h, "My list"));
         // Enter on the first button plays; Shift+Enter starts over
         h.state_mut().act(Action::Home);
         h.state_mut().act(Action::Activate);
@@ -1058,7 +1067,7 @@ pub(crate) mod tests {
             let bravo = testkit::named_movies(c, b, &[("EN - Dune (2021)", "Dune")])?[0];
             let list = crate::store::user::default_fav_list(c)?;
             let fav = ItemRef { source: b, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
-            crate::store::user::set_favourite(c, list, &fav, true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &fav, true, 1)?;
             Ok((a, b, alpha, bravo))
         });
         let copy = |s: SourceId| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
@@ -1066,17 +1075,17 @@ pub(crate) mod tests {
         let reader = |h: &H| h.state().t.services().store.reader().unwrap();
         let fav_rows = |h: &H| {
             let r = reader(h);
-            let n = |s: SourceId| -> i64 { r.query_row("SELECT count(*) FROM fav_item WHERE source_id = ?1", [s.0], |r| r.get(0)).unwrap() };
+            let n = |s: SourceId| -> i64 { r.query_row("SELECT count(*) FROM watchlist_item WHERE source_id = ?1", [s.0], |r| r.get(0)).unwrap() };
             [a, b].into_iter().filter(|s| n(*s) > 0).collect::<Vec<_>>()
         };
         let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::MovieDetail(alpha));
         until(&mut h, "the copies", |h| has_label(h, "COPIES · 2"));
-        assert!(has_label(&h, "Favourite"), "Bravo's copy is a favourite: the title is");
+        assert!(has_label(&h, "My list"), "Bravo's copy is a favourite: the title is");
         // ★ off: every copy leaves Favourites; Undo puts Bravo's back
         h.state_mut().act(Action::ToggleFavourite);
         let toast = h.state_mut().undo_toast().expect("an Undo toast");
-        assert_eq!(toast.text, "Removed from Favourites in Alpha and Bravo");
+        assert_eq!(toast.text, "Removed from My list");
         assert!(fav_rows(&h).is_empty());
         let Some((_, undo)) = toast.action else { unreachable!() };
         h.state_mut().act(undo);

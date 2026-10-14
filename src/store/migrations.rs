@@ -31,6 +31,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0013_agent_names", include_str!("migrations/0013_agent_names.sql")),
     // casting (DESIGN §40; skeleton CAST-0, architect sign-off)
     ("0014_cast", include_str!("migrations/0014_cast.sql")),
+    ("0015_watchlists", include_str!("migrations/0015_watchlists.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -56,6 +57,9 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     cast_hint_failures(conn, current)?;
     for (i, (name, sql)) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         tracing::info!("applying migration {name}");
+        if *name == "0015_watchlists" {
+            crate::store::backup::before_watchlists(conn)?;
+        }
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         backfill(&tx, name)?;
@@ -159,6 +163,11 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
         "0009_guide_fixes" => guide_fix_columns(conn),
         "0011_follow" => follow_columns(conn),
         "0013_agent_names" => agent_names(conn),
+        "0015_watchlists" => {
+            add_column_if_missing(conn, "queue_item", "watchlist_item_id", "INTEGER")?;
+            crate::store::watchlist::refresh_episode_matches(conn, None)?;
+            crate::store::watchlist::move_favourites(conn).map(|_| ())
+        }
         _ => Ok(()),
     }
 }
@@ -445,7 +454,8 @@ mod tests {
                 "0011_follow",
                 "0012_spoiler_guard",
                 "0013_agent_names",
-                "0014_cast"
+                "0014_cast",
+                "0015_watchlists"
             ]
         );
         for (t, col) in [
@@ -469,6 +479,9 @@ mod tests {
             ("channel_epg_map", "shift_min"),
             ("channel_epg", "shift_min"),
             ("queue_item", "any_copy"),
+            ("queue_item", "watchlist_item_id"),
+            ("watchlist", "since"),
+            ("watchlist_item", "season_from"),
             ("follow_match", "event_key"),
             ("spoiler_seen", "event_key"),
             ("guide_fix_log", "actor"),
@@ -839,6 +852,41 @@ mod tests {
             2,
             "a provider flag stays"
         );
+    }
+
+    /// DESIGN §42 §8.11: the v14 move preserves list order and orphan fingerprints, leaves
+    /// channel-only lists alone, and runs once. Restoring an old backup uses this same step.
+    #[test]
+    fn watchlists_migration_moves_vod_favourites_once() {
+        let mut c = migrated_to(14);
+        c.execute_batch("INSERT INTO source(id,name,kind,created_at) VALUES (1,'TV','m3u-url',0);
+          INSERT INTO movie(source_id,key,name,clean_name,norm_name,year,stream,provider_order,seen_gen) VALUES
+            (1,'empire','Empire','Empire','empire',1980,'{}',0,1),(1,'hope','A New Hope','A New Hope','anewhope',1977,'{}',1,1);
+          INSERT INTO fav_list(id,name,icon,sort_index,is_default) VALUES (20,'Trending','',1,0),(21,'Channels','',2,0),(22,'My list','',3,0);
+          INSERT INTO fav_item(list_id,source_id,kind,item_key,position,added_at,fp,orphaned_since) VALUES
+            (1,1,'movie','empire',0,5,'{}',NULL),(1,1,'channel','bbc',1,5,'{}',NULL),(1,1,'movie','hope',2,6,'{}',NULL),
+            (20,1,'movie','orphan',0,5,'{\"norm_name\":\"missingfilm\"}',9),(21,1,'channel','itv',0,5,'{}',NULL),(22,1,'movie','hope',0,5,'{}',NULL);") .unwrap();
+        migrate(&mut c).unwrap();
+        let mine = crate::store::watchlist::default_list(&c).unwrap();
+        let rows = crate::store::watchlist::entries(&c, mine).unwrap();
+        assert_eq!(rows.iter().map(|e| (e.title.as_str(), e.position)).collect::<Vec<_>>(), [("Empire", 0), ("A New Hope", 1)]);
+        let named = crate::store::watchlist::lists(&c).unwrap();
+        assert!(named.iter().any(|l| l.name == "My list (favourites)"));
+        let trending = named.iter().find(|l| l.name == "Trending").unwrap();
+        let orphan = &crate::store::watchlist::entries(&c, trending.id).unwrap()[0];
+        assert_eq!(orphan.orphaned_since, Some(9));
+        assert_eq!(orphan.fingerprint.norm_name, "missingfilm");
+        assert_eq!(c.query_row("SELECT count(*) FROM fav_item WHERE kind<>'channel'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(c.query_row("SELECT count(*) FROM fav_list WHERE id IN (20,22)", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(c.query_row("SELECT count(*) FROM fav_list WHERE id=21", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let item = crate::model::ItemRef {
+            source: crate::model::SourceId(1),
+            kind: crate::model::ItemKind::Movie,
+            key: crate::model::ItemKey("empire".into()),
+        };
+        assert!(crate::store::user::set_favourite(&c, crate::model::FavListId(1), &item, true, 10).is_err());
+        migrate(&mut c).unwrap();
+        assert_eq!(crate::store::watchlist::lists(&c).unwrap().len(), 3);
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub const ITEMS: &[SidebarItem] = &[
     SidebarItem { id: ScreenId::Series, glyph: glyphs::SERIES, label: "Series" },
     // only while Up next has items to go, with their count (DESIGN §32)
     SidebarItem { id: ScreenId::Queue, glyph: glyphs::UP_NEXT, label: "Up next" },
+    SidebarItem { id: ScreenId::Watchlists, glyph: glyphs::FAV_LIST, label: "Watchlists" },
     SidebarItem { id: ScreenId::Settings, glyph: glyphs::SETTINGS, label: "Settings" },
 ];
 
@@ -154,10 +155,10 @@ mod tests {
     #[test]
     fn vod_entries_hide_without_vod_and_search_comes_first() {
         let labels = |vod, up_next| entries(vod, up_next).map(|e| e.map_or("Search", |it| it.label)).collect::<Vec<_>>();
-        assert_eq!(labels(true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"]);
-        assert_eq!(labels(false, None), ["Search", "Home", "Live TV", "Guide", "Settings"]);
-        assert_eq!(labels(true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Settings"]);
-        assert_eq!(labels(false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Settings"]);
+        assert_eq!(labels(true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Watchlists", "Settings"]);
+        assert_eq!(labels(false, None), ["Search", "Home", "Live TV", "Guide", "Watchlists", "Settings"]);
+        assert_eq!(labels(true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Settings"]);
+        assert_eq!(labels(false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Watchlists", "Settings"]);
         assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
         assert!(!is_current(ScreenId::Live, ScreenId::Guide));
     }

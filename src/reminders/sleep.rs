@@ -370,6 +370,7 @@ pub struct SleepHandle {
     /// What plays now, for setting and reading the timer between the runner's looks.
     player: watch::Receiver<Arc<PlayerSnapshot>>,
     queue: watch::Receiver<Arc<QueueSnapshot>>,
+    queue_handle: Arc<Mutex<Option<crate::queue::QueueHandle>>>,
 }
 
 impl std::fmt::Debug for SleepHandle {
@@ -379,6 +380,17 @@ impl std::fmt::Debug for SleepHandle {
 }
 
 impl SleepHandle {
+    /// Watchlists feed rows lazily, so end-of-queue must be known before the queue asks for
+    /// another list entry (DESIGN §42 §3). Tests without an engine leave this disconnected.
+    pub fn connect_queue(&self, handle: Option<crate::queue::QueueHandle>) {
+        *self.queue_handle.lock().unwrap_or_else(|e| e.into_inner()) = handle;
+    }
+
+    fn queue_command(&self, command: crate::queue::QueueCommand) {
+        if let Some(queue) = self.queue_handle.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            queue.send(command);
+        }
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -393,6 +405,7 @@ impl SleepHandle {
         let run = SleepRun::arm(SleepTimer { when, action, warn_s, set_at: w.now }, &w, programme_stop)?;
         let status = run.status(&w);
         self.lock().run = Some(run);
+        self.queue_command(crate::queue::QueueCommand::EndAfterQueue(when == SleepWhen::EndOfQueue));
         tracing::info!("sleep timer set: {when:?}, then {action:?}");
         self.bus.send(AppEvent::Reminder(super::ReminderEvent::SleepChanged(Some(status))));
         self.wake.notify_one();
@@ -403,6 +416,7 @@ impl SleepHandle {
     pub fn cancel(&self) -> bool {
         let had = self.lock().run.take().is_some();
         if had {
+            self.queue_command(crate::queue::QueueCommand::EndAfterQueue(false));
             tracing::info!("sleep timer cancelled");
             self.bus.send(AppEvent::Reminder(super::ReminderEvent::SleepChanged(None)));
             self.wake.notify_one();
@@ -428,7 +442,14 @@ impl SleepService {
         actuator: Actuator,
         bus: EventBus,
     ) -> SleepHandle {
-        let handle = SleepHandle { state: Arc::default(), wake: Arc::new(Notify::new()), bus, player: player.clone(), queue: queue.clone() };
+        let handle = SleepHandle {
+            state: Arc::default(),
+            wake: Arc::new(Notify::new()),
+            bus,
+            player: player.clone(),
+            queue: queue.clone(),
+            queue_handle: Arc::default(),
+        };
         rt.spawn(run(handle.clone(), player, queue, actuator));
         handle
     }
@@ -451,6 +472,8 @@ async fn run(h: SleepHandle, mut player: watch::Receiver<Arc<PlayerSnapshot>>, m
             Some(SleepStep::Warn { at }) => h.bus.send(AppEvent::Reminder(super::ReminderEvent::SleepWarn { at })),
             Some(SleepStep::Fire(action)) => {
                 tracing::info!("sleep timer: {action:?}");
+                h.queue_command(crate::queue::QueueCommand::Cancel);
+                h.queue_command(crate::queue::QueueCommand::EndAfterQueue(false));
                 act(action);
                 h.bus.send(AppEvent::Reminder(super::ReminderEvent::SleepNow { action }));
                 h.bus.send(AppEvent::Reminder(super::ReminderEvent::SleepChanged(None)));
@@ -605,6 +628,7 @@ mod tests {
                 state,
                 by_agent: false,
                 orphaned: false,
+                watchlist_item_id: None,
             },
             locked: false,
             eta: None,

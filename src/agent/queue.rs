@@ -93,6 +93,30 @@ fn blocked_name(b: Blocked) -> &'static str {
     }
 }
 
+/// A timer can relock between the engine's publication and an agent read. Apply the live
+/// view again before returning rows or counts, including rows from a watchlist (DESIGN §42 §6).
+pub(super) fn visible_snapshot(q: &Q, snapshot: &QueueSnapshot) -> QueueSnapshot {
+    let mut visible = snapshot.clone();
+    let rows: Vec<_> = snapshot.rows.iter().filter(|row| !q.conceals(&row.entry.item)).collect();
+    if rows.len() != snapshot.rows.len() {
+        let mut rows: Vec<_> = rows.into_iter().cloned().collect();
+        for row in &mut rows {
+            row.eta = None;
+        }
+        visible.rows = rows.into();
+        visible.current = visible.current.filter(|id| visible.row(*id).is_some());
+        visible.next = visible.next.filter(|id| visible.row(*id).is_some());
+        visible.stop_after = visible.stop_after.filter(|id| visible.row(*id).is_some());
+        visible.blocked_id = visible.blocked_id.filter(|id| visible.row(*id).is_some());
+        if visible.blocked_id.is_none() {
+            visible.blocked = None;
+        }
+        visible.eta_end = None;
+        visible.countdown = None;
+    }
+    visible
+}
+
 /// The snapshot as `list` shows it (concealed rows are never in it).
 pub fn list_out(s: &QueueSnapshot, include_played: bool) -> QueueListOut {
     let items = s
@@ -229,7 +253,7 @@ fn shows(reply: &QueueReply, moves: bool) -> Shows {
 /// player there (without it the window stayed on Home with the corner mini player). A wait
 /// for the PIN brings the window forward (the PIN is typed there); nothing played puts an
 /// empty pop-out back in. `opened_in` for the result; `None` when nothing started.
-async fn show(h: &Inner, reply: &QueueReply, asked: Option<crate::model::OpenIn>, moves: bool) -> Option<super::proto::OpenedIn> {
+pub(super) async fn show(h: &Inner, reply: &QueueReply, asked: Option<crate::model::OpenIn>, moves: bool) -> Option<super::proto::OpenedIn> {
     match shows(reply, moves) {
         // casting: it plays on the TV and the window stays where it is (DESIGN §40 §3.8)
         Shows::Place { pin: false } | Shows::Stays if h.player.snapshot().cast.is_some() => Some(super::proto::OpenedIn::Device),
@@ -266,7 +290,10 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Queue) -> Out<Value> {
         return Err(Fail::bad("open_in is for play and skip"));
     }
     match action {
-        QueueAction::List => to_value(&list_out(&engine.snapshot(), p.include_played == Some(true))),
+        QueueAction::List => {
+            let snapshot = engine.snapshot();
+            h.run(true, move |q| to_value(&list_out(&visible_snapshot(q, &snapshot), p.include_played == Some(true)))).await
+        }
         QueueAction::Add => {
             let at = insert(p.at.as_deref())?;
             let (targets, mut refused) = h.run(true, move |q| targets(q, &p)).await?;

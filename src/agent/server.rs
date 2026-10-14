@@ -248,6 +248,14 @@ impl Inner {
                     }
                 })
             }
+            Call::Watchlist(p) => {
+                let starts = p.action == super::params::WatchlistAction::Play;
+                super::watchlist::handle(&self, p, &who).await.inspect_err(|_| {
+                    if starts {
+                        self.undo_empty_pop_out();
+                    }
+                })
+            }
             Call::Follow(p) => super::follow::handle(&self, p, &who).await,
             Call::SpoilerGuard(p) => super::spoiler::handle(&self, p, &who).await,
             Call::GuideFix(p) => super::guide::handle(&self, p, &who).await,

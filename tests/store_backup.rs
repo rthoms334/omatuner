@@ -186,11 +186,18 @@ fn populate(s: &Store, creds: &Creds) -> Fixture {
 
         let fav = user::default_fav_list(c)?;
         user::rename_fav_list(c, fav, "Mine", "*")?;
-        let kids = user::create_fav_list(c, "Kids", "k")?;
+        let kids = tuner::store::watchlist::create(c, "Kids", None, tuner::watchlist::PlayOrder::Any, "app", NOW)?;
         user::set_favourite(c, fav, &ch(xt, "xt:live:2"), true, NOW)?;
         user::set_favourite(c, fav, &ch(xt, "xt:live:1"), true, NOW + 1)?;
         user::set_favourite(c, fav, &ch(m3u, "m3u:aa"), true, NOW + 2)?;
-        user::set_favourite(c, kids, &mv(xt, "xt:vod:7"), true, NOW + 3)?;
+        tuner::store::watchlist::add(
+            c,
+            &tuner::store::library::load(c)?,
+            kids,
+            &[tuner::store::watchlist::new_entry(c, &mv(xt, "xt:vod:7"))?],
+            tuner::watchlist::Insert::End,
+            NOW + 3,
+        )?;
         user::set_item_override(
             c,
             &ch(xt, "xt:live:1"),
@@ -289,6 +296,20 @@ fn normalized(mut b: Backup) -> Backup {
     for c in b.features.guide_fix.iter_mut().flat_map(|v| v["channels"].as_array_mut().unwrap()) {
         c["item"]["source"] = sources[&c["item"]["source"].as_i64().unwrap()].into();
     }
+    if let Some(w) = b.features.watchlists.as_mut() {
+        let ids: HashMap<i64, i64> =
+            w["lists"].as_array().unwrap().iter().enumerate().map(|(i, l)| (l["id"].as_i64().unwrap(), i as i64 + 1)).collect();
+        for l in w["lists"].as_array_mut().unwrap() {
+            l["id"] = ids[&l["id"].as_i64().unwrap()].into();
+        }
+        for (i, e) in w["entries"].as_array_mut().unwrap().iter_mut().enumerate() {
+            e["id"] = (i as i64 + 1).into();
+            e["list_id"] = ids[&e["list_id"].as_i64().unwrap()].into();
+            if let Some(source) = e["item"]["source"].as_i64() {
+                e["item"]["source"] = sources[&source].into();
+            }
+        }
+    }
     b
 }
 
@@ -304,7 +325,7 @@ fn export_wipe_restore_round_trip_is_lossless() {
     assert_eq!(b1.sources.len(), 2);
     assert_eq!(b1.sources[0].xt_password.as_deref(), Some(creds.xt_pass.as_str()));
     assert_eq!(b1.epg_sources.len(), 2);
-    assert_eq!((b1.fav_lists.len(), b1.fav_items.len()), (2, 4));
+    assert_eq!((b1.fav_lists.len(), b1.fav_items.len()), (1, 3));
     assert_eq!((b1.item_overrides.len(), b1.group_overrides.len(), b1.progress.len()), (3, 1, 1));
     assert_eq!((b1.history.len(), b1.reminders.len(), b1.manual_mappings.len()), (3, 1, 1));
     let m = &b1.manual_mappings[0];
@@ -337,11 +358,11 @@ fn export_wipe_restore_round_trip_is_lossless() {
         let r = target.reader().unwrap();
         // catalogue rows are not part of a backup: they come back with the next refresh
         assert_eq!(count(&r, "SELECT count(*) FROM channel"), 0);
-        assert_eq!(count(&r, "SELECT count(*) FROM fav_list"), 2);
+        assert_eq!(count(&r, "SELECT count(*) FROM fav_list"), 1);
         assert_eq!(count(&r, "SELECT count(*) FROM epg_source WHERE kind = 'provider'"), 0);
         assert_eq!(count(&r, "SELECT count(*) FROM pragma_foreign_key_check"), 0);
         assert_eq!(count(&r, "SELECT count(*) FROM source"), 2, "Replace does not keep the old sources next to the restored ones");
-        assert_eq!(count(&r, "SELECT count(*) FROM fav_item"), 4);
+        assert_eq!(count(&r, "SELECT count(*) FROM fav_item"), 3);
     }
 }
 
@@ -378,7 +399,7 @@ fn export_without_credentials_strips_secrets_and_restores_disabled_sources() {
     assert!(!mine.enabled, "a guide URL with a masked key is restored disabled");
     assert!(guides.iter().find(|g| g.name == "Local file").unwrap().enabled);
     // user data is there, keyed by the new source ids
-    assert_eq!(count(&r, "SELECT count(*) FROM fav_item"), 4);
+    assert_eq!(count(&r, "SELECT count(*) FROM fav_item"), 3);
     assert_eq!(count(&r, "SELECT count(*) FROM watch_progress"), 1);
     assert_eq!(count(&r, "SELECT count(*) FROM history"), 0);
     assert_eq!(count(&r, "SELECT count(*) FROM channel_epg_map WHERE method = 'manual'"), 1);
@@ -438,10 +459,21 @@ fn merge_restore_matches_sources_and_keeps_newer_local_data() {
     let fx = populate(&s, &creds);
     let b = w(&s, |c| backup::export(c, FULL, None, NOW));
     let r = s.reader().unwrap();
-    let before: Vec<i64> = ["fav_item", "fav_list", "item_override", "group_override", "reminder", "channel_epg_map", "source", "epg_source"]
-        .iter()
-        .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
-        .collect();
+    let before: Vec<i64> = [
+        "watchlist",
+        "watchlist_item",
+        "fav_item",
+        "fav_list",
+        "item_override",
+        "group_override",
+        "reminder",
+        "channel_epg_map",
+        "source",
+        "epg_source",
+    ]
+    .iter()
+    .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
+    .collect();
 
     // local progress moved on since the backup; another item has older local progress
     let (xt, m3u) = (fx.xt, fx.m3u);
@@ -470,10 +502,21 @@ fn merge_restore_matches_sources_and_keeps_newer_local_data() {
     });
     let report = w(&s, move |c| backup::restore(c, &b2, RestoreMode::Merge));
     assert_eq!((report.sources_added, report.sources_matched), (0, 2));
-    let after: Vec<i64> = ["fav_item", "fav_list", "item_override", "group_override", "reminder", "channel_epg_map", "source", "epg_source"]
-        .iter()
-        .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
-        .collect();
+    let after: Vec<i64> = [
+        "watchlist",
+        "watchlist_item",
+        "fav_item",
+        "fav_list",
+        "item_override",
+        "group_override",
+        "reminder",
+        "channel_epg_map",
+        "source",
+        "epg_source",
+    ]
+    .iter()
+    .map(|t| count(&r, &format!("SELECT count(*) FROM {t}")))
+    .collect();
     assert_eq!(after, before, "nothing duplicated; the removed favourite came back");
     let p = user::progress(&r, &mv(xt, "xt:vod:7")).unwrap().unwrap();
     assert_eq!(p.position_s, 4000.0, "newer local progress wins");
@@ -579,4 +622,37 @@ fn upgraded_sources_survive_a_backup_and_merge_across_the_switch() {
     });
     let report = w(&s, move |c| backup::restore(c, &full, RestoreMode::Merge));
     assert_eq!((report.sources_added, report.sources_matched), (0, 2), "no duplicate sources");
+}
+
+/// DESIGN §42 §8.11: a pre-watchlists backup restored on a newer build follows the same
+/// channel/VOD split as the migration, preserving orphan fingerprints and list order.
+#[test]
+fn restoring_legacy_favourites_moves_films_to_watchlists() {
+    let original = store("watchlists-legacy-backup");
+    let fx = populate(&original, &Creds::new("legacy-watchlists"));
+    let mut old = w(&original, |c| backup::export(c, FULL, None, NOW));
+    old.features.watchlists = None;
+    old.fav_items.push(FavouriteEntry {
+        list: old.fav_lists[0].id,
+        item: mv(fx.xt, "gone"),
+        position: 3,
+        added_at: NOW,
+        fingerprint: Fingerprint { norm_name: "missingfilm".into(), ..Default::default() },
+        orphaned_since: Some(NOW - 100),
+    });
+    let restored = store("watchlists-legacy-restored");
+    w(&restored, move |c| backup::restore(c, &old, RestoreMode::Replace));
+    let c = restored.reader().unwrap();
+    assert_eq!(count(&c, "SELECT count(*) FROM fav_item WHERE kind<>'channel'"), 0);
+    let mine = tuner::store::watchlist::default_list(&c).unwrap();
+    let rows = tuner::store::watchlist::entries(&c, mine).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].position, 0);
+    assert_eq!(rows[0].fingerprint.norm_name, "missingfilm");
+    assert_eq!(rows[0].orphaned_since, Some(NOW - 100));
+    assert_eq!(tuner::store::watchlist::moved_card(&c).unwrap(), ["My list"]);
+    assert!(
+        std::fs::read_dir(restored.path().parent().unwrap()).unwrap().any(|p| p.unwrap().file_name().to_string_lossy().contains("before-watchlists")),
+        "a backup precedes the one-way restore move"
+    );
 }

@@ -117,6 +117,7 @@ pub fn delete_fav_list(conn: &Connection, id: FavListId) -> Result<()> {
         return Err(Error::Other("the default favourites list cannot be deleted".into()));
     }
     conn.execute("DELETE FROM fav_list WHERE id = ?1", [id])?;
+    conn.execute("DELETE FROM meta WHERE key = ?1", [format!("watchlist:favourites:{id}")])?;
     Ok(())
 }
 
@@ -166,6 +167,9 @@ pub fn fav_items(conn: &Connection, list: FavListId) -> Result<Vec<FavouriteEntr
 
 /// Add (appended at the end; fingerprint computed inside) or remove. Idempotent.
 pub fn set_favourite(conn: &Connection, list: FavListId, item: &ItemRef, on: bool, now: Timestamp) -> Result<()> {
+    if item.kind != ItemKind::Channel {
+        return Err(crate::error::Error::other("use_watchlist: films and series belong in Watchlists"));
+    }
     if !on {
         conn.execute(
             "DELETE FROM fav_item WHERE list_id = ?1 AND source_id = ?2 AND kind = ?3 AND item_key = ?4",
@@ -817,6 +821,8 @@ pub struct Orphan {
 /// expression, key column, extra condition).
 const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     ("favourite", "fav_item", "kind", "item_key", ""),
+    // Watchlists survive re-keys; placeholders have no ItemRef (DESIGN §42 §4).
+    ("watchlist", "watchlist_item", "kind", "item_key", " AND source_id IS NOT NULL"),
     ("override", "item_override", "kind", "item_key", ""),
     ("progress", "watch_progress", "kind", "item_key", ""),
     ("reminder", "reminder", "'channel'", "channel_key", ""),
@@ -914,6 +920,7 @@ pub fn forget_orphan(conn: &mut Connection, item: &ItemRef) -> Result<()> {
             params![item.source, item.key.as_str()],
         )?;
     }
+    crate::store::watchlist::compact_positions(&tx)?;
     tx.commit()?;
     Ok(())
 }

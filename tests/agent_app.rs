@@ -47,7 +47,7 @@ fn pin_config() -> Config {
 /// * Guide: ITV4 has "Touring Car Highlights" (ended 1 h ago), "British Touring Car
 ///   Championship" (live) and "Touring Cars Qualifying" (in 2 h); Late Night has "Touring Cars
 ///   After Dark" (live, explicit); BBC One has "Old News" (ended), "News at Six" (live).
-/// * Favourites: ITV4, Airplane!, Late Night. Progress: Watched Comedy, The Show 1×2, Adult Film.
+/// * Favourites: ITV4, Late Night. My list: Airplane!. Progress: Watched Comedy, The Show 1×2, Adult Film.
 #[allow(clippy::type_complexity)] // the seed tables read best as tuples
 fn seed(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
     let tx = c.transaction()?;
@@ -214,9 +214,13 @@ fn seed(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
         tuner::store::user::push_history(c, &tuner::model::HistoryEntry { item, at: now - 3600 + i as i64, title: title.into() })?;
     }
     let list = tuner::store::user::default_fav_list(c)?;
-    for (kind, key) in [(ItemKind::Channel, "m3u:itv4"), (ItemKind::Movie, "m3u:airplane"), (ItemKind::Channel, "m3u:late")] {
+    for (kind, key) in [(ItemKind::Channel, "m3u:itv4"), (ItemKind::Channel, "m3u:late")] {
         tuner::store::user::set_favourite(c, list, &ItemRef { source: SourceId(1), kind, key: ItemKey(key.into()) }, true, now)?;
     }
+    let library = tuner::store::library::load(c)?;
+    let mine = tuner::store::watchlist::default_list(c)?;
+    let film = tuner::store::watchlist::new_entry(c, &ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:airplane".into()) })?;
+    tuner::store::watchlist::add(c, &library, mine, &[film], tuner::watchlist::Insert::End, now)?;
     Ok(())
 }
 
@@ -424,13 +428,14 @@ fn catalogue_tools() {
     assert_eq!(show["next_episode"]["season"], 1);
     assert_eq!(show["progress"]["position_min"], 15);
 
-    // favourites: ITV4 and Airplane!, never Late Night
+    // favourites: channels only; Airplane! is in My list, never Late Night
     let r = w.ok("favourites", json!({}));
     let list = &r["lists"][0];
     assert_eq!(list["name"], "Favourites");
-    assert_eq!(names(list, "items", "name"), ["ITV4", "Airplane!"]);
+    assert_eq!(names(list, "items", "name"), ["ITV4"]);
     let r = w.ok("favourites", json!({"kind": "movie"}));
-    assert_eq!(names(&r["lists"][0], "items", "name"), ["Airplane!"]);
+    assert_eq!(r["use_watchlist"], "watchlist");
+    assert!(r["lists"].as_array().unwrap().is_empty());
 
     // details
     let airplane = w.ok("search", json!({"query": "airplane", "kinds": ["movie"]}))["results"][0]["ref"].as_str().unwrap().to_owned();
@@ -1081,16 +1086,20 @@ fn library_tools_keep_the_parental_rules() {
     assert_eq!(eps["next_episode"], eps["episodes"][1]["ref"]);
     assert_eq!(names(&w.ok("episodes", json!({ "series_ref": show, "query": "episode 3" })), "episodes", "title"), ["Episode 3"]);
 
-    // favourites_edit: a new list; the locked film and the explicit one are refused
+    // favourites_edit: channel lists only; film refs point to the watchlist tool.
     let dune = first_ref(&w.ok("search", json!({ "query": "dune" })), "results");
     let locked = first_ref(&w.ok("search", json!({ "query": "locked film" })), "results");
-    let out = w.ok("favourites_edit", json!({ "create": "Trending", "add": [dune, locked, "movie:1:m3u:adult"] }));
+    let redirected = w.ok("favourites_edit", json!({"create": "Films belong in Watchlists", "add": [dune]}));
+    assert_eq!(redirected["created"], false);
+    assert_eq!(redirected["use_watchlist"], "watchlist");
+    assert_eq!(redirected["refused"][0]["error"], "use_watchlist");
+    let channel = first_ref(&w.ok("search", json!({ "query": "BBC One", "kinds": ["channel"] })), "results");
+    let out = w.ok("favourites_edit", json!({ "create": "News", "add": [channel, dune, locked, "movie:1:m3u:adult"] }));
     assert_eq!((out["created"].as_bool(), out["added"].as_u64()), (Some(true), Some(1)), "{out}");
-    let errors: Vec<&str> = out["refused"].as_array().unwrap().iter().map(|r| r["error"].as_str().unwrap()).collect();
-    assert_eq!(errors, ["locked: needs your PIN in Tuner", "not_found"]);
-    let favs = w.ok("favourites", json!({ "list": "trending" }));
-    assert_eq!(names(&favs["lists"][0], "items", "name"), ["Dune"]);
-    let out = w.ok("favourites_edit", json!({ "list": "trending", "remove": [dune] }));
+    assert!(out["refused"].as_array().unwrap().iter().all(|r| r["error"].as_str().unwrap().starts_with("use_watchlist")));
+    let favs = w.ok("favourites", json!({ "list": "news" }));
+    assert_eq!(names(&favs["lists"][0], "items", "name"), ["BBC One HD"]);
+    let out = w.ok("favourites_edit", json!({ "list": "news", "remove": [channel] }));
     assert_eq!(out["removed"], 1);
 
     // lock: adds only; an episode isn't lockable
@@ -1244,6 +1253,7 @@ fn the_queue_tool_drives_up_next() {
             config: s.config.clone(),
             player: Arc::new(s.tiles.focused()),
             bus: s.bus.clone(),
+            jobs: None,
         },
     );
     s.agent.set_queue_handle(Some(engine));
@@ -1325,6 +1335,7 @@ fn agent_plays_open_in_the_window_on_screen_and_say_where() {
             config: s.config.clone(),
             player: Arc::new(s.tiles.focused()),
             bus: s.bus.clone(),
+            jobs: None,
         },
     );
     shared.set_queue_handle(Some(engine));
@@ -1933,4 +1944,196 @@ mod casting {
         off.publish(Visibility::NO_EXPLICIT);
         assert!(off.ok("diagnose", json!({})).get("cast").is_none());
     }
+}
+
+/// DESIGN §42 §7: real list reads and writes, initials, ambiguity, missing titles, ranges,
+/// duplicate refusals and My list's protected name all use the running handler and its store.
+#[test]
+fn watchlists_agent_edits_and_reads_the_same_derived_lists_as_the_app() {
+    let mut w = World::new(Config::default());
+    w.publish(Visibility::ALL);
+    w.agent = Some(ClientInfo { name: "codex-mcp-client".into(), title: Some("Codex".into()) });
+    let movie = first_ref(&w.ok("search", json!({"query": "dune", "kinds": ["movie"]})), "results");
+    let series = first_ref(&w.ok("search", json!({"query": "the show", "kinds": ["series"]})), "results");
+    let created = w.ok(
+        "watchlist",
+        json!({"action": "create", "name": "Star Wars", "note": "story order", "refs": [movie],
+        "placeholders": [{"title": "The Missing Film", "year": 1988, "kind": "movie"}]}),
+    );
+    assert_eq!(created["added"].as_array().unwrap().len(), 2, "{created}");
+    let list = created["list"]["id"].as_i64().unwrap();
+    assert_eq!(created["list"]["play_order"], "ordered");
+    let stored_by: String =
+        w.ui.services().store.reader().unwrap().query_row("SELECT created_by FROM watchlist WHERE id=?1", [list], |r| r.get(0)).unwrap();
+    assert_eq!(stored_by, "Codex");
+    let shown = w.ok("watchlist", json!({"action": "show", "list": "SW"}));
+    assert_eq!(names(&shown, "items", "title"), ["Dune", "The Missing Film"]);
+    assert_eq!(shown["items"][1]["state"], "missing");
+    assert!(shown["items"][1].get("ref").is_none());
+    let missing = shown["items"][1]["id"].as_i64().unwrap();
+    let film = shown["items"][0]["id"].as_i64().unwrap();
+    let duplicate = w.ok("watchlist", json!({"action": "add", "list": list, "refs": [movie]}));
+    assert!(duplicate["added"].as_array().unwrap().is_empty());
+    assert_eq!(duplicate["refused"].as_array().unwrap().len(), 1);
+    let range = w.ok("watchlist", json!({"action": "add", "list": list, "refs": [series], "seasons": {"from": 1, "to": 1}, "at": "next"}));
+    let series_id = range["added"][0].as_i64().unwrap();
+    let shown = w.ok("watchlist", json!({"action": "show", "list": list}));
+    assert_eq!(shown["items"][1]["id"], series_id);
+    assert_eq!(shown["items"][1]["seasons"], json!({"from": 1, "to": 1}));
+    w.ok("watchlist", json!({"action": "move", "list": list, "ids": [missing], "to": 0}));
+    let next = w.ok("watchlist", json!({"action": "next", "list": list}));
+    assert_eq!(next["item"]["id"], film);
+    assert_eq!(next["passed_over"][0]["why"], "not in your playlists");
+    w.ok("watchlist", json!({"action": "skip", "list": list, "ids": [film]}));
+    let next = w.ok("watchlist", json!({"action": "next", "list": list}));
+    assert_eq!(next["item"]["id"], series_id);
+    assert_eq!(next["resume_at"], 900.0);
+    assert_eq!(next["episode"]["season"], 1);
+    assert_eq!(next["episode"]["episode"], 2);
+    assert!(next.get("plot").is_none());
+    w.ok("watchlist", json!({"action": "restart", "list": list}));
+    assert_eq!(w.ok("watchlist", json!({"action": "next", "list": list}))["item"]["id"], film);
+    w.ok("watchlist", json!({"action": "create", "name": "Star Trek"}));
+    let ambiguous = w.ok("watchlist", json!({"action": "show", "list": "star"}));
+    assert_eq!(ambiguous["ambiguous"].as_array().unwrap().len(), 2);
+    assert!(ambiguous.get("items").is_none());
+    w.ok("watchlist", json!({"action": "remove", "list": list, "ids": [missing]}));
+    w.ok("watchlist", json!({"action": "rename", "list": list, "name": "Space films", "play_order": "any"}));
+    assert_eq!(w.ok("watchlist", json!({"action": "show", "list": list}))["list"]["play_order"], "any");
+    assert_eq!(w.err("watchlist", json!({"action": "rename", "list": "My list", "name": "Mine"})), ErrorCode::Unavailable);
+    assert_eq!(w.err("watchlist", json!({"action": "delete", "list": "My list"})), ErrorCode::Unavailable);
+    w.ok("watchlist", json!({"action": "delete", "list": list}));
+    assert_eq!(w.err("watchlist", json!({"action": "show", "list": list})), ErrorCode::NotFound);
+
+    // A standalone episode carries the same Subject::Episode guard as a series' next one.
+    let episodes = w.ok("episodes", json!({"series_ref": series}));
+    let future = episodes["episodes"][2]["ref"].as_str().unwrap();
+    let later = w.ok("watchlist", json!({"action": "create", "name": "Later episodes", "refs": [future]}));
+    w.ok("spoiler_guard", json!({"action": "add_series", "series_ref": series}));
+    // TestUi omits integration workers and starts with the identity guard. Build the same
+    // snapshot the app's guard worker publishes from the stored rule and real progress.
+    let services = w.ui.services();
+    let guard = tuner::spoiler::snapshot::build(&services.store.reader().unwrap(), &services.config(), &services.agent.library(), w.now).unwrap();
+    services.agent.set_guard(tuner::guard::Guard::with_snapshot(guard));
+    let guarded = w.ok("watchlist", json!({"action": "show", "list": later["list"]["id"]}));
+    assert!(guarded["items"][0].get("title").is_none(), "{guarded}");
+    assert_eq!(guarded["items"][0]["season"], 1);
+    assert_eq!(guarded["items"][0]["episode"], 3);
+    assert!(!mentions(&guarded, "Episode 3"));
+}
+
+/// DESIGN §42 §6, §8.12: concealed rows never enter replies or counts, including after a
+/// timer relocks a previously visible snapshot. Locked rows are read but never played/added.
+#[test]
+fn watchlists_agent_conceals_counts_refuses_locked_and_never_returns_addresses() {
+    let mut w = World::new(pin_config());
+    w.publish(Visibility::ALL);
+    w.unlock(Some(Instant::now()));
+    let (list, explicit_list, locked_id) = {
+        let s = w.ui.services();
+        let lib = s.agent.library();
+        s.store
+            .writer()
+            .blocking(move |c| {
+                let list = tuner::store::watchlist::create(c, "Evening", None, tuner::watchlist::PlayOrder::Ordered, "app", tuner::model::now())?;
+                let only =
+                    tuner::store::watchlist::create(c, "Private list", None, tuner::watchlist::PlayOrder::Ordered, "app", tuner::model::now())?;
+                let entries = ["m3u:adult", "m3u:lockedfilm", "m3u:airplane"]
+                    .iter()
+                    .map(|key| {
+                        tuner::store::watchlist::new_entry(c, &ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey((*key).into()) })
+                    })
+                    .collect::<tuner::error::Result<Vec<_>>>()?;
+                tuner::store::watchlist::add(c, &lib, only, &entries[..1], tuner::watchlist::Insert::End, tuner::model::now())?;
+                let added = tuner::store::watchlist::add(c, &lib, list, &entries, tuner::watchlist::Insert::End, tuner::model::now())?;
+                Ok((list.0, only.0, added.added[1].0))
+            })
+            .unwrap()
+    };
+    assert_eq!(w.ok("watchlist", json!({"action": "show", "list": list}))["list"]["total"], 3);
+    // A snapshot published before relocking still contains the explicit row. Both the
+    // queue's count and the list chip must use the live parental view in status.
+    let entries = tuner::store::watchlist::entries(&w.ui.services().store.reader().unwrap(), tuner::model::WatchlistId(list)).unwrap();
+    let rows: Vec<_> = [0, 2]
+        .iter()
+        .enumerate()
+        .map(|(index, &entry)| {
+            let entry = &entries[entry];
+            tuner::queue::QueueRow {
+                entry: tuner::queue::QueueEntry {
+                    id: tuner::model::QueueId(index as i64 + 1),
+                    item: entry.item.clone().unwrap(),
+                    any_copy: true,
+                    programme: None,
+                    title: entry.title.clone(),
+                    subtitle: None,
+                    duration_s: Some(5400.0),
+                    from_start: false,
+                    state: if index == 0 { tuner::queue::RowState::Current } else { tuner::queue::RowState::Pending },
+                    by_agent: false,
+                    orphaned: false,
+                    watchlist_item_id: Some(entry.id),
+                },
+                locked: false,
+                eta: None,
+                note: None,
+            }
+        })
+        .collect();
+    w.ui.services().agent.publish_queue(Arc::new(tuner::queue::QueueSnapshot {
+        rows: rows.into(),
+        current: Some(tuner::model::QueueId(1)),
+        next: Some(tuner::model::QueueId(2)),
+        driving: true,
+        context: Some(tuner::model::WatchlistId(list)),
+        watchlist: Some(tuner::queue::ListContext {
+            id: tuner::model::WatchlistId(list),
+            name: "Evening".into(),
+            any_order: false,
+            position: 1,
+            total: 3,
+            playing_through: true,
+            then: Vec::new(),
+        }),
+        ..Default::default()
+    }));
+    assert_eq!(w.ok("status", json!({}))["watchlist"]["total"], 3);
+    w.unlock(Some(Instant::now() - Duration::from_secs(61)));
+    let status = w.ok("status", json!({}));
+    assert_eq!(status["watchlist"]["total"], 2);
+    assert_eq!(status["queue"]["left"], 1);
+    assert!(!mentions(&status, "Adult Film"));
+    let shown = w.ok("watchlist", json!({"action": "show", "list": list}));
+    assert_eq!(shown["list"]["total"], 2);
+    assert!(!mentions(&shown, "adult"));
+    assert_eq!(shown["items"][0]["state"], "locked");
+    let lists = w.ok("watchlist", json!({"action": "lists"}));
+    assert!(!mentions(&lists, "Private list"));
+    assert_eq!(w.err("watchlist", json!({"action": "show", "list": explicit_list})), ErrorCode::NotFound);
+    assert_eq!(w.err("watchlist", json!({"action": "play", "list": list, "id": locked_id})), ErrorCode::Unavailable);
+    let next = w.ok("watchlist", json!({"action": "next", "list": list}));
+    assert_eq!(next["item"]["title"], "Airplane!");
+    assert!(next["passed_over"][0]["why"].as_str().unwrap().starts_with("locked"));
+    let refused = w.ok(
+        "watchlist",
+        json!({"action": "add", "list": list,
+        "refs": ["movie:1:m3u:adult", "movie:1:m3u:lockedfilm"],
+        "placeholders": [{"title": "Adult Film", "year": 2010, "kind": "movie"}, {"title": "Locked Film", "year": 2015, "kind": "movie"}]}),
+    );
+    assert_eq!(refused["refused"].as_array().unwrap().len(), 4);
+    assert!(refused["added"].as_array().unwrap().is_empty());
+    for reply in [&shown, &lists, &next, &refused] {
+        assert!(!reply.to_string().contains("http"), "{reply}");
+        assert!(!mentions(reply, "Adult Film"), "{reply}");
+    }
+    w.unlock(Some(Instant::now()));
+    let shown = w.ok("watchlist", json!({"action": "show", "list": list}));
+    assert_eq!(shown["list"]["total"], 3);
+    assert_eq!(shown["items"][0]["title"], "Adult Film");
+    assert_eq!(shown["items"][1]["id"], locked_id);
+    assert_eq!(
+        w.err("watchlist", json!({"action": "play", "list": list, "id": locked_id})),
+        ErrorCode::Unavailable,
+        "MCP never starts a locked list entry, even in an unlocked session"
+    );
 }

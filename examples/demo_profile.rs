@@ -1073,7 +1073,7 @@ fn series_plot(title: &str) -> String {
     format!("Season after season, the people of {title} keep each other's secrets — until they don't.")
 }
 
-/// Favourites, recently watched channels, Continue Watching, reminders, Up next and the
+/// Favourites, watchlists, recently watched channels, Continue Watching, reminders, Up next and the
 /// playlists' connection limits.
 fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error::Result<()> {
     use tuner::store::user;
@@ -1113,9 +1113,9 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
     for (i, f) in favs.iter().enumerate() {
         user::set_favourite(c, list, f, true, now - 86_400 + i as i64 * 60)?;
     }
-    // titles go in a list of their own: a rail mixing channel tiles and posters leaves a gap
-    // under the tiles on Home
-    let night = user::create_fav_list(c, "Films & series", tuner::ui::widgets::glyphs::FAV_LIST)?;
+    // Saved titles live in watchlists; favourites hold channels (DESIGN §42 §4.1).
+    let night = tuner::store::watchlist::create(c, "Films & series", None, tuner::watchlist::PlayOrder::Any, "app", now - 80_000)?;
+    let library = tuner::store::library::load(c)?;
     let titles = [
         need(movie(c, north, "Keeper of Wren Point")?, "The Keeper of Wren Point")?,
         need(movie(c, aurora, "Quiet Frequencies")?, "Quiet Frequencies")?,
@@ -1124,7 +1124,8 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
         need(movie(c, north, "Copper Sky")?, "Copper Sky")?,
     ];
     for (i, f) in titles.iter().enumerate() {
-        user::set_favourite(c, night, f, true, now - 80_000 + i as i64 * 60)?;
+        let entry = tuner::store::watchlist::new_entry(c, f)?;
+        tuner::store::watchlist::add(c, &library, night, &[entry], tuner::watchlist::Insert::End, now - 80_000 + i as i64 * 60)?;
     }
 
     // recently watched channels (oldest first)

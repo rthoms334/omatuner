@@ -57,6 +57,8 @@ pub fn refresh_source(conn: &Connection, source: SourceId) -> Result<u32> {
         "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![stamp_key(source), stamp],
     )?;
+    crate::store::watchlist::refresh_episode_matches(conn, Some(source))?;
+    crate::store::watchlist::match_placeholders(conn)?;
     Ok(written)
 }
 

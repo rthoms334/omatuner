@@ -30,6 +30,7 @@ pub mod stacks;
 #[doc(hidden)]
 pub mod testing;
 pub mod video_host;
+pub mod watchlists;
 pub mod widgets;
 
 use std::path::PathBuf;
@@ -64,6 +65,7 @@ pub enum ScreenId {
     Logs,
     /// Up next (Alt+6, DESIGN §32).
     Queue,
+    Watchlists,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -144,6 +146,9 @@ pub enum Route {
     Logs,
     /// Up next (Alt+6, DESIGN §32).
     Queue,
+    Watchlists {
+        list: Option<crate::model::WatchlistId>,
+    },
 }
 
 impl Route {
@@ -162,6 +167,7 @@ impl Route {
             Route::EpgMapping { .. } => ScreenId::EpgMapping,
             Route::Logs => ScreenId::Logs,
             Route::Queue => ScreenId::Queue,
+            Route::Watchlists { .. } => ScreenId::Watchlists,
         }
     }
 }
@@ -186,6 +192,13 @@ pub enum OverlayRequest {
     Rename(overlays::RenameSpec),
     /// Pick favourites lists (Ctrl+Shift+F), incl. "New list…".
     ListPicker(overlays::ListPickerSpec),
+    WatchlistPicker(overlays::watchlists::PickerSpec),
+    WatchlistsMoved(Vec<String>),
+    WatchlistFind {
+        entry: crate::model::WatchlistItemId,
+        kind: crate::model::ItemKind,
+        title: String,
+    },
     /// Guide programme popover (WP-11). `zap`: the list Watch zaps through (the opener's
     /// collection, DESIGN §13.0); `None` = the channel's primary group.
     Programme {
@@ -297,6 +310,7 @@ impl BackTarget {
             ScreenId::EpgMapping => "Guide fixes",
             ScreenId::Logs => "Logs",
             ScreenId::Queue => "Up next",
+            ScreenId::Watchlists => "Watchlists",
         };
         Self { label }
     }

@@ -43,6 +43,10 @@ impl ResumeOverlay {
     }
 
     fn start(&self, ctx: &mut UiCtx<'_>, resume: bool) -> OverlayOutcome {
+        if let Some(w) = self.spec.watchlist {
+            crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayListFrom { list: w.list, from: w.from, just_one: w.just_one, resume });
+            return OverlayOutcome::Close;
+        }
         if let Some(q) = self.spec.queue {
             let sent = crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayAtFrom { id: q.id, resume });
             if sent && q.fullscreen {
@@ -185,7 +189,15 @@ mod tests {
     use crate::model::MediaRef;
 
     fn spec(pos: f64) -> ResumeSpec {
-        ResumeSpec { media: MediaRef::Url("x".into()), title: "T".into(), position_s: pos, duration_s: Some(100.0), copy: None, queue: None }
+        ResumeSpec {
+            media: MediaRef::Url("x".into()),
+            title: "T".into(),
+            position_s: pos,
+            duration_s: Some(100.0),
+            copy: None,
+            queue: None,
+            watchlist: None,
+        }
     }
 
     use crate::ui::NavRequest;

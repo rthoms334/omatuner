@@ -325,6 +325,24 @@ impl PlayerScreen {
                 items.push(menu_item(icon, label, Action::ToggleFavourite, true, k));
             }
         }
+        if let Some(item) = snap.playable.as_ref().and_then(|p| p.item.as_ref()) {
+            if item.kind != crate::model::ItemKind::Channel {
+                items.push(menu_item(
+                    glyphs::FAVOURITE,
+                    if ctx.favs.is_fav(item) { "Remove from My list" } else { "Save to My list" },
+                    Action::ToggleFavourite,
+                    true,
+                    k,
+                ));
+            }
+            items.push(menu_item(
+                glyphs::FAV_LIST,
+                if item.kind == crate::model::ItemKind::Channel { "Favourites lists…" } else { "Watchlists…" },
+                Action::AddToList,
+                true,
+                k,
+            ));
+        }
         // the TV has its own picture, tracks and window (DESIGN §40 §3.3)
         let casting = snap.cast.is_some();
         if !casting {
@@ -581,6 +599,13 @@ impl Screen for PlayerScreen {
             Action::ToggleFavourite => {
                 if let Some(ch) = playing_channel(ctx.player).and_then(|id| ctx.lib.live.get(id).cloned()) {
                     live::toggle_favourite(ctx, live::channel_ref(&ch), &ch.name);
+                } else if let Some(item) = ctx.player.playable.as_ref().and_then(|p| p.item.clone()) {
+                    crate::ui::watchlists::toggle_my_list(ctx, &item);
+                }
+            }
+            Action::AddToList => {
+                if let Some((item, title)) = ctx.player.playable.as_ref().and_then(|p| p.item.clone().map(|i| (i, p.title.clone()))) {
+                    crate::ui::screens::home::kit::list_picker(ctx, &item, &title);
                 }
             }
             Action::Back => {

@@ -58,6 +58,85 @@ pub struct Queue {
 }
 
 tool_actions!(
+    /// `watchlist` (DESIGN §42 §7).
+    pub enum WatchlistAction {
+        Lists => ("lists", false),
+        Show => ("show", false),
+        Next => ("next", false),
+        Play => ("play", true),
+        Stop => ("stop", true),
+        Create => ("create", true),
+        Add => ("add", true),
+        Move => ("move", true),
+        Remove => ("remove", true),
+        Skip => ("skip", true),
+        Restart => ("restart", true),
+        Rename => ("rename", true),
+        Delete => ("delete", true),
+    }
+);
+
+/// Names are matched without guessing when several lists fit; ids are exact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WatchlistSelector {
+    Id(i64),
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchlistPlaceholder {
+    pub title: String,
+    pub year: Option<u16>,
+    pub kind: crate::model::ItemKind,
+    pub tmdb_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchlistSeasons {
+    pub from: u32,
+    pub to: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Watchlist {
+    pub action: WatchlistAction,
+    pub list: Option<WatchlistSelector>,
+    pub include_done: Option<bool>,
+    pub id: Option<i64>,
+    pub just_one: Option<bool>,
+    pub open_in: Option<String>,
+    pub name: Option<String>,
+    pub note: Option<String>,
+    pub play_order: Option<String>,
+    pub refs: Option<Vec<String>>,
+    pub placeholders: Option<Vec<WatchlistPlaceholder>>,
+    /// `end`, `next`, or a zero-based position.
+    #[serde(default, deserialize_with = "watchlist_position")]
+    pub at: Option<String>,
+    pub seasons: Option<WatchlistSeasons>,
+    pub ids: Option<Vec<i64>>,
+    /// move: the same positions as `at`.
+    #[serde(default, deserialize_with = "watchlist_position")]
+    pub to: Option<String>,
+    /// skip: false clears a skip; absent toggles it.
+    pub skipped: Option<bool>,
+}
+
+fn watchlist_position<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Number(n)) if n.as_u64().is_some() => Ok(Some(n.to_string())),
+        _ => Err(D::Error::custom("give end, next or a nonnegative index")),
+    }
+}
+
+tool_actions!(
     /// `follow` (Following, DESIGN §33; news flash included).
     pub enum FollowAction {
         Preview => ("preview", false),
@@ -411,6 +490,7 @@ mod tests {
     #[test]
     fn verb_names_match_the_wire() {
         assert_wire_names::<QueueAction>();
+        assert_wire_names::<WatchlistAction>();
         assert_wire_names::<FollowAction>();
         assert_wire_names::<SpoilerAction>();
         assert_wire_names::<GuideFixAction>();

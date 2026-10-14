@@ -123,11 +123,14 @@ pub struct FeatureBackup {
     /// `store::guide_fix::export` (G-core): time shifts and dismissals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guide_fix: Option<serde_json::Value>,
+    /// Watchlists, their ranges, skips and restart boundaries (DESIGN §42).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watchlists: Option<serde_json::Value>,
 }
 
 impl FeatureBackup {
     pub fn is_empty(&self) -> bool {
-        self.queue.is_none() && self.follow.is_none() && self.spoiler.is_none() && self.guide_fix.is_none()
+        self.queue.is_none() && self.follow.is_none() && self.spoiler.is_none() && self.guide_fix.is_none() && self.watchlists.is_none()
     }
 }
 
@@ -270,6 +273,7 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             follow: crate::store::follow::export(conn)?,
             spoiler: crate::store::spoiler::export(conn)?,
             guide_fix: crate::store::guide_fix::export(conn)?,
+            watchlists: crate::store::watchlist::export(conn)?,
         },
         config: config_toml,
     })
@@ -327,6 +331,9 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         return Err(Error::BadPayload("not a supported Tuner backup".into()));
     }
     let now = crate::model::now();
+    if b.fav_items.iter().any(|e| e.item.kind != crate::model::ItemKind::Channel) {
+        before_watchlists(conn)?;
+    }
     let tx = conn.transaction()?;
     let mut report = RestoreReport::default();
 
@@ -337,7 +344,7 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         for e in crate::store::sources::list_epg_sources(&tx)? {
             crate::store::sources::purge_epg_source(&tx, e.id)?;
         }
-        tx.execute_batch("DELETE FROM fav_item; DELETE FROM fav_list WHERE is_default = 0; DELETE FROM history;")?;
+        tx.execute_batch("DELETE FROM watchlist_item; DELETE FROM watchlist WHERE is_default=0; UPDATE watchlist SET note=NULL,play_order='any',since=0,last_played_at=NULL WHERE is_default=1; DELETE FROM meta WHERE key IN ('queue:context','queue:context_agent') OR key LIKE 'watchlist:%'; DELETE FROM fav_item; DELETE FROM fav_list WHERE is_default = 0; DELETE FROM history;")?;
     }
 
     // ---- sources
@@ -465,6 +472,8 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         )?;
     }
 
+    crate::store::watchlist::move_favourites(&tx)?;
+
     // ---- overrides
     for o in &b.item_overrides {
         let Some(item) = remap(&o.item) else { continue };
@@ -581,8 +590,14 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         )?;
     }
     // ---- the batch features (each owner remaps its own refs; rule ids never carry over)
+    let watchlists = if let Some(v) = &b.features.watchlists {
+        crate::store::watchlist::import(&tx, v, &remap)?
+    } else {
+        crate::store::watchlist::ImportResult::default()
+    };
+    rows += watchlists.rows;
     if let Some(v) = &b.features.queue {
-        rows += crate::store::queue::import(&tx, v, &remap)?;
+        rows += crate::store::queue::import_with_watchlists(&tx, v, &remap, &watchlists.entries)?;
     }
     if let Some(v) = &b.features.follow {
         rows += crate::store::follow::import(&tx, v, &remap)?;
@@ -621,4 +636,22 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     crate::store::sources::register_secrets(conn)?;
     report.user_rows = rows as u32;
     Ok(report)
+}
+
+/// An exact pre-migration safety copy, including the old catalogue and credentials. SQLite
+/// snapshots the live WAL via VACUUM INTO; a failed backup prevents the move (DESIGN §42 §4.1).
+/// In-memory test databases have no file to preserve.
+pub(crate) fn before_watchlists(conn: &Connection) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path: String = conn.query_row("SELECT file FROM pragma_database_list WHERE name='main'", [], |r| r.get(0))?;
+    if path.is_empty() {
+        return Ok(());
+    }
+    let original = std::path::Path::new(&path);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(Error::other)?.as_nanos();
+    let backup = original.with_file_name(format!("{}.before-watchlists-{stamp}.db", original.file_name().unwrap_or_default().to_string_lossy()));
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&backup).map_err(|e| Error::io(&backup, e))?;
+    conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+    std::fs::File::open(&backup).and_then(|f| f.sync_all()).map_err(|e| Error::io(&backup, e))?;
+    Ok(())
 }

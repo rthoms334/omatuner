@@ -46,6 +46,7 @@ pub mod stacks;
 pub mod titles;
 pub mod user;
 pub mod vod;
+pub mod watchlist;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

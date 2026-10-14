@@ -366,6 +366,12 @@ impl TunerApp {
         app.handle_ipc(&initial);
         app.start_agent_pass();
         app.start_cast_pass();
+        if let Ok(names) = crate::store::watchlist::moved_card(&app.db)
+            && !names.is_empty()
+        {
+            app.nav.push(NavRequest::Open(OverlayRequest::WatchlistsMoved(names)));
+            let _ = app.services().store.writer().submit(|c| crate::store::watchlist::dismiss_moved_card(c));
+        }
         app
     }
 
@@ -1074,7 +1080,16 @@ impl TunerApp {
 
     /// DataScope → reaction (DESIGN §5.4).
     fn on_data_changed(&mut self, scope: DataScope) {
+        crate::ui::watchlists::invalidate();
         match scope {
+            DataScope::Watchlists => {
+                if let Ok(f) = crate::store::library::load_favs(&self.db) {
+                    self.favs = f;
+                }
+                if let Some(q) = &self.services().queue {
+                    q.send(crate::queue::QueueCommand::RefreshLists);
+                }
+            }
             DataScope::Favourites => match crate::store::library::load_favs(&self.db) {
                 Ok(f) => self.favs = f,
                 Err(e) => tracing::warn!("favourites: {e}"),
@@ -2098,6 +2113,7 @@ impl TunerApp {
             Action::GoSeries => self.nav.push(NavRequest::Switch(Route::Series { group: None })),
             Action::GoSettings => self.nav.push(NavRequest::Switch(Route::Settings(Default::default()))),
             // the batch features' global keys (each a no-op while its feature is off)
+            Action::GoWatchlists => self.nav.push(NavRequest::Switch(Route::Watchlists { list: None })),
             Action::GoQueue if crate::queue::ENABLED => self.nav.push(NavRequest::Switch(Route::Queue)),
             Action::SpoilerMenu if crate::spoiler::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SpoilerMenu)),
             Action::SleepTimer if crate::reminders::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SleepTimer)),
@@ -2139,6 +2155,7 @@ impl TunerApp {
             // an automatic switch's toast (DESIGN §30.8)
             Action::CancelSwitch(id) => self.cancel_switch(id),
             // a toast's Undo off the screens that made it: Up next's rows, a guide-fix batch
+            Action::Undo(n) if crate::ui::watchlists::is_undo(n) => crate::ui::watchlists::undo(self.services(), n),
             Action::Undo(n) if crate::queue::ui::is_undo(n) => {
                 if let Err(e) = crate::queue::ui::undo_in(self.services(), n) {
                     self.toast(Toast::info(e));
@@ -3040,6 +3057,7 @@ fn route_for_screen(id: ScreenId) -> Route {
         ScreenId::Logs => Route::Logs,
         ScreenId::EpgMapping => Route::EpgMapping { channel: None },
         ScreenId::Queue => Route::Queue,
+        ScreenId::Watchlists => Route::Watchlists { list: None },
         ScreenId::MovieDetail | ScreenId::SeriesDetail => Route::Home,
     }
 }
@@ -3082,7 +3100,7 @@ fn view_name(screen: ScreenId) -> Option<&'static str> {
         ScreenId::Movies | ScreenId::MovieDetail => "movies",
         ScreenId::Series | ScreenId::SeriesDetail => "series",
         ScreenId::Settings | ScreenId::Logs | ScreenId::EpgMapping => "settings",
-        ScreenId::Player | ScreenId::Onboarding | ScreenId::Queue => return None,
+        ScreenId::Player | ScreenId::Onboarding | ScreenId::Queue | ScreenId::Watchlists => return None,
     })
 }
 
@@ -4179,8 +4197,8 @@ mod tests {
         }));
         assert_eq!(rig.log().toasts.last().unwrap().text, "TV couldn't play Dune — playing from TV 2");
 
-        // ★ removed from both copies; the toast's Undo puts both back
-        let copy = |s: i64| ItemRef { source: SourceId(s), kind: ItemKind::Movie, key: ItemKey(format!("m{s}")) };
+        // Channel favourites retain their combined-action Undo.
+        let copy = |s: i64| ItemRef { source: SourceId(s), kind: ItemKind::Channel, key: ItemKey(format!("m{s}")) };
         let (a, b) = (copy(1), copy(2));
         let undo = rig
             .writer()
@@ -4196,7 +4214,7 @@ mod tests {
         let n = rig.app.services().undo.stash(undo);
         // a newer combined action (on another page, say) doesn't change what the older toast
         // undoes: the split stays
-        let split = rig.writer().blocking(move |c| crate::store::copies::split(c, &copy(2), true, 4)).unwrap();
+        let split = rig.writer().blocking(move |c| crate::store::copies::split(c, &ItemRef { kind: ItemKind::Movie, ..copy(2) }, true, 4)).unwrap();
         rig.app.services().undo.stash(split);
         let ctx = rig.ctx.clone();
         rig.app.global_action(Action::Undo(n), &[], &ctx);
@@ -5773,6 +5791,7 @@ mod tests {
                 duration_s: None,
                 copy: None,
                 queue: None,
+                watchlist: None,
             }),
         ];
         for o in overlays {

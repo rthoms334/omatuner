@@ -42,6 +42,7 @@ mod code {
     pub const SHUFFLE: u8 = 209;
     pub const CLEAR: u8 = 210;
     pub const CARRY_ON: u8 = 211;
+    pub const SAVE_LIST: u8 = 212;
 }
 /// "Use another copy…": copy `k` is `COPY + k`.
 const COPY: u8 = 100;
@@ -152,6 +153,7 @@ impl QueueScreen {
         if s.rows.iter().filter(|r| r.entry.state == RowState::Pending).count() > 2 {
             items.push(mi(glyphs::SYNC, "Shuffle the rest", code::SHUFFLE));
         }
+        items.push(mi(glyphs::FAV_LIST, "Save as a watchlist…", code::SAVE_LIST));
         items.push(mi(glyphs::CLOSE, "Clear Up next…", code::CLEAR));
         self.menu_row = Some(id);
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: crate::queue::ui::row_title(e), items }));
@@ -164,6 +166,16 @@ impl QueueScreen {
         let Some(row) = s.row(id) else { return };
         let ids = if self.list.marks.contains(&id) { self.list.targets() } else { vec![id] };
         let cmd = match c {
+            code::SAVE_LIST => {
+                let items = s.rows.iter().map(|r| r.entry.item.clone()).collect();
+                ctx.open(OverlayRequest::WatchlistPicker(crate::ui::overlays::watchlists::PickerSpec {
+                    items,
+                    title: "Save Up next".into(),
+                    edit: None,
+                    create: true,
+                }));
+                return;
+            }
             code::PLAY => return self.play(ctx, id, false),
             code::CARRY_ON => QueueCommand::Resume,
             code::FROM_START => QueueCommand::FromStart(id, !row.entry.from_start),
@@ -541,6 +553,12 @@ pub(crate) mod tests {
     fn the_screen_lists_sections_and_the_card_at_every_width() {
         for (w, scale) in [(1600.0, 1.0), (790.0, 1.0), (790.0, 16.0 / 12.0)] {
             let (mut t, one) = rig();
+            crate::ui::screens::home::testkit::seed(&mut t, |c| {
+                let source = crate::ui::screens::home::testkit::source(c, "TV")?;
+                crate::ui::screens::home::testkit::movies(c, source, 3)?;
+                c.execute("UPDATE movie SET key='m' || id", [])?;
+                Ok(())
+            });
             let base = crate::theme::Theme::fallback();
             t.theme = crate::theme::Theme::from_parts(base.name.clone(), base.palette.clone(), base.shell.clone(), 0.0, scale);
             let layout = LayoutClass::from_width(w, t.theme.rem());
@@ -581,7 +599,13 @@ pub(crate) mod tests {
         let s = t.services();
         let _ = s.agent.publish_library(&t.lib);
         let rec = Arc::new(Rec::default());
-        let deps = crate::queue::EngineDeps { store: s.store.clone(), config: s.config.clone(), player: rec.clone(), bus: s.bus.clone() };
+        let deps = crate::queue::EngineDeps {
+            store: s.store.clone(),
+            config: s.config.clone(),
+            player: rec.clone(),
+            bus: s.bus.clone(),
+            jobs: Some(s.jobs.clone()),
+        };
         s.agent.set_queue_handle(Some(crate::queue::service::spawn(s.rt.handle(), s.agent.clone(), deps)));
         rec
     }

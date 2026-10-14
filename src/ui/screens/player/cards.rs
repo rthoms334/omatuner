@@ -495,7 +495,17 @@ mod tests {
 
     /// A film playing, the player entered, the engine running.
     fn player(video_only: bool, size: egui::Vec2) -> H {
-        let (t, one) = rig();
+        let (mut t, one) = rig();
+        crate::ui::screens::home::testkit::seed(&mut t, |c| {
+            let source = crate::ui::screens::home::testkit::source(c, "TV")?;
+            crate::ui::screens::home::testkit::named_movies(
+                c,
+                source,
+                &[("Moonraker", "Moonraker"), ("Thunderball", "Thunderball"), ("Dr. No", "Dr. No")],
+            )?;
+            c.execute("UPDATE movie SET key='m' || id", [])?;
+            Ok(())
+        });
         player_on(t, one, video_only, size).0
     }
 

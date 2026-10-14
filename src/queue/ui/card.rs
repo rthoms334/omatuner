@@ -22,6 +22,7 @@ pub enum Card {
         place: Option<(usize, usize)>,
         /// The live slot that ended / the item that failed.
         before: Option<String>,
+        list: Option<(String, bool)>,
     },
     /// "Up next is locked · You Only Live Twice".
     Locked { title: String },
@@ -41,6 +42,7 @@ pub enum Button {
     PlayNow,
     List,
     Cancel,
+    StopList,
     KeepWatching,
     EnterPin,
     Skip,
@@ -57,6 +59,7 @@ impl Button {
         match self {
             Button::PlayNow => (g::PLAY, "Play now", "Enter"),
             Button::List => (g::UP_NEXT, "List", "u"),
+            Button::StopList => (g::STOP, "Stop the list", "Esc"),
             Button::Cancel => (g::CLOSE, "Cancel", "Esc"),
             Button::KeepWatching => (g::CLOSE, "Keep watching", "Esc"),
             Button::EnterPin => (g::LOCK, "Enter PIN", "Enter"),
@@ -106,7 +109,12 @@ impl Card {
                 }
                 _ => None,
             };
-            return Some(Card::Countdown { why: c.why, next, detail, left, place: c.id.and_then(|id| s.place(id)), before });
+            let list =
+                c.id.and_then(|id| s.row(id))
+                    .and_then(|r| r.entry.watchlist_item_id)
+                    .and(s.watchlist.as_ref())
+                    .map(|w| (w.name.clone(), w.any_order));
+            return Some(Card::Countdown { why: c.why, next, detail, left, place: c.id.and_then(|id| s.place(id)), before, list });
         }
         if let Some(b) = s.blocked {
             let row = s.blocked_id.and_then(|id| s.row(id));
@@ -123,6 +131,7 @@ impl Card {
         }
         let f = s.finished?;
         let text = match f {
+            FinishedWhy::EndOfList(_) => format!("That was {} ✓", s.finished_watchlist.as_deref().unwrap_or("your watchlist")),
             FinishedWhy::EndOfQueue => "That was Up next.".to_owned(),
             FinishedWhy::StopAfter(id) => match title_of(s, Some(id)) {
                 Some(t) => format!("Stopped after {t}, as asked"),
@@ -141,25 +150,37 @@ impl Card {
     pub fn lines(&self, now: Timestamp, h24: bool) -> (String, Option<String>) {
         let secs = |left: Option<i64>| left.map(|l| format!(" in {l} s")).unwrap_or_default();
         match self {
-            Card::Countdown { why, next, detail, left, place, before } => {
+            Card::Countdown { why, next, detail, left, place, before, list } => {
                 let of = place.map(|(k, n)| format!(" · {k} of {n}")).unwrap_or_default();
-                let head = match why {
-                    CountdownWhy::NextEpisode => format!("Next episode{}", secs(*left)),
-                    CountdownWhy::SlotEnded => match (before, next) {
-                        (Some(b), Some(_)) => format!("{b} has ended — up next{}", secs(*left)),
-                        (Some(b), None) => format!("{b} has ended"),
-                        (None, _) => format!("Up next{}", secs(*left)),
-                    },
-                    CountdownWhy::Failed => match before {
-                        Some(b) => format!("Couldn't play {b} — next{}", secs(*left)),
-                        None => format!("Couldn't play that — next{}", secs(*left)),
-                    },
-                    CountdownWhy::Ended => format!("Up next{}{of}", secs(*left)),
+                let head = if let Some((name, any)) = list {
+                    if *any {
+                        next.as_ref().map_or_else(|| format!("Another from {name}"), |n| format!("Another from {name}: {n}"))
+                    } else {
+                        format!("Next in {name}{}", secs(*left))
+                    }
+                } else {
+                    match why {
+                        CountdownWhy::NextEpisode => format!("Next episode{}", secs(*left)),
+                        CountdownWhy::SlotEnded => match (before, next) {
+                            (Some(b), Some(_)) => format!("{b} has ended — up next{}", secs(*left)),
+                            (Some(b), None) => format!("{b} has ended"),
+                            (None, _) => format!("Up next{}", secs(*left)),
+                        },
+                        CountdownWhy::Failed => match before {
+                            Some(b) => format!("Couldn't play {b} — next{}", secs(*left)),
+                            None => format!("Couldn't play that — next{}", secs(*left)),
+                        },
+                        CountdownWhy::Ended => format!("Up next{}{of}", secs(*left)),
+                    }
                 };
-                let line = match (next, detail) {
-                    (Some(n), Some(d)) => Some(format!("{n} · {d}")),
-                    (Some(n), None) => Some(n.clone()),
-                    _ => None,
+                let line = if list.as_ref().is_some_and(|(_, any)| *any) {
+                    detail.clone()
+                } else {
+                    match (next, detail) {
+                        (Some(n), Some(d)) => Some(format!("{n} · {d}")),
+                        (Some(n), None) => Some(n.clone()),
+                        _ => None,
+                    }
                 };
                 (head, line)
             }
@@ -191,6 +212,7 @@ impl Card {
 
     pub fn buttons(&self) -> Vec<Button> {
         match self {
+            Card::Countdown { list: Some(_), .. } => vec![Button::PlayNow, Button::StopList],
             Card::Countdown { why: CountdownWhy::SlotEnded, next: Some(_), .. } => vec![Button::PlayNow, Button::KeepWatching],
             Card::Countdown { why: CountdownWhy::SlotEnded, next: None, .. } => vec![Button::KeepWatching],
             Card::Countdown { why: CountdownWhy::NextEpisode, .. } => vec![Button::PlayNow, Button::Cancel],
@@ -207,6 +229,7 @@ impl Card {
     /// A button's step.
     pub fn press(&self, b: Button) -> Step {
         match b {
+            Button::StopList => Step::Send(QueueCommand::Cancel),
             Button::PlayNow => Step::Send(QueueCommand::Now),
             Button::List => Step::List,
             Button::Cancel | Button::KeepWatching | Button::Close => Step::Send(QueueCommand::Cancel),
@@ -237,7 +260,7 @@ impl Card {
             },
             Action::QueuePanel => Button::List,
             // Esc in controls focus mode too: the card is the rung before leaving the controls
-            Action::Back | Action::LeaveOsdControls => first(&[Button::Cancel, Button::KeepWatching, Button::Close])?,
+            Action::Back | Action::LeaveOsdControls => first(&[Button::Cancel, Button::StopList, Button::KeepWatching, Button::Close])?,
             _ => return None,
         };
         Some(self.press(b))

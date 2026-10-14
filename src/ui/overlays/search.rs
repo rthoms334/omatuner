@@ -75,6 +75,7 @@ enum Row {
     Header(&'static str),
     Hit(SearchHit),
     Guide(ProgrammeHit),
+    Watchlist(crate::model::WatchlistId, String),
 }
 
 impl Row {
@@ -103,6 +104,7 @@ pub struct SearchOverlay {
     top: Option<f32>,
     last_top: Option<f32>,
     scroll_to_cursor: bool,
+    watchlists_key: usize,
 }
 
 impl SearchOverlay {
@@ -120,6 +122,7 @@ impl SearchOverlay {
             top: None,
             last_top: None,
             scroll_to_cursor: false,
+            watchlists_key: 0,
         }
     }
 
@@ -163,6 +166,10 @@ impl SearchOverlay {
     fn activate(&mut self, ctx: &mut UiCtx<'_>, row: Row, alt: bool) -> OverlayOutcome {
         match row {
             Row::Header(_) => OverlayOutcome::Keep,
+            Row::Watchlist(id, _) => {
+                ctx.push(Route::Watchlists { list: Some(id) });
+                OverlayOutcome::Close
+            }
             Row::Hit(h) => match h.item.target {
                 SearchTarget::Channel(id) => {
                     if !kit::play_channel(ctx, id, None, PlayOrigin::Search) {
@@ -347,7 +354,7 @@ impl SearchOverlay {
             shortcut: Some(shortcut.into()),
         };
         let (title, items) = match row {
-            Row::Header(_) => return,
+            Row::Header(_) | Row::Watchlist(_, _) => return,
             Row::Guide(g) => {
                 let (play, play_label) = match guide_channel(ctx, g) {
                     Some((_, p)) if p.contains(ctx.now) => (glyphs::PLAY, "Watch"),
@@ -361,8 +368,19 @@ impl SearchOverlay {
             }
             Row::Hit(h) => {
                 let fav = Self::hit_item(ctx, h).is_some_and(|(item, ..)| ctx.favs.is_fav(&item));
-                let fav = mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F");
-                let lists = mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F");
+                let channel = matches!(h.item.target, SearchTarget::Channel(_));
+                let fav = mi(
+                    glyphs::FAVOURITE,
+                    match (channel, fav) {
+                        (true, true) => "Remove from Favourites",
+                        (true, false) => "Add to Favourites",
+                        (false, true) => "Remove from My list",
+                        (false, false) => "Save to My list",
+                    },
+                    Action::ToggleFavourite,
+                    "Ctrl+F",
+                );
+                let lists = mi(glyphs::FAV_LIST, if channel { "Favourites lists…" } else { "Watchlists…" }, Action::AddToList, "Ctrl+Shift+F");
                 let mut items = match h.item.target {
                     SearchTarget::Channel(_) => vec![
                         mi(glyphs::PLAY, "Play now", Action::Activate, "Enter"),
@@ -506,6 +524,14 @@ impl SearchOverlay {
             }
             rows.extend(guide.into_iter().take(take).map(Row::Guide));
         }
+        if self.section == SearchSection::All {
+            let lists = crate::ui::watchlists::snapshot(ctx);
+            let hits: Vec<_> = lists.lists.iter().filter(|l| hit_matches(&self.query, &l.list.name, None)).collect();
+            if !hits.is_empty() {
+                rows.push(Row::Header("Watchlists"));
+            }
+            rows.extend(hits.into_iter().map(|l| Row::Watchlist(l.list.id, l.list.name.clone())));
+        }
         self.rows = rows;
         let n = self.selectable().len();
         self.cursor = self.cursor.min(n.saturating_sub(1));
@@ -532,7 +558,7 @@ pub(crate) fn hit_matches(query: &str, title: &str, sub_title: Option<&str>) -> 
 fn row_target(ctx: &UiCtx<'_>, row: &Row) -> Option<crate::ui::item_menu::Target> {
     use crate::ui::item_menu::Target;
     Some(match row {
-        Row::Header(_) => return None,
+        Row::Header(_) | Row::Watchlist(_, _) => return None,
         Row::Guide(g) => {
             let (channel, p) = guide_channel(ctx, g)?;
             Target::Programme { programme: p.id, channel }
@@ -618,6 +644,13 @@ impl Overlay for SearchOverlay {
     }
 
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
+        let lists = crate::ui::watchlists::snapshot(ctx);
+        let key = Arc::as_ptr(&lists) as usize;
+        if self.watchlists_key != key {
+            self.watchlists_key = key;
+            self.rows_key = None;
+        }
+
         self.ensure_index(egui_ctx, ctx);
         let mut matched = false;
         if let Some(idx) = ctx.search_index.as_mut() {
@@ -723,6 +756,16 @@ impl Overlay for SearchOverlay {
                             let title = crate::ui::widgets::spoiler::Spoilers::of(ctx).programme_title(&g.programme).into_owned();
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title));
                             paint_guide(ui, ctx, rect, g, is_cursor);
+                        }
+                        Row::Watchlist(_, name) => {
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+                            ui.painter().text(
+                                rect.left_center() + egui::vec2(16.0, 0.0),
+                                Align2::LEFT_CENTER,
+                                format!("{}  {name}", glyphs::FAV_LIST),
+                                egui::FontId::proportional(theme.font(TypeToken::Body)),
+                                theme.tokens.fg,
+                            );
                         }
                         Row::Header(_) => {}
                     }
@@ -1096,7 +1139,9 @@ mod tests {
         h.state_mut().act(Action::FocusNext);
         h.run_steps(1);
         assert_eq!(h.state_mut().act(Action::AddToList), "Keep");
-        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(crate::ui::OverlayRequest::ListPicker(_))]));
+        assert!(
+            matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(crate::ui::OverlayRequest::WatchlistPicker(spec))] if spec.items.len()==1 && spec.items[0].kind==ItemKind::Movie)
+        );
         assert_eq!(h.state_mut().act(Action::ShowDetails), "Close");
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::MovieDetail(movies[1]))]);
     }

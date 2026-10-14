@@ -201,6 +201,10 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   short countdown (Settings ▸ Interface ▸ Playback), steps aside when you pick something else
   ("Up next paused · Alt+6 to carry on"), waits for the PIN on locked items and never plays
   after a restart. With Up next empty, the next episode of a series follows on its own.
+- **Watchlists:** keep named lists of films, series, season ranges and episodes (`Alt+7`).
+  Play In order or Any order, with progress from every copy and missing-title placeholders.
+  Playing a list carries on through Up next; anything you queue plays first. `Ctrl+F` saves
+  titles to My list and `Ctrl+Shift+F` chooses another list. Favourites now hold channels only.
 - **Following:** rules that watch the guide for a team, a show, an event or a news bulletin and
   set reminders or switches for you (`R` on a programme, *Follow…* in its menu, or Settings ▸
   Following). Repeats, +1 channels and the same match on two channels count once; your other
@@ -632,7 +636,8 @@ Tuner is built for the keyboard, and everything is also clickable. The basics:
 The full reference is generated from `src/keymap.rs`:
 
 <!-- keymap:start -->
-### Everywhere (`Global`)
+
+#### Everywhere (`Global`)
 
 | Keys | Action |
 |---|---|
@@ -644,6 +649,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Alt+4` | Movies |
 | `Alt+5` | Series |
 | `Alt+6` | Up next |
+| `Alt+7` | Watchlists |
 | `Ctrl+Comma` / `Alt+0` | Settings |
 | `Alt+←` | Back |
 | `F11` | Toggle window fullscreen |
@@ -660,7 +666,16 @@ The full reference is generated from `src/keymap.rs`:
 | `Alt+P` | Choose the playlist shown (Movies, Series, Live TV, guide) |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
-### Lists (`List`)
+#### Watchlists (`Watchlists`)
+
+| Keys | Action |
+|---|---|
+| `Ctrl+Shift+Enter` | Play just this one |
+| `s` | Skip in this list / unskip |
+| `o` | In order / Any order |
+| `+` | New list… |
+
+#### Lists (`List`)
 
 | Keys | Action |
 |---|---|
@@ -676,8 +691,8 @@ The full reference is generated from `src/keymap.rs`:
 | `?` | Keyboard help |
 | `Space` / `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+O` | Play from another playlist (Also on)… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -695,7 +710,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
-### Lists while filtering (`ListFiltering`)
+#### Lists while filtering (`ListFiltering`)
 
 | Keys | Action |
 |---|---|
@@ -711,8 +726,8 @@ The full reference is generated from `src/keymap.rs`:
 | `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+O` | Play from another playlist (Also on)… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -730,7 +745,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
-### Tick lists (`Checklist`)
+#### Tick lists (`Checklist`)
 
 | Keys | Action |
 |---|---|
@@ -747,7 +762,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Esc` | Clear the filter, then cancel |
 | `a–z, 0–9 …` | Type to filter |
 
-### Movies & series grid (`PosterGrid`)
+#### Movies & series grid (`PosterGrid`)
 
 | Keys | Action |
 |---|---|
@@ -763,8 +778,8 @@ The full reference is generated from `src/keymap.rs`:
 | `?` | Keyboard help |
 | `Space` | Show each copy / fold them (stack card) |
 | `Ctrl+O` | Play from another copy… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -782,7 +797,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
-### Movies & series grid while filtering (`PosterGridFiltering`)
+#### Movies & series grid while filtering (`PosterGridFiltering`)
 
 | Keys | Action |
 |---|---|
@@ -795,8 +810,8 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+O` | Play from another copy… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -814,7 +829,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 | `a–z, 0–9 …` | Type to filter |
 
-### Movie & series pages (`Detail`)
+#### Movie & series pages (`Detail`)
 
 | Keys | Action |
 |---|---|
@@ -828,8 +843,8 @@ The full reference is generated from `src/keymap.rs`:
 | `/` | Search everything |
 | `?` | Keyboard help |
 | `Ctrl+O` | Play from another copy… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -846,7 +861,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | Context menu |
 
-### TV guide (`Guide`)
+#### TV guide (`Guide`)
 
 | Keys | Action |
 |---|---|
@@ -869,7 +884,7 @@ The full reference is generated from `src/keymap.rs`:
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+E` | Assign guide channel |
 | `Ctrl+I` | Edit channel information |
 | `F2` | Rename channel |
@@ -880,7 +895,7 @@ The full reference is generated from `src/keymap.rs`:
 | `?` | Keyboard help |
 | `Esc` | Back |
 
-### Player — live TV (`PlayerLive`)
+#### Player — live TV (`PlayerLive`)
 
 | Keys | Action |
 |---|---|
@@ -913,12 +928,13 @@ The full reference is generated from `src/keymap.rs`:
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
-| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
 | `?` | Keyboard help |
 
-### Player — movies, episodes, catch-up (`PlayerVod`)
+#### Player — movies, episodes, catch-up (`PlayerVod`)
 
 | Keys | Action |
 |---|---|
@@ -950,12 +966,13 @@ The full reference is generated from `src/keymap.rs`:
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
-| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
 | `?` | Keyboard help |
 
-### Player — on-screen controls (`PlayerOsd`)
+#### Player — on-screen controls (`PlayerOsd`)
 
 | Keys | Action |
 |---|---|
@@ -965,7 +982,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
 
-### Player — multi-view (`MultiView`)
+#### Player — multi-view (`MultiView`)
 
 | Keys | Action |
 |---|---|
@@ -977,7 +994,7 @@ The full reference is generated from `src/keymap.rs`:
 | `q` | Close this picture (the other carries on) |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
 
-### Pop-out player (`PopOut`)
+#### Pop-out player (`PopOut`)
 
 | Keys | Action |
 |---|---|
@@ -985,7 +1002,7 @@ The full reference is generated from `src/keymap.rs`:
 | `f` | Back to the full window, fullscreen |
 | `Delete` | Cancel the coming switch / end the news flash (back to what you were watching) |
 
-### Channel number entry (`NumericEntry`)
+#### Channel number entry (`NumericEntry`)
 
 | Keys | Action |
 |---|---|
@@ -994,7 +1011,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Backspace` | Delete digit |
 | `Esc` | Cancel |
 
-### Guide fixes (`EpgMapping`)
+#### Guide fixes (`EpgMapping`)
 
 | Keys | Action |
 |---|---|
@@ -1005,7 +1022,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+Z` | Undo the last guide fix |
 | `Ctrl+Shift+→` / `Ctrl+Shift+←` | Time shift +1 h / −1 h |
 
-### Search (`Search`)
+#### Search (`Search`)
 
 | Keys | Action |
 |---|---|
@@ -1018,8 +1035,8 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` | Clear |
 | `Esc` | Clear, then close |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -1032,7 +1049,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Ctrl+M` | Watch alongside |
 | `Shift+F10` / `Ctrl+Enter` | List these shortcuts |
 
-### Dialogs & menus (`Modal`)
+#### Dialogs & menus (`Modal`)
 
 | Keys | Action |
 |---|---|
@@ -1041,7 +1058,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Enter` / `Space` | Confirm |
 | `Esc` | Cancel |
 
-### Text fields (`TextInput`)
+#### Text fields (`TextInput`)
 
 | Keys | Action |
 |---|---|
@@ -1049,7 +1066,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Enter` | Confirm |
 | `Esc` | Leave the field |
 
-### Settings (`Panel`)
+#### Settings (`Panel`)
 
 | Keys | Action |
 |---|---|
@@ -1064,7 +1081,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Esc` | Back |
 | `?` | Keyboard help |
 
-### Keyboard help (`Help`)
+#### Keyboard help (`Help`)
 
 | Keys | Action |
 |---|---|
@@ -1078,6 +1095,7 @@ The full reference is generated from `src/keymap.rs`:
 | `?` | Close (types ? while filtering) |
 | `Enter` | Close |
 | `a–z, 0–9 …` | Type to filter |
+
 <!-- keymap:end -->
 
 ## Mouse
@@ -1498,7 +1516,7 @@ use them directly. Their full descriptions are in `src/agent/tools.rs` and
 | Area | Tools |
 |---|---|
 | Find | `guide_search` (programmes by title, category or time window), `whats_on` (what's on at a time), `search` (channels, movies and series by name), `details` (plot, cast, what's on next, other copies), `categories`, `browse` (filters for picking by mood), `episodes`, `continue_watching`, `favourites`, `history`, `match_titles` (which titles from a web list you have) |
-| Play | `play`, `control` (pause, volume, mute, previous channel, pop-out, stop casting, play here), `status`, `cast_devices` (the TVs Tuner can cast to; `play` takes a `device`), `multiview`, `queue` (Up next), `sleep_timer` |
+| Play | `play`, `control` (pause, volume, mute, previous channel, pop-out, stop casting, play here), `status`, `cast_devices` (the TVs Tuner can cast to; `play` takes a `device`), `multiview`, `queue` (Up next), `watchlist`, `sleep_timer` |
 | Plan | `reminders` (notify or switch), `schedule_switch`, `cancel_switch`, `follow` (Following rules and news flashes) |
 | Look after | `spoiler_guard`, `guide_fix`, `favourites_edit`, `lock` (add locks only), `parental_status`, `diagnose` (playback health), `sources` (account status, expiry, connections, guide coverage) |
 

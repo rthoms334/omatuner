@@ -435,7 +435,7 @@ fn xtream(base: &str) -> SourceDraft {
     d
 }
 
-/// Favourite two channels and a movie, watch a channel, half-watch the movie.
+/// Favourite two channels and save a movie to My list, watch a channel, half-watch the movie.
 fn add_user_data(app: &App, source: SourceId, movie_key: &str) {
     let (bbc, espn) = (channel(source, "xt:live:1001"), channel(source, "xt:live:1002"));
     let movie = ItemRef { source, kind: ItemKind::Movie, key: ItemKey(movie_key.into()) };
@@ -443,7 +443,8 @@ fn add_user_data(app: &App, source: SourceId, movie_key: &str) {
         let list = tuner::store::user::default_fav_list(c)?;
         tuner::store::user::set_favourite(c, list, &bbc, true, 1)?;
         tuner::store::user::set_favourite(c, list, &espn, true, 2)?;
-        tuner::store::user::set_favourite(c, list, &movie, true, 3)?;
+        let lib = tuner::store::library::load(c)?;
+        tuner::store::watchlist::toggle_my_list(c, &lib, &movie, 3)?;
         tuner::store::user::push_history(c, &HistoryEntry { item: espn.clone(), at: tuner::model::now() - 60, title: "ESPN".into() })?;
         let fingerprint = tuner::store::user::fingerprint_of(c, &movie)?;
         let p = WatchProgress {
@@ -459,16 +460,19 @@ fn add_user_data(app: &App, source: SourceId, movie_key: &str) {
     });
 }
 
-/// (favourite keys in list order, most recent channel key, continue-watching keys).
+/// (saved channel/movie keys, most recent channel key, continue-watching keys).
 fn user_data(app: &App) -> (Vec<String>, Vec<String>, Vec<(String, f64)>) {
     let conn = app.reader();
     let list = tuner::store::user::fav_lists(&conn).expect("lists").into_iter().find(|l| l.is_default).expect("default list").id;
     let favs = tuner::store::user::fav_items(&conn, list).expect("favs");
     assert!(favs.iter().all(|f| f.orphaned_since.is_none()), "{favs:?}");
+    let my_list = tuner::store::watchlist::default_list(&conn).expect("My list");
+    let saved = tuner::store::watchlist::entries(&conn, my_list).expect("saved films");
+    assert!(saved.iter().all(|e| e.orphaned_since.is_none()), "{saved:?}");
     let recent = tuner::store::user::recent_channels(&conn, 10).expect("recent");
     let cw = tuner::store::user::continue_watching(&conn, 10).expect("continue");
     (
-        favs.iter().map(|f| f.item.key.0.clone()).collect(),
+        favs.iter().map(|f| f.item.key.0.clone()).chain(saved.iter().map(|e| e.item.as_ref().expect("attached").key.0.clone())).collect(),
         recent.iter().map(|h| h.item.key.0.clone()).collect(),
         cw.iter().map(|p| (p.item.key.0.clone(), p.position_s)).collect(),
     )
@@ -578,12 +582,14 @@ fn a_restart_keeps_sources_user_data_and_settings_and_a_renumbered_refresh_moves
     // and the library (what Home, Live and the zap list read) resolves every one of them
     let lib = app.library();
     let fav_refs = lib.favs.items(lib.favs.default_list().expect("default list"));
-    assert_eq!(fav_refs.len(), 3);
+    assert_eq!(fav_refs.len(), 2);
     assert!(lib.live.by_ref(&fav_refs[0]).is_some() && lib.live.by_ref(&fav_refs[1]).is_some());
     let espn = lib.live.by_ref(&channel(source, "xt:live:8002")).expect("ESPN");
     assert_eq!(lib.recent_channels, [espn]);
     let bbc = lib.live.by_ref(&channel(source, "xt:live:8001")).expect("BBC");
     assert!(lib.live.hidden.contains(&bbc), "the hidden override follows the renumbered channel");
-    assert!(lib.vod.movies.iter().any(|m| m.key.0 == "xt:vod:12001"), "the favourite movie is in the library");
+    let saved_movie = ItemRef { source, kind: ItemKind::Movie, key: ItemKey("xt:vod:12001".into()) };
+    assert!(lib.favs.is_fav(&saved_movie), "My list marks follow the re-keyed film");
+    assert!(lib.vod.movies.iter().any(|m| m.key.0 == "xt:vod:12001"), "the saved movie is in the library");
     app.shutdown();
 }

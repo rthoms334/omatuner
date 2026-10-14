@@ -15,6 +15,7 @@ pub mod queue;
 pub mod series;
 pub mod series_detail;
 pub mod settings;
+pub mod watchlists;
 
 use super::Screen;
 
@@ -34,5 +35,6 @@ pub fn all() -> Vec<Box<dyn Screen>> {
         Box::new(epg_mapping::EpgMappingScreen::default()),
         Box::new(logs::LogsScreen::default()),
         Box::new(queue::QueueScreen::default()),
+        Box::new(watchlists::WatchlistsScreen::default()),
     ]
 }

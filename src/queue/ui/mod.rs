@@ -47,7 +47,7 @@ pub const PIN_CODE: u8 = 250;
 pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
     remember(ctx);
     let raw = ctx.services.agent.queue();
-    if !crate::spoiler::ENABLED || (raw.rows.is_empty() && raw.next_episode.is_none()) {
+    if raw.rows.is_empty() && raw.next_episode.is_none() && raw.watchlist.is_none() && raw.finished_watchlist.is_none() {
         return raw;
     }
     // once per published snapshot, minute (the guard's windows move with the clock) and guard
@@ -56,7 +56,9 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
         static GUARDED: std::cell::RefCell<Option<Guarded>> = const { std::cell::RefCell::new(None) };
     }
     let sp = crate::ui::widgets::spoiler::Spoilers::of(ctx);
-    let key = (ctx.now / 60, sp.stamp());
+    let visible = crate::ui::watchlists::snapshot(ctx);
+    let hides = ctx.parental.hides_explicit(&ctx.config.parental);
+    let key = (ctx.now / 60, sp.stamp(), ctx.lib.generation, hides, Arc::as_ptr(&visible) as usize);
     GUARDED.with_borrow_mut(|g| {
         if let Some((w, k, s)) = g.as_ref()
             && *k == key
@@ -64,20 +66,75 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
         {
             return s.clone();
         }
-        let s = Arc::new(guard_snapshot(&sp, &raw));
+        let mut filtered = guard_snapshot(&sp, &raw);
+        if hides {
+            let places: std::collections::HashMap<_, _> = visible
+                .lists
+                .iter()
+                .flat_map(|l| l.entries.iter().enumerate().map(move |(i, e)| (e.entry.id, (l.list.name.clone(), i + 1, l.total))))
+                .collect();
+            filtered.rows = filtered
+                .rows
+                .iter()
+                .filter(|r| {
+                    !ctx.lib.conceals(&r.entry.item)
+                        && !ctx.lib.explicit.contains(&r.entry.item)
+                        && r.entry.watchlist_item_id.is_none_or(|id| places.contains_key(&id))
+                })
+                .cloned()
+                .collect();
+            if filtered.watchlist.as_ref().is_some_and(|l| visible.list(l.id).is_none()) {
+                filtered.watchlist = None;
+            }
+            if matches!(filtered.finished,Some(crate::queue::FinishedWhy::EndOfList(id)) if visible.list(id).is_none()) {
+                filtered.finished = None;
+                filtered.finished_watchlist = None;
+            }
+            filtered.watchlist_chips.retain(|id, chip| {
+                if let Some((name, position, total)) = places.get(id) {
+                    chip.name = name.clone();
+                    chip.position = *position;
+                    chip.total = *total;
+                    true
+                } else {
+                    false
+                }
+            });
+            if let Some(l) = &mut filtered.watchlist {
+                l.then.retain(|e| places.contains_key(&e.id));
+                if let Some(v) = visible.list(l.id) {
+                    l.total = v.total;
+                    l.position = v.next.and_then(|id| v.place(id)).map_or(0, |p| p.0);
+                }
+            }
+        }
+        let s = Arc::new(filtered);
         *g = Some((Arc::downgrade(&raw), key, s.clone()));
         s
     })
 }
 
 /// The guarded snapshot of (the raw one, the minute and guard stamp it was made for).
-type Guarded = (Weak<QueueSnapshot>, (i64, (u64, u64)), Arc<QueueSnapshot>);
+type Guarded = (Weak<QueueSnapshot>, (i64, (u64, u64), u64, bool, usize), Arc<QueueSnapshot>);
 
 /// `raw` with its rows' and next episode's text through the guard.
 fn guard_snapshot(sp: &crate::ui::widgets::spoiler::Spoilers, raw: &QueueSnapshot) -> QueueSnapshot {
     let mut s = raw.clone();
     s.rows = s.rows.iter().map(|r| crate::queue::QueueRow { entry: guarded(sp, &r.entry), ..r.clone() }).collect();
     s.next_episode = s.next_episode.map(|n| guarded_next(sp, n));
+    if let Some(list) = &mut s.watchlist {
+        for e in &mut list.then {
+            if e.kind == ItemKind::Episode
+                && let (Some(series), Some(season), Some(episode)) = (&e.series, e.season, e.episode)
+            {
+                let norm = crate::spoiler::series_key(series);
+                let subject = crate::guard::Subject::Episode { series_norm: &norm, season: season as i32, episode: episode as i32 };
+                e.title = sp
+                    .text(&subject, crate::guard::Field::EpisodeTitle, &e.title)
+                    .map_or_else(|| format!("{series} · S{season}E{episode}"), |t| t.into_owned());
+            }
+        }
+    }
     s
 }
 
@@ -216,6 +273,7 @@ pub fn play_row(ctx: &mut UiCtx<'_>, s: &QueueSnapshot, id: QueueId, fullscreen:
                 duration_s: at.duration_s,
                 copy: None,
                 queue: Some(crate::ui::overlays::QueueResume { id, fullscreen }),
+                watchlist: None,
             }));
             return RowPlay::Prompt;
         }
@@ -714,6 +772,7 @@ pub(crate) mod tests {
             state,
             by_agent: false,
             orphaned: false,
+            watchlist_item_id: None,
         }
     }
 

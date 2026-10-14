@@ -425,6 +425,8 @@ pub struct MoveItem {
     pub matched: MatchedBy,
     /// Favourites lists holding it.
     pub lists: Vec<FavListId>,
+    /// Watchlists whose entries follow this title (DESIGN §42 §4).
+    pub watchlists: Vec<crate::model::WatchlistId>,
     /// Its progress row (position, watched) when the plan was made; [`move_titles`] moves the
     /// row as it is when it runs.
     pub progress: Option<crate::model::WatchProgress>,
@@ -621,9 +623,15 @@ pub fn move_plan(conn: &Connection, from: SourceId) -> Result<MovePlan> {
         let what = if channels == 1 { "1 channel favourite".to_owned() } else { format!("{channels} channel favourites") };
         plan.cannot.push(CantMove { what, why: "channels aren't matched across playlists".to_owned(), title_ref: None });
     }
+    let watchlist_refs: Vec<ItemRef> = conn
+        .prepare_cached("SELECT DISTINCT source_id,kind,item_key FROM watchlist_item WHERE source_id=?1 AND any_copy=1 ORDER BY list_id,position,id")?
+        .query_map([from], |r| {
+            Ok(ItemRef { source: r.get(0)?, kind: crate::store::sql::kind_from_sql(&r.get::<_, String>(1)?)?, key: ItemKey(r.get(2)?) })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
     // every movie / series / episode with data, in a stable order
     let mut refs: Vec<ItemRef> = Vec::new();
-    for r in favs.iter().map(|(r, _)| r).chain(progress.iter().map(|p| &p.item)) {
+    for r in favs.iter().map(|(r, _)| r).chain(watchlist_refs.iter()).chain(progress.iter().map(|p| &p.item)) {
         if r.kind != ItemKind::Channel && !refs.contains(r) {
             refs.push(r.clone());
         }
@@ -641,6 +649,10 @@ pub fn move_plan(conn: &Connection, from: SourceId) -> Result<MovePlan> {
     let differs = |a: &TitleRow, b: &TitleRow| (b.name != a.name || b.year != a.year).then(|| with_year(&b.name, b.year));
     for r in refs {
         let lists: Vec<FavListId> = favs.iter().filter(|(f, _)| *f == r).map(|(_, l)| *l).collect();
+        let watchlists: Vec<crate::model::WatchlistId> = conn
+            .prepare_cached("SELECT DISTINCT list_id FROM watchlist_item WHERE source_id=?1 AND kind=?2 AND item_key=?3 AND any_copy=1")?
+            .query_map(params![r.source, r.kind.as_str(), r.key.as_str()], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let prog = progress.iter().find(|p| p.item == r).cloned();
         match r.kind {
             ItemKind::Movie | ItemKind::Series => {
@@ -662,6 +674,7 @@ pub fn move_plan(conn: &Connection, from: SourceId) -> Result<MovePlan> {
                         title,
                         matched,
                         lists,
+                        watchlists,
                         progress: prog,
                     }),
                     None => plan.cannot.push(CantMove { what: title, why: "no copy in another playlist".to_owned(), title_ref: Some(r) }),
@@ -717,6 +730,7 @@ pub fn move_plan(conn: &Connection, from: SourceId) -> Result<MovePlan> {
                             title,
                             matched,
                             lists,
+                            watchlists,
                             progress: prog,
                         });
                     }
@@ -739,6 +753,7 @@ pub fn move_plan(conn: &Connection, from: SourceId) -> Result<MovePlan> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Moved {
     pub favourites: usize,
+    pub watchlists: usize,
     pub progress: usize,
 }
 
@@ -750,6 +765,7 @@ pub fn move_titles(conn: &Connection, items: &[MoveItem]) -> Result<Moved> {
     atomic(conn, |c| {
         let mut moved = Moved::default();
         for m in items {
+            moved.watchlists += c.execute("UPDATE watchlist_item SET source_id=?3,item_key=?4,fp=?5,orphaned_since=NULL WHERE source_id=?1 AND kind=?6 AND item_key=?2 AND any_copy=1",params![m.from.source,m.from.key.as_str(),m.to.source,m.to.key.as_str(),crate::store::sql::fp_to_json(&user::fingerprint_of(c,&m.to)?),m.from.kind.as_str()])?;
             for &list in &m.lists {
                 let fp = crate::store::sql::fp_opt(&user::fingerprint_of(c, &m.to)?);
                 moved.favourites += c.execute(
