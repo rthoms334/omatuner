@@ -1022,10 +1022,11 @@ Daily `Maintenance`: programmes with `stop < now − max(epg_keep_past_days, max
 generation beside the old one, so the file briefly holds two guides; with `auto_vacuum=NONE`
 it never shrank back (a user's 690 MB file was 270 MB free pages). After every generation sweep
 and in `Maintenance`, `store::release_free_pages` runs `PRAGMA incremental_vacuum` in 8 MiB
-steps (one short write transaction each) until nothing is free. A database from before this is
-converted once by `Store::open` (one `VACUUM`, its scratch copy in a temp file rather than
-memory: 2.2 s for that 690 MB file, leaving 390 MB). A failed conversion is logged and tried
-again on the next start.
+steps (one short write transaction each) until nothing is free. New databases get the mode
+before their first table. 0.3.2 converted existing databases once, as `Store::open` opened them
+(one `VACUUM`: 14 s for that 690 MB file, leaving 389 MB). Later builds dropped the conversion
+(user decision, 2026-10-15), so a database made before 0.3.2 that never ran 0.3.2 keeps
+`auto_vacuum=NONE`: `incremental_vacuum` does nothing there and its file stays at its peak.
 
 ---
 
