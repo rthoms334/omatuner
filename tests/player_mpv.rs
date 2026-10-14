@@ -1420,6 +1420,73 @@ mod casting {
         assert!(h.snapshot().playable.as_ref().is_some_and(|p| p.media == ch.media));
     }
 
+    /// The Play on switch chosen while picture A plays here (in multi-view, then it ended; or
+    /// a move to the TV that failed): previous channel, the next channel and numeric tuning
+    /// go to the TV as a `Play` does, not here (DESIGN §40 §3.9).
+    #[test]
+    fn play_on_sends_zaps_recall_and_numeric_tuning_of_a_local_picture_to_the_tv() {
+        let Some((media, _serial)) = setup() else { return };
+        let srv = TestServer::start(media, Faults::default());
+        let a = live(77, srv.url("long/index.m3u8"));
+        let b = live(78, srv.url("long/index.m3u8"));
+        let (mut h, sessions) = start_casting(vec![a.clone(), b.clone()]);
+        let zap = ZapList { collection: Collection::AllChannels, channels: vec![ChannelId(77), ChannelId(78)].into() };
+        h.handle.send(PlayerCommand::Play(PlayRequest {
+            media: a.media.clone(),
+            zap: Some(zap),
+            origin: PlayOrigin::Fullscreen,
+            resume: false,
+            immediate: true,
+        }));
+        h.wait_state(LONG, is_playing);
+        let mark = h.mark();
+        h.play(b.media.clone(), true);
+        h.wait_state_from(mark, LONG, is_playing);
+        h.handle.send(PlayerCommand::SetPlayOn(Some(device())));
+        let s = h.wait_snapshot(LONG, |s| s.play_on == Some(device()));
+        assert!(s.cast.is_none() && s.previous_live.as_ref().is_some_and(|p| p.media == a.media), "b plays here, a before it");
+
+        // each lands on a TV; Play here brings the picture back here for the next one
+        let on_tv = |h: &mut Harness, cmd: PlayerCommand, want: &Playable| {
+            h.handle.send(cmd);
+            let mut tv = sessions.recv_timeout(LONG).expect("a session: the play went to the TV");
+            let (generation, playable, _) = tv.load();
+            assert_eq!(playable.media, want.media);
+            tv.start(generation);
+            h.wait_snapshot(LONG, casting_and_playing);
+            h.handle.send(PlayerCommand::StopCasting { play_here: true });
+            assert_eq!(tv.next(), RemoteCmd::Close { fast: false });
+            tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+            let s = h.wait_snapshot(LONG, |s| s.cast.is_none() && s.state == PlayerState::Playing);
+            assert_eq!(s.playable.as_ref().map(|p| p.media.clone()), Some(want.media.clone()), "Play here: the same item here");
+        };
+        on_tv(&mut h, PlayerCommand::LastChannel { unlocked: true }, &a);
+        on_tv(&mut h, PlayerCommand::Zap { forward: true, unlocked: true }, &b);
+        on_tv(&mut h, PlayerCommand::ZapTo { id: ChannelId(77), unlocked: true }, &a);
+    }
+
+    /// A play the Play on switch sent to a TV whose session can't open, while an older item
+    /// still plays here: the failure's Play here replaces the older item with it.
+    #[test]
+    fn play_here_after_a_cast_that_never_opened_replaces_what_still_plays_here() {
+        let Some((media, _serial)) = setup() else { return };
+        let srv = TestServer::start(media, Faults::default());
+        let a = live(79, srv.url("long/index.m3u8"));
+        let b = live(80, srv.url("long/index.m3u8"));
+        let mut h = start_with(vec![a.clone(), b.clone()], Arc::new(NoTv));
+        h.play(a.media.clone(), true);
+        h.wait_state(LONG, is_playing);
+        h.handle.send(PlayerCommand::SetPlayOn(Some(device())));
+        let mark = h.mark();
+        h.play(b.media.clone(), true);
+        assert!(h.wait_event_from(mark, LONG, |e| matches!(e, PlayerEvent::Failed(_))).is_some(), "the cast failed");
+        let s = h.snapshot();
+        assert_eq!((s.state.clone(), s.playable.as_ref().map(|p| p.media.clone())), (PlayerState::Playing, Some(a.media.clone())), "a plays on");
+        h.handle.send(PlayerCommand::StopCasting { play_here: true });
+        let s = h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| p.media == b.media));
+        assert!(s.cast.is_none(), "here, not on a TV");
+    }
+
     /// Play here: the session closes (its last position report still counts), and the film
     /// carries on here from where the TV was.
     #[test]

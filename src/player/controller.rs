@@ -287,7 +287,8 @@ struct Controller {
     /// The user's mpv-only snapshot fields while casting ([`LocalView`]).
     local_view: Option<LocalView>,
     /// A play whose cast couldn't even start (its session didn't open: casting off, the TV no
-    /// longer paired): the failure's Play here plays it here. Any other play forgets it.
+    /// longer paired): the failure's Play here plays it here, replacing what still plays here.
+    /// Any other play, or a stop, forgets it.
     undelivered: Option<CopyPlay>,
 }
 
@@ -795,10 +796,6 @@ impl Controller {
         (!lines.is_empty()).then(|| crate::redact::redact(&lines.join(" ")).into_owned())
     }
 
-    fn resolve_and_play(&mut self, req: PlayRequest) -> bool {
-        self.play_copy(CopyPlay { req, fallback: None, elsewhere: None, start_at: None })
-    }
-
     /// Resolve and play; a copy with a fallback that can't be resolved goes straight to the
     /// fallback (once). The machine is armed only for the target that actually plays.
     fn play_copy(&mut self, c: CopyPlay) -> bool {
@@ -903,17 +900,11 @@ impl Controller {
         match cmd {
             PlayerCommand::Play(req) => {
                 self.snap.zap_anchor = None;
-                return match self.play_on_tv(&req) {
-                    Some(device) => self.cast_to(device, Some(req.into())),
-                    None => self.resolve_and_play(req),
-                };
+                return self.play_where_on(req.into());
             }
             PlayerCommand::PlayCopy(c) => {
                 self.snap.zap_anchor = None;
-                return match self.play_on_tv(&c.req) {
-                    Some(device) => self.cast_to(device, Some(c)),
-                    None => self.play_copy(c),
-                };
+                return self.play_where_on(c);
             }
             PlayerCommand::Stop => return self.feed(Input::Stop, Instant::now()),
             PlayerCommand::TogglePause => {
@@ -958,14 +949,14 @@ impl Controller {
                         return false;
                     }
                     let req = self.zap_request(prev.media.clone(), true);
-                    return self.resolve_and_play(req);
+                    return self.play_where_on(req.into());
                 }
             }
             PlayerCommand::JumpToLive => {
                 self.snap.zap_anchor = None;
                 if let Some(MediaRef::Catchup { channel, .. }) = self.snap.playable.as_ref().map(|p| p.media.clone()) {
                     let req = self.zap_request(MediaRef::Channel(channel), true);
-                    return self.resolve_and_play(req);
+                    return self.play_where_on(req.into());
                 }
             }
             PlayerCommand::SetVolume(v) => {
@@ -1058,6 +1049,18 @@ impl Controller {
     fn play_on_tv(&self, req: &PlayRequest) -> Option<DeviceId> {
         let here = self.tile == TileId::A && !self.casting() && !self.budget.others_claim(self.tile);
         self.snap.play_on.filter(|_| here && req.origin != PlayOrigin::LivePreview)
+    }
+
+    /// A play the user asked for — `Play`, `PlayCopy`, and the zaps, numeric tuning, history,
+    /// previous channel and back-to-live of a picture A still playing here (the switch chosen in
+    /// multi-view, or a move to the TV that failed) — goes where the Play on switch says
+    /// (DESIGN §40 §3.9): [`Controller::play_on_tv`]'s TV, else here. Not Play here's own play
+    /// (`stop_casting`), which is this computer's by definition.
+    fn play_where_on(&mut self, c: CopyPlay) -> bool {
+        match self.play_on_tv(&c.req) {
+            Some(device) => self.cast_to(device, Some(c)),
+            None => self.play_copy(c),
+        }
     }
 
     /// mpv shows the current target (what `CastTo` reads the hints from).
@@ -1171,8 +1174,10 @@ impl Controller {
     /// last item here when nothing plays (the alert after the TV stopped it).
     fn stop_casting(&mut self, play_here: bool) -> bool {
         let was = self.leave_remote(false, if play_here { "Play here" } else { "Stop casting" }).is_some();
-        // a play the TV never got (its session couldn't even open): Play here plays it here
-        if let Some(c) = self.undelivered.take().filter(|_| play_here && !was && !self.busy()) {
+        // a play the TV never got (its session couldn't even open): Play here plays it here, in
+        // place of whatever still plays here (the item the play was to replace: any later play
+        // or stop forgot it)
+        if let Some(c) = self.undelivered.take().filter(|_| play_here && !was) {
             return self.play_copy(c);
         }
         if !was && (!play_here || self.busy()) {
@@ -1498,7 +1503,7 @@ impl Controller {
     /// Tune `ch` (or its `copy`, keeping `ch` as the zap-list position) as a zap.
     fn zap_onto(&mut self, ch: ChannelId, copy: Option<ChannelId>) -> bool {
         let req = self.zap_request(MediaRef::Channel(copy.unwrap_or(ch)), false);
-        let changed = self.resolve_and_play(req);
+        let changed = self.play_where_on(req.into());
         self.snap.zap_anchor = copy.map(|_| ch);
         if let Some(c) = copy {
             tracing::info!("{}: channel {} is on a playlist another picture holds; playing its copy {}", self.log, ch.0, c.0);
