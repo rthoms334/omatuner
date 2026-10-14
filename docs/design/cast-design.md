@@ -489,6 +489,10 @@ Casting is the one kind of playback that doesn't need Tuner's window: the pictur
                                          │   Firewall help…                 │
                                          └──────────────────────────────────┘
  status bar:  … Ctrl+F fav · Shift+F10 more      󰄙 Play on: This computer 󰅀   Guide updated 10 min ago
+ sidebar:      ┌──────────────────┐   (a TV is the target: 󰄙 in the accent colour, "Living Room")
+               │ 󰄙 This computer  │   rail: 󰄙 alone, tooltip "Play on: This computer (Alt+T)"
+               │ 󰍉 Search         │
+               │ 󰋜 Home …         │
 ```
 
 **What it is.** A switch for where plays go: this computer, or a TV. With a TV chosen, every
@@ -507,7 +511,17 @@ Multi-view that ended on picture B: a play while the switch names a TV, and a *C
 picture A as a film does (picture B stops, its claim goes at once: `app::mv_vod_to_a`).
 On a TV already, plays land on that TV as before (§3.3).
 
-**The chooser** (`OverlayRequest::PlayOn`; the status chip, Alt+T, Settings ▸ Cast ▸ *Play on:
+**The sidebar control.** The most used of the entry points, so it heads the left sidebar, directly
+above Search: `widgets::sidebar::PlayOn` — a cast glyph and "This computer" / the TV's name (the
+TV in the accent colour, with the connected glyph, so it is plain that plays go there); the rail
+and the Compact glyph strip show the glyph alone, its tooltip "Play on: Living Room (Alt+T)". A
+click or Enter opens the same chooser as the chip (`Action::PlayOnMenu`). It is a control, not a
+screen: never the lit tab, no `ScreenId`, no Alt+digit. It shows on the chip's condition
+(`App::play_on_target`: casting on and a TV ready, or a cast or the switch names one), so a
+sidebar without TVs is unchanged; unlike the chip it also shows beside the Compact cast chip.
+The video-only and pop-out windows, Onboarding and the player have no sidebar, so none either.
+
+**The chooser** (`OverlayRequest::PlayOn`; the sidebar control, the status chip, Alt+T, Settings ▸ Cast ▸ *Play on:
 …*): this panel headed `PLAY ON`, the mark on where plays go now (the TV casting, else the
 switch's). A choice works like a speaker picker (`ui::casting::choose`): what plays here moves
 to the TV chosen (`CastTo { play: None }`; a Live preview stops instead), a cast moves to the TV

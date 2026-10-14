@@ -417,24 +417,27 @@ fn sidebar_rail_and_compact_glyph_strip() {
         strip: bool,
         clicked: Option<ScreenId>,
         search: bool,
+        play_on: bool,
     }
     // below 480·rem the sidebar panel is gone; the app draws the strip in a horizontal layout
     assert_eq!(tuner::ui::layout::sidebar_width(400.0, 1.0, tuner::config::SidebarMode::Auto), 0.0);
     let mut h = Harness::builder().with_size(egui::vec2(400.0, 500.0)).build_ui_state(
         |ui, s: &mut S| {
-            let mut search = false;
+            let (mut search, mut play_on_clicked) = (false, false);
+            let play_on = Some(tuner::ui::widgets::sidebar::PlayOn { tv: None, key: "Alt+T" });
             let clicked = if s.strip {
-                ui.horizontal(|ui| sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, None, &mut search)).inner
+                ui.horizontal(|ui| sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, None, play_on, &mut search, &mut play_on_clicked)).inner
             } else {
-                sidebar(ui, &s.theme, ScreenId::Live, false, false, None, &mut search)
+                sidebar(ui, &s.theme, ScreenId::Live, false, false, None, None, &mut search, &mut play_on_clicked)
             };
             s.clicked = s.clicked.or(clicked);
             s.search |= search;
+            s.play_on |= play_on_clicked;
         },
-        S { theme: Theme::fallback(), strip: true, clicked: None, search: false },
+        S { theme: Theme::fallback(), strip: true, clicked: None, search: false, play_on: false },
     );
     h.run();
-    let labels = ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"];
+    let labels = ["Play on: This computer (Alt+T)", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"];
     let rects: Vec<Rect> = labels.iter().map(|l| h.get_by_label(l).rect()).collect();
     for w in rects.windows(2) {
         assert_eq!(w[0].top(), w[1].top(), "one row");
@@ -450,6 +453,10 @@ fn sidebar_rail_and_compact_glyph_strip() {
     h.get_by_label("Search").click();
     h.run();
     assert!(h.state().search);
+    // Play on is a control: it reports its own click and is never a screen
+    h.get_by_label("Play on: This computer (Alt+T)").click();
+    h.run();
+    assert!(h.state().play_on && h.state().clicked == Some(ScreenId::Guide));
 
     // vertical rail without VOD: Movies/Series hidden, entries stacked, Search on top
     h.state_mut().strip = false;
@@ -457,6 +464,7 @@ fn sidebar_rail_and_compact_glyph_strip() {
     assert!(h.query_by_label("Movies").is_none() && h.query_by_label("Series").is_none());
     let (search, a, b) = (h.get_by_label("Search").rect(), h.get_by_label("Home").rect(), h.get_by_label("Live TV").rect());
     assert!(a.top() >= search.bottom() && b.top() >= a.bottom() && a.left() == b.left());
+    assert!(h.query_by_label("Play on: This computer (Alt+T)").is_none(), "no Play on without a TV");
 }
 
 // ------------------------------------------------------------------ toasts

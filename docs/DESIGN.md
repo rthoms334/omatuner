@@ -1507,6 +1507,7 @@ clamp(width/1280, 1, 1.6).
 ### 12.2 Shell
 ```
 ┌sidebar┬───────────────────────────── content (screen) ─────────────────────────────┐
+│ 󰄙     │  ← Play on (only with a TV, §40)                                            │
 │ 󰍉     │                                                                             │
 │ 󰋜     │                                                       ┌ toast ────────────┐ │
 │ 󰔂     │                                                       └───────────────────┘ │
@@ -1688,7 +1689,7 @@ adds a `Quality` line on live channels with a quality word: "Quality  named 4K �
 | Logo / monogram | `logo::logo` | square, aspect kept; monogram on fg @ 0.04, text @ 0.52 |
 | Poster card | `poster::poster_card` | 2:3; title body; meta body-small @ 0.52 (year · ★ rating; the playlist is a code chip, §13.0); progress accent; cursor 2 px accent outline; corner chips: playlist top-left, lock / watched top-right |
 | Empty / error state | `empty_state::empty_state` | glyph display-large 28 accent @ 0.8; title 14 fg @ 0.7; detail @ 0.52 |
-| Sidebar | `sidebar::sidebar` | bg dark_background; row control-height + md; selected fg @ 0.18 + accent; order Search · Home, Live TV, Guide, Movies, Series, Up next · Settings (a panel gap sets Search and Settings apart; same in the rail and the Compact glyph strip; Alt+digits stay bound to their screens) |
+| Sidebar | `sidebar::sidebar` | bg dark_background; row control-height + md; selected fg @ 0.18 + accent; order [Play on] · Search · Home, Live TV, Guide, Movies, Series, Up next · Settings (Play on — where plays go, "This computer" / the TV's name in the accent colour, a click opens the chooser — is shown only while casting is on and a TV is ready, is a control and never the lit tab: cast design §3.9; a panel gap sets Play on, Search and Settings apart; same in the rail and the Compact glyph strip; Alt+digits stay bound to their screens) |
 | Status bar | `status_bar::status_bar` | height 26 (Omarchy bar), body-small, fg @ 0.52 |
 | Toast | `toast::Toasts` | popup card, kind glyph (info fg, success green, warning yellow, error urgent) |
 | Scrim | overlays | `menu.scrim` @ 0.5; click cancels |

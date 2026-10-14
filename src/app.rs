@@ -601,12 +601,11 @@ impl TunerApp {
         !self.mv.view.on && self.services().tiles.a().handle().snapshot().play_on.is_some()
     }
 
-    /// The status bar's "Play on" chip (DESIGN §40 §3.9): where plays go — the TV casting now,
-    /// else the switch's TV, else "This computer" — and a click (or Alt+T) for the chooser.
-    /// Shown while casting is on and a TV is ready (paired), or a cast or the switch names one;
-    /// not beside the Compact cast chip, which already says "Casting · Living Room".
-    fn play_on_chip(&self, cast_chip: bool) -> Option<crate::ui::widgets::status_bar::StatusChip> {
-        if cast_chip || !crate::cast::on(&self.services().config()) {
+    /// Where plays go, for the Play on controls (DESIGN §40 §3.9): `None` hides them — casting
+    /// is off, or no TV is ready (paired) and neither a cast nor the switch names one; else the
+    /// TV casting now, else the switch's TV (`Some(name)`), else this computer (`Some(None)`).
+    fn play_on_target(&self) -> Option<Option<String>> {
+        if !crate::cast::on(&self.services().config()) {
             return None;
         }
         let a = self.services().tiles.a().handle().snapshot();
@@ -615,11 +614,22 @@ impl TunerApp {
         if to.is_none() && crate::ui::casting::ready(&devices).is_empty() {
             return None;
         }
-        let name = to.map(|id| match (devices.iter().find(|d| d.id == id), &a.cast) {
+        Some(to.map(|id| match (devices.iter().find(|d| d.id == id), &a.cast) {
             (Some(d), _) => d.name.clone(),
             (None, Some(c)) => c.name.clone(),
             (None, None) => "your TV".to_owned(),
-        });
+        }))
+    }
+
+    /// The status bar's "Play on" chip (DESIGN §40 §3.9): where plays go ([`Self::play_on_target`])
+    /// and a click (or Alt+T) for the chooser. Not beside the Compact cast chip, which already
+    /// says "Casting · Living Room". The sidebar's Play on entry shows on the same condition.
+    fn play_on_chip(&self, cast_chip: bool) -> Option<crate::ui::widgets::status_bar::StatusChip> {
+        if cast_chip {
+            return None;
+        }
+        let name = self.play_on_target()?;
+        let a = self.services().tiles.a().handle().snapshot();
         let key = keymap::GLOBAL.iter().find(|b| b.action == Action::PlayOnMenu).map(|b| b.chord.label()).unwrap_or_default();
         let (text, label) = crate::ui::casting::chip_text(name.as_deref(), &key);
         Some(crate::ui::widgets::status_bar::StatusChip {
@@ -2730,7 +2740,11 @@ impl TunerApp {
 
     /// Sidebar (vertical) or, below 480·rem in Compact, the top glyph strip (horizontal).
     fn sidebar_panel(&mut self, ui: &mut egui::Ui, theme: &Theme, current: ScreenId, side_w: f32) {
-        let mut search_clicked = false;
+        let (mut search_clicked, mut play_on_clicked) = (false, false);
+        // the Play on entry, on the status chip's condition (DESIGN §40 §3.9)
+        let play_on_name = self.play_on_target();
+        let key = keymap::GLOBAL.iter().find(|b| b.action == Action::PlayOnMenu).map(|b| b.chord.label()).unwrap_or_default();
+        let play_on = play_on_name.as_ref().map(|tv| crate::ui::widgets::sidebar::PlayOn { tv: tv.as_deref(), key: &key });
         let has_vod = self.lib.has_vod() || self.lib.has_series() || self.lib.built_at == 0;
         // Up next's entry shows only while it has pending items (DESIGN §32)
         let up_next = crate::queue::ENABLED.then(|| self.services().agent.queue().pending()).filter(|n| *n > 0);
@@ -2741,7 +2755,19 @@ impl TunerApp {
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(frame)
-                .show(ui, |ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, side_w > 100.0, has_vod, up_next, &mut search_clicked))
+                .show(ui, |ui| {
+                    crate::ui::widgets::sidebar::sidebar(
+                        ui,
+                        theme,
+                        current,
+                        side_w > 100.0,
+                        has_vod,
+                        up_next,
+                        play_on,
+                        &mut search_clicked,
+                        &mut play_on_clicked,
+                    )
+                })
                 .inner
         } else {
             let strip = theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Md);
@@ -2751,7 +2777,20 @@ impl TunerApp {
                 .show_separator_line(false)
                 .frame(frame.inner_margin(egui::Margin::symmetric(theme.space(SpaceToken::Md) as i8, 0)))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| crate::ui::widgets::sidebar::sidebar(ui, theme, current, false, has_vod, up_next, &mut search_clicked)).inner
+                    ui.horizontal(|ui| {
+                        crate::ui::widgets::sidebar::sidebar(
+                            ui,
+                            theme,
+                            current,
+                            false,
+                            has_vod,
+                            up_next,
+                            play_on,
+                            &mut search_clicked,
+                            &mut play_on_clicked,
+                        )
+                    })
+                    .inner
                 })
                 .inner
         };
@@ -2766,6 +2805,10 @@ impl TunerApp {
         }
         if search_clicked {
             self.nav.push(NavRequest::Open(OverlayRequest::Search { initial: String::new() }));
+        }
+        if play_on_clicked {
+            // the chip's and Alt+T's way: the same chooser
+            self.global_action(Action::PlayOnMenu, &[], &ui.ctx().clone());
         }
     }
 }
@@ -6619,6 +6662,53 @@ mod tests {
         let load = tv_load(&mut rig, &sessions);
         assert_eq!(Some(&load.media), rig.app.lib.live.by_ref(&channel_ref(0)).map(MediaRef::Channel).as_ref());
         assert_eq!(rig.route(), &Route::Player, "the player shows the casting card");
+    }
+
+    /// The sidebar's Play on entry (DESIGN §40 §3.9): with a TV paired it heads the sidebar, above
+    /// Search, saying where plays go; a click opens the chooser (the chip's and Alt+T's) and
+    /// Living Room there turns it to the TV's name. Without a TV it isn't there, and it is
+    /// still there as an icon in the rail (Medium).
+    #[test]
+    fn the_sidebar_play_on_entry_opens_the_chooser_and_names_the_target() {
+        let play_on = |out: &egui::FullOutput| {
+            let t = texts(out);
+            let b =
+                t.iter().find(|(l, _, role)| l.starts_with("Play on: ") && *role == egui::accesskit::Role::Button && !l.contains("choose")).cloned();
+            (b, t)
+        };
+        // no TV known: the sidebar is unchanged
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 3, None));
+        rig.settle();
+        assert!(play_on(&rig.frame_with(vec![])).0.is_none(), "no TV, no entry");
+        paired_living_room(&mut rig);
+        rig.frame_with(vec![]);
+        let (entry, t) = play_on(&rig.frame_with(vec![]));
+        let (name, rect, _) = entry.expect("the Play on entry once a TV is paired");
+        assert_eq!(name, "Play on: This computer (Alt+T)");
+        let search = *button(&t, "Search").expect("Search entry");
+        assert!(rect.y1 <= search.y0, "above Search: {rect:?} vs {search:?}");
+        rig.click(centre(&rect), egui::PointerButton::Primary);
+        assert_eq!(rig.overlay_kinds(), [kind(OverlayRequest::PlayOn)]);
+        rig.frame_with(vec![]);
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::Enter, NONE);
+        rig.until("the switch on Living Room", |r| r.app.services().tiles.a().handle().snapshot().play_on == Some(living_room()));
+        rig.frame_with(vec![]);
+        let (entry, _) = play_on(&rig.frame_with(vec![]));
+        assert_eq!(entry.expect("still shown").0, "Play on: Living Room (Alt+T)");
+        // the rail (790 pt): the icon alone, same entry
+        rig.size = egui::vec2(790.0, 800.0);
+        rig.frame_with(vec![]);
+        let (entry, t) = play_on(&rig.frame_with(vec![]));
+        let (_, rect, _) = entry.expect("the rail keeps the entry");
+        assert!(rect.x1 - rect.x0 < 60.0 && rect.y1 <= button(&t, "Search").unwrap().y0, "an icon above Search: {rect:?}");
+        // the Compact glyph strip (420 pt): one row, Play on first, and it all still fits
+        rig.size = egui::vec2(420.0, 800.0);
+        rig.frame_with(vec![]);
+        let (entry, t) = play_on(&rig.frame_with(vec![]));
+        let (_, rect, _) = entry.expect("the strip keeps the entry");
+        let (search, settings) = (*button(&t, "Search").unwrap(), *button(&t, "Settings").unwrap());
+        assert!(rect.y0 == search.y0 && rect.x1 <= search.x0 && settings.x1 <= 420.0, "{rect:?} {search:?} {settings:?}");
     }
 
     /// "Remember Play on across restarts" brings the switch back at the next start; off (the

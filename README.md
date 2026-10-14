@@ -85,7 +85,7 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   two playlists that share a colour.
 - **Casting:** send live TV, catch-up, films and episodes to an Apple TV on your network
   (AirPlay): *Cast to…* on any channel, card, programme or episode (`C` or `Alt+C`), `C` in the
-  player for what you are watching, or set **Play on** to the TV and everything you play goes
+  player for what you are watching, or set **Play on** (top of the sidebar) to the TV and everything you play goes
   there. Tuner fetches the stream itself and serves the TV a plain picture, so your playlists'
   addresses and logins never leave this computer. See [Casting to a TV](#casting-to-a-tv).
 - **Several playlists:** when two or more playlists have movies, series or channels, Movies,
@@ -1200,8 +1200,9 @@ Three ways, for live TV, catch-up, films and episodes alike:
   with copies in several playlists falls back to the next copy. A programme in the guide casts
   its channel while it is on and its catch-up once it has aired; one that hasn't started offers
   *Remind me* instead.
-- **Play on.** The status bar's chip **Play on: This computer ▾** (there once a TV is paired),
-  `Alt+T` or Settings ▸ Cast choose where everything plays: this computer or a TV. With a TV chosen, Enter or a
+- **Play on.** The first entry of the left sidebar (above Search; there once a TV is paired) says where
+  plays go, **This computer** or the TV's name in the accent colour, and a click opens the chooser, as do the status bar's chip **Play on: This computer ▾**,
+  `Alt+T` and Settings ▸ Cast: they choose where everything plays: this computer or a TV. With a TV chosen, Enter or a
   click on a channel, a film, an episode, the guide's Watch, a Home tile, Up next, a reminder
   that switches channel and what an agent plays all go to the TV, and the player shows the
   casting card. What is playing here moves to the TV when you choose it, and *This computer*

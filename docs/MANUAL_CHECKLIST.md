@@ -1840,13 +1840,15 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
     menu has no *Cast to…*). With two TVs the panel "CAST “…” TO" asks which; an unpaired TV
     there pairs first and then casts that item. Typing `C` in a Live TV list still filters.
 - [ ] **17. Play on** (cast design §3.9):
-  - **Do:** with a channel playing here, click the status bar's *Play on: This computer ▾*
-    (or `Alt+T`) and pick Living Room. Then Enter on another channel in Live TV, Shift+Enter on
+  - **Do:** with a channel playing here, click the sidebar's *This computer* (the first entry,
+    above Search; or the status bar's *Play on: This computer ▾*, or `Alt+T`) and pick Living Room.
+    Try it with the sidebar expanded, as the icon rail (hover for the tooltip) and in the Compact
+    glyph strip; remove the TV (or turn casting off) and it goes. Then Enter on another channel in Live TV, Shift+Enter on
     a film, the guide's Watch, a Home tile, Up next's *Play now*, a reminder that switches,
     and ask Claude to "put BBC One on" (no TV named). Move the Live TV cursor with preview
     autoplay on. Turn the TV off and play something. Restart Tuner (with and without *Remember
     Play on across restarts*).
-  - **Expect:** what played here moves to the TV at once; the chip reads *Play on: Living
+  - **Expect:** what played here moves to the TV at once; the sidebar entry reads *Living Room* in the accent colour (the icon alone in the rail, tooltip *Play on: Living Room (Alt+T)*, never lit like a screen) and the chip *Play on: Living
     Room*; every play after it goes to the TV (the player screen shows the casting card where
     it would open; Live TV's preview pane shows it on Enter); Claude says it's on Living Room
     (`opened_in: "device"`, `status.play_on`) and nothing moves on screen. The preview never
