@@ -14,6 +14,7 @@
 //! * UI code never calls mpv: player control is `ctx.play(PlayerCommand)` (non-blocking),
 //!   state is `ctx.player` (snapshot).
 
+pub mod casting;
 pub mod click_guard;
 pub mod copies;
 pub mod data;
@@ -255,6 +256,18 @@ pub enum OverlayRequest {
     /// The first-run card and setup wizard: pair → network → Test on TV (DESIGN §40 §3.5;
     /// CAST-9). Opened by the app, once per Tuner version.
     CastOffer(crate::cast::SetupOffer),
+    /// "Cast to…" on an item with no single TV ready (DESIGN §40 §3.1): the picker for that
+    /// item, which casts it itself (`ui::casting`).
+    CastItem(casting::ItemCast),
+    /// The Play on chooser (DESIGN §40 §3.9; the status chip, Alt+T, Settings ▸ Cast): this
+    /// computer or a TV.
+    PlayOn,
+    /// [`OverlayRequest::CastPair`] with what follows the pairing: the item "Cast to…" was for,
+    /// or the Play on switch.
+    CastPairThen {
+        device: crate::model::DeviceId,
+        then: casting::AfterPair,
+    },
 }
 
 /// Requests a screen makes during a frame; the app applies them after the frame.
@@ -353,6 +366,9 @@ pub struct UiCtx<'a> {
     mv_out: std::cell::RefCell<Vec<multiview::MvRequest>>,
     toasts: &'a mut Vec<Toast>,
     config_edits: &'a mut Vec<ConfigEdit>,
+    /// "Cast to…" in progress ([`UiCtx::cast_with`]): where this action's plays go, and whether
+    /// one went.
+    cast: std::cell::RefCell<Option<(casting::CastDest, bool)>>,
 }
 
 /// The app-owned parts a [`UiCtx`] borrows (keeps `UiCtx::new` readable).
@@ -408,6 +424,7 @@ impl<'a> UiCtx<'a> {
             mv_out: Default::default(),
             toasts: p.toasts,
             config_edits: p.config_edits,
+            cast: Default::default(),
         }
     }
 
@@ -415,9 +432,22 @@ impl<'a> UiCtx<'a> {
         self.nav.push(r);
     }
     pub fn push(&mut self, route: Route) {
+        // a cast from where things are chosen stays there: the mini player shows the casting
+        // card (DESIGN §40 §3.1)
+        if route == Route::Player && self.cast.borrow().is_some() {
+            return;
+        }
         self.nav.push(NavRequest::Push(route));
     }
     pub fn open(&mut self, o: OverlayRequest) {
+        // the Resume prompt of a film "Cast to…" casts: its answer plays on the TV too
+        let o = match (o, self.cast.borrow().as_ref()) {
+            (OverlayRequest::Resume(mut spec), Some((dest, _))) => {
+                spec.cast = Some(dest.clone());
+                OverlayRequest::Resume(spec)
+            }
+            (o, _) => o,
+        };
         self.nav.push(NavRequest::Open(o));
     }
     pub fn toast(&mut self, t: Toast) {
@@ -432,12 +462,55 @@ impl<'a> UiCtx<'a> {
     /// the picture on screen. Multi-view (DESIGN §35): volume and mute to the picture with the
     /// sound, a channel or catch-up through the copy planner for the focused picture, a film or
     /// episode ends multi-view ([`multiview::route_command`]); the rest to the focused picture.
+    /// Inside [`UiCtx::cast_with`] a play goes to that TV instead (DESIGN §40 §3.1).
     pub fn play(&self, cmd: crate::player::PlayerCommand) {
+        use crate::player::PlayerCommand as C;
+        // "Cast to…" (`cast_with`): the play goes to the TV instead
+        let cmd = match (self.cast.borrow_mut().as_mut(), cmd) {
+            (Some((dest, sent)), C::Play(req)) => {
+                *sent = true;
+                C::CastTo { device: dest.device, play: Some(req) }
+            }
+            (Some((dest, sent)), C::PlayCopy(copy)) => {
+                *sent = true;
+                C::CastCopy { device: dest.device, copy }
+            }
+            (_, cmd) => cmd,
+        };
+        // single view on picture B (multi-view ended there): a cast, and any play while picture
+        // A's Play on switch names a TV, goes to picture A — the one that casts (the app's
+        // `mv_vod_to_a`; DESIGN §40 §3.1, §3.9)
+        let view = &self.multiview.view;
+        if !view.on && view.focus != crate::model::TileId::A {
+            let casts = match &cmd {
+                C::CastTo { play, .. } => play.is_some(),
+                C::CastCopy { .. } => true,
+                C::Play(_) | C::PlayCopy(_) => self.services.tiles.a().handle().snapshot().play_on.is_some(),
+                _ => false,
+            };
+            if casts {
+                self.mv_out.borrow_mut().push(multiview::MvRequest::SingleView(Box::new(cmd)));
+                return;
+            }
+        }
         match multiview::route_command(&self.multiview.view, cmd) {
             multiview::Routed::Focused(cmd) => self.services.tiles.focused().send(cmd),
             multiview::Routed::Audible(cmd) => self.services.tiles.audible_handle().send(cmd),
             multiview::Routed::Request(r) => self.mv_out.borrow_mut().push(r),
         }
+    }
+    /// "Cast to…" (DESIGN §40 §3.1): run `f` — a play exactly as it plays here, its PIN, copy
+    /// and Resume rules included — with its plays sent to `dest`'s TV: `Play` becomes `CastTo`,
+    /// `PlayCopy` `CastCopy`, a Resume prompt it opens casts its answer, and the Player screen
+    /// isn't opened (the mini player shows the casting card). A play that went out is toasted
+    /// ("Casting Dune to Living Room").
+    pub fn cast_with<R>(&mut self, dest: casting::CastDest, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.cast.replace(Some((dest, false)));
+        let r = f(self);
+        if let Some((dest, true)) = self.cast.replace(outer) {
+            self.toast(Toast::info(format!("Casting {} to {}", dest.title, dest.tv)));
+        }
+        r
     }
     /// Send a command to one picture, whatever has the focus (multi-view chrome).
     pub fn play_in(&self, tile: crate::model::TileId, cmd: crate::player::PlayerCommand) {

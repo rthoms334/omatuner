@@ -578,6 +578,12 @@ pub struct CastConfig {
     pub interlaced: CastInterlaced,
     /// Block system sleep while casting (logind inhibitor).
     pub keep_awake: bool,
+    /// The Play on switch's TV (DESIGN §40 §3.9; a `DeviceId` in hex), written whenever it
+    /// changes; `None`: this computer. Read back at start only with `remember_play_on`.
+    pub play_on: Option<String>,
+    /// Settings ▸ Cast "Remember Play on across restarts": off, every start plays on this
+    /// computer (a TV that is off at the next start never swallows plays).
+    pub remember_play_on: bool,
 }
 
 impl CastConfig {
@@ -596,6 +602,8 @@ impl Default for CastConfig {
             convert: CastConvert::Auto,
             interlaced: CastInterlaced::Auto,
             keep_awake: true,
+            play_on: None,
+            remember_play_on: false,
         }
     }
 }

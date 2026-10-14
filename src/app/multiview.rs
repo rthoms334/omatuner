@@ -164,13 +164,28 @@ impl TunerApp {
     /// A film, an episode or a file while multi-view is on (or single view went on in picture
     /// B): it plays in picture A, where resume and the next-episode card live, and picture B
     /// stops (multi-view ends with the next frame). True when it was sent that way.
+    ///
+    /// Casting (DESIGN §40 §3.1, §3.9) is picture A's too: with single view on picture B, a
+    /// "Cast to…" play, and any play while A's Play on switch names a TV, go there the same
+    /// way. Picture B's claim then goes at once, so A's controller sees single view (the switch
+    /// casts the play; the relay's lease still waits for B's stream to close).
     pub(super) fn mv_vod_to_a(&self, cmd: &PlayerCommand) -> bool {
         let vod = played_media(cmd).is_some_and(|m| media_kind(m) == Kind::Vod);
-        if !vod || (!self.mv.view.on && self.mv.view.focus == A) {
+        let single_b = !self.mv.view.on && self.mv.view.focus != A;
+        let to_tv = single_b
+            && match cmd {
+                PlayerCommand::CastTo { play, .. } => play.is_some(),
+                PlayerCommand::CastCopy { .. } => true,
+                cmd => played_media(cmd).is_some() && self.services().tiles.handle(A).snapshot().play_on.is_some(),
+            };
+        if !(vod || to_tv) || (!self.mv.view.on && self.mv.view.focus == A) {
             return false;
         }
         if self.services().tiles.b().is_some() {
             self.send_to(B, PlayerCommand::Stop);
+            if to_tv {
+                self.services().tiles.budget().claim(B, None);
+            }
         }
         self.services().tiles.handle(A).send(cmd.clone());
         true

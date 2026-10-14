@@ -5,6 +5,8 @@
 //! CASTING
 //! Cast to TVs                                                        [ On  ]
 //! Offer to set up new TVs                                            [ On  ]
+//! 󰄘 Play on: This computer…
+//! Remember Play on across restarts                                   [ Off ]
 //! TVS
 //! 󰄙 Living Room      Apple TV 4K (3rd generation) · Paired · tvOS 26.6 · used 2 h ago · default   ⋯
 //! 󰄙 Living Room TV   Hisense 85E75LE · Not paired                                                ⋯
@@ -24,7 +26,10 @@
 //! Live TV on the TV runs about 10–20 s behind the computer.
 //! ```
 //! The rows reuse `Row::Section`, `Row::Toggle`, `Row::Choice`, `Row::Item` + menu and
-//! `Row::Act`. The device list is read from `CastHandle::devices()` every frame, and the page
+//! `Row::Act`. **Play on** (DESIGN §40 §3.9) names where plays go and opens the chooser
+//! (`OverlayRequest::PlayOn`, as the status chip and Alt+T do); "Remember Play on across
+//! restarts" (off) brings the switch back at the next start. Forgetting the TV the switch names
+//! puts it back on this computer. The device list is read from `CastHandle::devices()` every frame, and the page
 //! keeps discovery running while it is open (`CastHandle::browse`, on demand only). A TV's
 //! version comes from its TXT `osvers` or `/info` (§7.6): a sanitized device string, shown only
 //! here. No address is shown: the TV is named by its name, this computer by its interface.
@@ -54,6 +59,7 @@ const ACT_COPY_COMMAND: u16 = 4;
 const ACT_REMOVE: u16 = 5;
 const ACT_CHECK: u16 = 6;
 const ACT_TEST: u16 = 7;
+const ACT_PLAY_ON: u16 = 8;
 
 /// A TV's menu codes (`Action::Digit`; kept clear of the page's own `MENU_*` and the agents').
 const MENU_PAIR: u8 = 50;
@@ -75,9 +81,24 @@ pub(super) struct State {
 }
 
 static TOGGLES: [CfgToggle; 2] = [
-    CfgToggle { label: "Cast to TVs", get: |c| c.cast.enabled, set: |c, v| c.cast.enabled = v },
+    // off: the Play on switch goes back to this computer (the services' `SetPlayOn(None)`), and
+    // so does what it keeps for the next start (DESIGN §40 §3.9)
+    CfgToggle {
+        label: "Cast to TVs",
+        get: |c| c.cast.enabled,
+        set: |c, v| {
+            c.cast.enabled = v;
+            if !v {
+                c.cast.play_on = None;
+            }
+        },
+    },
     CfgToggle { label: "Offer to set up new TVs", get: |c| c.cast.offer_setup, set: |c, v| c.cast.offer_setup = v },
 ];
+
+/// The Play on switch's memory (DESIGN §40 §3.9): off, every start plays on this computer.
+static REMEMBER_PLAY_ON: CfgToggle =
+    CfgToggle { label: "Remember Play on across restarts", get: |c| c.cast.remember_play_on, set: |c, v| c.cast.remember_play_on = v };
 
 static PICTURE: [CfgToggle; 1] =
     [CfgToggle { label: "Keep this computer awake while casting", get: |c| c.cast.keep_awake, set: |c, v| c.cast.keep_awake = v }];
@@ -173,6 +194,14 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     }
 
     let devices = cast.devices();
+    // where plays go: the TV casting, else the switch's (the status chip says the same)
+    let to = crate::ui::casting::plays_on(&ctx.services.tiles.a().handle().snapshot());
+    let name = to.map_or_else(
+        || "This computer".to_owned(),
+        |id| devices.iter().find(|d| d.id == id).map_or_else(|| "your TV".to_owned(), |d| d.name.clone()),
+    );
+    v.push(Row::Act { act: Act::Feature(Feature::Cast, ACT_PLAY_ON), icon: glyphs::CAST, label: format!("Play on: {name}…"), danger: false });
+    v.push(Row::Toggle(&REMEMBER_PLAY_ON));
     v.push(Row::Section(if cast.searching() { "TVs · searching…".into() } else { "TVs".into() }));
     let casting = ctx.player.cast.as_ref().map(|c| c.device);
     for d in &devices {
@@ -301,6 +330,7 @@ pub(super) fn act(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, n: u16) {
             }
         }
         ACT_CHECK => cast.firewall_check(),
+        ACT_PLAY_ON => ctx.open(OverlayRequest::PlayOn),
         ACT_TEST => {
             if let Some(id) = test_device(ctx.config, &cast.devices()) {
                 test(s, &cast, id);
@@ -375,6 +405,11 @@ pub(super) fn confirmed(ctx: &mut UiCtx<'_>, id: i64) {
         cast.forget(d.id);
         if is_default(ctx.config, &d) {
             ctx.edit_config(|c| c.cast.default_device = None);
+        }
+        // a forgotten TV can't be where plays go
+        if ctx.services.tiles.a().handle().snapshot().play_on == Some(d.id) {
+            ctx.play_in(crate::model::TileId::A, crate::player::PlayerCommand::SetPlayOn(None));
+            ctx.edit_config(|c| c.cast.play_on = None);
         }
     }
 }
@@ -462,6 +497,8 @@ mod tests {
         assert!(has_label(&h, "Tuner serves the TV from this computer (wlan0), port 47800."));
         assert!(has_label(&h, "Allow on firewall") && !has_label(&h, "Remove rule"));
         assert!(has_label(&h, "Test on TV…"));
+        // where plays go (DESIGN §40 §3.9): the chooser, and whether it comes back at the next start
+        assert!(has_label(&h, "Play on: This computer…") && has_label(&h, "Remember Play on across restarts"));
         let calls = fake.take_calls();
         assert!(calls.contains(&FakeCall::FirewallCheck) && calls.contains(&FakeCall::Browse), "{calls:?}");
         {

@@ -969,6 +969,12 @@ impl CastApi for Api {
         }
     }
 
+    /// The AirPlay client's own (one session at a time), while a session runs.
+    fn position_source(&self) -> Option<super::PositionSource> {
+        let running = lock(&self.0.live).as_ref().is_some_and(|l| !l.task.is_finished());
+        running.then(super::airplay::position_source).flatten()
+    }
+
     /// A session counts from `open` until its task let go of the TV (a stopped one may still be
     /// closing); a pairing from `pair_start` until the overlay cancels or closes (its drop
     /// cancels), whatever the job's state.

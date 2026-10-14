@@ -33,6 +33,15 @@
 //! While casting the cursor starts on "This computer", so stopping is `C` then Enter. A Mac or
 //! a TV set to "Same Home only" is listed greyed and the cursor skips it. In multi-view the
 //! panel is one line: "Leave multi-view to cast". Esc, ✕ or a click outside closes.
+//!
+//! The same panel serves two more purposes ([`For`]):
+//! * **"Cast to…" an item** (`OverlayRequest::CastItem`, DESIGN §40 §3.1): headed with the item,
+//!   no "This computer" row; a TV casts that item (`ui::casting::cast_target`: as it plays here,
+//!   only on the TV), an unpaired one pairs first and then casts it.
+//! * **Play on** (`OverlayRequest::PlayOn`, §3.9): headed "PLAY ON", the mark on where plays go
+//!   now (the TV casting, else the switch's); a row sets the switch and what plays follows it
+//!   (`ui::casting::choose`), an unpaired TV pairs first. Not refused in multi-view: the switch
+//!   applies once it ends.
 
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -45,6 +54,7 @@ use crate::keymap::{Action, KeyContext};
 use crate::model::{CastErrorKind, DeviceId};
 use crate::player::PlayerCommand;
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
+use crate::ui::casting::{AfterPair, CastDest, ItemCast};
 use crate::ui::video_host::osd_text;
 use crate::ui::widgets::glyphs;
 use crate::ui::widgets::text_field::text_field;
@@ -98,7 +108,19 @@ struct Adding {
     enter: bool,
 }
 
+/// What the panel chooses a TV for.
+#[derive(Debug, Clone, PartialEq)]
+enum For {
+    /// `C` in the player, its Cast control and menu: what plays moves to the TV chosen.
+    Playing,
+    /// "Cast to…" on an item: that item goes to the TV chosen.
+    Item(ItemCast),
+    /// The Play on chooser: where plays go.
+    PlayOn,
+}
+
 pub struct CastPicker {
+    purpose: For,
     cursor: usize,
     /// The user moved the cursor (a key or the pointer): it stays where they put it, instead of
     /// following the best row while discovery is still finding TVs.
@@ -118,7 +140,22 @@ enum Click {
 
 impl CastPicker {
     pub fn new() -> Self {
-        Self { cursor: 0, touched: false, scroll_to_cursor: true, opened: None, adding: None, focus: None }
+        Self { purpose: For::Playing, cursor: 0, touched: false, scroll_to_cursor: true, opened: None, adding: None, focus: None }
+    }
+
+    /// "Cast to…" on an item (DESIGN §40 §3.1).
+    pub fn for_item(item: ItemCast) -> Self {
+        Self { purpose: For::Item(item), ..Self::new() }
+    }
+
+    /// The Play on chooser (DESIGN §40 §3.9).
+    pub fn play_on() -> Self {
+        Self { purpose: For::PlayOn, ..Self::new() }
+    }
+
+    /// Multi-view can't cast: the panel is one line (the switch can still be set).
+    fn refused(&self, ctx: &UiCtx<'_>) -> bool {
+        ctx.multiview.on() && self.purpose != For::PlayOn
     }
 
     fn since_open(&self) -> Duration {
@@ -157,15 +194,36 @@ impl CastPicker {
     fn choose(&mut self, ctx: &mut UiCtx<'_>, row: &Row) -> OverlayOutcome {
         match pick(row) {
             Pick::CastTo(device) => {
-                ctx.play(PlayerCommand::CastTo { device, play: None });
+                match &self.purpose {
+                    For::Playing => ctx.play(PlayerCommand::CastTo { device, play: None }),
+                    For::Item(item) => {
+                        let tv = match row {
+                            Row::Device { device, .. } => device.name.clone(),
+                            _ => String::new(),
+                        };
+                        crate::ui::casting::cast_target(ctx, CastDest { device, tv, title: item.title.clone() }, &item.target);
+                    }
+                    For::PlayOn => crate::ui::casting::choose(ctx, Some(device)),
+                }
                 OverlayOutcome::Close
             }
             Pick::Pair(device) => {
-                ctx.open(OverlayRequest::CastPair { device, then_cast: true });
+                let then = match &self.purpose {
+                    For::Playing => AfterPair::CastPlaying,
+                    For::Item(item) => AfterPair::Item(item.clone()),
+                    For::PlayOn => AfterPair::PlayOn,
+                };
+                ctx.open(match then {
+                    AfterPair::CastPlaying => OverlayRequest::CastPair { device, then_cast: true },
+                    then => OverlayRequest::CastPairThen { device, then },
+                });
                 OverlayOutcome::Close
             }
             Pick::PlayHere => {
-                ctx.play(PlayerCommand::StopCasting { play_here: true });
+                match self.purpose {
+                    For::PlayOn => crate::ui::casting::choose(ctx, None),
+                    _ => ctx.play(PlayerCommand::StopCasting { play_here: true }),
+                }
                 OverlayOutcome::Close
             }
             Pick::AddAddress => {
@@ -176,14 +234,46 @@ impl CastPicker {
                 ctx.open(OverlayRequest::CastFirewall);
                 OverlayOutcome::Close
             }
-            Pick::Close => OverlayOutcome::Close,
+            // Play on: the TV casting now (a one-off) becomes where plays go from now on
+            Pick::Close => {
+                if let (For::PlayOn, Row::Device { device, .. }) = (&self.purpose, row)
+                    && ctx.services.tiles.a().handle().snapshot().play_on != Some(device.id)
+                {
+                    crate::ui::casting::choose(ctx, Some(device.id));
+                }
+                OverlayOutcome::Close
+            }
             Pick::Nothing => OverlayOutcome::Keep,
         }
     }
 
     /// The rows now: the TVs known, whether a browse runs and how long the panel has been up.
+    /// The mark: the TV casting (the player's picker), where plays go (Play on), none (an item).
     fn rows(&self, ctx: &UiCtx<'_>, devices: Vec<Device>, searching: bool) -> Vec<Row> {
-        rows_of(devices, ctx.player.cast.as_ref().map(|c| c.device), searching, self.since_open())
+        let (current, here) = match self.purpose {
+            For::Playing => (ctx.player.cast.as_ref().map(|c| c.device), true),
+            For::Item(_) => (None, false),
+            For::PlayOn => (crate::ui::casting::plays_on(&ctx.services.tiles.a().handle().snapshot()), true),
+        };
+        rows_of(devices, current, here, searching, self.since_open())
+    }
+
+    /// Where the cursor starts ([`Self::best`]; Play on: the marked row).
+    fn start(&self, rows: &[Row], casting: bool, default: Option<&str>) -> usize {
+        match self.purpose {
+            For::PlayOn => rows.iter().position(|r| matches!(r, Row::Here { here: true } | Row::Device { current: true, .. })).unwrap_or(0),
+            For::Item(_) => Self::best(rows, false, default),
+            For::Playing => Self::best(rows, casting, default),
+        }
+    }
+
+    /// The panel's heading: "CAST TO", "CAST “Dune” TO", "PLAY ON".
+    fn heading(&self) -> String {
+        match &self.purpose {
+            For::Playing => "CAST TO".into(),
+            For::Item(item) => format!("CAST “{}” TO", item.title),
+            For::PlayOn => "PLAY ON".into(),
+        }
     }
 
     /// Enter in the address field: probe it.
@@ -229,11 +319,11 @@ impl Default for CastPicker {
     }
 }
 
-/// The rows for a state (pure: `casting` is the TV casting now, `age` how long the panel has
-/// been open).
-fn rows_of(devices: Vec<Device>, casting: Option<DeviceId>, searching: bool, age: Duration) -> Vec<Row> {
+/// The rows for a state (pure: `casting` is the TV marked — casting now, or where plays go —
+/// `here` whether "This computer" is offered, `age` how long the panel has been open).
+fn rows_of(devices: Vec<Device>, casting: Option<DeviceId>, here: bool, searching: bool, age: Duration) -> Vec<Row> {
     let seen = devices.iter().any(|d| d.available);
-    let mut rows = vec![Row::Here { here: casting.is_none() }];
+    let mut rows = if here { vec![Row::Here { here: casting.is_none() }] } else { Vec::new() };
     rows.extend(devices.into_iter().map(|d| Row::Device { current: casting == Some(d.id), device: Box::new(d) }));
     if searching {
         rows.push(Row::Searching);
@@ -342,7 +432,7 @@ impl Overlay for CastPicker {
                 _ => OverlayOutcome::Ignored,
             };
         }
-        if ctx.multiview.on() {
+        if self.refused(ctx) {
             return match action {
                 Action::Activate | Action::Back => OverlayOutcome::Close,
                 _ => OverlayOutcome::Ignored,
@@ -350,7 +440,7 @@ impl Overlay for CastPicker {
         }
         let cast = ctx.services.agent.cast();
         let rows = self.rows(ctx, cast.devices(), cast.searching());
-        self.cursor = self.cursor.min(rows.len() - 1);
+        self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         match action {
             Action::Up => {
                 self.step(&rows, -1);
@@ -381,7 +471,7 @@ impl Overlay for CastPicker {
         let title_h = theme.font(TypeToken::Caption) * s * 2.0;
         let font = FontId::proportional((theme.font(TypeToken::Title) * s).round());
         let caption = FontId::proportional((theme.font(TypeToken::Caption) * s).round());
-        let multiview = ctx.multiview.on();
+        let multiview = self.refused(ctx);
 
         // discovery runs while the panel is up, and only then (DESIGN §40 §6)
         let cast = ctx.services.agent.cast();
@@ -399,7 +489,7 @@ impl Overlay for CastPicker {
             self.touched = true;
         }
         if !self.touched && !rows.is_empty() {
-            self.cursor = Self::best(&rows, casting, default.as_deref());
+            self.cursor = self.start(&rows, casting, default.as_deref());
         }
         self.cursor = self.cursor.min(rows.len().saturating_sub(1));
         // the clock for "No TVs found" and the busy bar
@@ -428,7 +518,7 @@ impl Overlay for CastPicker {
             },
         );
         let pointer_moved = egui_ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
-        let look = Look { theme, font, caption, pad, row_h };
+        let look = Look { theme, font, caption, pad, row_h, heading: self.heading() };
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
         let mut click = None;
         let mut picked_hover = None;
@@ -512,6 +602,7 @@ struct Look<'a> {
     caption: FontId,
     pad: f32,
     row_h: f32,
+    heading: String,
 }
 
 impl Look<'_> {
@@ -529,7 +620,7 @@ impl Look<'_> {
         }
     }
 
-    /// `CAST TO                      ✕`.
+    /// `CAST TO                      ✕` (or the item's, or `PLAY ON`).
     fn header(&self, ui: &mut egui::Ui, h: f32) -> Option<Click> {
         let t = &self.theme.tokens;
         let (head, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
@@ -537,10 +628,10 @@ impl Look<'_> {
             ui.painter(),
             egui::pos2(head.left() + self.pad / 2.0, head.center().y),
             Align2::LEFT_CENTER,
-            "CAST TO",
+            &self.heading,
             self.caption.clone(),
             t.osd_accent,
-            f32::INFINITY,
+            head.width() - head.height() - self.pad,
         );
         let close = Rect::from_min_size(egui::pos2(head.right() - head.height(), head.top()), egui::vec2(head.height(), head.height()));
         let clicked = self.target(ui, close, "close", "Close (Esc)", Some("Close (Esc)")).clicked();
@@ -733,16 +824,16 @@ mod tests {
 
     #[test]
     fn rows_follow_what_discovery_has_found() {
-        let none = |age| rows_of(Vec::new(), None, true, Duration::from_secs(age));
+        let none = |age| rows_of(Vec::new(), None, true, true, Duration::from_secs(age));
         assert_eq!(none(0), vec![Row::Here { here: true }, Row::Searching, Row::Add, Row::Help]);
         assert_eq!(none(7), vec![Row::Here { here: true }, Row::Searching, Row::NoneFound, Row::Add, Row::Help]);
         // a TV seen: never "No TVs found"; a remembered one that isn't on the network doesn't count
-        let rows = rows_of(devices(), Some(id(1)), false, Duration::from_secs(30));
+        let rows = rows_of(devices(), Some(id(1)), true, false, Duration::from_secs(30));
         assert_eq!(rows.len(), 1 + 3 + 2);
         assert!(matches!(&rows[0], Row::Here { here: false }));
         assert!(matches!(&rows[1], Row::Device { current: true, .. }) && matches!(&rows[2], Row::Device { current: false, .. }));
         let remembered = Device { available: false, ..devices().remove(0) };
-        assert!(rows_of(vec![remembered], None, false, Duration::from_secs(7)).contains(&Row::NoneFound));
+        assert!(rows_of(vec![remembered], None, true, false, Duration::from_secs(7)).contains(&Row::NoneFound));
     }
 
     #[test]
@@ -759,12 +850,12 @@ mod tests {
 
     #[test]
     fn the_cursor_starts_on_the_default_or_first_usable_tv_and_on_this_computer_while_casting() {
-        let rows = rows_of(devices(), None, false, Duration::ZERO);
+        let rows = rows_of(devices(), None, true, false, Duration::ZERO);
         assert_eq!(CastPicker::best(&rows, false, None), 1, "the first TV (most recent first)");
         assert_eq!(CastPicker::best(&rows, false, Some(&id(2).to_string())), 2, "cast.default_device");
         assert_eq!(CastPicker::best(&rows, false, Some(&id(3).to_string())), 1, "a Mac can't be the default");
         assert_eq!(CastPicker::best(&rows, true, None), 0, "C then Enter stops casting");
-        assert_eq!(CastPicker::best(&rows_of(Vec::new(), None, true, Duration::ZERO), false, None), 0);
+        assert_eq!(CastPicker::best(&rows_of(Vec::new(), None, true, true, Duration::ZERO), false, None), 0);
     }
 
     /// The panel's height is its rows' (computed, not the window's) in a tall window too.
@@ -817,6 +908,34 @@ mod tests {
         h.state_mut().nav();
         assert_eq!(h.state_mut().act(Action::Activate), "Close");
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastFirewall)]);
+    }
+
+    /// "Cast to…" an item (DESIGN §40 §3.1): the panel names it and offers no "This computer";
+    /// the cursor starts on the first TV ready, and an unpaired TV pairs first, then casts that
+    /// item. Play on (§3.9): "PLAY ON", the cursor on where plays go (this computer here).
+    #[test]
+    fn the_item_and_play_on_pickers() {
+        use crate::ui::casting::{AfterPair, ItemCast};
+        let item = ItemCast { target: crate::ui::item_menu::Target::Channel(crate::model::ChannelId(1)), title: "BBC One".into() };
+        let (t, one) = rig();
+        let fake = Arc::new(FakeCast::default());
+        fake.script(|s| s.devices = devices());
+        t.services().agent.set_cast(Some(CastHandle::new(fake)));
+        let mut h = overlay_harness(t, one, CastPicker::for_item(item.clone()), egui::vec2(1200.0, 800.0));
+        h.run_steps(2);
+        let texts = painted(&h);
+        assert!(texts.iter().any(|t| t == "CAST “BBC One” TO") && !texts.iter().any(|t| t == "This computer"), "{texts:?}");
+        assert_eq!(h.state().o.cursor, 0, "Living Room");
+        h.state_mut().act(Action::Down);
+        h.state_mut().nav();
+        assert_eq!(h.state_mut().act(Action::Activate), "Close");
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPairThen { device: id(2), then: AfterPair::Item(item) })]);
+        drop(h);
+        let (mut h, _fake) = picker(devices());
+        h.state_mut().o = CastPicker::play_on();
+        h.run_steps(2);
+        assert!(painted(&h).iter().any(|t| t == "PLAY ON"));
+        assert_eq!(h.state().o.cursor, 0, "this computer, marked");
     }
 
     /// "Add by address…" probes the typed IPv4 address; a bad one says what is expected, and

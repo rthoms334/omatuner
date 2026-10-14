@@ -23,6 +23,8 @@
 
 use super::super::{CastErrorKind, CastHints, CastLevel, ReceiverKind};
 use crate::config::{CastConvert, CastInterlaced};
+use crate::model::cast::{CastFeed, FeedPicture, FeedSound, FeedSurround};
+use crate::player::tracks::StreamInfo;
 
 /// What a receiver plays without converting (DESIGN §40 §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +282,65 @@ fn audio(f: &Facts) -> Audio {
     }
 }
 
+/// What `plan` feeds the TV (the info panel while casting, DESIGN §40 §11.3): its level and
+/// each stream's way there, with the source facts it planned on (`probed`: ffprobe's, else the
+/// hints'); `target_s` once the item's target duration is pinned (§8.1.4).
+pub fn feed(plan: &Plan, facts: &Facts, probed: bool, target_s: Option<u32>) -> CastFeed {
+    CastFeed {
+        probed,
+        level: plan.level,
+        picture: match plan.video {
+            Video::None => FeedPicture::None,
+            Video::Copy => FeedPicture::Copied,
+            Video::Encode { deinterlace } => FeedPicture::Converted { deinterlaced: deinterlace },
+        },
+        sound: match plan.audio {
+            Audio::None => FeedSound::None,
+            Audio::Copy => FeedSound::Copied,
+            Audio::Aac => FeedSound::Stereo,
+        },
+        surround: plan.surround.map(|s| match s {
+            Surround::Copy { .. } => FeedSurround::Copied,
+            Surround::Ac3 => FeedSurround::Ac3,
+        }),
+        fmp4: plan.segments == Segments::Fmp4,
+        target_s,
+        full_length: None,
+        interlaced: facts.interlaced,
+        layout: facts.layout.clone(),
+    }
+}
+
+/// The info panel's view of a launch (§11.3): ffprobe's view of the source (`probed`) or, when
+/// the hints sufficed and the probe was skipped (§8.1.2), the source as the facts know it — the
+/// codec names stay ffmpeg's, as the session copies them into the item's hints — with
+/// [`feed`]. The relay sends it once the target is pinned ([`pinned`]).
+pub fn fed_info(probed: Option<StreamInfo>, facts: &Facts, plan: &Plan) -> StreamInfo {
+    let was_probed = probed.is_some();
+    let mut info = probed.unwrap_or_else(|| StreamInfo {
+        video_codec: facts.vcodec.clone(),
+        width: facts.width.map(i64::from),
+        height: facts.height.map(i64::from),
+        fps: facts.fps,
+        audio_codec: facts.acodec.clone(),
+        audio_channels: facts.channels.map(|c| c.to_string()),
+        samplerate: facts.sample_rate,
+        ..StreamInfo::default()
+    });
+    info.cast = Some(feed(plan, facts, was_probed, None));
+    info
+}
+
+/// [`fed_info`] with the target duration the launch pinned and, for a full-length item (§8.5),
+/// its playlist's segment count.
+pub fn pinned(mut info: StreamInfo, target_s: u32, full_length: Option<u64>) -> StreamInfo {
+    if let Some(f) = info.cast.as_mut() {
+        f.target_s = Some(target_s);
+        f.full_length = full_length;
+    }
+    info
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +475,57 @@ mod tests {
         assert!(hints_suffice(&full, ReceiverKind::AppleTv));
         assert!(!hints_suffice(&CastHints { interlaced: None, ..full.clone() }, ReceiverKind::AppleTv), "mpv knows interlace only per frame");
         assert!(!hints_suffice(&CastHints::default(), ReceiverKind::AppleTv));
+    }
+
+    /// What the info panel says the TV gets (§11.3), per rung of the ladder: the level, each
+    /// stream's way, the segments; a launch from the hints alone keeps their facts and says it
+    /// wasn't probed, one from ffprobe keeps the probe's view; the pinned target comes last.
+    #[test]
+    fn the_feed_says_how_each_stream_reaches_the_tv() {
+        use FeedPicture as P;
+        let fed = |f: &Facts| feed(&plan(ReceiverKind::AppleTv, f, AUTO).unwrap(), f, true, None);
+        let surround = Facts { layout: Some("5.1(side)".into()), ..facts(Some("h264"), Some("ac3"), 6, false) };
+        // level, picture, stereo sound, surround, fMP4
+        type Way = (CastLevel, FeedPicture, FeedSound, Option<FeedSurround>, bool);
+        let rows: &[(&str, Facts, Way)] = &[
+            ("as it comes", facts(Some("h264"), Some("aac"), 2, false), (CastLevel::Repackaged, P::Copied, FeedSound::Copied, None, false)),
+            ("MP2 to AAC", facts(Some("h264"), Some("mp2"), 2, false), (CastLevel::Repackaged, P::Copied, FeedSound::Stereo, None, false)),
+            (
+                "576i MPEG-2",
+                facts(Some("mpeg2video"), Some("mp2"), 2, true),
+                (CastLevel::Converted, P::Converted { deinterlaced: true }, FeedSound::Stereo, None, false),
+            ),
+            ("HEVC", facts(Some("hevc"), Some("aac"), 2, false), (CastLevel::Repackaged, P::Copied, FeedSound::Copied, None, true)),
+            ("AC-3 5.1", surround.clone(), (CastLevel::Repackaged, P::Copied, FeedSound::Stereo, Some(FeedSurround::Copied), true)),
+            (
+                "DTS 5.1",
+                facts(Some("h264"), Some("dts"), 6, false),
+                (CastLevel::Repackaged, P::Copied, FeedSound::Stereo, Some(FeedSurround::Ac3), true),
+            ),
+            ("radio", facts(None, Some("mp3"), 2, false), (CastLevel::Repackaged, P::None, FeedSound::Stereo, None, false)),
+        ];
+        for (what, f, want) in rows {
+            let got = fed(f);
+            assert_eq!((got.level, got.picture, got.sound, got.surround, got.fmp4), *want, "{what}");
+        }
+        assert_eq!(fed(&surround).layout.as_deref(), Some("5.1(side)"));
+
+        // hints alone: their facts, not probed; the probe's own view wins when it ran
+        let f = Facts { height: Some(1080), width: Some(1920), ..facts(Some("h264"), Some("ac3"), 2, true) };
+        let p = plan(ReceiverKind::AppleTv, &f, AUTO).unwrap();
+        let info = fed_info(None, &f, &p);
+        assert_eq!((info.video_codec.as_deref(), info.height, info.audio_channels.as_deref()), (Some("h264"), Some(1080), Some("2")));
+        let cast = info.cast.clone().unwrap();
+        assert!(!cast.probed && cast.interlaced == Some(true) && cast.target_s.is_none(), "{cast:?}");
+        let probed = StreamInfo { video_codec: Some("h264 (High@4.0)".into()), container: Some("mpegts".into()), ..StreamInfo::default() };
+        let info = fed_info(Some(probed), &f, &p);
+        assert_eq!((info.video_codec.as_deref(), info.container.as_deref()), (Some("h264 (High@4.0)"), Some("mpegts")));
+        assert!(info.cast.as_ref().is_some_and(|c| c.probed));
+        let growing = pinned(info.clone(), 6, None).cast.unwrap();
+        assert_eq!((growing.target_s, growing.full_length), (Some(6), None));
+        // a full-length item (§8.5): the same feed, its map's target and segment count
+        let full = pinned(info, 7, Some(1084)).cast.unwrap();
+        assert_eq!((full.target_s, full.full_length), (Some(7), Some(1084)));
+        assert_eq!((full.level, full.picture, full.sound, full.probed), (growing.level, growing.picture, growing.sound, true));
     }
 }

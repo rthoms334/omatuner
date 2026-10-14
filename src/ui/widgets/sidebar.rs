@@ -1,7 +1,11 @@
-//! Left navigation (Search · Home, Live TV, Guide, Movies, Series, Up next · Settings). Expanded (glyph +
-//! label, 184 pt) / rail (glyph only, 48 pt) / hidden (Compact). Current item = selected fill +
-//! accent text; hover = fg@0.08. Shows Movies/Series only when some source provides them.
-//! Owner: WP-10a.
+//! Left navigation ([Play on] · Search · Home, Live TV, Guide, Movies, Series, Up next · Settings).
+//! Expanded (glyph + label, 184 pt) / rail (glyph only, 48 pt) / hidden (Compact). Current item =
+//! selected fill + accent text; hover = fg@0.08. Shows Movies/Series only when some source
+//! provides them. Owner: WP-10a.
+//!
+//! **Play on** (DESIGN §40 §3.9) heads the list while casting is on and a TV is ready: where plays
+//! go ("This computer" / the TV's name, the TV in the accent colour); a click opens the same
+//! chooser as the status bar's chip and Alt+T. It is a control, not a screen: never the lit tab.
 //!
 //! **Top glyph strip** (Compact below 480·rem, where `layout::sidebar_width` is 0): call
 //! [`sidebar`] inside a horizontal layout (e.g. `ui.horizontal(|ui| sidebar(ui, …))` in a top
@@ -32,7 +36,7 @@ pub const ITEMS: &[SidebarItem] = &[
     SidebarItem { id: ScreenId::Settings, glyph: glyphs::SETTINGS, label: "Settings" },
 ];
 
-/// Pseudo-entry for the search button (drawn first, above Home).
+/// Pseudo-entry for the search button (drawn above Home).
 const SEARCH: SidebarItem = SidebarItem { id: ScreenId::Home, glyph: glyphs::SEARCH, label: "Search" };
 
 /// Whether `current` highlights entry `id` (detail pages belong to their grid, Logs and EPG
@@ -44,33 +48,67 @@ pub fn is_current(id: ScreenId, current: ScreenId) -> bool {
         || (id == ScreenId::Settings && matches!(current, ScreenId::Logs | ScreenId::EpgMapping))
 }
 
-/// The visible entries in order; `None` marks the search button. `up_next`: Up next's pending
-/// items (`None`: the entry is hidden).
-fn entries(has_vod: bool, up_next: Option<usize>) -> impl Iterator<Item = Option<&'static SidebarItem>> {
-    std::iter::once(None).chain(
+/// What a sidebar row is: the Play on control, the search button or a screen.
+#[derive(Clone, Copy)]
+enum Entry {
+    PlayOn,
+    Search,
+    Screen(&'static SidebarItem),
+}
+
+/// Where plays go, for the Play on entry (`None` from the app: the entry is hidden).
+#[derive(Clone, Copy)]
+pub struct PlayOn<'a> {
+    /// The TV's name; `None`: this computer.
+    pub tv: Option<&'a str>,
+    /// The key that opens the chooser (for the rail's tooltip).
+    pub key: &'a str,
+}
+
+/// The visible entries in order. `play_on`: the Play on control is shown; `up_next`: Up next's
+/// pending items (`None`: the entry is hidden).
+fn entries(play_on: bool, has_vod: bool, up_next: Option<usize>) -> impl Iterator<Item = Entry> {
+    play_on.then_some(Entry::PlayOn).into_iter().chain(std::iter::once(Entry::Search)).chain(
         ITEMS
             .iter()
             .filter(move |it| has_vod || !matches!(it.id, ScreenId::Movies | ScreenId::Series))
             .filter(move |it| up_next.is_some() || it.id != ScreenId::Queue)
-            .map(Some),
+            .map(Entry::Screen),
     )
+}
+
+/// What one row shows: glyph, label, and the name / tooltip when that differs from the label.
+struct Row<'a> {
+    glyph: &'a str,
+    label: &'a str,
+    /// The accessible name and the rail's tooltip (default: the label, with `count`).
+    name: Option<String>,
+    /// Drawn in the accent colour (Play on while a TV is the target).
+    accent: bool,
 }
 
 /// One entry: `size` rect, glyph (+ label when `expanded`), tooltip otherwise; `count` (Up
 /// next's items to go) right-aligned when expanded, on the glyph's corner otherwise. Returns
 /// clicked.
-fn entry(ui: &mut egui::Ui, theme: &Theme, it: &SidebarItem, size: egui::Vec2, expanded: bool, selected: bool, count: Option<usize>) -> bool {
+fn entry(ui: &mut egui::Ui, theme: &Theme, it: &Row<'_>, size: egui::Vec2, expanded: bool, selected: bool, count: Option<usize>) -> bool {
     let t = &theme.tokens;
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let label = match count {
-        Some(n) => format!("{} {n}", it.label),
-        None => it.label.to_owned(),
+    let label = match (&it.name, count) {
+        (Some(name), _) => name.clone(),
+        (None, Some(n)) => format!("{} {n}", it.label),
+        (None, None) => it.label.to_owned(),
     };
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, &label));
     if ui.is_rect_visible(rect) {
         paint_row_state(ui.painter(), rect, theme, RowState::from_flags(resp.hovered(), selected));
-        let color = if selected || resp.hovered() { t.list_cursor_text } else { t.fg };
+        let color = if selected || resp.hovered() {
+            t.list_cursor_text
+        } else if it.accent {
+            t.accent
+        } else {
+            t.fg
+        };
         let icon_font = paint::font(theme, TypeToken::IconLarge);
         let count_color = if selected || resp.hovered() { t.list_cursor_text } else { t.text_secondary };
         if expanded {
@@ -110,7 +148,9 @@ fn entry(ui: &mut egui::Ui, theme: &Theme, it: &SidebarItem, size: egui::Vec2, e
     resp.clicked()
 }
 
-/// Draw; returns the clicked item. `search_clicked` is set when the search entry is clicked.
+/// Draw; returns the clicked item. `search_clicked` is set when the search entry is clicked,
+/// `play_on_clicked` when the Play on control (shown for `Some`) is.
+#[allow(clippy::too_many_arguments)]
 pub fn sidebar(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -118,7 +158,9 @@ pub fn sidebar(
     expanded: bool,
     has_vod: bool,
     up_next: Option<usize>,
+    play_on: Option<PlayOn<'_>>,
     search_clicked: &mut bool,
+    play_on_clicked: &mut bool,
 ) -> Option<ScreenId> {
     let side = theme.space(SpaceToken::ControlHeight) + theme.space(SpaceToken::Md);
     let strip = ui.layout().main_dir().is_horizontal();
@@ -126,21 +168,30 @@ pub fn sidebar(
     if !strip {
         ui.add_space(theme.space(SpaceToken::PanelPadding));
     }
-    let mut after_search = false;
-    for e in entries(has_vod, up_next) {
-        let it = e.unwrap_or(&SEARCH);
-        // Search and Settings stand apart from the screens between them
-        if after_search || e.is_some_and(|it| it.id == ScreenId::Settings) {
+    let mut gap_before = false;
+    for e in entries(play_on.is_some(), has_vod, up_next) {
+        // Play on and Search stand apart from the screens, Settings from those between
+        if gap_before || matches!(e, Entry::Screen(it) if it.id == ScreenId::Settings) {
             ui.add_space(theme.space(if strip { SpaceToken::Lg } else { SpaceToken::PanelGap }));
         }
-        after_search = e.is_none();
+        gap_before = matches!(e, Entry::PlayOn | Entry::Search);
+        let row = match (e, play_on) {
+            (Entry::Screen(it), _) => Row { glyph: it.glyph, label: it.label, name: None, accent: false },
+            (Entry::PlayOn, Some(p)) => {
+                let target = p.tv.unwrap_or("This computer");
+                let glyph = if p.tv.is_some() { glyphs::CAST_CONNECTED } else { glyphs::CAST };
+                Row { glyph, label: target, name: Some(format!("Play on: {target} ({})", p.key)), accent: p.tv.is_some() }
+            }
+            _ => Row { glyph: SEARCH.glyph, label: SEARCH.label, name: None, accent: false },
+        };
         let size = if strip { egui::vec2(side, side) } else { egui::vec2(ui.available_width(), side) };
-        let selected = e.is_some_and(|it| is_current(it.id, current));
-        let count = up_next.filter(|_| e.is_some_and(|it| it.id == ScreenId::Queue));
-        if entry(ui, theme, it, size, expanded && !strip, selected, count) {
+        let selected = matches!(e, Entry::Screen(it) if is_current(it.id, current));
+        let count = up_next.filter(|_| matches!(e, Entry::Screen(it) if it.id == ScreenId::Queue));
+        if entry(ui, theme, &row, size, expanded && !strip, selected, count) {
             match e {
-                Some(it) => clicked = Some(it.id),
-                None => *search_clicked = true,
+                Entry::Screen(it) => clicked = Some(it.id),
+                Entry::Search => *search_clicked = true,
+                Entry::PlayOn => *play_on_clicked = true,
             }
         }
     }
@@ -153,11 +204,22 @@ mod tests {
 
     #[test]
     fn vod_entries_hide_without_vod_and_search_comes_first() {
-        let labels = |vod, up_next| entries(vod, up_next).map(|e| e.map_or("Search", |it| it.label)).collect::<Vec<_>>();
-        assert_eq!(labels(true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"]);
-        assert_eq!(labels(false, None), ["Search", "Home", "Live TV", "Guide", "Settings"]);
-        assert_eq!(labels(true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Settings"]);
-        assert_eq!(labels(false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Settings"]);
+        let labels = |play_on, vod, up_next| {
+            entries(play_on, vod, up_next)
+                .map(|e| match e {
+                    Entry::PlayOn => "Play on",
+                    Entry::Search => "Search",
+                    Entry::Screen(it) => it.label,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(false, true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"]);
+        assert_eq!(labels(false, false, None), ["Search", "Home", "Live TV", "Guide", "Settings"]);
+        assert_eq!(labels(false, true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Settings"]);
+        assert_eq!(labels(false, false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Settings"]);
+        // Play on heads the list when shown, and is no screen
+        assert_eq!(labels(true, false, None), ["Play on", "Search", "Home", "Live TV", "Guide", "Settings"]);
+        assert_eq!(labels(true, true, Some(2)), ["Play on", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Settings"]);
         assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
         assert!(!is_current(ScreenId::Live, ScreenId::Guide));
     }

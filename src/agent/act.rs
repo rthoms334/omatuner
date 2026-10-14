@@ -261,6 +261,14 @@ pub fn on_the_tv(out: &mut PlayOut, tv: &str) {
     out.message = clean(&format!("{} It's on {tv}.", out.message));
 }
 
+/// `status.play_on` (DESIGN §40 §3.9): the Play on switch's TV (`snap.play_on`, picture A's),
+/// named from `devices` (a TV the registry no longer lists reads "your TV").
+pub fn play_on_out(snap: &PlayerSnapshot, devices: &[Device]) -> Option<super::proto::PlayOnOut> {
+    let id = snap.play_on?;
+    let name = devices.iter().find(|d| d.id == id).map_or("your TV", |d| d.name.as_str());
+    Some(super::proto::PlayOnOut { device_ref: device_ref(id), device: clean(name) })
+}
+
 /// The reply to a `play {device}` for an unpaired TV: nothing was sent.
 pub fn pairing_required(out: &PlayOut, d: &Device) -> PlayOut {
     PlayOut {
@@ -636,6 +644,8 @@ pub struct StatusMore {
     pub sleep: Option<crate::reminders::sleep::SleepStatus>,
     /// `status.casting` ([`casting_out`]).
     pub casting: Option<CastingOut>,
+    /// `status.play_on` ([`play_on_out`]).
+    pub play_on: Option<super::proto::PlayOnOut>,
 }
 
 /// [`status`] with Up next, multi-view, the playlists' streams and the sleep timer.
@@ -690,6 +700,7 @@ pub fn status_with(q: &Q, snap: &PlayerSnapshot, more: &StatusMore) -> Out<Statu
         .collect();
     out.sleep_timer = more.sleep.map(|s| sleep_out(&s));
     out.casting = more.casting.clone();
+    out.play_on = more.play_on.clone();
     Ok(out)
 }
 
@@ -782,6 +793,7 @@ pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
         streams: Vec::new(),
         sleep_timer: None,
         casting: None,
+        play_on: None,
     })
 }
 

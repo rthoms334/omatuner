@@ -1850,6 +1850,47 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
   on a channel the computer can't convert in time, and pkexec, polkit and ufw on a real system
   (the helper at `/usr/lib/tuner/tuner-firewall` exists after installing the package, and the
   dialog names the action "Allow your TV to connect to Tuner for casting").
+- [ ] **16. Cast to… where things are chosen** (cast design §3.1):
+  - **Do:** with only Living Room paired and nothing playing, right-click a Live TV channel ▸
+    *Cast to Living Room*; then `Alt+C` on a Home tile, on a film card (with progress) and on a
+    series card; `C` on an episode row of a series page, on a film's page, and in the guide on
+    an airing programme, a past one with catch-up and an upcoming one. Pair the Hisense too and
+    repeat one of them.
+  - **Expect:** each goes straight to the TV with the toast "Casting … to Living Room"; the
+    screen stays and the mini player shows the casting card; the local player never starts
+    (no picture, no sound here, and on a one-stream account no 403). The film asks *Resume* /
+    *Start over* first and the TV starts at the chosen point; a locked channel asks for the
+    PIN first; the series card plays its next episode; the airing programme casts the
+    channel, the past one its catch-up, the upcoming one only says "It hasn't started yet" (its
+    menu has no *Cast to…*). With two TVs the panel "CAST “…” TO" asks which; an unpaired TV
+    there pairs first and then casts that item. Typing `C` in a Live TV list still filters.
+- [ ] **17. Play on** (cast design §3.9):
+  - **Do:** with a channel playing here, click the sidebar's *This computer* (the first entry,
+    above Search; or the status bar's *Play on: This computer ▾*, or `Alt+T`) and pick Living Room.
+    Try it with the sidebar expanded, as the icon rail (hover for the tooltip) and in the Compact
+    glyph strip; remove the TV (or turn casting off) and it goes. Then Enter on another channel in Live TV, Shift+Enter on
+    a film, the guide's Watch, a Home tile, Up next's *Play now*, a reminder that switches,
+    and ask Claude to "put BBC One on" (no TV named). Move the Live TV cursor with preview
+    autoplay on. Turn the TV off and play something. Restart Tuner (with and without *Remember
+    Play on across restarts*).
+  - **Expect:** what played here moves to the TV at once; the sidebar entry reads *Living Room* in the accent colour (the icon alone in the rail, tooltip *Play on: Living Room (Alt+T)*, never lit like a screen) and the chip *Play on: Living
+    Room*; every play after it goes to the TV (the player screen shows the casting card where
+    it would open; Live TV's preview pane shows it on Enter); Claude says it's on Living Room
+    (`opened_in: "device"`, `status.play_on`) and nothing moves on screen. The preview never
+    plays or casts while the cursor moves. With the TV off: the error card "Living Room isn't
+    answering…" with *Play here*, and the chip still says Living Room. *This computer* in the
+    chooser brings the cast back here. After a restart plays are here unless *Remember…* is
+    on.
+- [ ] **18. Stream info while casting** (cast design §11.3):
+  - **Do:** cast a live channel by moving it from the player (`C`), press `I`; then a film by
+    *Cast to…*, `I` again; then a 576i channel and a 5.1 film.
+  - **Expect:** the panel shows over the casting card at once (never stuck on "Reading stream
+    info…"): `Casting  Living Room · Apple TV 4K (3rd generation)`, the source's codecs, size,
+    frame rate and scan, the sound's layout, the picture's way (copied and repackaged, or
+    deinterlaced and converted on this computer), the sound's (copied, to AAC stereo, surround
+    copied or as AC-3 5.1), the segments and their target duration, how far behind live, and
+    for the film where its position comes from. A moved channel says the probe was skipped.
+    The programme banner shows now / next and the progress as during local play.
 
 ## 31. Updates: a real update from vN to vN+1 (DESIGN §41)
 

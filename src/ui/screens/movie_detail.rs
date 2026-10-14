@@ -61,6 +61,7 @@ pub(crate) fn resume_or_play(ctx: &mut UiCtx<'_>, media: MediaRef, item: &ItemRe
                 duration_s: p.duration_s,
                 copy: None,
                 queue: None,
+                cast: None,
             }));
         }
         _ => kit::play_media(ctx, media, true, origin),

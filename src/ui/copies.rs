@@ -83,6 +83,7 @@ pub fn play_title(ctx: &mut UiCtx<'_>, movies: bool, item: u32, pick: Option<u32
                     duration_s: p.duration_s,
                     copy: Some(Box::new(copy)),
                     queue: None,
+                    cast: None,
                 };
                 ctx.open(OverlayRequest::Resume(spec));
             }
@@ -155,6 +156,7 @@ pub fn play_episode(ctx: &mut UiCtx<'_>, plan: &CopyPlan, series: SeriesId, ep: 
                 duration_s: p.duration_s,
                 copy: Some(Box::new(copy)),
                 queue: None,
+                cast: None,
             };
             ctx.open(OverlayRequest::Resume(spec));
         }

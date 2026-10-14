@@ -11,6 +11,10 @@
 > §17 lists the decisions. The user checks the result on the real TV once, at the end (§18). Once approved this becomes DESIGN **§40 Casting**, the next free number after §39. Code comments cite it as "DESIGN §40 §x.y". Appendix B lists what changed from revision 1.
 >
 > Revision 4, 2026-10-13: films, episodes and catch-up reach the TV **full length** (§8.5), the Phase 2 design's §29.6 applied to the AirPlay path; Appendix D lists what changed.
+>
+> Addendum, 2026-10-13 (after 0.3.0 in real use): "Cast to…" on every playable item and the
+> **Play on** switch (§3.1, §3.9, the keys in §3.7), and the info panel while casting says what
+> the TV is fed (§11.3).
 
 This design is based on `main` at 17f9986. It was built from:
 - four codebase maps: playback, UI, services and tests;
@@ -148,13 +152,34 @@ Citations:
 
 ### 3.1 Choosing the TV
 
-**Phase 1 entry points:**
+**Entry points:**
 - the OSD **Cast** control (wide layout, before Fullscreen);
 - the player menu item **Cast to…**;
-- the key `C`;
-- the agent.
-
-Guide and browse context menus get "Play on Living Room" in Phase 2.
+- the key `C` in the player;
+- the agent;
+- **"Cast to…" on any playable item** (0.3.0 field feedback: "no way to just click a button to
+  cast without first starting it in the player"): the item menu of a Live TV channel row, a
+  Home tile, a film or series card, a title's page, an episode row and a guide programme, and
+  the key `Action::CastItem` on the focused one (§3.7). Code: `ui/casting.rs`, hooked into
+  `ui::item_menu::extend` / `dispatch` like the batch features.
+  - Exactly one TV ready (usable, paired or needing no pairing; a remembered TV not seen this
+    run counts: its stored address is tried, and a TV that's off gets the typed error card):
+    the entry reads "Cast to Living Room" and casts straight there, with the toast "Casting BBC
+    One to Living Room". Several, or none ready: "Cast to…" opens this panel for that item
+    (`OverlayRequest::CastItem`): headed `CAST “BBC One” TO`, no "This computer" row; an
+    unpaired TV pairs first, then casts the item (`AfterPair::Item`).
+  - The item plays exactly as Shift+Enter plays it here — the same PIN prompt
+    (`Action::CastUnlocked` comes back to the app, which casts it then), the same copy with its
+    fallback, the same Resume / Start over prompt for a film or an episode — only its commands
+    go to the TV (`UiCtx::cast_with`: `Play` → `CastTo`, `PlayCopy` → `CastCopy`, a Resume
+    prompt opened meanwhile casts its answer). Nothing plays here first: the TV's first load is
+    the relay's, under picture A's lease (§10). The screen stays; the mini player shows the
+    casting card.
+  - A programme casts its channel while it airs and its catch-up once it aired (on a channel
+    with an archive); one that hasn't started isn't offered (the reminder entries are).
+  - Not in multi-view (§0.6): the entry isn't offered there, and the key says "Leave
+    multi-view to cast".
+- **Play on** (§3.9): a switch that sends every play to a TV.
 
 ```
                                          ┌ Cast to ─────────────────────────┐
@@ -371,6 +396,8 @@ Settings ▸ Cast
  Casting
    Cast to TVs                                         [on]
    Offer to set up new TVs                             [on]
+   Play on: This computer…                             (the chooser, §3.9)
+   Remember Play on across restarts                    [off]
  TVs
    Living Room       Apple TV 4K (3rd generation) · Paired · tvOS 26.6 · used today ⋯   (Pair again · Forget · Make default)
    Living Room TV    Hisense 85E75LE · Not paired                                   ⋯   (Pair · Forget)
@@ -403,6 +430,9 @@ Settings ▸ Cast
 | Key | Action | Where |
 |---|---|---|
 | `C` | `Action::CastMenu`: "Cast to a TV…". While casting it opens the picker with "This computer" focused, so `C` then Enter is Play here (back to this computer). | `PLAYER_COMMON` (checked free) |
+| `C` | `Action::CastItem`: "Cast to a TV…" on the focused item (§3.1). | `GUIDE`, `DETAIL` (no filter there; checked free) |
+| Alt+C | `Action::CastItem` | `ITEM_ACTIONS` (lists, grids, Home, detail pages, filtering or not), `SEARCH_ITEM_ACTIONS`, `GUIDE`. Lists and grids filter on every printable key, so a plain `C` there would steal a filter's capital C — and with one paired TV, typing "CNN" would cast. |
+| Alt+T | `Action::PlayOnMenu`: "Play on… (this computer or a TV)", the chooser (§3.9). T for TV; Alt+C is the item's. | `GLOBAL` (works from a text field too; Omarchy binds no Alt+letter) |
 | — | `Action::StopCasting`: "Stop casting". No default key; it is in the menu, the card and the chip (the picker offers Play here, `StopCasting { play_here: true }`). | — |
 | — | `Action::PlayHere`: "Play here" on the alert after the TV stopped the cast (§3.4 "Play here · Cast again"). No default key. | — |
 | Enter / ↑↓ / Esc | Picker and PIN overlay. They reuse the `Modal`/`List` contexts, so there is no new `KeyContext`. | — |
@@ -447,6 +477,76 @@ Casting is the one kind of playback that doesn't need Tuner's window: the pictur
   - The polkit dialog is drawn by Omarchy's shell on the focused monitor, not inside Tuner's window, so it appears where the user is.
 - **Power.** The logind sleep inhibitor doesn't depend on the window (§11.5).
   - Hyprland keeps rendering Tuner on hidden workspaces (`render_unfocused`, DESIGN §22). Casting needs no local rendering at all.
+
+### 3.9 Play on
+
+```
+                                         ┌ PLAY ON ─────────────────────────┐
+                                         │ ✓ This computer                  │
+                                         │   Living Room                    │
+                                         │   Apple TV 4K (3rd gen…) · Paired│
+                                         │   Living Room TV                 │
+                                         │   Hisense 85E75LE · Pair first   │
+                                         │   Add by address…                │
+                                         │   Firewall help…                 │
+                                         └──────────────────────────────────┘
+ status bar:  … Ctrl+F fav · Shift+F10 more      󰄙 Play on: This computer 󰅀   Guide updated 10 min ago
+ sidebar:      ┌──────────────────┐   (a TV is the target: 󰄙 in the accent colour, "Living Room")
+               │ 󰄙 This computer  │   rail: 󰄙 alone, tooltip "Play on: This computer (Alt+T)"
+               │ 󰍉 Search         │
+               │ 󰋜 Home …         │
+```
+
+**What it is.** A switch for where plays go: this computer, or a TV. With a TV chosen, every
+play of picture A goes there instead of mpv — Enter or a click on a channel, a film, an
+episode, the guide's Watch, a Home tile, Up next, a reminder's switch, `--play`, and an agent's
+`play` without `device` — and the player screen shows the casting card where it would open.
+
+**Where it lives.** Picture A's controller holds it (`PlayerCommand::SetPlayOn`,
+`PlayerSnapshot::play_on`): a `Play` or `PlayCopy` while the output is local becomes
+`cast_to(device, play)` — so every sender follows it without knowing (the screens, the app, Up
+next's engine, the agent) and the PIN, copy and Resume rules stay the senders' as for a local
+play. Not diverted: the Live preview's plays (`PlayOrigin::LivePreview`: moving the cursor never
+casts; the preview autoplay is off anyway while the switch is on a TV, `live.rs` / `guide.rs`),
+and anything in multi-view (two pictures are this computer's; the switch applies once it ends).
+Multi-view that ended on picture B: a play while the switch names a TV, and a *Cast to…*, go to
+picture A as a film does (picture B stops, its claim goes at once: `app::mv_vod_to_a`).
+On a TV already, plays land on that TV as before (§3.3).
+
+**The sidebar control.** The most used of the entry points, so it heads the left sidebar, directly
+above Search: `widgets::sidebar::PlayOn` — a cast glyph and "This computer" / the TV's name (the
+TV in the accent colour, with the connected glyph, so it is plain that plays go there); the rail
+and the Compact glyph strip show the glyph alone, its tooltip "Play on: Living Room (Alt+T)". A
+click or Enter opens the same chooser as the chip (`Action::PlayOnMenu`). It is a control, not a
+screen: never the lit tab, no `ScreenId`, no Alt+digit. It shows on the chip's condition
+(`App::play_on_target`: casting on and a TV ready, or a cast or the switch names one), so a
+sidebar without TVs is unchanged; unlike the chip it also shows beside the Compact cast chip.
+The video-only and pop-out windows, Onboarding and the player have no sidebar, so none either.
+
+**The chooser** (`OverlayRequest::PlayOn`; the sidebar control, the status chip, Alt+T, Settings ▸ Cast ▸ *Play on:
+…*): this panel headed `PLAY ON`, the mark on where plays go now (the TV casting, else the
+switch's). A choice works like a speaker picker (`ui::casting::choose`): what plays here moves
+to the TV chosen (`CastTo { play: None }`; a Live preview stops instead), a cast moves to the TV
+chosen, and "This computer" while casting is Play here. An unpaired TV pairs first
+(`AfterPair::PlayOn`). The chip ("󰄙 Play on: Living Room 󰅀") shows while casting is on and a TV
+is ready, or a cast or the switch names one; not beside the Compact cast chip, which says it.
+
+**It only changes when the user changes it.** A TV that doesn't answer shows the typed error
+card (§3.4) with Play here, and the switch stays; Stop casting and Play here leave it too (Play
+here plays that item here; the next play goes to the TV again). A session that can't even open
+(the TV forgotten, casting switched off meanwhile) toasts the failure with **Play here**, which
+plays the item that was on its way (the controller keeps it: `undelivered`). Forgetting the
+TV in Settings and switching casting off put the switch back on this computer.
+
+**Across restarts.** The switch lasts for the session. It is written to `cast.play_on` whenever
+it changes and restored at start only with Settings ▸ Cast ▸ *Remember Play on across restarts*
+(`cast.remember_play_on`, off): by default every start plays here, so a TV that's off at the
+next start never swallows plays.
+
+**Agents.** `status.play_on` names the switch's TV (single view), and a `play` without `device` while it names
+one is answered as a cast (`opened_in: "device"`, the TV named, the window left in place, §3.8),
+as a play while casting is. Agents never change the switch: it is the user's (RULES.md §2, §12).
+Reminder switches follow it too, and skip their "Open in" placement as while casting.
 
 ---
 
@@ -1354,7 +1454,7 @@ The TV gets a film, an episode or a catch-up programme whole: a VOD playlist (`#
 - **Production stays capped.** A run reads its first minute as fast as the provider sends it, then at real time; it pauses (SIGSTOP) while more than 180 s ahead of the segment the TV fetched last, until under 120 s, never while a request waits. The 8 GiB cap deletes the published segments furthest from the TV first (a scrub back to them makes them again). Otherwise segments stay for the generation, so scrubbing back is free; the directory goes with the generation (zap, stop, session end).
 - **The token** of a whole playlist lives as long as its generation (§9.2's 60 s after the end doesn't apply: having fetched the last segment, the TV may still scrub back).
 - **The provider connection** is the generation's: a run ending (the item's end, a stop for a scrub) closes the provider's request, not the feed, and sends no `UpstreamEof` (the TV may still scrub anywhere; the controller ends the item at the TV's `Ended`). `UpstreamClosed` comes when the generation ends, or at once when the provider fails, so the controller's reconnect policy reloads where the TV is.
-- **Starting somewhere** (a resume, Tuner's seek bar, a reload): the whole playlist under a new token with `#EXT-X-START:TIME-OFFSET=<t>,PRECISE=YES` (RFC 8216 §4.4.2.2); the TV starts there and its scrubber covers the whole item. tvOS honours `TIME-OFFSET=0` (§8.4, 2026-10-13); a positive offset is unverified on this TV, and third-party TVs may ignore it. So the LAN server checks the first picture segment fetched under such a token: one more than a segment before where it should start means the TV started from the beginning, and the relay reports `StartIgnored` (once per session). The session then replaces the item with a *view* from there (a VOD playlist from segment *k*, `MEDIA-SEQUENCE:k`, its start the positions' offset, as Phase 1's views), and every later start in the session is one: the TV's scrubber then covers the rest of the item.
+- **Starting somewhere** (a resume, Tuner's seek bar, a reload): the whole playlist under a new token with `#EXT-X-START:TIME-OFFSET=<t>,PRECISE=YES` (RFC 8216 §4.4.2.2); the TV starts there and its scrubber covers the whole item. tvOS honours `TIME-OFFSET=0` (§8.4, 2026-10-13); a positive offset is unverified on this TV, and third-party TVs may ignore it. So the LAN server checks the first picture segment fetched under such a token: one before the segment holding the start (the segment before a cut the start sits on, within 0.5 s, is the TV's rounding of the `EXTINF`s) means the TV started from the beginning, and the relay reports `StartIgnored` (once per session). The session then replaces the item with a *view* from there (a VOD playlist from segment *k*, `MEDIA-SEQUENCE:k`, its start the positions' offset, as Phase 1's views), and every later start in the session is one: the TV's scrubber then covers the rest of the item.
 - **Positions and progress.** A whole playlist is the item's own time (offset 0), so `RemoteEvent::Position`, progress and `finished` need nothing more: `playbackInfo` answers are the TV's own; `timeJumped` places the estimate; a fetch run that breaks (a scrub on the TV) rebases it at that segment's start (behind, never ahead); an item's first fetch past its playlist's start (an `EXT-X-START`) places it there too. The catch-up clamp (`produced_s`) doesn't apply: the whole item is reachable.
 - **Not verified on the TV yet** (§18 item 8): that tvOS starts at a positive `EXT-X-START`, plays the split surround renditions of a full-length film, and how long a scrub takes to the first picture (a run's start: the provider's seek plus a segment).
 
@@ -1638,7 +1738,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 | `Zap`, `ZapTo`, `LastChannel`, `JumpToLive`, `Play`, `PlayCopy` | Unchanged up to `Effect::Load`, then `RemoteCmd::Load` → replace | same |
 | `SetVolume`, `AdjustVolume`, `ToggleMute`, `SetMute` | Banner "Use the TV remote for volume". The snapshot volume is left alone. | Receiver level: Tuner 0–130 maps to `min(v,100)/100` |
 | Audio or subtitle track, aspect, zoom, sub delay or scale, `SetLightDecode`, `ResumeVideo` | No-op, banner "Not available while casting". The controls are hidden. | Phase 2: track choice is a reload with `-map` |
-| `RefreshStreamInfo` | Filled from the probe: codec, size, fps, interlace, level, level path | same |
+| `RefreshStreamInfo` | What the TV is fed, from the relay: it reports it at every launch (`RelayEvent::Probed`, kept per generation), probed or not — the hints often suffice and the probe is skipped (§8.1.2), which in 0.3.0 left the panel on "Reading stream info…". `StreamInfo::cast` (`CastFeed`): from the probe or the hints, the level, the picture's way (copied / converted, deinterlaced), the sound's (copied / AAC stereo), surround (copied / AC-3 5.1), fMP4 or TS, the pinned target duration and, for a full-length item (§8.5), its segment count (`launch_full` reports the same as a growing playlist's launch, with the map's target). The panel adds the TV and its model, behind-live, and the position source (`CastApi::position_source`: the TV's `playbackInfo` or the estimate) | same |
 | `Reconnect` | Restart the pipeline and replace, where the TV clock says the TV is (§11.2) | same |
 | `ApplyConfig` | Applied to the local player. `[cast]` changes take effect on the next load. | — |
 | `Shutdown` | Fast stop (≤ 300 ms), then the session closes | same |
@@ -1652,7 +1752,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
   - `record_video` is skipped while casting: there are no measured dimensions.
 - **MPRIS.** Unchanged; the media keys drive the TV. A volume change through MPRIS is a no-op on AirPlay.
 - **Sleep timer.** Stop and SetPause reach the TV.
-- **Live preview autoplay.** Suppressed while `snap.cast.is_some()` (`live.rs:2212`, `guide.rs:566`). Otherwise moving the cursor in Live would retune the TV. The preview pane shows the casting card.
+- **Live preview autoplay.** Suppressed while `snap.cast.is_some()` or while Play on is a TV (§3.9; `live.rs`, `guide.rs`). Otherwise moving the cursor in Live would retune the TV. The preview pane shows the casting card. The controller never casts a `LivePreview` play either.
 - **Parental.** Relock stops a cast that is showing locked or explicit content, exactly as it stops the local picture (`sync_explicit`).
 - **Reminders.** A switch while casting retunes the TV and skips its "Open in" placement (§3.8).
 
@@ -1687,7 +1787,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 - `pause`, `resume`, `stop` and `volume` already reach the TV through handle A. On AirPlay, `volume` answers `unsupported`.
 - `popout` and `window` while casting answer `unavailable: casting`.
 
-**`status`** gains `casting: {device, kind, phase, behind_live_s?, error?}`. `error` is the typed reason of the last failure (`cast-firewall`, `cast-stopped-on-tv`, …). It lets an agent explain a failure while Tuner is out of sight (§3.8).
+**`status`** gains `casting: {device, kind, phase, behind_live_s?, error?}`, and `play_on: {ref, device}` while the Play on switch names a TV (§3.9: a `play` without `device` then goes there, `opened_in: "device"`). `error` is the typed reason of the last failure (`cast-firewall`, `cast-stopped-on-tv`, …). It lets an agent explain a failure while Tuner is out of sight (§3.8).
 
 **`diagnose`** gains a `cast` section, with no addresses:
 - the receiver model and tvOS version (§7.6);

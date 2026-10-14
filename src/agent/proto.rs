@@ -985,6 +985,21 @@ pub struct StatusOut {
     /// (DESIGN §40 §12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub casting: Option<CastingOut>,
+    /// Tuner's Play on switch names a TV (DESIGN §40 §3.9): every play goes there, a `play`
+    /// without `device` too (`opened_in: "device"`). Absent: plays are on this computer (always
+    /// with two pictures: multi-view is this computer's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_on: Option<PlayOnOut>,
+}
+
+/// `status.play_on`: the TV plays go to. No address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayOnOut {
+    /// The TV's `cast_devices` ref.
+    #[serde(rename = "ref")]
+    pub device_ref: String,
+    /// The TV's name (sanitised).
+    pub device: String,
 }
 
 /// Where a cast is (`status.casting`). No address: the TV is named and referred to by its

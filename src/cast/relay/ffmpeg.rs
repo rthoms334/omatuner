@@ -81,8 +81,9 @@ const TAIL_LINES: usize = 8;
 /// A kept line is cut at this many characters (ffmpeg's `Last message repeated` lines and
 /// demuxer dumps can be long).
 const TAIL_CHARS: usize = 240;
-/// How long the exit waits for stderr to drain, so the report holds ffmpeg's last words.
-const STDERR_DRAIN: Duration = Duration::from_millis(500);
+/// How long the exit waits for stderr and the progress pipe to drain, so the report holds
+/// ffmpeg's last words and its last progress block (the stop position).
+const PIPE_DRAIN: Duration = Duration::from_millis(500);
 /// The test card (§8.5): 15 s of `testsrc2` and a 440 Hz tone.
 const TEST_CARD_S: u32 = 15;
 /// EVENT playlists (VOD, catch-up): ffmpeg reads the first minute as fast as the provider sends
@@ -715,7 +716,7 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
         })
     });
     let Progress { base_s, watch_speed, on_slow } = progress;
-    if let Some(out) = child.stdout.take() {
+    let progressed = child.stdout.take().map(|out| {
         let seen = seen.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(out).lines();
@@ -735,8 +736,8 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
                     f();
                 }
             }
-        });
-    }
+        })
+    });
     let stop = kill.clone();
     let shared = seen.clone();
     tokio::spawn(async move {
@@ -761,10 +762,14 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
                 Exit::Killed
             }
         };
-        // stderr ends with the process: let its last lines land before anyone asks why
-        if let Some(d) = drained {
-            let _ = tokio::time::timeout(STDERR_DRAIN, d).await;
-        }
+        // both pipes end with the process: let stderr's last lines and the last progress block
+        // (`media_s`, where it stopped) land before anyone asks why (one deadline for the two)
+        let _ = tokio::time::timeout(PIPE_DRAIN, async {
+            for task in [drained, progressed].into_iter().flatten() {
+                let _ = task.await;
+            }
+        })
+        .await;
         let _ = tx.send(Some(exit));
     });
     Ok(Child { kill, exit: rx, pid, started: Instant::now(), seen })
@@ -1109,6 +1114,22 @@ mod tests {
 
         let silent = Failure { status: String::new(), lines: Vec::new(), media_s: None };
         assert_eq!(silent.text(true), "no stderr");
+    }
+
+    /// The exit waits for the progress pipe as it does for stderr: a last block still in the
+    /// pipe when the process is gone (here written by a straggler that holds stdout a moment
+    /// longer) is the stop position the failure reports, not a missing or older one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_failure_waits_for_the_last_progress_block() {
+        let script = "echo out_time_us=1000000; echo 'pipe:: Invalid data found' >&2; \
+                      (/bin/sleep 0.2; echo out_time_us=7500000; echo progress=end) 2>/dev/null & exit 1";
+        let progress = Progress { base_s: 60.0, watch_speed: false, on_slow: Box::new(|| {}) };
+        let mut child = spawn(Path::new("/bin/sh"), &["-c".into(), script.into()], "test".into(), progress).unwrap();
+        assert_eq!(child.wait().await, Exit::Failed);
+        let why = child.failure();
+        assert_eq!(why.status, "exit status: 1");
+        assert_eq!(why.lines, ["pipe:: Invalid data found"]);
+        assert_eq!(why.media_s, Some(67.5), "the last block, after the seek");
     }
 
     #[test]

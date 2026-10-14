@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TrySendError};
 use tracing::Level;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
@@ -250,6 +250,18 @@ impl FileWriter {
         }
     }
 
+    /// A line that must reach the file (the fatal record, §21.7): it waits up to `timeout` for
+    /// room in a full queue instead of being dropped, then until it is on disk.
+    fn send_and_flush(&self, line: String, timeout: Duration) {
+        match self.tx.send_timeout(FileCmd::Line(line), timeout) {
+            Ok(()) => self.flush(timeout),
+            Err(SendTimeoutError::Timeout(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(SendTimeoutError::Disconnected(_)) => {}
+        }
+    }
+
     /// Block until the lines sent so far are written, or for at most about `timeout`.
     fn flush(&self, timeout: Duration) {
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -379,8 +391,8 @@ pub fn flush(timeout: Duration) {
 pub fn record_fatal(log_file: &Path, message: &str) {
     let line = LogLine { at: crate::model::now(), level: Level::ERROR, target: "tuner".into(), message: crate::redact::redact(message).into_owned() };
     if let Some(w) = FILE.get() {
-        w.send(line.to_text());
-        w.flush(Duration::from_secs(1));
+        // not `send`: a queue the writer hasn't caught up with would drop exactly this line
+        w.send_and_flush(line.to_text(), Duration::from_secs(1));
         return;
     }
     if let Ok(mut sink) = FileSink::open(log_file, ROTATE_BYTES) {
@@ -593,6 +605,34 @@ mod tests {
         assert!(lines[1].ends_with("ERROR tuner::t: m2"), "{text}");
         assert_eq!(mode(&out), 0o600);
         assert!(buf.export(&dir.path().join("missing/dir/x.txt")).is_err());
+    }
+
+    /// The fatal record waits for room in a full queue (the writer behind a burst of lines):
+    /// it is the line that says why Tuner exits, and the flush after it only covers what got in.
+    #[test]
+    fn the_fatal_line_waits_for_room_in_a_full_queue() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let w = FileWriter { tx, dropped: Arc::new(AtomicU64::new(0)) };
+        w.send("a".into());
+        w.send("b".into());
+        // the writer catches up a moment later, acknowledging flushes as the thread does
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut lines = Vec::new();
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    FileCmd::Line(l) => lines.push(l),
+                    FileCmd::Flush(ack) => {
+                        let _ = ack.send(());
+                        return lines;
+                    }
+                }
+            }
+            lines
+        });
+        w.send_and_flush("Tuner exits: no display".into(), Duration::from_secs(30));
+        assert_eq!(writer.join().unwrap(), ["a", "b", "Tuner exits: no display"]);
+        assert_eq!(w.dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]

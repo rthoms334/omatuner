@@ -364,6 +364,10 @@ impl Services {
                 // and every later play would try to reopen it
                 self.tiles.handle(TileId::A).send(PlayerCommand::StopCasting { play_here: true });
             }
+            if !new.cast.enabled {
+                // and plays stay here (the Play on switch, DESIGN §40 §3.9): no service to cast
+                self.tiles.handle(TileId::A).send(PlayerCommand::SetPlayOn(None));
+            }
             self.stop_cast();
             if crate::cast::ENABLED && new.cast.enabled {
                 self.start_cast();

@@ -30,9 +30,12 @@
 //!
 //! The PIN goes to the service once (`pair_submit`, a [`Pin`]) and is dropped: it is never
 //! logged, stored or shown in `Debug` output, and the digit buffer is zeroed when it is sent or
-//! cleared. On success: the toast "Paired with <TV>", and when opened to cast (the picker, the
-//! casting card's Pair) with something playing, the cast starts (`PlayerCommand::CastTo`, what
-//! plays moves to the TV); from Settings ▸ Cast or the setup wizard it only pairs.
+//! cleared. On success: the toast "Paired with <TV>", then what it was opened for
+//! ([`AfterPair`]): from the player's picker or the casting card with something playing, the
+//! cast starts (`PlayerCommand::CastTo`, what plays moves to the TV); from an item's picker
+//! that item is cast (`ui::casting::cast_target`, DESIGN §40 §3.1); from the Play on chooser the
+//! switch goes to the TV (`ui::casting::choose`, §3.9); from Settings ▸ Cast or the setup wizard
+//! it only pairs.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -48,6 +51,7 @@ use crate::msg::Toast;
 use crate::player::PlayerCommand;
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
+use crate::ui::casting::{AfterPair, CastDest};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::card::CardKind;
 use crate::ui::widgets::progress::busy_bar;
@@ -114,8 +118,8 @@ impl Code {
 
 pub struct CastPair {
     pub device: DeviceId,
-    /// Cast once paired (opened from the picker or the casting card).
-    then_cast: bool,
+    /// What pairing leads to.
+    then: AfterPair,
     /// The job and the service that runs it (cancelled when the overlay goes, unless it ended).
     job: Option<(CastHandle, PairJob)>,
     code: Code,
@@ -148,10 +152,17 @@ enum Failure {
 }
 
 impl CastPair {
+    /// `then_cast`: what plays moves to the TV once paired (the player's picker, the casting
+    /// card), else pairing only (Settings, the setup wizard).
     pub fn new(device: DeviceId, then_cast: bool) -> Self {
+        Self::then(device, if then_cast { AfterPair::CastPlaying } else { AfterPair::Nothing })
+    }
+
+    /// Pair, then do `then`.
+    pub fn then(device: DeviceId, then: AfterPair) -> Self {
         Self {
             device,
-            then_cast,
+            then,
             job: None,
             code: Code::default(),
             focus: Focus::Code,
@@ -360,9 +371,18 @@ impl Overlay for CastPair {
             PairState::Paired => {
                 self.ended = true;
                 ctx.toast(Toast::info(format!("Paired with {name}")));
-                // opened to cast, what plays moves to the TV; Settings and the wizard only pair
-                if self.then_cast && ctx.player.playable.is_some() {
-                    ctx.play(PlayerCommand::CastTo { device: self.device, play: None });
+                // opened to cast, what plays moves to the TV (or the item goes there, or the
+                // switch does); Settings and the wizard only pair
+                match &self.then {
+                    AfterPair::CastPlaying if ctx.player.playable.is_some() => {
+                        ctx.play(PlayerCommand::CastTo { device: self.device, play: None });
+                    }
+                    AfterPair::Item(item) => {
+                        let dest = CastDest { device: self.device, tv: name.clone(), title: item.title.clone() };
+                        crate::ui::casting::cast_target(ctx, dest, &item.target);
+                    }
+                    AfterPair::PlayOn => crate::ui::casting::choose(ctx, Some(self.device)),
+                    AfterPair::CastPlaying | AfterPair::Nothing => {}
                 }
                 return self.cancel();
             }
