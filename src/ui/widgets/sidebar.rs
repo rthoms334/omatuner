@@ -220,7 +220,10 @@ mod tests {
         assert_eq!(labels(false, false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Watchlists", "Settings"]);
         // Play on heads the list when shown, and is no screen
         assert_eq!(labels(true, false, None), ["Play on", "Search", "Home", "Live TV", "Guide", "Watchlists", "Settings"]);
-        assert_eq!(labels(true, true, Some(2)), ["Play on", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Settings"]);
+        assert_eq!(
+            labels(true, true, Some(2)),
+            ["Play on", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Settings"]
+        );
         assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
         assert!(!is_current(ScreenId::Live, ScreenId::Guide));
     }
