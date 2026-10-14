@@ -288,7 +288,8 @@ enum Fail {
 struct Launch {
     argv: Vec<String>,
     /// What the TV is fed (the info panel while casting, §11.3): sent once the target is
-    /// pinned ([`plan::pinned`]).
+    /// pinned ([`plan::pinned`]), by [`RelaySession::launch`] and [`RelaySession::launch_full`]
+    /// alike.
     info: crate::player::tracks::StreamInfo,
     live: bool,
     level: CastLevel,
@@ -821,7 +822,7 @@ impl RelaySession {
             });
             let behind_live_s = l.live.then(|| (3.0 * f64::from(target) + l.hls_time).round().min(f64::from(u16::MAX)) as u16);
             tracing::debug!("{}: ready, target duration {target} s", self.label);
-            let info = Box::new(plan::pinned(l.info.clone(), target));
+            let info = Box::new(plan::pinned(l.info.clone(), target, None));
             let _ = self.tx.send(RelayEvent::Probed { generation: l.generation.load(Ordering::Relaxed), info });
             if ended && let Some(feed) = &l.feed {
                 // the monitor left this to us: the input's end, then the close
@@ -980,6 +981,9 @@ impl RelaySession {
             monitor,
         });
         tracing::debug!("{}: ready from segment {k}, target duration {} s", self.label, od.map.target());
+        // what the TV is fed (§11.3), as a growing playlist's launch reports it: the whole map
+        let info = Box::new(plan::pinned(l.info, od.map.target(), Some(od.map.len())));
+        let _ = self.tx.send(RelayEvent::Probed { generation: l.generation.load(Ordering::Relaxed), info });
         let load = LoadReq { url: Secret::new(url), live: false, offset_s };
         Ok(Prepared { load, level: l.level, behind_live_s: None, surround: l.surround.is_some(), as_is: l.as_is })
     }

@@ -516,6 +516,13 @@ async fn every_rendition_shares_the_pictures_timeline() {
         let spec = LoadSpec { receiver, ..spec(1, Arc::new(p), force) };
         let prepared = relay.load(spec).await.unwrap_or_else(|e| panic!("{case}: {e:?}"));
         assert_eq!(prepared.surround, receiver == ReceiverKind::AppleTv, "{case}");
+        // the info panel's report of what the TV is fed (§11.3), full length or not: queued
+        // before the load returns
+        let seen = until(&mut relay, Duration::from_secs(5), |e| matches!(e, RelayEvent::Probed { info, .. } if info.cast.is_some())).await;
+        let RelayEvent::Probed { info, .. } = seen.last().unwrap() else { unreachable!() };
+        let fed = info.cast.clone().unwrap();
+        assert!(fed.probed && fed.target_s.is_some(), "{case}: {fed:?}");
+        assert_eq!((fed.level, fed.surround.is_some(), fed.full_length.is_some()), (prepared.level, prepared.surround, full), "{case}: {fed:?}");
         let (tv, base) = (tv(), base_of(&prepared));
         let renditions: &[&str] = if prepared.surround { &["v/", "a/", "s/"] } else { &[""] };
         // full length: the TV fetches where the playlist starts it, then (a scrub) jumps
@@ -526,6 +533,10 @@ async fn every_rendition_shares_the_pictures_timeline() {
             assert_eq!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"), full, "{case} {r}:\n{text}");
             let (names, starts): (Vec<String>, Option<f64>) = if full {
                 let segs = vod_segments(&text);
+                // the whole playlist: the panel's count and target are the TV's
+                assert_eq!(fed.full_length, Some(segs.len() as u64), "{case} {r}");
+                let target = fed.target_s.unwrap();
+                assert!(text.contains(&format!("#EXT-X-TARGETDURATION:{target}\n")), "{case} {r}: target {target}:\n{text}");
                 assert_eq!(ext_x_start(&text), start_at, "{case} {r}");
                 let at = |t: f64| segs.iter().rposition(|s| s.0 <= t).unwrap();
                 let k = at(start_at.unwrap_or(0.0));

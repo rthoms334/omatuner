@@ -160,10 +160,11 @@ fn local_lines(ctx: &UiCtx<'_>, snap: &PlayerSnapshot, i: &StreamInfo) -> Vec<St
 /// the relay reports it at every launch (`StreamInfo::cast`). The TV and what it is
 /// (`Device::make`, sanitized device strings only); the source as the relay knew it (ffprobe's
 /// view, else the hints' when they sufficed and the probe was skipped, §8.1.2); each stream's way
-/// to the TV (§8.3 levels, §8.4 surround); the segments and their pinned target (§8.1.4); how far
-/// behind live; where positions come from (§7.3). mpv's decoder, drops, cache and bitrates say
-/// nothing here: mpv isn't playing it. No address or URL can reach these lines (none is in a
-/// `StreamInfo` or a `Device`'s shown strings).
+/// to the TV (§8.3 levels, §8.4 surround); the segments, their pinned target (§8.1.4) and, for
+/// a full-length item, their count (§8.5); how far behind live; where positions come from
+/// (§7.3). mpv's decoder, drops, cache and bitrates say nothing here: mpv isn't playing it. No
+/// address or URL can reach these lines (none is in a `StreamInfo` or a `Device`'s shown
+/// strings).
 fn cast_lines(ctx: &UiCtx<'_>, snap: &PlayerSnapshot, view: &CastView) -> Vec<String> {
     let cast = ctx.services.agent.cast();
     let tv = match cast.devices().into_iter().find(|d| d.id == view.device) {
@@ -206,11 +207,11 @@ fn cast_lines(ctx: &UiCtx<'_>, snap: &PlayerSnapshot, view: &CastView) -> Vec<St
         lines.push(format!("  → TV   {way}"));
     }
     if let Some(f) = feed {
-        let segments = if f.fmp4 { "fMP4" } else { "MPEG-TS" };
-        lines.push(match f.target_s {
-            Some(t) => format!("Segments {segments} · target {t} s"),
-            None => format!("Segments {segments}"),
-        });
+        let mut parts = vec![if f.fmp4 { "fMP4" } else { "MPEG-TS" }.to_owned()];
+        parts.extend(f.target_s.map(|t| format!("target {t} s")));
+        // a film, an episode or catch-up the TV has whole (§8.5)
+        parts.extend(f.full_length.map(|n| format!("full length, {n} segments")));
+        lines.push(format!("Segments {}", parts.join(" · ")));
     }
     if is_live(snap) {
         if let Some(s) = view.behind_live_s {
@@ -338,6 +339,7 @@ mod tests {
             surround: Some(FeedSurround::Copied),
             fmp4: true,
             target_s: Some(6),
+            full_length: None,
             interlaced: Some(false),
             layout: Some("5.1(side)".into()),
         };
@@ -353,7 +355,7 @@ mod tests {
             cast: Some(feed),
             ..StreamInfo::default()
         };
-        h.state_mut().t.snapshot = Arc::new(PlayerSnapshot { stream_info: Some(info), ..snap });
+        h.state_mut().t.snapshot = Arc::new(PlayerSnapshot { stream_info: Some(info.clone()), ..snap.clone() });
         h.run_steps(2);
         let texts = painted(&h);
         for want in [
@@ -375,5 +377,14 @@ mod tests {
         // painted after the card, so it shows over it
         let card = texts.iter().position(|t| t.ends_with("Playing on Living Room")).expect("the casting card");
         assert!(texts.iter().position(|t| t == casting).is_some_and(|p| p > card), "{texts:?}");
+
+        // a full-length film (§8.5): the whole playlist's segment count on the Segments line
+        let mut info = info;
+        info.cast.as_mut().unwrap().full_length = Some(1084);
+        h.state_mut().t.snapshot = Arc::new(PlayerSnapshot { stream_info: Some(info), ..snap });
+        h.run_steps(2);
+        let texts = painted(&h);
+        let want = "Segments fMP4 · target 6 s · full length, 1084 segments";
+        assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
     }
 }

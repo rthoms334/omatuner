@@ -305,6 +305,7 @@ pub fn feed(plan: &Plan, facts: &Facts, probed: bool, target_s: Option<u32>) -> 
         }),
         fmp4: plan.segments == Segments::Fmp4,
         target_s,
+        full_length: None,
         interlaced: facts.interlaced,
         layout: facts.layout.clone(),
     }
@@ -330,10 +331,12 @@ pub fn fed_info(probed: Option<StreamInfo>, facts: &Facts, plan: &Plan) -> Strea
     info
 }
 
-/// [`fed_info`] with the target duration the launch pinned.
-pub fn pinned(mut info: StreamInfo, target_s: u32) -> StreamInfo {
+/// [`fed_info`] with the target duration the launch pinned and, for a full-length item (§8.5),
+/// its playlist's segment count.
+pub fn pinned(mut info: StreamInfo, target_s: u32, full_length: Option<u64>) -> StreamInfo {
     if let Some(f) = info.cast.as_mut() {
         f.target_s = Some(target_s);
+        f.full_length = full_length;
     }
     info
 }
@@ -518,6 +521,11 @@ mod tests {
         let info = fed_info(Some(probed), &f, &p);
         assert_eq!((info.video_codec.as_deref(), info.container.as_deref()), (Some("h264 (High@4.0)"), Some("mpegts")));
         assert!(info.cast.as_ref().is_some_and(|c| c.probed));
-        assert_eq!(pinned(info, 6).cast.and_then(|c| c.target_s), Some(6));
+        let growing = pinned(info.clone(), 6, None).cast.unwrap();
+        assert_eq!((growing.target_s, growing.full_length), (Some(6), None));
+        // a full-length item (§8.5): the same feed, its map's target and segment count
+        let full = pinned(info, 7, Some(1084)).cast.unwrap();
+        assert_eq!((full.target_s, full.full_length), (Some(7), Some(1084)));
+        assert_eq!((full.level, full.picture, full.sound, full.probed), (growing.level, growing.picture, growing.sound, true));
     }
 }

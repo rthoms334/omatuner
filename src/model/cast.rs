@@ -222,6 +222,9 @@ pub struct CastFeed {
     pub fmp4: bool,
     /// The item's pinned `#EXT-X-TARGETDURATION` (§8.1.4), once its first segments are ready.
     pub target_s: Option<u32>,
+    /// A full-length item (§8.5): the TV has the whole VOD playlist, this many segments, each
+    /// made when the TV asks for it. `None`: a growing (EVENT) or live playlist.
+    pub full_length: Option<u64>,
     /// The source's scan type as planned on (`None`: unknown).
     pub interlaced: Option<bool>,
     /// The source sound's channel layout as ffprobe names it (`5.1(side)`); probe only.
