@@ -830,7 +830,8 @@ async fn an_xtream_playlist_upgrades_silently_keeping_user_data_and_can_switch_b
             use tuner::store::user;
             let list = user::default_fav_list(c)?;
             user::set_favourite(c, list, &b, true, 1)?;
-            user::set_favourite(c, list, &m, true, 2)?;
+            let lib = tuner::store::library::load(c)?;
+            tuner::store::watchlist::toggle_my_list(c, &lib, &m, 2)?;
             let progress = WatchProgress {
                 item: p,
                 position_s: 300.0,
@@ -863,6 +864,7 @@ async fn an_xtream_playlist_upgrades_silently_keeping_user_data_and_can_switch_b
         .unwrap();
     let user_data = || async {
         let mut v = h.strings("SELECT kind || ' ' || item_key FROM fav_item WHERE source_id = ?1 AND orphaned_since IS NULL", source).await;
+        v.extend(h.strings("SELECT kind || ' ' || item_key FROM watchlist_item WHERE source_id = ?1 AND orphaned_since IS NULL", source).await);
         v.sort();
         for sql in [
             "SELECT 'progress ' || kind || ' ' || item_key FROM watch_progress WHERE source_id = ?1 AND orphaned_since IS NULL",
@@ -1179,7 +1181,8 @@ async fn legacy_channels_of_a_kept_playlist_become_movies_and_series_with_their_
     let mut expected = vec![keys[2].clone(), keys[3].clone(), keys[4].clone()];
     expected.sort();
     assert_eq!(episodes, expected);
-    assert_eq!(h.strings("SELECT kind || ' ' || item_key FROM fav_item WHERE source_id = ?1", source).await, [format!("movie {}", keys[1])]);
+    assert!(h.strings("SELECT item_key FROM fav_item WHERE source_id = ?1", source).await.is_empty());
+    assert_eq!(h.strings("SELECT kind || ' ' || item_key FROM watchlist_item WHERE source_id = ?1", source).await, [format!("movie {}", keys[1])]);
     assert_eq!(
         h.strings("SELECT kind || ' ' || item_key FROM item_override WHERE source_id = ?1 AND locked = 1", source).await,
         [format!("movie {}", keys[1])]

@@ -48,6 +48,10 @@ row_id!(/// `reminder.id`
     ReminderId);
 row_id!(/// `queue_item.id` (Up next, DESIGN §32; batch base).
     QueueId);
+row_id!(/// `watchlist.id` (DESIGN §42).
+    WatchlistId);
+row_id!(/// `watchlist_item.id` (DESIGN §42).
+    WatchlistItemId);
 row_id!(/// `follow_rule.id` (Following, DESIGN §33; batch base).
     FollowRuleId);
 row_id!(/// `spoiler_rule.id` (spoiler guard, DESIGN §34; batch base).

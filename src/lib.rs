@@ -56,6 +56,7 @@ pub mod textmatch;
 
 // Tuner's own updates (DESIGN §41)
 pub mod update;
+pub mod watchlist;
 
 /// Application id: binary name, Wayland `app_id` (= Hyprland `class`), MPRIS bus suffix,
 /// `.desktop` basename, XDG directory name.

@@ -33,7 +33,7 @@ pub fn undo(services: &crate::services::Services, n: u16) -> bool {
 
 /// Run a combined write on the store writer; when it succeeds, toast `text` with an Undo
 /// button for the rows it found.
-fn write_with_undo(
+pub(crate) fn write_with_undo(
     ctx: &crate::ui::UiCtx<'_>,
     scope: DataScope,
     text: String,
@@ -84,6 +84,7 @@ pub fn play_title(ctx: &mut UiCtx<'_>, movies: bool, item: u32, pick: Option<u32
                     copy: Some(Box::new(copy)),
                     queue: None,
                     cast: None,
+                    watchlist: None,
                 };
                 ctx.open(OverlayRequest::Resume(spec));
             }
@@ -157,6 +158,7 @@ pub fn play_episode(ctx: &mut UiCtx<'_>, plan: &CopyPlan, series: SeriesId, ep: 
                 copy: Some(Box::new(copy)),
                 queue: None,
                 cast: None,
+                watchlist: None,
             };
             ctx.open(OverlayRequest::Resume(spec));
         }
@@ -346,6 +348,12 @@ pub fn toggle_favourite(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan) {
 /// [`toggle_favourite`] where `plays` is the copy that would play (a detail page's picked
 /// copy) instead of the plan's first.
 pub fn toggle_favourite_of(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, plays: Option<u32>) {
+    if let Some(item) = plays.or(plan.first()).and_then(|i| plan.get(i)).map(|c| c.item_ref.clone())
+        && item.kind != ItemKind::Channel
+    {
+        crate::ui::watchlists::toggle_my_list_of(ctx, &item, &plan.refs());
+        return;
+    }
     let Some(list) = ctx.favs.default_list() else {
         ctx.toast(Toast::error("The Favourites list is missing"));
         return;

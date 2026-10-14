@@ -10,7 +10,7 @@
 use serde_json::{Value, json};
 
 use super::actions::{ToolAction, action_schema};
-use super::params::{FollowAction, GuideFixAction, MultiViewAction, QueueAction, RemindersAction, SleepAction, SpoilerAction};
+use super::params::{FollowAction, GuideFixAction, MultiViewAction, QueueAction, RemindersAction, SleepAction, SpoilerAction, WatchlistAction};
 use super::tools::{TIME, ToolDef, kind_enum, limit, object, open_in, reveal, spoiler_safe, text};
 
 fn strings(description: &str) -> Value {
@@ -55,6 +55,57 @@ than 3 items, clear and play need the user's confirmation first.",
             read_only: read_only::<QueueAction>(),
             launches: true,
             example: json!({ "action": "add", "refs": ["movie:3:xt:vod:812"], "at": "end" }),
+            mixed: true,
+        },
+        ToolDef {
+            name: "watchlist",
+            title: "Watchlists",
+            description: "Named, lasting lists of films, series, season ranges and episodes. lists, show and next read progress across \
+all copies; next explains missing or locked entries it passes over. play starts the chosen id or next entry, resumes progress, then \
+carries on through the list after Up next's own rows (call status first); just_one plays only that entry. stop ends the list after \
+the current item. create / add take at most 50 refs and placeholders together; unavailable titles stay as placeholders. Lists are \
+ordered (In order) or any (Any order); any picks an unfinished item, preferring part-watched ones. Never play or add locked entries: \
+they need the PIN in Tuner. Ambiguous list names return ambiguous names; ask which. Creating, adding more than 3, removing, deleting, \
+restarting and reordering need the user's yes. Never reorder without asking. My list cannot be renamed or deleted. \
+Favourites are for channels; save films and series here. No plot text is returned.",
+            input_schema: object(
+                json!({
+                    "action": action_schema::<WatchlistAction>("What to do."),
+                    "list": { "oneOf": [{"type": "string", "maxLength": 200}, {"type": "integer"}], "description": "List name or id; names match fuzzily, ambiguous matches are returned." },
+                    "include_done": { "type": "boolean", "default": false },
+                    "id": { "type": "integer", "description": "play: an entry from show or next; omitted picks next." },
+                    "just_one": { "type": "boolean", "default": false },
+                    "open_in": open_in("play: where it plays, as for play."),
+                    "name": text("create / rename: list name."),
+                    "note": text("create / rename: a short note such as story order (label your own knowledge)."),
+                    "play_order": { "type": "string", "enum": ["ordered", "any"], "default": "ordered" },
+                    "refs": strings("create / add: film, series or episode refs (≤ 50 including placeholders)."),
+                    "placeholders": { "type": "array", "maxItems": 50, "items": { "oneOf": [
+                        object(json!({
+                            "title": text("Missing film or series title."), "year": {"type": "integer", "minimum": 0, "maximum": 65535},
+                            "kind": {"type": "string", "enum": ["movie", "series"]},
+                            "tmdb_id": {"type": "integer", "minimum": 1}
+                        }), &["title", "kind"]),
+                        object(json!({
+                            "kind": {"type": "string", "enum": ["episode"]},
+                            "series_title": text("Parent series title; matched by TMDB id first, else folded title and series year."),
+                            "year": {"type": "integer", "minimum": 0, "maximum": 65535, "description": "Parent series premiere year."},
+                            "tmdb_id": {"type": "integer", "minimum": 1, "description": "Parent series TMDB id."},
+                            "season": {"type": "integer", "minimum": 0},
+                            "episode": {"type": "integer", "minimum": 0}
+                        }), &["kind", "series_title", "year", "season", "episode"])
+                    ] } },
+                    "at": {"oneOf": [{"type": "string"}, {"type": "integer", "minimum": 0}], "description": "add: end (default), next (after the next entry), or a zero-based position."},
+                    "seasons": object(json!({"from": {"type": "integer", "minimum": 0}, "to": {"type": "integer", "minimum": 0}}), &["from", "to"]),
+                    "ids": ids("move / remove / skip: entry ids from show."),
+                    "to": {"oneOf": [{"type": "string"}, {"type": "integer", "minimum": 0}], "description": "move: end, next or a zero-based position."},
+                    "skipped": {"type": "boolean", "description": "skip: true skips, false clears skips; omitted toggles each entry."},
+                }),
+                &["action"],
+            ),
+            read_only: read_only::<WatchlistAction>(),
+            launches: true,
+            example: json!({ "action": "next", "list": "Star Wars" }),
             mixed: true,
         },
         ToolDef {
@@ -284,7 +335,7 @@ copies; narrow with season or query. spoiler_safe=true drops plots; the spoiler 
         ToolDef {
             name: "favourites_edit",
             title: "Edit favourites",
-            description: "Add refs to or remove them from a favourites list (by name), or create a list. Confirm with the user first; \
+            description: "Add channel refs to or remove them from a favourites list (by name), or create a channel list. Films and series return use_watchlist: use watchlist instead. Confirm with the user first; \
 locked items are never added. The user can undo it in Tuner.",
             input_schema: object(
                 json!({

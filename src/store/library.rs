@@ -539,6 +539,8 @@ pub struct FavIndex {
     pub lists: Vec<FavouriteList>,
     items: HashMap<FavListId, Vec<ItemRef>>,
     membership: HashMap<ItemRef, Vec<FavListId>>,
+    /// My list is the VOD save mark; favourites lists themselves contain channels only.
+    my_list: HashSet<ItemRef>,
 }
 
 impl FavIndex {
@@ -562,8 +564,23 @@ impl FavIndex {
     }
     /// Member of the default list (what Ctrl+F toggles and the ★ glyph shows).
     pub fn is_fav(&self, item: &ItemRef) -> bool {
+        if item.kind != ItemKind::Channel {
+            return self.my_list.contains(item);
+        }
         self.default_list().is_some_and(|d| self.lists_of(item).contains(&d))
     }
+    pub fn my_list_items(&self) -> impl Iterator<Item = &ItemRef> {
+        self.my_list.iter()
+    }
+
+    pub fn apply_my_list(&mut self, item: &ItemRef, on: bool) {
+        if on {
+            self.my_list.insert(item.clone());
+        } else {
+            self.my_list.remove(item);
+        }
+    }
+
     pub fn default_list(&self) -> Option<FavListId> {
         self.lists.iter().find(|l| l.is_default).map(|l| l.id)
     }
@@ -1362,7 +1379,7 @@ impl LanguageRule {
         let mut protected: HashMap<(SourceId, ItemKind), HashSet<String>> = HashMap::new();
         if !keep.is_empty() {
             let mut stmt = conn.prepare_cached(
-                "SELECT source_id, kind, item_key FROM fav_item WHERE kind IN ('movie', 'series')
+                "SELECT source_id, kind, item_key FROM watchlist_item WHERE source_id IS NOT NULL AND kind IN ('movie', 'series')
                  UNION SELECT source_id, kind, item_key FROM watch_progress WHERE kind IN ('movie', 'series')
                  UNION SELECT e.source_id, 'series', x.key FROM watch_progress w
                        JOIN episode e ON e.source_id = w.source_id AND e.key = w.item_key JOIN series x ON x.id = e.series_id
@@ -1743,7 +1760,14 @@ pub fn load_favs(conn: &Connection) -> Result<FavIndex> {
     let mut stmt =
         conn.prepare_cached(&format!("SELECT {} FROM fav_item ORDER BY list_id, position, added_at", crate::store::user::FAV_ITEM_COLS))?;
     let entries = stmt.query_map([], crate::store::user::fav_entry_from_row)?.collect::<rusqlite::Result<Vec<FavouriteEntry>>>()?;
-    Ok(FavIndex::from_parts(lists, entries))
+    let mut favs = FavIndex::from_parts(lists, entries);
+    let mut stmt = conn.prepare_cached("SELECT w.source_id,w.kind,w.item_key FROM watchlist_item w JOIN watchlist l ON l.id=w.list_id WHERE l.is_default=1 AND w.source_id IS NOT NULL AND w.orphaned_since IS NULL")?;
+    favs.my_list = stmt
+        .query_map([], |r| {
+            Ok(ItemRef { source: r.get(0)?, kind: crate::store::sql::kind_from_sql(&r.get::<_, String>(1)?)?, key: ItemKey(r.get(2)?) })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(favs)
 }
 
 #[cfg(test)]

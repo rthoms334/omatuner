@@ -345,6 +345,7 @@ mod tests {
             copy: None,
             queue: None,
             cast: None,
+            watchlist: None,
         };
         t.with_ctx(|ctx| {
             ctx.cast_with(dest.clone(), |ctx| {

@@ -21,7 +21,7 @@ Use these tools to find something to watch and start it in Tuner instead of the 
 airing=upcoming → tell the user when it starts and offer a reminder (reminders add with mode switch, or schedule_switch: Tuner \
 then switches to it by itself at the start, showing a toast with Cancel 10 seconds before). airing=past with catchup=true → play replays it from the archive.\n\
 * \"what's on <channel> at 9\" → whats_on with channel and at.\n\
-* play (and queue play) open in Tuner's window when it is on screen, else in the pop-out, pinned on every workspace; when the user wants \
+* play, queue play and watchlist play open in Tuner's window when it is on screen, else in the pop-out, pinned on every workspace; when the user wants \
 full screen, the big screen or (with no TV in cast_devices) the TV: open_in full_window (control window moves what already plays there). Tell the user where it \
 opened (opened_in).\n\
 * A mood (\"something light under 2 hours\") → categories, then browse with a fitting category, max_minutes, unwatched=true, \
@@ -30,6 +30,10 @@ sort=random; details for a plot; pick one and play it. continue_watching for \"c
 \"hidden by your spoiler guard\" rather than guessing, and pass reveal_spoilers only for what the user asks to see in that turn.\n\
 * Writes need the user's yes first: more than 3 reminders or queue items, any switch, favourites edits, locks, follow rules, guide \
 fixes. Everything scheduled can be listed and cancelled.\n\
+* Watchlists hold films, series, season ranges and missing-title placeholders; favourites are channels only. \
+watchlist next before watchlist play lets you name what is next and where it resumes; play carries on through the list, \
+just_one stops after it. Ask before creating, adding more than 3, removing, deleting, restarting or reordering a list. \
+Never reorder without asking; label story or release order as your own knowledge. Locked entries are never added or played through watchlist.\n\
 * Refs are opaque strings from tool results: pass them back unchanged, never build them.\n\
 * Starting a cast on a TV needs the user's yes: naming the TV is the yes, and so is asking for \"the TV\" when exactly one TV in \
 cast_devices is paired (cast to it, no question); with two or more paired, ask which. Unpaired TVs don't count. cast_devices lists \
@@ -289,7 +293,7 @@ random = a fresh sample each call). total counts every match.",
         ToolDef {
             name: "favourites",
             title: "Favourites",
-            description: "The user's favourites lists and their channels, movies and series.",
+            description: "The user's channel favourites lists. Films and series use the watchlist tool; asking for those kinds returns use_watchlist.",
             input_schema: object(json!({ "kind": kind_enum(), "list": text("Favourites list name."), "limit": limit(100, 50) }), &[]),
             read_only: true,
             launches: true,
@@ -439,6 +443,9 @@ mod tests {
 
     /// A value that fits `schema` (the required properties of an object).
     fn sample(schema: &Value) -> Value {
+        if let Some(branch) = schema["oneOf"].as_array().and_then(|branches| branches.first()) {
+            return sample(branch);
+        }
         match schema["type"].as_str() {
             Some("boolean") => json!(true),
             Some("integer") => json!(schema["minimum"].as_i64().unwrap_or(1).max(1)),
@@ -473,6 +480,19 @@ mod tests {
                 if let Err(e) = Call::from_tool(t.name, Value::Object(args)) {
                     panic!("{}.{name}: {e}", t.name);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn watchlist_placeholder_schemas_accept_movie_series_and_episode_shapes() {
+        let t = tool("watchlist").unwrap();
+        let branches = t.input_schema["properties"]["placeholders"]["items"]["oneOf"].as_array().unwrap();
+        for branch in branches {
+            for kind in branch["properties"]["kind"]["enum"].as_array().unwrap() {
+                let mut placeholder = sample(branch);
+                placeholder["kind"] = kind.clone();
+                assert!(Call::from_tool("watchlist", json!({"action": "add", "list": 1, "placeholders": [placeholder]})).is_ok());
             }
         }
     }

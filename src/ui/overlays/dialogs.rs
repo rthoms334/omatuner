@@ -640,6 +640,13 @@ fn save_rename(store: &Store, target: &RenameTarget, name: String) -> Ticket<()>
             let icon = user::fav_lists(c)?.into_iter().find(|l| l.id == id).map(|l| l.icon).unwrap_or_else(|| glyphs::FAV_LIST.into());
             user::rename_fav_list(c, id, &name, &icon)
         }),
+        RenameTarget::Watchlist(id) => w.submit_notify(DataScope::Watchlists, move |c| {
+            let note = crate::store::watchlist::list(c, id)?.and_then(|l| l.note);
+            crate::store::watchlist::rename(c, id, &name, note.as_deref())
+        }),
+        RenameTarget::DuplicateWatchlist(id) => {
+            w.submit_notify(DataScope::Watchlists, move |c| crate::store::watchlist::duplicate(c, id, &name, crate::model::now()).map(|_| ()))
+        }
         RenameTarget::Source(id) => w.submit_notify(DataScope::Sources, move |c| {
             let mut s = sources::get_source(c, id)?;
             s.name = name;
@@ -671,7 +678,12 @@ impl RenameOverlay {
             return OverlayOutcome::Keep;
         }
         let name = self.text.trim().to_owned();
-        if name.is_empty() && matches!(self.spec.target, RenameTarget::FavList(_) | RenameTarget::Source(_)) {
+        if name.is_empty()
+            && matches!(
+                self.spec.target,
+                RenameTarget::FavList(_) | RenameTarget::Source(_) | RenameTarget::Watchlist(_) | RenameTarget::DuplicateWatchlist(_)
+            )
+        {
             self.error = Some("The name can't be empty".into());
             return OverlayOutcome::Keep;
         }

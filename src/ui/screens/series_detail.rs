@@ -570,6 +570,17 @@ impl Screen for SeriesDetailScreen {
                     self.mark(ctx, vec![e], on);
                 }
             }
+            Action::ToggleFavourite if self.section == Section::Episodes => {
+                if let Some(e) = self.focused_episode() {
+                    kit::toggle_favourite(ctx, &ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key });
+                }
+            }
+            Action::AddToList if self.section == Section::Episodes => {
+                if let Some(e) = self.focused_episode() {
+                    let title = format!("S{}E{}", e.season, e.episode);
+                    kit::list_picker(ctx, &ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key }, &title);
+                }
+            }
             Action::ToggleFavourite => self.press(ctx, Btn::Favourite),
             // a combined series: lock, hide and rename cover every copy, with Undo
             Action::ToggleLock | Action::Rename | Action::ToggleHidden if self.copies.combined() => {
@@ -619,8 +630,8 @@ impl Screen for SeriesDetailScreen {
                     mi(glyphs::CHECK, "Mark season watched", Action::Digit(MENU_SEASON_WATCHED), None),
                     mi(glyphs::CLOSE, "Mark season unwatched", Action::Digit(MENU_SEASON_UNWATCHED), None),
                     episode,
-                    mi(glyphs::FAVOURITE, "Add to / remove from Favourites", Action::ToggleFavourite, Some("Ctrl+F")),
-                    mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, Some("Ctrl+Shift+F")),
+                    mi(glyphs::FAVOURITE, "Save to / remove from My list", Action::ToggleFavourite, Some("Ctrl+F")),
+                    mi(glyphs::FAV_LIST, "Watchlists…", Action::AddToList, Some("Ctrl+Shift+F")),
                     mi(glyphs::TAG, if every { "Rename every copy…" } else { "Rename…" }, Action::Rename, Some("F2")),
                     mi(glyphs::LOCK, if every { "Lock / unlock every copy" } else { "Lock / unlock" }, Action::ToggleLock, Some("Ctrl+L")),
                     mi(glyphs::HIDDEN, if every { "Hide every copy" } else { "Hide" }, Action::ToggleHidden, Some("Ctrl+H")),
@@ -839,7 +850,7 @@ impl Screen for SeriesDetailScreen {
                             Btn::PlayFrom => (glyphs::PLAYLIST, "Play from ▾".into(), false, false),
                             Btn::Favourite => (
                                 if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF },
-                                if fav { "Favourite".into() } else { "Add to Favourites".into() },
+                                if fav { "My list".into() } else { "Save to My list".into() },
                                 false,
                                 fav,
                             ),
@@ -863,6 +874,14 @@ impl Screen for SeriesDetailScreen {
                         }
                     }
                 });
+                if let Some(item) = self.series_ref() {
+                    if button(ui, ctx.theme, Some(glyphs::ADD), "Watchlist ▾", ButtonStyle { bordered: true, ..Default::default() }).clicked() {
+                        kit::list_picker(ctx, &item, s.display_name());
+                    }
+                    if let Some(line) = crate::ui::watchlists::membership_line(ctx, &item) {
+                        ui.label(line);
+                    }
+                }
             });
             if let Some((done, n)) = fetching {
                 // a combined ✓ waits for the other copies' episodes (P3)
@@ -905,6 +924,21 @@ impl Screen for SeriesDetailScreen {
                     );
                 }
                 return;
+            }
+            if self.section == Section::Episodes
+                && let Some(e) = self.focused_episode()
+            {
+                let item = episode_ref(&e);
+                let label = format!("S{}E{}", e.season, e.episode);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&label);
+                    if button(ui, ctx.theme, Some(glyphs::ADD), "Watchlist ▾", ButtonStyle::default()).clicked() {
+                        kit::list_picker(ctx, &item, &label);
+                    }
+                    if let Some(line) = crate::ui::watchlists::membership_line(ctx, &item) {
+                        ui.label(line);
+                    }
+                });
             }
             // season tabs
             ui.horizontal_wrapped(|ui| {
@@ -1378,5 +1412,23 @@ mod tests {
         assert_eq!(episode_label(&ep(7, 1, 3)), "S01E03 · Episode 3");
         // a playlist episode without a title (DESIGN §27.7)
         assert_eq!(episode_label(&Episode { title: String::new(), ..ep(8, 2, 4) }), "S02E04 · Episode 4");
+    }
+    #[test]
+    fn ctrl_shift_f_on_series_opens_the_season_range_picker() {
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            Ok(testkit::series(c, src, 1, 3, 2)?[0])
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "series page", |h| h.state().s.data.is_some());
+        h.state_mut().act(Action::FocusNext);
+        assert_eq!(h.state().s.section, Section::Buttons);
+        h.state_mut().act(Action::AddToList);
+        let nav = h.state_mut().nav();
+        assert!(
+            matches!(nav.last(),Some(NavRequest::Open(OverlayRequest::WatchlistPicker(spec))) if spec.items.len()==1 && spec.items[0].kind==ItemKind::Series && spec.edit.is_none())
+        );
     }
 }

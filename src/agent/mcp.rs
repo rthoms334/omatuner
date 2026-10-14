@@ -348,6 +348,7 @@ fn launch_for(tool: &tools::ToolDef, call: &Call, hyprland: bool, setting: impl 
         Call::Play(p) if p.device.is_some() => return Launch::Window,
         Call::Play(p) => p.open_in.as_deref(),
         Call::Queue(q) if matches!(q.action, QueueAction::Play | QueueAction::Skip) => q.open_in.as_deref(),
+        Call::Watchlist(p) if p.action == super::params::WatchlistAction::Play => p.open_in.as_deref(),
         _ => return Launch::Window,
     };
     // a bad open_in is refused by Tuner anyway
@@ -428,6 +429,8 @@ mod tests {
         assert_eq!(launch("queue", json!({ "action": "play" }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("queue", json!({ "action": "play", "open_in": "popout" }), true, OpenIn::PopOut), Launch::PopOut);
         assert_eq!(launch("queue", json!({ "action": "add", "refs": ["movie:2:xt:vod:1"] }), true, OpenIn::PopOut), Launch::Window);
+        assert_eq!(launch("watchlist", json!({ "action": "play", "list": "My list", "open_in": "popout" }), true, OpenIn::PopOut), Launch::PopOut);
+        assert_eq!(launch("watchlist", json!({ "action": "next", "list": "My list" }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("search", json!({ "query": "dune" }), true, OpenIn::PopOut), Launch::Window);
         assert_eq!(launch("status", json!({}), true, OpenIn::PopOut), Launch::No);
         // a cast never starts the pop-out, whatever is asked or set

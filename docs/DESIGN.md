@@ -2380,6 +2380,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Alt+4` | Movies |
 | `Alt+5` | Series |
 | `Alt+6` | Up next |
+| `Alt+7` | Watchlists |
 | `Ctrl+Comma` / `Alt+0` | Settings |
 | `Alt+←` | Back |
 | `F11` | Toggle window fullscreen |
@@ -2397,6 +2398,16 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Alt+T` | Play on… (this computer or a TV) |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous playlist (Movies, Series, Live TV, guide) |
 
+#### Watchlists (`Watchlists`)
+
+| Keys | Action |
+|---|---|
+| `→` | Open entries / move right |
+| `Ctrl+Shift+Enter` | Play just this one |
+| `s` | Skip in this list / unskip |
+| `o` | In order / Any order |
+| `+` | New list… |
+
 #### Lists (`List`)
 
 | Keys | Action |
@@ -2413,8 +2424,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `?` | Keyboard help |
 | `Space` / `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+O` | Play from another playlist (Also on)… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -2449,8 +2460,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+O` | Play from another playlist (Also on)… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -2502,8 +2513,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `?` | Keyboard help |
 | `Space` | Show each copy / fold them (stack card) |
 | `Ctrl+O` | Play from another copy… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -2535,8 +2546,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+O` | Play from another copy… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -2570,8 +2581,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `?` | Keyboard help |
 | `Ctrl+O` | Play from another copy… |
 | `C` / `Alt+C` | Cast to a TV… |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -2612,7 +2623,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+Shift+F` | Favourites lists… |
 | `Ctrl+E` | Assign guide channel |
 | `Ctrl+I` | Edit channel information |
 | `F2` | Rename channel |
@@ -2656,7 +2667,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
-| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
 | `?` | Keyboard help |
@@ -2693,7 +2705,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `u` | Up next |
 | `n` / `N` | Next / previous in Up next |
 | `Ctrl+M` | Watch alongside… (choose the channel) |
-| `Ctrl+F` | Add to / remove from Favourites |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Esc` | Back (hide banner, then leave; keeps playing in the mini player) |
 | `/` | Search everything |
 | `?` | Keyboard help |
@@ -2761,8 +2774,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` | Clear |
 | `Esc` | Clear, then close |
-| `Ctrl+F` | Add to / remove from Favourites |
-| `Ctrl+Shift+F` | Favourites lists… (add, new list) |
+| `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
+| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
 | `F2` | Rename |
 | `Ctrl+L` | Lock with PIN / unlock |
@@ -5400,7 +5413,7 @@ variant, timing, firewall state, last error kind). Placement: a `play` with `dev
 window placement entirely (`opened_in: "device"`); a popped-out window is put back in, unraised.
 The bridge never retries a `device` play without the field on an older Tuner (it answers "The
 running Tuner can't cast; update Tuner"). Casting calls are actions (the 2/s bucket). No tool
-changes the firewall. There are 29 tools with `cast_devices`. Whether a cast needs a question is the
+changes the firewall. There are 30 tools with `cast_devices` and `watchlist` (§42). Whether a cast needs a question is the
 agent's protocol (the MCP instructions, `RULES.md` section 12, the tool descriptions), not the
 server's: naming the TV is the user's yes, and so is "on the TV" when exactly one TV is `paired`;
 with two or more paired TVs the agent asks which; unpaired TVs (only discovered) don't count;
@@ -6200,12 +6213,12 @@ Verified against Hyprland's source and docs only; the real-desktop check is in
 Build notes: `docs/design/agent.md`. Extends §30.
 
 ### 37.1 Tools
-29 tools (28 before casting added `cast_devices`, §30.5): the 13 of §30.5 (extended: `guide_search` without a query over a window and
+30 tools (casting adds `cast_devices`, §30.5; Watchlists adds `watchlist`, §42): the 13 of §30.5 (extended: `guide_search` without a query over a window and
 categories, `whats_on` filters, `details.copies`, `search.explain_filtered`, `status.queue /
 multiview / streams / sleep_timer`, `control.previous_channel / popout / tile`), plus
 `match_titles`, `history`, `episodes`, `favourites_edit`, `parental_status`, `lock`,
 `diagnose`, `sources`, `reminders`, `sleep_timer`, `queue`, `follow`, `spoiler_guard`,
-`guide_fix`, `multiview`. A tool whose feature's kill switch is off answers `unavailable`.
+`guide_fix`, `multiview`, `watchlist`. A tool whose feature's kill switch is off answers `unavailable`.
 Every read reply passes the spoiler guard (`spoiler_safe` strips harder; `reveal_spoilers`
 names what may show).
 
@@ -6774,3 +6787,54 @@ The real update (password, rule, restart, refusals) is `docs/MANUAL_CHECKLIST.md
   `base`); without it `install` fails (exit 4, systemd-run's message). An install already in
   its service when Tuner quits or gives up waiting finishes; the next one meanwhile is busy.
 * The download stops past 256 MiB whatever size GitHub lists for the package.
+
+## 42. Watchlists
+
+Design: `docs/design/watchlists-design.md`; its §11 records the approved decisions.
+
+### 42.1 Lists and saved titles
+Named, persistent lists of films, series, season ranges and episodes. In order follows the
+first unfinished entry; Any order chooses an unwatched entry, preferring unfinished progress.
+Done is derived across title copies, including watches outside a list. Start again changes
+only the list's progress boundary and clears its skips. Placeholders keep missing titles in
+place and attach when an import supplies their identity.
+
+Alt+7 opens Watchlists; the sidebar entry is always present. Ctrl+F saves a film, series or
+episode to My list; Ctrl+Shift+F opens Watchlists… with season ranges and insertion position.
+Only My list puts a star on posters. Home's Your watchlists rail follows Continue watching;
+detail pages show list membership. Favourites and their Settings page now hold channels only.
+In the lists pane, Enter, → and a click select the list and open its entries; Play remains in
+its menu, header and Home tile. A ticked list toggles off a single title or the exact series
+range with Undo. Batch additions skip duplicates and report “N already there”. Save Up next
+keeps pending film/series/episode rows and reports live or unavailable rows left out.
+
+### 42.2 Playing through Up next
+`QueueCommand::PlayList` sets `QueueMachine.context` and adds one entry. When the queue's
+pending rows run out, the engine derives the list's next entry afresh and counts down to it.
+Rows added with Ctrl+N play first. Chips identify list entries; Then from … previews the list
+without creating queue rows. The PIN, copies, resume, playback placement and media keys use
+Up next's existing paths. A foreign play steps aside and retains the context; a restart never
+auto-plays. Stop the list, just one, the sleep timer's end-of-queue and three failures end the
+context; exhausting it shows That was … ✓. Ending the context discards only its automatic
+pending rows, preserving Ctrl+N additions. Timed sleep stops and cancelling an unrelated
+next-episode countdown retain the context. An ended movie or episode is excluded for the
+rest of that run even if it did not reach watched_pct or has no duration; watched state is
+unchanged. Series details load through jobs; an unavailable series is passed over and named
+once for the run. A countdown's row is pre-resolved when it starts: reordering during it
+changes the following pick. In order missing/agent-locked notices occur once per run; Any
+order does not report entries merely preceding its random pick.
+
+### 42.3 Storage and agents
+Migration 0015 creates `watchlist` and `watchlist_item`, links queue rows to entries and moves
+saved films and series out of favourites in one transaction. Only upgrades from v14 with
+film/series favourites make one small `before-watchlists.json` user-data export, without
+credentials or catalogue rows. Backup failure is logged and does not block the transaction.
+Fresh installs and restores do not make that backup. Legacy restores merge same-name lists,
+skip duplicate titles, and repair fallback identities when the catalogue attaches them.
+The next launch explains the move once; OK, Open Watchlists or Esc acknowledges the card. Fingerprints, HOLDERS, import matching and backups
+preserve lists across refreshes, re-keyed copies and playlist deletion.
+
+The `watchlist` MCP tool reads and edits lists and starts or stops their playback;
+`status.watchlist` identifies the active list. Locked entries are never played or added over
+MCP, concealed entries are absent from all views and counts, and episode labels use the
+existing spoiler guard. Plugin skills and RULES.md describe watchlists and their confirmations.

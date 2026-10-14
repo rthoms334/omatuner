@@ -27,6 +27,8 @@ pub enum DataScope {
     /// A new EPG generation became active, or mappings changed → flush EPG caches.
     Epg,
     Favourites,
+    /// Watchlist rows, order, mode or membership changed (DESIGN §42).
+    Watchlists,
     Overrides,
     Progress,
     History,

@@ -424,7 +424,7 @@ impl VodBrowser {
             Cat::All if self.movies => "All movies",
             Cat::All => "All series",
             Cat::Continue => "Continue watching",
-            _ => "Favourites",
+            _ => "My list",
         }
     }
 
@@ -493,8 +493,7 @@ impl VodBrowser {
     /// the matches' keys are cloned).
     fn refresh_index(&mut self, ctx: &UiCtx<'_>) {
         let kind = if self.movies { ItemKind::Movie } else { ItemKind::Series };
-        let favs: Vec<&crate::model::ItemRef> =
-            ctx.favs.default_list().map(|l| ctx.favs.items(l).iter().filter(|r| r.kind == kind).collect()).unwrap_or_default();
+        let favs: Vec<&crate::model::ItemRef> = ctx.favs.my_list_items().filter(|r| r.kind == kind).collect();
         let fingerprint = {
             use std::hash::{Hash, Hasher};
             let mut h = std::hash::DefaultHasher::new();
@@ -561,11 +560,7 @@ impl VodBrowser {
             Cat::Continue => self.progress.order.iter().filter_map(|k| self.index.get(k).copied()).collect(),
             Cat::Favourites => {
                 let kind = if movies { ItemKind::Movie } else { ItemKind::Series };
-                let list = ctx.favs.default_list();
-                list.map(|l| {
-                    ctx.favs.items(l).iter().filter(|r| r.kind == kind).filter_map(|r| self.index.get(&(r.source, r.key.clone())).copied()).collect()
-                })
-                .unwrap_or_default()
+                ctx.favs.my_list_items().filter(|r| r.kind == kind).filter_map(|r| self.index.get(&(r.source, r.key.clone())).copied()).collect()
             }
         };
         // the virtual categories show the playlists in scope (a category is one playlist's);
@@ -841,14 +836,14 @@ impl VodBrowser {
         let fav =
             fav || (stack.is_some() && copies.iter().any(|c| self.all(ctx).get(*c as usize).is_some_and(|x| ctx.favs.is_fav(&st::item_ref(x)))));
         items.extend([
-            mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"),
-            mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"),
+            mi(glyphs::FAVOURITE, if fav { "Remove from My list" } else { "Save to My list" }, Action::ToggleFavourite, "Ctrl+F"),
+            mi(glyphs::FAV_LIST, "Watchlists…", Action::AddToList, "Ctrl+Shift+F"),
         ]);
         if matches!(v.kind, VodKind::Movie(_)) {
             items.push(mi(glyphs::CHECK, "Mark watched", Action::MarkWatched, "Ctrl+W"));
         }
         match self.open {
-            Cat::Favourites => items.push(mi(glyphs::CLOSE, "Remove from Favourites", Action::Remove, "Delete")),
+            Cat::Favourites => items.push(mi(glyphs::CLOSE, "Remove from My list", Action::Remove, "Delete")),
             Cat::Continue => items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, "Delete")),
             _ => {}
         }
@@ -858,12 +853,29 @@ impl VodBrowser {
             mi(glyphs::HIDDEN, "Hide", Action::ToggleHidden, "Ctrl+H"),
             mi(glyphs::SORT, "Sort & view options…", Action::SortMenu, "Ctrl+S"),
         ]);
+        if self.movies && !self.shown.is_empty() && self.shown.len() <= 50 {
+            items.push(MenuItem {
+                icon: glyphs::FAV_LIST,
+                label: format!("Add the {} shown to a watchlist, by year", self.shown.len()),
+                action: Action::Digit(242),
+                enabled: true,
+                shortcut: None,
+            });
+        }
         crate::ui::item_menu::extend(&mut items, &crate::ui::item_menu::Target::vod(v.kind), ctx, KeyContext::List);
         ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: v.name.to_string(), items }));
     }
 
     /// Item actions shared by the grid keys and the context menu.
     fn item_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        if action == Action::Digit(242) {
+            let mut shown: Vec<_> = self.shown.iter().filter_map(|i| self.all(ctx).get(*i as usize)).collect();
+            shown.sort_by_key(|v| v.year);
+            let refs = shown.into_iter().take(50).map(st::item_ref).collect();
+            crate::ui::watchlists::picker(ctx, refs, "Films shown, by year");
+            return true;
+        }
+
         self.pending_cat = None;
         // the batch features' keys and menu choices on the card (Ctrl+N…)
         if let Some(v) = self.current(ctx)
@@ -1224,6 +1236,9 @@ impl VodBrowser {
 
     pub(super) fn overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
         match result {
+            OverlayResult::Chosen(Action::Digit(242)) => {
+                self.item_action(ctx, Action::Digit(242));
+            }
             OverlayResult::Chosen(Action::Digit(d)) if (d as usize) < SORTS.len() => {
                 self.set_sort(ctx, SORTS[d as usize].0);
             }
@@ -1643,7 +1658,7 @@ impl VodBrowser {
             } else {
                 match self.open {
                     Cat::Continue => (glyphs::HISTORY, "Nothing to continue".to_owned(), Some("Titles you start watching show up here."), None),
-                    Cat::Favourites => (glyphs::FAVOURITE, "No favourites yet".to_owned(), Some("Press Ctrl+F on any title to add it here"), None),
+                    Cat::Favourites => (glyphs::FAVOURITE, "My list is empty".to_owned(), Some("Press Ctrl+F on any title to add it here"), None),
                     _ => (glyphs::FILMSTRIP, "This category is empty".to_owned(), None, None),
                 }
             };
@@ -1785,8 +1800,8 @@ mod tests {
             testkit::channels(c, free, 2)?;
             let list = crate::store::user::default_fav_list(c)?;
             let fav = |s: SourceId, i: usize| crate::model::ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{i:010}")) };
-            crate::store::user::set_favourite(c, list, &fav(a, 0), true, 1)?;
-            crate::store::user::set_favourite(c, list, &fav(b, 0), true, 2)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &fav(a, 0), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &fav(b, 0), true, 2)?;
             Ok((a, b, free))
         });
         let mut h = harness(t, one, MoviesScreen::default(), egui::vec2(1400.0, 900.0));
@@ -2093,8 +2108,7 @@ mod tests {
         assert_eq!(h.state().s.browser.progress_idx.get(&solo), Some(&0.1));
         // a favourite toggled without a library rebuild
         let app = h.state_mut();
-        let list = app.t.favs.default_list().unwrap();
-        app.t.favs.apply_toggle(list, &named(a, 2), true);
+        app.t.favs.apply_my_list(&named(a, 2), true);
         h.run_steps(1);
         assert_eq!(keys(&h), [format!("{}:m3u:named0002", a.0), format!("{}:m3u:named0001", b.0)]);
 
@@ -2132,8 +2146,8 @@ mod tests {
         let (a, b) = dune(&mut t);
         seed(&mut t, move |c| {
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &named(a, 1), true, 1)?;
-            crate::store::user::set_favourite(c, list, &named(b, 0), true, 2)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &named(a, 1), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &named(b, 0), true, 2)?;
             for (i, item) in [named(a, 0), named(b, 0)].into_iter().enumerate() {
                 let p = crate::model::WatchProgress {
                     item,
@@ -2155,23 +2169,23 @@ mod tests {
         h.state_mut().act(Action::Down);
         h.state_mut().act(Action::Down); // Favourites
         h.run_steps(1);
-        assert_eq!(shown_names(&h), ["Dune"], "two favourite copies, one card");
+        assert_eq!(shown_names(&h), ["Dune (FR)"], "My list retains the first saved copy of a title");
         h.state_mut().act(Action::FocusNext);
         h.state_mut().act(Action::ToggleFavourite);
         let fav = |h: &egui_kittest::Harness<'_, testkit::App<MoviesScreen>>, r: crate::model::ItemRef| h.state().t.favs.is_fav(&r);
         assert!(!fav(&h, named(a, 1)) && !fav(&h, named(b, 0)), "every copy left Favourites");
         let toast = h.state_mut().undo_toast().expect("an Undo toast");
-        assert_eq!(toast.text, "Removed from Favourites in Alpha and Bravo");
+        assert_eq!(toast.text, "Removed from My list");
         h.state_mut().act(toast.action.unwrap().1);
         until(&mut h, "Undo puts them back", |h| {
             let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
-            favs.is_fav(&named(a, 1)) && favs.is_fav(&named(b, 0))
+            favs.is_fav(&named(a, 1)) && !favs.is_fav(&named(b, 0))
         });
         let favs = crate::store::library::load_favs(&h.state().t.services().store.reader().unwrap()).unwrap();
         h.state_mut().t.favs = favs;
         // (the frames `until` stepped while the Undo was being written showed an empty
         // Favourites list: wait for the card to be back before acting on it)
-        until(&mut h, "the restored favourites listed", |h| shown_names(h) == ["Dune"]);
+        until(&mut h, "the restored saved title listed", |h| shown_names(h) == ["Dune (FR)"]);
         // Ctrl+F again: out again (no Undo taken); then on the stack in All, with no favourite
         // copy, Ctrl+F adds the copy that plays first — Bravo's, the one watched last
         h.state_mut().act(Action::ToggleFavourite);
@@ -2378,7 +2392,7 @@ mod tests {
         assert!(has_label(&h, "Nothing to continue"));
         h.state_mut().act(Action::Down); // Favourites
         h.run_steps(1);
-        assert!(has_label(&h, "No favourites yet"));
+        assert!(has_label(&h, "My list is empty"));
         h.state_mut().act(Action::Down); // the provider category
         h.state_mut().act(Action::Activate);
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PosterGrid], "Enter moves to the grid");

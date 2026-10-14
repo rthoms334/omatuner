@@ -37,6 +37,7 @@ pub mod setup;
 pub mod spoiler;
 pub mod tools;
 pub mod tools_batch;
+pub mod watchlist;
 
 use crate::model::{MediaRef, SeriesId};
 

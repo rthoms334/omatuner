@@ -30,7 +30,6 @@
 //! This file also hosts [`kit`]: helpers shared by the WP-12 screens and overlays (background
 //! reads, fullscreen playback with the right zap list, favourites, parental checks).
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -144,6 +143,10 @@ pub(crate) mod kit {
     /// Toggle membership in the default favourites list (Ctrl+F): written through the store,
     /// patched optimistically into the app-owned index.
     pub(crate) fn toggle_favourite(ctx: &mut UiCtx<'_>, item: &ItemRef) {
+        if item.kind != crate::model::ItemKind::Channel {
+            crate::ui::watchlists::toggle_my_list(ctx, item);
+            return;
+        }
         let Some(list) = ctx.favs.default_list() else {
             ctx.toast(Toast::error("The Favourites list is missing"));
             return;
@@ -296,6 +299,10 @@ pub(crate) mod kit {
 
     /// Ctrl+Shift+F: the favourites-list picker (the overlay writes the membership).
     pub(crate) fn list_picker(ctx: &mut UiCtx<'_>, item: &ItemRef, title: &str) {
+        if item.kind != crate::model::ItemKind::Channel {
+            crate::ui::watchlists::picker(ctx, vec![item.clone()], title);
+            return;
+        }
         ctx.open(OverlayRequest::ListPicker(ListPickerSpec { item: item.clone(), title: title.to_owned() }));
     }
 
@@ -446,11 +453,17 @@ enum Tile {
     Start(StartAction),
     /// Up next: carry on where it stopped, or start it (DESIGN §32).
     UpNext,
+    Watchlist {
+        id: crate::model::WatchlistId,
+        name: String,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RailKind {
     UpNext,
+    Watchlists,
     Continue,
     Favourites,
     Recent,
@@ -481,6 +494,7 @@ struct RailsKey {
     generation: u64,
     favs: u64,
     continue_gen: u64,
+    watchlists: u64,
     /// Copies of one title are one tile (`interface.same_title`).
     combine: bool,
     /// Up next's tile: (items to go, the row it resumes) while nothing plays.
@@ -500,12 +514,6 @@ pub struct HomeScreen {
     recent_built_at: Timestamp,
     recent_movies: Vec<VodSummary>,
     recent_series: Vec<VodSummary>,
-    /// (kind, source, key) → movie / series of the favourited titles (all lists), and the
-    /// (VOD lists, favourites fingerprint) they were resolved for: a zap's library copy shares
-    /// the lists and rescans nothing. Only favourites: a map of every title cloned every key
-    /// (~40 MiB for 380k titles).
-    vod_refs: HashMap<ItemRef, VodKind>,
-    vod_refs_for: Option<(crate::store::library::VodIdentity, u64)>,
     /// The rails the user sees (actions resolve against them).
     rails: Vec<Rail>,
     rails_key: Option<RailsKey>,
@@ -531,10 +539,12 @@ impl HomeScreen {
     /// Rebuild the rails when the library, the favourites or Continue watching changed.
     fn build_rails(&mut self, ctx: &mut UiCtx<'_>) {
         let combine = st::combine(ctx.config);
+        let watchlists = crate::ui::watchlists::snapshot(ctx);
         let key = RailsKey {
             generation: ctx.lib.generation,
             favs: favs_signature(ctx.favs),
             continue_gen: self.continue_gen,
+            watchlists: crate::ui::watchlists::revision(),
             combine,
             up_next: up_next_key(ctx),
         };
@@ -563,11 +573,6 @@ impl HomeScreen {
             self.recent_movies = take(true, &ctx.lib.vod.movies);
             self.recent_series = take(false, &ctx.lib.vod.series);
         }
-        let refs_for = (ctx.lib.vod_identity(), key.favs);
-        if self.vod_refs_for.as_ref() != Some(&refs_for) {
-            self.vod_refs_for = Some(refs_for);
-            self.vod_refs = favourite_vod(ctx.lib, ctx.favs);
-        }
         let mut rails = Vec::new();
         // Up next first while it has items to go and nothing plays (DESIGN §32)
         if key.up_next.is_some() {
@@ -594,8 +599,25 @@ impl HomeScreen {
         if !continues.is_empty() {
             rails.push(Rail { kind: RailKind::Continue, title: "Continue watching".into(), list: None, tiles: continues });
         }
+        let mut active: Vec<_> = watchlists.active().collect();
+        active.sort_by_key(|v| std::cmp::Reverse(v.list.last_played_at));
+        let tiles = active
+            .into_iter()
+            .map(|v| Tile::Watchlist {
+                id: v.list.id,
+                name: v.list.name.clone(),
+                detail: format!(
+                    "next: {} · {} of {}",
+                    v.next_entry().map(|e| crate::ui::watchlists::label(ctx, e)).unwrap_or_default(),
+                    v.next.and_then(|id| v.place(id)).map_or(0, |x| x.0),
+                    v.total
+                ),
+            })
+            .collect::<Vec<_>>();
+        if !tiles.is_empty() {
+            rails.push(Rail { kind: RailKind::Watchlists, title: "Your watchlists".into(), list: None, tiles });
+        }
         for list in ctx.favs.non_empty_lists() {
-            let mut seen = std::collections::HashSet::new();
             let tiles: Vec<Tile> = ctx
                 .favs
                 .items(list.id)
@@ -607,7 +629,7 @@ impl HomeScreen {
                         .by_ref(r)
                         .filter(|id| !ctx.lib.live.hidden.contains(id))
                         .map(|id| Tile::Channel { id, collection: Some(Collection::Favourites(list.id)) }),
-                    _ => self.vod_refs.get(r).copied().filter(|k| stack_key(*k).is_none_or(|s| seen.insert(s))).map(Tile::Vod),
+                    _ => None,
                 })
                 .take(RAIL_MAX)
                 .collect();
@@ -740,6 +762,7 @@ impl HomeScreen {
                 ctx.navigate(crate::ui::NavRequest::Switch(Route::Live { group: None, channel: None }));
             }
             Tile::UpNext => resume_up_next(ctx),
+            Tile::Watchlist { id, .. } => crate::ui::watchlists::play(ctx, id, None, false),
         }
     }
 
@@ -759,7 +782,7 @@ impl HomeScreen {
             Tile::Channel { id, .. } => ctx.lib.live.get(*id).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }),
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map(vod_ref),
             Tile::Continue(i) => self.continue_items.get(*i).map(|c| c.item.clone()),
-            Tile::Start(_) | Tile::UpNext => None,
+            Tile::Start(_) | Tile::UpNext | Tile::Watchlist { .. } => None,
         }
     }
 
@@ -770,7 +793,7 @@ impl HomeScreen {
             Tile::Channel { id, .. } => Target::Channel(*id),
             Tile::Vod(kind) => Target::vod(*kind),
             Tile::Continue(i) => Target::vod(self.continue_items.get(*i)?.card.kind),
-            Tile::Start(_) | Tile::UpNext => return None,
+            Tile::Start(_) | Tile::UpNext | Tile::Watchlist { .. } => return None,
         })
     }
 
@@ -781,6 +804,7 @@ impl HomeScreen {
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map(|v| v.name.to_string()),
             Tile::Continue(i) => self.continue_items.get(*i).map(|c| c.card.name.to_string()),
             Tile::UpNext => Some("Up next".to_owned()),
+            Tile::Watchlist { name, .. } => Some(name.clone()),
             Tile::Start(_) => None,
         }
         .unwrap_or_default()
@@ -794,7 +818,7 @@ impl HomeScreen {
             }
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map_or((false, false), |v| (v.locked, vod_group_locked(ctx, v))),
             Tile::Continue(i) => self.continue_items.get(*i).map_or((false, false), |c| (c.card.locked, vod_group_locked(ctx, &c.card))),
-            Tile::Start(_) | Tile::UpNext => (false, false),
+            Tile::Start(_) | Tile::UpNext | Tile::Watchlist { .. } => (false, false),
         }
     }
 
@@ -924,6 +948,10 @@ impl HomeScreen {
                     items.push(mi(glyphs::CHECK, "Mark watched", Action::MarkWatched, "Ctrl+W"));
                 }
             }
+            Tile::Watchlist { id, .. } => {
+                ctx.push(Route::Watchlists { list: Some(*id) });
+                return;
+            }
             Tile::UpNext => {
                 let items = vec![
                     mi(glyphs::PLAY, "Carry on with Up next", Action::Activate, "Enter"),
@@ -935,8 +963,19 @@ impl HomeScreen {
             Tile::Start(_) => return,
         }
         let fav = self.tile_item(ctx, tile).is_some_and(|i| ctx.favs.is_fav(&i));
-        items.push(mi(glyphs::FAVOURITE, if fav { "Remove from Favourites" } else { "Add to Favourites" }, Action::ToggleFavourite, "Ctrl+F"));
-        items.push(mi(glyphs::FAV_LIST, "Favourites lists…", Action::AddToList, "Ctrl+Shift+F"));
+        let channel = matches!(tile, Tile::Channel { .. });
+        items.push(mi(
+            glyphs::FAVOURITE,
+            match (channel, fav) {
+                (true, true) => "Remove from Favourites",
+                (true, false) => "Add to Favourites",
+                (false, true) => "Remove from My list",
+                (false, false) => "Save to My list",
+            },
+            Action::ToggleFavourite,
+            "Ctrl+F",
+        ));
+        items.push(mi(glyphs::FAV_LIST, if channel { "Favourites lists…" } else { "Watchlists…" }, Action::AddToList, "Ctrl+Shift+F"));
         match rail {
             Some((RailKind::Favourites, Some(_))) => {
                 items.push(mi(glyphs::CLOSE, "Remove from this list", Action::Remove, "Delete"));
@@ -964,29 +1003,6 @@ fn vod_group_locked(ctx: &UiCtx<'_>, v: &VodSummary) -> bool {
         VodKind::Series(_) => &ctx.lib.vod.series_groups,
     };
     kit::any_group_locked(groups, &v.group_ids)
-}
-
-/// The favourited movies and series (any list) of the library, by their refs (one pass over
-/// the titles; only the favourites' keys are cloned).
-fn favourite_vod(lib: &crate::store::library::Library, favs: &FavIndex) -> HashMap<ItemRef, VodKind> {
-    let wanted: std::collections::HashSet<(crate::model::SourceId, ItemKind, &str)> = favs
-        .lists
-        .iter()
-        .flat_map(|l| favs.items(l.id))
-        .filter(|r| matches!(r.kind, ItemKind::Movie | ItemKind::Series))
-        .map(|r| (r.source, r.kind, r.key.0.as_str()))
-        .collect();
-    if wanted.is_empty() {
-        return HashMap::new();
-    }
-    let kind_of = |v: &VodSummary| if matches!(v.kind, VodKind::Movie(_)) { ItemKind::Movie } else { ItemKind::Series };
-    lib.vod
-        .movies
-        .iter()
-        .chain(&lib.vod.series)
-        .filter(|v| wanted.contains(&(v.source_id, kind_of(v), v.key.0.as_str())))
-        .map(|v| (vod_ref(v), v.kind))
-        .collect()
 }
 
 /// The durable reference of a poster-grid row.
@@ -1065,6 +1081,9 @@ impl Screen for HomeScreen {
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
+        if matches!(ev, AppEvent::Data(_)) {
+            crate::ui::watchlists::invalidate();
+        }
         match ev {
             AppEvent::Data(DataScope::Progress | DataScope::History | DataScope::All | DataScope::Sources | DataScope::Vod) => {
                 self.reload_continue(ctx)
@@ -1330,6 +1349,29 @@ fn draw_tile(
             channel_tile(ui, ctx, *id, cursor, is_playing)
         }
         Tile::UpNext => up_next_tile(ui, ctx, cursor),
+        Tile::Watchlist { id, name, detail } => {
+            let q = crate::queue::ui::snapshot(ctx);
+            let title = if q.context == Some(*id) && !q.driving { format!("Resume {name}") } else { name.clone() };
+            let (rect, resp) = tile_frame(ui, theme, egui::vec2(340.0 * theme.rem(), 78.0 * theme.rem()), &format!("{title} · {detail}"), cursor);
+            let pad = theme.space(SpaceToken::Lg);
+            elided(
+                ui.painter(),
+                rect.left_top() + egui::vec2(pad, 24.0 * theme.rem()),
+                &title,
+                egui::FontId::proportional(theme.font(TypeToken::Title)),
+                theme.tokens.fg,
+                rect.width() - pad * 2.0,
+            );
+            elided(
+                ui.painter(),
+                rect.left_top() + egui::vec2(pad, 52.0 * theme.rem()),
+                detail,
+                egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
+                theme.tokens.text_secondary,
+                rect.width() - pad * 2.0,
+            );
+            resp
+        }
         Tile::Start(a) => {
             let (glyph, label) = match a {
                 StartAction::BrowseLive => (glyphs::LIVE_TV, "Browse Live TV"),
@@ -1584,6 +1626,10 @@ pub(crate) mod testkit {
         pub fn act(&mut self, a: Action) -> bool {
             // a toast's Undo is the app's, whatever screen shows (`ui::copies::undo`)
             if let Action::Undo(n) = a {
+                if crate::ui::watchlists::is_undo(n) {
+                    crate::ui::watchlists::undo(self.t.services(), n);
+                    return true;
+                }
                 return crate::ui::copies::undo(self.t.services(), n);
             }
             let s = &mut self.s;
@@ -1610,6 +1656,10 @@ pub(crate) mod testkit {
                     self.t.lib = lib.clone();
                     self.t.favs = lib.favs.clone();
                     self.t.search_index = None;
+                }
+                if matches!(ev, AppEvent::Data(crate::msg::DataScope::Favourites | crate::msg::DataScope::Watchlists)) {
+                    self.t.favs = crate::store::library::load_favs(&self.t.db).expect("reload saved items");
+                    crate::ui::watchlists::invalidate();
                 }
                 if let AppEvent::Toast(t) = &ev {
                     self.t.toasts.push(t.clone());
@@ -1740,6 +1790,28 @@ pub(crate) mod testkit {
             flat(&c.shape, &mut out);
         }
         out
+    }
+
+    /// Fixtures save VOD in My list and channels in Favourites, as the UI does.
+    pub(crate) fn save_favourite(
+        c: &Connection,
+        list: crate::model::FavListId,
+        item: &crate::model::ItemRef,
+        on: bool,
+        now: Timestamp,
+    ) -> Result<()> {
+        if item.kind == crate::model::ItemKind::Channel {
+            return crate::store::user::set_favourite(c, list, item, on, now);
+        }
+        let lib = crate::store::library::load(c)?;
+        let id = crate::store::watchlist::default_list(c)?;
+        if on {
+            let entry = crate::store::watchlist::new_entry(c, item)?;
+            crate::store::watchlist::add(c, &lib, id, &[entry], crate::watchlist::Insert::End, now)?;
+        } else if crate::store::watchlist::memberships(c, &lib, item)?.iter().any(|(l, _, _)| l.is_default) {
+            crate::store::watchlist::toggle_my_list(c, &lib, item, now)?;
+        }
+        Ok(())
     }
 
     /// Seed with `f` on the writer, then load the library into the rig.
@@ -2017,7 +2089,7 @@ mod tests {
             testkit::channels(c, s, 4)?;
             testkit::movies(c, s, 3)?;
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &channel_ref(s, 1), true, 1)
+            crate::ui::screens::home::testkit::save_favourite(c, list, &channel_ref(s, 1), true, 1)
         });
         let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::Home);
@@ -2045,7 +2117,7 @@ mod tests {
             let mv = testkit::movies(c, s, 5)?;
             let list = crate::store::user::default_fav_list(c)?;
             for i in [3usize, 5] {
-                crate::store::user::set_favourite(c, list, &channel_ref(s, i), true, 1)?;
+                crate::ui::screens::home::testkit::save_favourite(c, list, &channel_ref(s, i), true, 1)?;
             }
             Ok((ch, mv))
         });
@@ -2217,7 +2289,7 @@ mod tests {
             let s = testkit::source(c, "My IPTV")?;
             testkit::channels(c, s, 3)?;
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &channel_ref(s, 1), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &channel_ref(s, 1), true, 1)?;
             crate::store::user::set_item_override(c, &channel_ref(s, 1), &crate::model::ItemOverride { locked: true, ..Default::default() })
         });
         let mut cfg = (*t.config).clone();
@@ -2269,7 +2341,7 @@ mod tests {
                     fingerprint: Default::default(),
                 };
                 crate::store::user::save_progress(c, &p)?;
-                crate::store::user::set_favourite(c, list, &item, true, 1)?;
+                crate::ui::screens::home::testkit::save_favourite(c, list, &item, true, 1)?;
             }
             Ok(())
         });
@@ -2281,11 +2353,11 @@ mod tests {
         let tiles = |h: &egui_kittest::Harness<'static, testkit::App<HomeScreen>>, kind: RailKind| {
             h.state().s.rails.iter().find(|r| r.kind == kind).map_or(0, |r| r.tiles.len())
         };
-        assert_eq!((tiles(&h, RailKind::Continue), tiles(&h, RailKind::Favourites), tiles(&h, RailKind::Movies)), (1, 1, 2));
+        assert_eq!((tiles(&h, RailKind::Continue), tiles(&h, RailKind::Favourites), tiles(&h, RailKind::Movies)), (1, 0, 2));
         assert!(!testkit::painted(&h).iter().any(|p| p.contains("Movie 0")), "the title isn't on screen");
         h.state_mut().t.set_library(shown);
         h.run_steps(2);
-        assert_eq!((tiles(&h, RailKind::Continue), tiles(&h, RailKind::Favourites), tiles(&h, RailKind::Movies)), (2, 2, 3));
+        assert_eq!((tiles(&h, RailKind::Continue), tiles(&h, RailKind::Favourites), tiles(&h, RailKind::Movies)), (2, 0, 3));
     }
 
     #[test]
@@ -2310,8 +2382,8 @@ mod tests {
             )?;
             crate::store::user::set_item_override(c, &movie(0), &crate::model::ItemOverride { locked: true, ..Default::default() })?;
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &movie(1), true, 1)?;
-            crate::store::user::set_favourite(c, list, &channel_ref(s, 2), true, 2)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &movie(1), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &channel_ref(s, 2), true, 2)?;
             Ok(s)
         });
         let mut cfg = (*t.config).clone();
@@ -2338,36 +2410,14 @@ mod tests {
         app.result(OverlayResult::Unlocked(Action::ActivateAlt));
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)], "resumed once unlocked");
 
-        // the favourites rail holds the movie and the channel (in list order)
-        assert!(has_label(&h, "FAVOURITES"));
-        h.state_mut().act(Action::Down);
-        let rail = &h.state().s.rails[h.state().s.rail];
-        assert_eq!(rail.kind, RailKind::Favourites);
-        assert!(matches!(rail.tiles.as_slice(), [Tile::Vod(VodKind::Movie(_)), Tile::Channel { .. }]), "{:?}", rail.tiles);
-        // the context menu lists the tile's actions; Delete removes the movie from the list
+        // Favourites contains channels only; the saved film belongs to My list's tile.
+        until(&mut h, "watchlists rail", |h| h.state().s.rails.iter().any(|r| r.kind == RailKind::Watchlists));
+        let at = h.state().s.rails.iter().position(|r| r.kind == RailKind::Favourites).unwrap();
+        h.state_mut().s.rail = at;
+        assert!(matches!(h.state().s.rails[at].tiles.as_slice(), [Tile::Channel { .. }]));
         h.state_mut().act(Action::ContextMenu);
         let nav = h.state_mut().nav();
-        assert!(
-            matches!(nav.as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i| i.action == Action::Remove)),
-            "{nav:?}"
-        );
-        // a right-click on the tile opens that same menu
-        h.state_mut().s.rail = 0;
-        h.run_steps(1);
-        // (the movie is in later rails too; the favourites rail is the first that has it)
-        let tile = h.query_all_by_label("Movie 1").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).expect("the tile");
-        tile.click_secondary();
-        h.run_steps(1);
-        assert_eq!(h.state_mut().nav(), nav, "right-click = the menu key");
-        assert_eq!(h.state().s.rails[h.state().s.rail].kind, RailKind::Favourites, "on the clicked tile");
-        h.state_mut().act(Action::Remove);
-        let movie1 = ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000001".into()) };
-        until(&mut h, "removed from the list", |h| {
-            crate::store::user::lists_containing(&h.state().t.services().store.reader().unwrap(), &movie1).unwrap().is_empty()
-        });
-        h.run_steps(1);
-        let rail = &h.state().s.rails[h.state().s.rail];
-        assert!(matches!(rail.tiles.as_slice(), [Tile::Channel { .. }]), "the rail follows at once: {:?}", rail.tiles);
+        assert!(matches!(nav.as_slice(),[NavRequest::Open(OverlayRequest::ContextMenu(m))] if m.items.iter().any(|i|i.action==Action::Remove)));
         // Ctrl+H hides the channel; Ctrl+G shows it in the guide; Ctrl+S explains itself
         h.state_mut().act(Action::ToggleHidden);
         until(&mut h, "hidden", |h| {
@@ -2408,42 +2458,68 @@ mod tests {
         assert!(has_label(&h, "FAVOURITES"));
     }
 
-    /// Favourited movies are resolved by key for their rail, and only they (a map of every
-    /// title cloned every key: ~40 MiB for 380k titles); one favourited later joins the rail.
     #[test]
-    fn only_favourite_titles_are_resolved_for_the_rails() {
+    fn watchlist_rail_orders_by_recency_without_changing_manual_list_order() {
+        use crate::store::watchlist as store;
+        use crate::watchlist::{Insert, PlayOrder};
+        let (mut t, one) = rig();
+        let (mine, a, b) = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::movies(c, src, 3)?;
+            let lib = crate::store::library::load(c)?;
+            let mine = store::default_list(c)?;
+            let a = store::create(c, "First", None, PlayOrder::Ordered, "app", 1)?;
+            let b = store::create(c, "Second", None, PlayOrder::Ordered, "app", 1)?;
+            for (i, id) in [mine, a, b].iter().enumerate() {
+                store::add(c, &lib, *id, &[store::new_entry(c, &movie_ref(src, i))?], Insert::End, 1)?;
+            }
+            store::played(c, a, 10)?;
+            store::played(c, b, 20)?;
+            Ok((mine, a, b))
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::Home);
+        let rail_order = |h: &egui_kittest::Harness<'_, testkit::App<HomeScreen>>| {
+            h.state()
+                .s
+                .rails
+                .iter()
+                .filter(|r| r.kind == RailKind::Watchlists)
+                .flat_map(|r| &r.tiles)
+                .filter_map(|t| if let Tile::Watchlist { id, .. } = t { Some(*id) } else { None })
+                .collect::<Vec<_>>()
+        };
+        until(&mut h, "recent watchlists first", |h| rail_order(h) == [b, a, mine]);
+        h.state_mut().t.services().store.writer().blocking(move |c| store::played(c, a, 30)).unwrap();
+        crate::ui::watchlists::invalidate();
+        until(&mut h, "recent play moves Home tile", |h| rail_order(h) == [a, b, mine]);
+        assert_eq!(store::lists(&h.state().t.db).unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [mine, a, b]);
+    }
+
+    /// Saved films make one tile per list; channel Favourites never gain film posters.
+    #[test]
+    fn saved_titles_make_watchlist_tiles_without_film_favourites() {
         let (mut t, one) = rig();
         let src = seed(&mut t, |c| {
             let s = testkit::source(c, "My IPTV")?;
             testkit::movies(c, s, 4)?;
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &movie_ref(s, 1), true, 1)?;
+            testkit::save_favourite(c, list, &movie_ref(s, 1), true, 1)?;
             Ok(s)
         });
         let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1200.0, 800.0));
         h.state_mut().enter(Route::Home);
-        h.run_steps(2);
-        assert_eq!(h.state().s.vod_refs.keys().collect::<Vec<_>>(), [&movie_ref(src, 1)]);
-        assert!(has_label(&h, "FAVOURITES"));
-        let app = h.state_mut();
-        let list = app.t.favs.default_list().unwrap();
-        app.t.favs.apply_toggle(list, &movie_ref(src, 3), true);
-        h.run_steps(1);
-        assert_eq!(h.state().s.vod_refs.len(), 2);
-        let favs = h.state().s.rails.iter().find(|r| r.kind == RailKind::Favourites).map(|r| r.tiles.len());
-        assert_eq!(favs, Some(2), "both favourites have a tile");
-        // a zap (the library copied with another recent list) shares the VOD lists: the rails
-        // are rebuilt for the recent list, the titles are not resolved again
-        let resolved = h.state().s.vod_refs_for.clone();
-        let app = h.state_mut();
-        app.t.lib = Arc::new(app.t.lib.with_recent_channels(Vec::new()));
-        h.run_steps(2);
-        assert!(resolved.is_some() && h.state().s.vod_refs_for == resolved, "no rescan for a zap");
-        // a rebuild has new lists (and the favourites as stored: the toggle above was in memory)
-        testkit::reload_library(&mut h.state_mut().t);
-        h.run_steps(2);
-        assert!(h.state().s.vod_refs_for != resolved);
-        assert_eq!(h.state().s.vod_refs.keys().collect::<Vec<_>>(), [&movie_ref(src, 1)]);
+        until(&mut h, "My list tile", |h| h.state().s.rails.iter().any(|r| r.kind == RailKind::Watchlists));
+        assert!(h.state().s.rails.iter().all(|r| r.kind != RailKind::Favourites));
+        let tile_count = |h: &egui_kittest::Harness<'static, testkit::App<HomeScreen>>| {
+            h.state().s.rails.iter().find(|r| r.kind == RailKind::Watchlists).unwrap().tiles.len()
+        };
+        assert_eq!(tile_count(&h), 1);
+        h.state_mut().t.with_ctx(|ctx| kit::toggle_favourite(ctx, &movie_ref(src, 3)));
+        until(&mut h, "second title saved", |h| {
+            crate::store::watchlist::entries(&h.state().t.db, crate::store::watchlist::default_list(&h.state().t.db).unwrap()).unwrap().len() == 2
+        });
+        assert_eq!(tile_count(&h), 1, "My list has one tile regardless of its entry count");
     }
 
     fn movie_ref(s: SourceId, i: usize) -> ItemRef {
@@ -2465,7 +2541,7 @@ mod tests {
             testkit::movies(c, b, 2)?;
             testkit::channels(c, b, 3)?;
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &channel_ref(b, 1), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &channel_ref(b, 1), true, 1)?;
             Ok(b)
         });
         let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
@@ -2548,8 +2624,10 @@ mod tests {
         let r = |s: SourceId, i: usize| ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:named{i:04}")) };
         assert!(h.state().t.favs.is_fav(&r(b, 0)) && !h.state().t.favs.is_fav(&r(a, 0)));
         h.run_steps(2);
-        let favs = h.state().s.rails.iter().find(|x| x.kind == RailKind::Favourites).map(|x| x.tiles.len());
-        assert_eq!(favs, Some(1));
+        until(&mut h, "My list tile", |h| h.state().s.rails.iter().any(|r| r.kind == RailKind::Watchlists));
+        let saved = h.state().s.rails.iter().find(|x| x.kind == RailKind::Watchlists).map(|x| x.tiles.len());
+        assert_eq!(saved, Some(1));
+        assert!(h.state().s.rails.iter().all(|r| r.kind != RailKind::Favourites));
         // show each copy
         let app = h.state_mut();
         let mut c = (*app.t.config).clone();
@@ -2612,7 +2690,7 @@ mod tests {
             let m = testkit::movies(c, s, 30)?[0];
             let sr = testkit::series(c, s, 3, 2, 4)?[0];
             let list = crate::store::user::default_fav_list(c)?;
-            crate::store::user::set_favourite(c, list, &channel_ref(s, 1), true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &channel_ref(s, 1), true, 1)?;
             // Live TV (and so the guide) shows one playlist: its button, stripe and breadcrumb
             c.execute("UPDATE source SET color = 'red' WHERE id = ?1", [s2])?;
             Ok((m, sr))

@@ -199,6 +199,7 @@ impl Services {
                 config: self.config.clone(),
                 player: Arc::new(self.tiles.handle(TileId::A)),
                 bus: self.bus.clone(),
+                jobs: Some(self.jobs.clone()),
             };
             self.queue = Some(crate::queue::service::spawn(self.rt.handle(), self.agent.clone(), deps));
             self.agent.set_queue_handle(self.queue.clone());
@@ -222,6 +223,7 @@ impl Services {
             },
             self.bus.clone(),
         );
+        sleep.connect_queue(self.queue.clone());
         self.agent.set_sleep(Some(sleep));
         self.integrations.scheduler = Some(crate::jobs::scheduler::spawn(self.jobs.clone()));
         match self.store.reader().and_then(|c| connection_limits(&c)) {

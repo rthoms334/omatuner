@@ -2,7 +2,7 @@
 name: pick
 description: Recommend and play a film, series or live show from the user's Tuner library. Moods, "like X", "surprise me", what can I finish in 40 minutes, for two people or the family, what's new, a film in a language, which films of a franchise I have and in what order.
 when_to_use: Use when the user wants Claude to choose something to watch from their own library, or to line several titles up in Tuner's Up next. Use discover for trending or top-10 lists from the web.
-allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__categories mcp__plugin_omatuner_tuner__browse mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__favourites mcp__plugin_omatuner_tuner__favourites_edit mcp__plugin_omatuner_tuner__match_titles mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue
+allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__categories mcp__plugin_omatuner_tuner__browse mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__watchlist mcp__plugin_omatuner_tuner__match_titles mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue
 ---
 
 # Pick: choose something for me
@@ -36,8 +36,16 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout.
   category's country or language tag; browse those.
 - **Franchise check** ("which Mission Impossible films do I have, in order?"): `search` each
   title (or `match_titles` with the list from your knowledge), report which are there and
-  which are missing, and label the order as yours. Offer to save them as a favourites list
-  (`favourites_edit`, confirm) or queue them.
+  which are missing, and label the order as yours. Offer “Save as a watchlist”
+  (`watchlist create`, confirm), with available refs in that order and missing titles as
+  placeholders (title, year, kind and TMDB id if known). Use `move` only after asking when
+  the two groups need interleaving; never change a user’s existing order without asking.
+- **Carry on with a list** (“play the next Star Wars”): `watchlist next`, say what it is and
+  where it resumes (“from 41 min”), then `status` → `watchlist play` with its `id`. It carries
+  on through the list; “just the one” means `just_one: true`. Report anything passed over.
+- **Choose from a list** (“something from Christmas under 90 minutes”): `watchlist show`,
+  use `details` on unfinished entries for length or genre, choose one, then `status` →
+  `watchlist play` with its `id`. An Any order list then keeps picking unfinished entries.
 - **Line-ups** ("queue three", "a Bond marathon in release order"): `queue` `add` with the refs
   in order (more than 3 needs one confirmation; say the order is from your knowledge). Then
   `queue` `play` only if asked.

@@ -46,9 +46,11 @@ fn demo_profile_builds_a_library_with_stacks() {
     let uhd: i64 = c.query_row("SELECT count(*) FROM channel WHERE quality = ?1", [Quality::Uhd as i64], |r| r.get(0)).unwrap();
     assert!(uhd >= 4);
 
-    // the user's side: favourites, recently watched, Continue Watching, reminders
+    // the user's side: channel favourites, saved titles, Continue Watching, reminders
     assert!(!lib.favs.is_empty() && lib.recent_channels.len() >= 4);
     let n = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(n("SELECT count(*) FROM fav_item WHERE kind<>'channel'"), 0);
+    assert_eq!(n("SELECT count(*) FROM watchlist_item"), 5);
     assert_eq!(n("SELECT count(*) FROM watch_progress"), 3);
     assert_eq!(n("SELECT count(*) FROM reminder WHERE rule_id IS NULL"), 3);
     assert_eq!(n("SELECT count(*) FROM reminder WHERE rule_id IS NULL AND mode = 'switch'"), 1);

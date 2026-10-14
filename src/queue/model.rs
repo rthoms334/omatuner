@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::model::{EpisodeId, ItemRef, QueueId, Timestamp};
+use crate::model::{EpisodeId, ItemRef, QueueId, Timestamp, WatchlistId, WatchlistItemId};
 
 /// A row's state (`queue_item.state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -69,6 +69,10 @@ pub struct QueueEntry {
     pub by_agent: bool,
     /// Its item vanished in a refresh (`store::user::HOLDERS`): "Unavailable", skipped.
     pub orphaned: bool,
+    /// The watchlist entry that fed this row (DESIGN §42 §3); rows outlive their list.
+    pub watchlist_item_id: Option<WatchlistItemId>,
+    /// Automatically fed by the context; distinct from a user-added list row.
+    pub list_context: bool,
 }
 
 /// One visible row of the snapshot (concealed rows are never in it, nor counted).
@@ -124,6 +128,40 @@ pub enum FinishedWhy {
     EndOfQueue,
     /// "Stopped after Goldfinger, as asked".
     StopAfter(QueueId),
+    /// "That was Star Wars ✓" (the name is resolved against the visible list).
+    EndOfList(WatchlistId),
+}
+
+/// The list's place, counted after concealment, on a row that came from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchlistChip {
+    pub name: String,
+    pub any_order: bool,
+    pub position: usize,
+    pub total: usize,
+}
+
+/// A future entry, not a queue row yet (DESIGN §42 §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPreview {
+    pub id: WatchlistItemId,
+    pub kind: crate::model::ItemKind,
+    pub title: String,
+    pub series: Option<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListContext {
+    pub id: WatchlistId,
+    pub name: String,
+    pub any_order: bool,
+    pub position: usize,
+    pub total: usize,
+    pub playing_through: bool,
+    pub then: Vec<ListPreview>,
 }
 
 /// The episode after the one that ended (the next-episode countdown, or the offer on the
@@ -162,6 +200,10 @@ pub struct QueueSnapshot {
     pub finished: Option<FinishedWhy>,
     /// The next-episode countdown's episode, or the one offered on the finished card.
     pub next_episode: Option<NextEpisode>,
+    pub context: Option<WatchlistId>,
+    pub watchlist: Option<ListContext>,
+    pub watchlist_chips: std::collections::HashMap<WatchlistItemId, WatchlistChip>,
+    pub finished_watchlist: Option<String>,
 }
 
 impl QueueSnapshot {
@@ -274,6 +316,37 @@ pub enum QueueReply {
 /// Commands to the engine (UI, MPRIS, MCP).
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueueCommand {
+    /// Ctrl+N on a list entry keeps its range, copy pin and chip without starting playback.
+    AddListEntry {
+        list: WatchlistId,
+        entry: WatchlistItemId,
+        at: Insert,
+    },
+    /// Start a list; its next entry feeds the queue only when the queue runs out.
+    PlayList {
+        list: WatchlistId,
+        from: Option<WatchlistItemId>,
+        just_one: bool,
+    },
+    /// The same request from MCP: locked entries are passed over on every advance.
+    PlayListAgent {
+        list: WatchlistId,
+        from: Option<WatchlistItemId>,
+        just_one: bool,
+    },
+    /// The app's Resume prompt answer, applying only to this first entry.
+    PlayListFrom {
+        list: WatchlistId,
+        from: Option<WatchlistItemId>,
+        just_one: bool,
+        resume: bool,
+    },
+    /// End the context; ordinary pending queue rows still play first.
+    StopList,
+    /// A list edit/progress write invalidates the cached names, places and previews.
+    RefreshLists,
+    /// The sleep timer's end-of-queue boundary excludes further watchlist entries.
+    EndAfterQueue(bool),
     Add {
         targets: Vec<AddTarget>,
         at: Insert,

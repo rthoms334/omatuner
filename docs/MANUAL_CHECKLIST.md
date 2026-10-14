@@ -2004,3 +2004,44 @@ helper's outcome.
   exits 6.
 - [ ] **Offline:** disconnect the network; *Check now*. **Expect:** "Couldn't check for
   updates: …" under the status, no toast; reconnecting and *Check now* clears it.
+
+## 32. Watchlists (DESIGN §42)
+
+- [ ] **Upgrade and restore:** in an isolated copy of a v14 profile, keep channel-only,
+  films-only and mixed favourites lists, including an orphan. Launch the new build.
+  **Expect:** a private pre-move backup; My list receives default-list films in order; other
+  titles keep their list names and order; only channel favourites remain. The moved card
+  opens Watchlists and is shown once. Restoring a pre-0015 backup makes the same move.
+- [ ] **Save while browsing:** Ctrl+F a film, series, episode and channel. Open the
+  Ctrl+Shift+F dialog on a series, choose S1–S2, a named list and a position. Toggle a tick off
+  and use Undo. **Expect:** films save to My list, channels to Favourites, only My list puts a
+  star on posters, and detail-page membership names the lists and positions.
+- [ ] **Lists and layouts:** Alt+7, create an In order list and an Any order list; try Wide,
+  Medium and Compact. Rename, duplicate, delete with confirmation, fold watched rows, switch
+  lists with Tab, reorder entries with Alt+↑↓ and drag. **Expect:** the cursor opens on Next,
+  folding survives leaving the screen, My list cannot be renamed or deleted, and mouse and
+  keys give the same stored entry order. Search finds list names; Home shows active lists.
+- [ ] **Derived progress:** finish a film through another playlist's copy and finish S1–S2
+  while S3 remains unwatched. Mark the film unwatched, skip a list entry, then Start again and
+  Undo. **Expect:** progress follows all copies and only the named seasons; unwatching affects
+  every list; a skip affects its list only; Start again and Undo leave History intact.
+- [ ] **Missing titles:** add film and series placeholders by TMDB id and by title plus year;
+  refresh a matching playlist, then delete it. **Expect:** matches attach without moving;
+  deletion makes placeholders again; Find in my playlists… attaches a chosen title.
+- [ ] **Play a list:** start from its tile, add a short with Ctrl+N during playback, reorder
+  future entries and watch another entry elsewhere. Repeat in the mini player, pop-out and
+  hidden window. **Expect:** one new queue row at a time, the short first, freshly derived
+  entries afterwards, the list chip and countdown text, and That was … ✓ at the end.
+- [ ] **Boundaries:** stop the list from its card, press Esc, choose Play just this one, set
+  sleep to end of Up next, start another list, and simulate three failed entries. Play a film
+  directly from Movies; interrupt a list with live TV; quit and restart.
+  **Expect:** each stop ends the context; another list replaces it; direct film playback has
+  no list continuation; interruption preserves Resume and restart plays nothing by itself.
+- [ ] **Locks and spoilers:** include a PIN-locked entry and concealed explicit entries; relock
+  during playback and inspect Home, counts, search, rows and MCP. **Expect:** the app requests
+  the PIN, MCP passes locked entries with a reason, concealed entries never appear or count,
+  and showing explicit content restores their positions. Episode titles obey spoiler guard.
+- [ ] **Agent:** list/show/next/play, choose an Any order entry by id, add placeholders, edit
+  ranges, skip, move, restart and stop. **Expect:** fuzzy names return ambiguity when needed,
+  status names the playing list, playback opens in the expected window/pop-out, and the
+  plugin asks for the confirmations in RULES.md. Film favourites edits point to watchlist.
