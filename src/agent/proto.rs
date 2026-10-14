@@ -112,6 +112,7 @@ pub enum Call {
     Control(Control),
     // ---- the batch (DESIGN §31–§35, the skill plan): action-shaped feature tools…
     Queue(Queue),
+    Watchlist(Watchlist),
     Follow(Follow),
     SpoilerGuard(SpoilerGuard),
     GuideFix(GuideFix),
@@ -148,6 +149,7 @@ impl Call {
             Call::CancelSwitch(_) => "cancel_switch",
             Call::Control(_) => "control",
             Call::Queue(_) => "queue",
+            Call::Watchlist(_) => "watchlist",
             Call::Follow(_) => "follow",
             Call::SpoilerGuard(_) => "spoiler_guard",
             Call::GuideFix(_) => "guide_fix",
@@ -173,6 +175,7 @@ impl Call {
             Call::Play(_) | Call::ScheduleSwitch(_) | Call::CancelSwitch(_) | Call::Control(_) => true,
             Call::FavouritesEdit(_) | Call::Lock(_) => true,
             Call::Queue(p) => p.action.mutates(),
+            Call::Watchlist(p) => p.action.mutates(),
             Call::Follow(p) => p.action.mutates(),
             Call::SpoilerGuard(p) => p.action.mutates(),
             Call::GuideFix(p) => p.action.mutates(),
@@ -910,6 +913,9 @@ pub struct FavListOut {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FavouritesOut {
     pub lists: Vec<FavListOut>,
+    /// Films and series live in Watchlists (DESIGN §42 §4.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_watchlist: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -972,6 +978,9 @@ pub struct StatusOut {
     /// Up next, while it has items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueStatusOut>,
+    /// The list following Up next (DESIGN §42 §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchlist: Option<WatchlistStatusOut>,
     /// Multi-view, while two pictures are on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multiview: Option<MultiviewStatusOut>,
@@ -1043,6 +1052,14 @@ pub struct CastDeviceOut {
     pub available: bool,
     /// Tuner casts to it now.
     pub casting: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchlistStatusOut {
+    pub name: String,
+    pub position: u32,
+    pub total: u32,
+    pub playing_through: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

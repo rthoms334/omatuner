@@ -1273,6 +1273,9 @@ pub fn continue_watching(q: &Q, p: &proto::ContinueWatching) -> Out<ContinueOut>
 }
 
 pub fn favourites(q: &Q, p: &Favourites) -> Out<FavouritesOut> {
+    if p.kind.is_some_and(|kind| kind != Kind::Channel) {
+        return Ok(FavouritesOut { lists: Vec::new(), use_watchlist: Some("watchlist".into()) });
+    }
     let limit = clamp(p.limit, 50, 100);
     let list_words = p.list.as_deref().map(|l| text("list", l).map(words)).transpose()?;
     let favs = q.favs();
@@ -1283,35 +1286,19 @@ pub fn favourites(q: &Q, p: &Favourites) -> Out<FavouritesOut> {
     let mut out = Vec::new();
     for l in lists {
         let mut items = Vec::new();
-        let mut seen: HashSet<(bool, u32)> = HashSet::new();
-        for r in favs.items(l.id) {
+        for r in favs.items(l.id).iter().filter(|r| r.kind == ItemKind::Channel) {
             if items.len() == limit {
                 break;
             }
-            let wanted = |k: Kind| p.kind.is_none_or(|x| x == k);
-            match r.kind {
-                ItemKind::Channel if wanted(Kind::Channel) => {
-                    if let Some(c) = q.channel_by_ref(r) {
-                        items.push(q.channel_item(c));
-                    }
-                }
-                ItemKind::Movie | ItemKind::Series if wanted(if r.kind == ItemKind::Movie { Kind::Movie } else { Kind::Series }) => {
-                    let movies = r.kind == ItemKind::Movie;
-                    if let Some(idx) = q.vod_index(r)? {
-                        let key = q.stack_key(movies, idx);
-                        if seen.insert((movies, key)) {
-                            items.push(ItemOut::Title(q.title_out(movies, key)));
-                        }
-                    }
-                }
-                _ => {}
+            if let Some(c) = q.channel_by_ref(r) {
+                items.push(q.channel_item(c));
             }
         }
         if !items.is_empty() {
             out.push(FavListOut { name: clean(&l.name), items });
         }
     }
-    Ok(FavouritesOut { lists: out })
+    Ok(FavouritesOut { lists: out, use_watchlist: None })
 }
 
 // ------------------------------------------------------------------ details

@@ -2487,7 +2487,7 @@ mod tests {
             c.execute(r#"UPDATE source SET settings = '{"in_all":false}' WHERE id = ?1"#, [free])?;
             let list = crate::store::user::default_fav_list(c)?;
             let fav = ItemRef { source: free, kind: ItemKind::Channel, key: crate::model::ItemKey("m3u:seed00000000000".into()) };
-            crate::store::user::set_favourite(c, list, &fav, true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &fav, true, 1)?;
             Ok((a_ch[0], b, free))
         });
         let mut cfg = (*t.config).clone();
@@ -2559,7 +2559,7 @@ mod tests {
             let chs = testkit::channels(c, a, 3)?;
             let list = crate::store::user::default_fav_list(c)?;
             let fav = ItemRef { source: a, kind: ItemKind::Channel, key: crate::model::ItemKey("m3u:seed00000000002".into()) };
-            crate::store::user::set_favourite(c, list, &fav, true, 1)?;
+            crate::ui::screens::home::testkit::save_favourite(c, list, &fav, true, 1)?;
             Ok((chs, fav, list))
         });
         let mut h = harness(t, one, LiveScreen::default(), egui::vec2(1600.0, 900.0));
@@ -2585,7 +2585,7 @@ mod tests {
         h.state_mut().apply_config();
         assert_eq!(first_open(&mut h), Some(Entry::FavList(list)));
         assert_eq!(h.state().s.cursor_channel(), Some(chs[2]));
-        seed(&mut h.state_mut().t, move |c| crate::store::user::set_favourite(c, list, &fav, false, 2));
+        seed(&mut h.state_mut().t, move |c| crate::ui::screens::home::testkit::save_favourite(c, list, &fav, false, 2));
         assert_eq!(first_open(&mut h), Some(Entry::All), "no favourites: All channels");
     }
 

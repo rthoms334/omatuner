@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::model::{EpisodeId, ItemRef, MediaRef, PlayOrigin, PlayableKind, QueueId, Timestamp};
+use crate::model::{EpisodeId, ItemRef, MediaRef, PlayOrigin, PlayableKind, QueueId, Timestamp, WatchlistId, WatchlistItemId};
 use crate::player::{PlayerSnapshot, PlayerState};
 use crate::queue::model::{
     AddTarget, AddedBy, Blocked, Countdown, CountdownWhy, FinishedWhy, Insert, NextEpisode, QueueCommand, QueueEntry, QueueRow, QueueSnapshot,
@@ -103,6 +103,15 @@ pub enum Input {
     },
     /// The answer to [`Effect::LookupNextEpisode`].
     NextEpisode(Option<NextEpisode>),
+    /// Startup / an outside deletion: restoring a context never starts playback.
+    Context(Option<(WatchlistId, AddedBy)>),
+    /// A list was re-read and exactly one entry added, or nothing remains.
+    ListNext {
+        list: WatchlistId,
+        row: Option<QueueId>,
+    },
+    /// An entry needs details; pass it for this run while the jobs task loads them.
+    ListPassed(WatchlistItemId),
 }
 
 /// A write to `queue_item` (one small transaction each).
@@ -148,6 +157,21 @@ pub enum Effect {
     Toast(&'static str),
     /// "Up next is waiting for your PIN" (a notification while the window is hidden).
     NotifyPin(QueueId),
+    /// Resolve fresh progress/order, then add one row (DESIGN §42 §5).
+    AddListEntry {
+        list: WatchlistId,
+        entry: WatchlistItemId,
+        at: Insert,
+    },
+    LookupList {
+        list: WatchlistId,
+        from: Option<WatchlistItemId>,
+        by: AddedBy,
+        excluded: Vec<WatchlistItemId>,
+        ended: Vec<ItemRef>,
+    },
+    /// Persist the context independently of the queue's current row.
+    Context(Option<(WatchlistId, AddedBy)>),
 }
 
 /// The settings it runs with (`[queue]`).
@@ -188,8 +212,22 @@ enum Lookup {
     Offer,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ListStart {
+    Play { resume: Option<bool>, just_one: bool },
+    Countdown(CountdownWhy),
+}
+
 #[derive(Debug, Default)]
 pub struct QueueMachine {
+    /// The list feeding Up next, including while playback has stepped aside (§42 §5).
+    pub context: Option<WatchlistId>,
+    context_agent: bool,
+    list_lookup: Option<(WatchlistId, ListStart)>,
+    /// Failed or explicitly skipped entries are passed over for this run only.
+    list_passed: HashSet<WatchlistItemId>,
+    list_ended: Vec<ItemRef>,
+    sleep_end_of_queue: bool,
     cfg: MachineConfig,
     rows: Vec<QueueEntry>,
     facts: HashMap<QueueId, RowFacts>,
@@ -239,6 +277,15 @@ impl QueueMachine {
         &self.rows
     }
 
+    /// The preview follows this run's exclusions and starts after the current row.
+    pub(crate) fn preview_exclusions(&self) -> (Vec<WatchlistItemId>, Vec<ItemRef>, bool) {
+        let mut ended = self.list_ended.clone();
+        if let Some(row) = self.current().and_then(|id| self.row(id)) {
+            ended.push(row.item.clone());
+        }
+        (self.list_passed.iter().copied().collect(), ended, self.context_agent)
+    }
+
     /// When the engine must tick next (a countdown, a slot's stop or start), if ever.
     pub fn next_deadline(&self) -> Option<Timestamp> {
         let countdown = self.countdown.as_ref().and_then(|c| c.at);
@@ -283,6 +330,49 @@ impl QueueMachine {
                 Some(Lookup::Offer) => self.next_episode = card,
                 None => {}
             },
+            Input::Context(context) => {
+                if context.is_none() && self.context.is_some() {
+                    self.end_context(&mut fx);
+                } else {
+                    self.context = context.map(|c| c.0);
+                    self.context_agent = context.is_some_and(|c| c.1 == AddedBy::Agent);
+                    if self.context.is_none() {
+                        self.list_lookup = None;
+                    }
+                }
+            }
+            Input::ListPassed(id) => {
+                self.list_passed.insert(id);
+            }
+            Input::ListNext { list, row } => {
+                if self.list_lookup.is_some_and(|(wanted, _)| wanted == list)
+                    && let Some((_, start)) = self.list_lookup.take()
+                {
+                    match row {
+                        Some(id) => {
+                            // Reuse the interrupted current row if the fresh pick is the same.
+                            // Otherwise retire it before set_current can demote it to Pending.
+                            if let Some(current) = self.current().filter(|current| *current != id) {
+                                self.set_state(current, RowState::Skipped, &mut fx);
+                            }
+                            self.discard_list_rows(Some(id), &mut fx);
+                            match start {
+                                ListStart::Play { resume, just_one } => {
+                                    if just_one {
+                                        self.stop_after = Some(id);
+                                    }
+                                    self.advance(Some(id), resume, now, &mut fx);
+                                }
+                                ListStart::Countdown(why) => self.start_countdown(why, Some(id), now, &mut fx),
+                            }
+                        }
+                        None => {
+                            self.end_context(&mut fx);
+                            self.finished = Some(FinishedWhy::EndOfList(list));
+                        }
+                    }
+                }
+            }
         }
         self.rebuild(now);
         fx
@@ -450,9 +540,13 @@ impl QueueMachine {
         self.owned = false;
         self.live_until = None;
         self.position = None;
+        if self.context.is_some() {
+            self.list_ended.extend(self.items.iter().cloned());
+        }
         self.set_state(id, RowState::Played, fx);
         if self.stop_after == Some(id) {
             self.stop_after = None;
+            self.end_context(fx);
             self.finished = Some(FinishedWhy::StopAfter(id));
             return;
         }
@@ -464,6 +558,9 @@ impl QueueMachine {
 
     /// Nothing left: "That was Up next." — an episode's successor is offered, no countdown.
     fn run_out(&mut self, s: &PlayerSnapshot, fx: &mut Vec<Effect>) {
+        if self.continue_list(ListStart::Countdown(CountdownWhy::Ended), fx) {
+            return;
+        }
         self.finished = Some(FinishedWhy::EndOfQueue);
         if let Some(MediaRef::Episode(ep)) = s.playable.as_ref().map(|p| &p.media) {
             self.lookup = Some(Lookup::Offer);
@@ -476,15 +573,21 @@ impl QueueMachine {
         self.live_until = None;
         self.set_state(id, RowState::Failed, fx);
         self.notes.insert(id, "Couldn't play");
+        self.pass_list_row(id);
         self.failed_streak = self.failed_streak.saturating_add(1);
         if self.failed_streak >= MAX_FAILED_STREAK {
+            self.end_context(fx);
             self.blocked = Some((Blocked::FailedStreak, None));
             fx.push(Effect::Toast(STREAK_TOAST));
             return;
         }
         match self.next_row() {
             Some(next) => self.start_countdown(CountdownWhy::Failed, Some(next), now, fx),
-            None => self.finished = Some(FinishedWhy::EndOfQueue),
+            None => {
+                if !self.continue_list(ListStart::Countdown(CountdownWhy::Failed), fx) {
+                    self.finished = Some(FinishedWhy::EndOfQueue);
+                }
+            }
         }
     }
 
@@ -533,6 +636,9 @@ impl QueueMachine {
                 Some(next) => self.start_countdown(CountdownWhy::SlotEnded, Some(next), now, fx),
                 // nothing after it: keep watching the channel, outside Up next
                 None => {
+                    if self.continue_list(ListStart::Countdown(CountdownWhy::SlotEnded), fx) {
+                        return;
+                    }
                     if let Some(cur) = self.current() {
                         self.owned = false;
                         self.set_state(cur, RowState::Played, fx);
@@ -595,6 +701,16 @@ impl QueueMachine {
                 return;
             }
             if facts.needs_pin {
+                if row.by_agent && row.watchlist_item_id.is_some() {
+                    self.set_state(row.id, RowState::Skipped, fx);
+                    self.pass_list_row(row.id);
+                    self.notes.insert(row.id, "Locked: needs your PIN in Tuner");
+                    id = self.next_row();
+                    if id.is_none() {
+                        self.continue_list(ListStart::Play { resume: None, just_one: false }, fx);
+                    }
+                    continue;
+                }
                 self.blocked = Some((Blocked::NeedsPin, Some(row.id)));
                 fx.push(Effect::NotifyPin(row.id));
                 return;
@@ -651,6 +767,17 @@ impl QueueMachine {
                 };
             }
             Resolved::NeedsPin => {
+                if self.row(id).is_some_and(|r| r.by_agent && r.watchlist_item_id.is_some()) {
+                    self.set_state(id, RowState::Skipped, fx);
+                    self.pass_list_row(id);
+                    self.notes.insert(id, "Locked: needs your PIN in Tuner");
+                    if let Some(next) = self.next_row() {
+                        self.advance(Some(next), None, now, fx);
+                    } else {
+                        self.continue_list(ListStart::Play { resume: None, just_one: false }, fx);
+                    }
+                    return;
+                }
                 self.blocked = Some((Blocked::NeedsPin, Some(id)));
                 fx.push(Effect::NotifyPin(id));
             }
@@ -660,6 +787,10 @@ impl QueueMachine {
                     f.unavailable = true;
                 }
                 let next = self.next_after(id);
+                self.pass_list_row(id);
+                if next.is_none() && self.continue_list(ListStart::Play { resume: None, just_one: false }, fx) {
+                    return;
+                }
                 self.advance(next, None, now, fx);
             }
             Resolved::Concealed => {
@@ -667,6 +798,10 @@ impl QueueMachine {
                     f.concealed = true;
                 }
                 let next = self.next_after(id);
+                self.pass_list_row(id);
+                if next.is_none() && self.continue_list(ListStart::Play { resume: None, just_one: false }, fx) {
+                    return;
+                }
                 self.advance(next, None, now, fx);
             }
             Resolved::Failed(_) => self.item_failed(id, now, fx),
@@ -677,6 +812,13 @@ impl QueueMachine {
 
     fn command(&mut self, c: QueueCommand, now: Timestamp, fx: &mut Vec<Effect>) {
         match c {
+            QueueCommand::RefreshLists => {}
+            QueueCommand::EndAfterQueue(on) => self.sleep_end_of_queue = on,
+            QueueCommand::AddListEntry { list, entry, at } => fx.push(Effect::AddListEntry { list, entry, at }),
+            QueueCommand::PlayList { list, from, just_one } => self.play_list(list, from, just_one, None, false, fx),
+            QueueCommand::PlayListAgent { list, from, just_one } => self.play_list(list, from, just_one, None, true, fx),
+            QueueCommand::PlayListFrom { list, from, just_one, resume } => self.play_list(list, from, just_one, Some(resume), false, fx),
+            QueueCommand::StopList => self.end_context(fx),
             QueueCommand::Add { targets, at, by } => fx.push(Effect::Add { targets, at, by }),
             QueueCommand::Move { ids, to } => fx.push(Effect::Write(Write::Move { ids, to })),
             QueueCommand::Reorder(ids) => fx.push(Effect::Write(Write::Order(ids))),
@@ -716,6 +858,10 @@ impl QueueMachine {
                 }
             }
             QueueCommand::Cancel => {
+                let own_card = self.countdown.as_ref().is_some_and(|c| c.why != CountdownWhy::NextEpisode) || self.blocked.is_some();
+                if own_card {
+                    self.end_context(fx);
+                }
                 if let Some(c) = self.countdown.take()
                     && c.why == CountdownWhy::SlotEnded
                     && let Some(cur) = self.current()
@@ -751,7 +897,12 @@ impl QueueMachine {
                 }
                 match self.current() {
                     Some(cur) => self.advance(Some(cur), Some(true), now, fx),
-                    None => self.advance(self.next_row(), None, now, fx),
+                    None => {
+                        if self.next_row().is_none() && self.continue_list(ListStart::Play { resume: None, just_one: false }, fx) {
+                            return;
+                        }
+                        self.advance(self.next_row(), None, now, fx);
+                    }
                 }
             }
         }
@@ -763,7 +914,12 @@ impl QueueMachine {
         match self.blocked {
             Some((Blocked::NeedsPin, Some(id))) => {
                 self.set_state(id, RowState::Skipped, fx);
+                self.pass_list_row(id);
                 self.notes.insert(id, "Locked");
+                if self.next_row().is_none() && self.continue_list(ListStart::Play { resume: None, just_one: false }, fx) {
+                    self.blocked = None;
+                    return;
+                }
                 self.advance(self.next_row(), None, now, fx);
                 return;
             }
@@ -779,13 +935,27 @@ impl QueueMachine {
             return;
         }
         let Some(next) = self.next_row() else {
+            if self.context.is_some() {
+                if self.owned
+                    && let Some(cur) = self.current()
+                {
+                    self.owned = false;
+                    self.set_state(cur, RowState::Skipped, fx);
+                    self.pass_list_row(cur);
+                }
+                self.continue_list(ListStart::Play { resume: None, just_one: false }, fx);
+                return;
+            }
             fx.push(Effect::Toast("Up next is empty"));
             return;
         };
         // a row Up next plays is skipped; an interrupted one keeps its place (Resume)
-        if self.owned
+        if (self.owned || self.context.is_some())
             && let Some(cur) = self.current()
         {
+            if self.owned {
+                self.pass_list_row(cur);
+            }
             self.owned = false;
             self.set_state(cur, RowState::Skipped, fx);
         }
@@ -848,7 +1018,98 @@ impl QueueMachine {
             driving,
             finished: self.finished,
             next_episode: self.next_episode.clone(),
+            context: self.context,
+            watchlist: None,
+            watchlist_chips: Default::default(),
+            finished_watchlist: None,
         };
+    }
+
+    fn pass_list_row(&mut self, id: QueueId) {
+        if let Some(entry) = self.row(id).and_then(|r| r.watchlist_item_id) {
+            self.list_passed.insert(entry);
+        }
+    }
+
+    fn discard_list_rows(&mut self, keep: Option<QueueId>, fx: &mut Vec<Effect>) {
+        let pending: Vec<_> =
+            self.rows.iter().filter(|r| r.list_context && r.state == RowState::Pending && Some(r.id) != keep).map(|r| r.id).collect();
+        for id in pending {
+            self.set_state(id, RowState::Skipped, fx);
+        }
+    }
+
+    fn end_context(&mut self, fx: &mut Vec<Effect>) {
+        self.reset_context(fx, false);
+    }
+
+    fn reset_context(&mut self, fx: &mut Vec<Effect>, keep_pending: bool) {
+        let auto_row = |id| self.row(id).is_some_and(|r| r.list_context);
+        if self.countdown.as_ref().and_then(|c| c.id).is_some_and(auto_row) {
+            self.countdown = None;
+        }
+        if self.blocked.and_then(|(_, id)| id).is_some_and(|id| self.row(id).is_some_and(|r| r.list_context)) {
+            self.blocked = None;
+        }
+        if !keep_pending {
+            self.discard_list_rows(None, fx);
+        }
+        if self.context.take().is_some() {
+            fx.push(Effect::Context(None));
+        }
+        self.list_lookup = None;
+        self.list_passed.clear();
+        self.list_ended.clear();
+        self.context_agent = false;
+    }
+
+    fn continue_list(&mut self, start: ListStart, fx: &mut Vec<Effect>) -> bool {
+        if self.sleep_end_of_queue {
+            self.end_context(fx);
+            return false;
+        }
+        let Some(list) = self.context else { return false };
+        if self.list_lookup.is_none() {
+            self.list_lookup = Some((list, start));
+            fx.push(Effect::LookupList {
+                list,
+                from: None,
+                by: if self.context_agent { AddedBy::Agent } else { AddedBy::App },
+                excluded: self.list_passed.iter().copied().collect(),
+                ended: self.list_ended.clone(),
+            });
+        }
+        true
+    }
+
+    fn play_list(
+        &mut self,
+        list: WatchlistId,
+        from: Option<WatchlistItemId>,
+        just_one: bool,
+        resume: Option<bool>,
+        agent: bool,
+        fx: &mut Vec<Effect>,
+    ) {
+        // Keep a pending automatic row until the fresh pick can reuse or retire it.
+        self.reset_context(fx, true);
+        self.countdown = None;
+        self.blocked = None;
+        self.finished = None;
+        self.next_episode = None;
+        self.lookup = None;
+        self.resolving = None;
+        self.stop_after = None;
+        self.interrupted = false;
+        self.owned = false;
+        let by = if agent { AddedBy::Agent } else { AddedBy::App };
+        if !just_one {
+            self.context = Some(list);
+            self.context_agent = agent;
+            fx.push(Effect::Context(Some((list, by))));
+        }
+        self.list_lookup = Some((list, ListStart::Play { resume, just_one }));
+        fx.push(Effect::LookupList { list, from, by, excluded: Vec::new(), ended: Vec::new() });
     }
 }
 
@@ -879,7 +1140,139 @@ mod tests {
             state: RowState::Pending,
             by_agent: false,
             orphaned: false,
+            watchlist_item_id: None,
+            list_context: false,
         }
+    }
+
+    fn begin_list(m: &mut QueueMachine, list: i64, just_one: bool) -> Vec<Effect> {
+        m.step(Input::Command(QueueCommand::PlayList { list: WatchlistId(list), from: None, just_one }), T0)
+    }
+
+    /// The store's answer adds one row; the machine must wait for that answer before play.
+    fn list_answer(m: &mut QueueMachine, list: i64, id: i64, at: Timestamp) -> Vec<Effect> {
+        let mut rows = m.rows.clone();
+        rows.push(QueueEntry { watchlist_item_id: Some(WatchlistItemId(id)), list_context: true, ..movie(id) });
+        let facts = rows.iter().map(|r| (r.id, RowFacts::default())).collect();
+        m.step(Input::Rows(rows), at);
+        m.step(Input::Facts(facts), at);
+        m.step(Input::ListNext { list: WatchlistId(list), row: Some(QueueId(id)) }, at)
+    }
+
+    fn list_loading(m: &mut QueueMachine, id: i64, generation: u64, at: Timestamp, state: PlayerState) {
+        let it = m.row(QueueId(id)).unwrap().item.clone();
+        m.step(Input::Resolved { id: QueueId(id), outcome: Resolved::Sent { items: vec![it.clone()] } }, at);
+        m.step(Input::Player(snap(state, generation, PlayOrigin::Queue, &it, PlayableKind::Movie, MediaRef::Movie(MovieId(id)))), at);
+    }
+
+    #[test]
+    fn a_list_feeds_one_row_per_end_and_finishes_with_its_own_card() {
+        let mut m = machine(Vec::new());
+        let fx = begin_list(&mut m, 5, false);
+        assert_eq!(m.context, Some(WatchlistId(5)));
+        assert!(m.rows().is_empty());
+        assert_eq!(fx.iter().filter(|e| matches!(e, Effect::LookupList { list: WatchlistId(5), .. })).count(), 1);
+        assert_eq!(plays(&list_answer(&mut m, 5, 1, T0)), vec![QueueId(1)]);
+        list_loading(&mut m, 1, 1, T0, PlayerState::Playing);
+        let fx = end(&mut m, 1, 1, T0 + 60);
+        assert!(fx.iter().any(|e| matches!(e, Effect::LookupList { list: WatchlistId(5), from: None, .. })));
+        assert_eq!(m.rows().len(), 1);
+        assert!(plays(&list_answer(&mut m, 5, 2, T0 + 60)).is_empty());
+        assert_eq!(m.rows().len(), 2);
+        assert_eq!(m.snapshot().countdown.as_ref().and_then(|c| c.id), Some(QueueId(2)));
+        assert_eq!(plays(&m.step(Input::Tick, T0 + 70)), vec![QueueId(2)]);
+        list_loading(&mut m, 2, 2, T0 + 70, PlayerState::Playing);
+        end(&mut m, 2, 2, T0 + 130);
+        let fx = m.step(Input::ListNext { list: WatchlistId(5), row: None }, T0 + 130);
+        assert_eq!(m.context, None);
+        assert_eq!(m.snapshot().finished, Some(FinishedWhy::EndOfList(WatchlistId(5))));
+        assert!(fx.contains(&Effect::Context(None)));
+        assert!(plays(&m.step(Input::Tick, T0 + 1000)).is_empty());
+    }
+
+    #[test]
+    fn rows_added_during_a_list_play_first_then_the_list_carries_on() {
+        let mut m = machine(Vec::new());
+        begin_list(&mut m, 5, false);
+        list_answer(&mut m, 5, 1, T0);
+        list_loading(&mut m, 1, 1, T0, PlayerState::Playing);
+        let mut rows = m.rows.clone();
+        rows.push(movie(9));
+        m.step(Input::Rows(rows), T0 + 5);
+        m.step(Input::Facts([(QueueId(1), RowFacts::default()), (QueueId(9), RowFacts::default())].into()), T0 + 5);
+        let fx = end(&mut m, 1, 1, T0 + 60);
+        assert!(!fx.iter().any(|e| matches!(e, Effect::LookupList { .. })));
+        assert_eq!(m.snapshot().countdown.as_ref().and_then(|c| c.id), Some(QueueId(9)));
+        assert_eq!(plays(&m.step(Input::Tick, T0 + 70)), vec![QueueId(9)]);
+        list_loading(&mut m, 9, 2, T0 + 70, PlayerState::Playing);
+        let fx = end(&mut m, 9, 2, T0 + 130);
+        assert!(fx.iter().any(|e| matches!(e, Effect::LookupList { list: WatchlistId(5), .. })));
+        assert_eq!(m.context, Some(WatchlistId(5)));
+    }
+
+    #[test]
+    fn list_stops_replaces_and_steps_aside_without_leaking_into_foreign_playback() {
+        for ending in [QueueCommand::StopList, QueueCommand::EndAfterQueue(true), QueueCommand::StopAfter(Some(QueueId(1)))] {
+            let mut m = machine(Vec::new());
+            begin_list(&mut m, 5, false);
+            list_answer(&mut m, 5, 1, T0);
+            list_loading(&mut m, 1, 1, T0, PlayerState::Playing);
+            m.step(Input::Command(ending), T0 + 5);
+            let fx = end(&mut m, 1, 1, T0 + 60);
+            assert_eq!(m.context, None);
+            assert!(!fx.iter().any(|e| matches!(e, Effect::LookupList { .. })));
+        }
+        let mut m = machine(Vec::new());
+        begin_list(&mut m, 5, true);
+        list_answer(&mut m, 5, 1, T0);
+        list_loading(&mut m, 1, 1, T0, PlayerState::Playing);
+        assert_eq!(m.context, None);
+        end(&mut m, 1, 1, T0 + 60);
+        assert_eq!(m.snapshot().finished, Some(FinishedWhy::StopAfter(QueueId(1))));
+
+        let mut m = machine(Vec::new());
+        begin_list(&mut m, 5, false);
+        list_answer(&mut m, 5, 1, T0);
+        list_loading(&mut m, 1, 1, T0, PlayerState::Playing);
+        begin_list(&mut m, 6, false);
+        assert_eq!(m.context, Some(WatchlistId(6)));
+        list_answer(&mut m, 6, 2, T0);
+        list_loading(&mut m, 2, 2, T0, PlayerState::Playing);
+        let foreign = item(ItemKind::Movie, "foreign");
+        m.step(
+            Input::Player(snap(PlayerState::Playing, 3, PlayOrigin::Fullscreen, &foreign, PlayableKind::Movie, MediaRef::Movie(MovieId(99)))),
+            T0 + 5,
+        );
+        assert_eq!(m.context, Some(WatchlistId(6)));
+        assert!(m.snapshot().interrupted);
+        let fx = m.step(
+            Input::Player(snap(PlayerState::Ended, 3, PlayOrigin::Fullscreen, &foreign, PlayableKind::Movie, MediaRef::Movie(MovieId(99)))),
+            T0 + 60,
+        );
+        assert!(!fx.iter().any(|e| matches!(e, Effect::LookupList { .. } | Effect::Play { .. })));
+
+        let mut m = machine(vec![movie(1)]);
+        start(&mut m, 1, 1, T0);
+        assert!(!end(&mut m, 1, 1, T0 + 60).iter().any(|e| matches!(e, Effect::LookupList { .. })));
+    }
+
+    #[test]
+    fn three_failed_list_entries_end_the_context() {
+        let mut m = machine(Vec::new());
+        begin_list(&mut m, 5, false);
+        for id in 1..=3 {
+            list_answer(&mut m, 5, id, T0 + id * 60);
+            if id > 1 {
+                m.step(Input::Command(QueueCommand::Now), T0 + id * 60);
+            }
+            let fx = m.step(Input::Resolved { id: QueueId(id), outcome: Resolved::Failed("failed".into()) }, T0 + id * 60);
+            if id < 3 {
+                assert!(fx.iter().any(|e| matches!(e, Effect::LookupList { excluded, .. } if excluded.contains(&WatchlistItemId(id)))));
+            }
+        }
+        assert_eq!(m.context, None);
+        assert_eq!(m.snapshot().blocked, Some(Blocked::FailedStreak));
+        assert_eq!(m.snapshot().failed_streak, 3);
     }
 
     fn slot(id: i64, start: Timestamp, stop: Timestamp) -> QueueEntry {
@@ -1204,5 +1597,54 @@ mod tests {
         assert!(plays(&m.step(Input::Tick, T0 + 10)).is_empty());
         assert_eq!(m.snapshot().blocked, Some(Blocked::MultiView));
         assert_eq!(plays(&m.step(Input::MultiView(false), T0 + 20)), vec![QueueId(2)]);
+    }
+    #[test]
+    fn cancelling_a_foreign_episode_countdown_keeps_the_interrupted_list() {
+        let mut m = machine(Vec::new());
+        begin_list(&mut m, 5, false);
+        list_answer(&mut m, 5, 1, T0);
+        list_loading(&mut m, 1, 1, T0, PlayerState::Playing);
+        let foreign = item(ItemKind::Episode, "foreign");
+        for state in [PlayerState::Playing, PlayerState::Ended] {
+            m.step(
+                Input::Player(snap(
+                    state,
+                    2,
+                    PlayOrigin::Fullscreen,
+                    &foreign,
+                    PlayableKind::Episode { season: 1, episode: 1 },
+                    MediaRef::Episode(EpisodeId(9)),
+                )),
+                T0 + 10,
+            );
+        }
+        m.step(
+            Input::NextEpisode(Some(NextEpisode { id: EpisodeId(10), label: "Next".into(), series: "Foreign".into(), season: 1, episode: 2 })),
+            T0 + 10,
+        );
+        assert_eq!(m.snapshot().countdown.as_ref().unwrap().why, CountdownWhy::NextEpisode);
+        m.step(Input::Command(QueueCommand::Cancel), T0 + 11);
+        assert_eq!(m.context, Some(WatchlistId(5)));
+        assert!(m.snapshot().countdown.is_none());
+        assert_eq!(m.row(QueueId(1)).unwrap().state, RowState::Current);
+    }
+
+    #[test]
+    fn cancelling_a_list_countdown_discards_only_its_automatic_pending_rows() {
+        for command in [QueueCommand::Cancel, QueueCommand::StopList] {
+            let mut m = machine(Vec::new());
+            begin_list(&mut m, 5, false);
+            list_answer(&mut m, 5, 1, T0);
+            list_loading(&mut m, 1, 1, T0, PlayerState::Playing);
+            end(&mut m, 1, 1, T0 + 10);
+            list_answer(&mut m, 5, 2, T0 + 10);
+            let mut rows = m.rows.clone();
+            rows.push(QueueEntry { watchlist_item_id: Some(WatchlistItemId(3)), ..movie(3) });
+            m.step(Input::Rows(rows), T0 + 10);
+            m.step(Input::Command(command), T0 + 11);
+            assert!(m.context.is_none());
+            assert_eq!(m.row(QueueId(2)).unwrap().state, RowState::Skipped);
+            assert_eq!(m.row(QueueId(3)).unwrap().state, RowState::Pending);
+        }
     }
 }

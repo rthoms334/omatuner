@@ -117,6 +117,7 @@ pub fn delete_fav_list(conn: &Connection, id: FavListId) -> Result<()> {
         return Err(Error::Other("the default favourites list cannot be deleted".into()));
     }
     conn.execute("DELETE FROM fav_list WHERE id = ?1", [id])?;
+    conn.execute("DELETE FROM meta WHERE key = ?1", [format!("watchlist:favourites:{id}")])?;
     Ok(())
 }
 
@@ -166,6 +167,9 @@ pub fn fav_items(conn: &Connection, list: FavListId) -> Result<Vec<FavouriteEntr
 
 /// Add (appended at the end; fingerprint computed inside) or remove. Idempotent.
 pub fn set_favourite(conn: &Connection, list: FavListId, item: &ItemRef, on: bool, now: Timestamp) -> Result<()> {
+    if item.kind != ItemKind::Channel {
+        return Err(crate::error::Error::other("use_watchlist: films and series belong in Watchlists"));
+    }
     if !on {
         conn.execute(
             "DELETE FROM fav_item WHERE list_id = ?1 AND source_id = ?2 AND kind = ?3 AND item_key = ?4",
@@ -817,6 +821,8 @@ pub struct Orphan {
 /// expression, key column, extra condition).
 const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     ("favourite", "fav_item", "kind", "item_key", ""),
+    // Watchlists survive re-keys; placeholders have no ItemRef (DESIGN §42 §4).
+    ("watchlist", "watchlist_item", "kind", "item_key", " AND source_id IS NOT NULL"),
     ("override", "item_override", "kind", "item_key", ""),
     ("progress", "watch_progress", "kind", "item_key", ""),
     ("reminder", "reminder", "'channel'", "channel_key", ""),
@@ -909,11 +915,16 @@ pub(crate) fn holders_for(kind: ItemKind) -> impl Iterator<Item = (&'static str,
 pub fn forget_orphan(conn: &mut Connection, item: &ItemRef) -> Result<()> {
     let tx = conn.transaction()?;
     for (table, key, extra) in holders_for(item.kind) {
+        if table == "watchlist_item" {
+            tx.execute(&format!("UPDATE {table} SET source_id=NULL,item_key=NULL,orphaned_since=NULL WHERE source_id=?1 AND {key}=?2 AND orphaned_since IS NOT NULL{extra}"), params![item.source, item.key.as_str()])?;
+            continue;
+        }
         tx.execute(
             &format!("DELETE FROM {table} WHERE source_id = ?1 AND {key} = ?2 AND orphaned_since IS NOT NULL{extra}"),
             params![item.source, item.key.as_str()],
         )?;
     }
+    crate::store::watchlist::compact_positions(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -935,6 +946,7 @@ pub(crate) fn mark_orphaned(conn: &Connection, item: &ItemRef, now: Timestamp) -
 /// The item exists: clear `orphaned_since` and refresh the stored fingerprint. Returns true if
 /// any row was orphaned before.
 pub(crate) fn mark_attached(conn: &Connection, item: &ItemRef, fp: &Fingerprint) -> Result<bool> {
+    crate::store::watchlist::repair_attached(conn, item, item)?;
     let fp = fp_opt(fp);
     let mut was_orphan = false;
     for (table, key, extra) in holders_for(item.kind) {
@@ -961,6 +973,7 @@ pub(crate) fn move_user_data(conn: &Connection, from: &ItemRef, to: &ItemRef) ->
     if from == to {
         return Ok(());
     }
+    crate::store::watchlist::repair_attached(conn, from, to)?;
     let fp = fp_opt(&fingerprint_of(conn, to)?);
     if from.kind == ItemKind::Channel {
         // `channel_epg_map` is keyed per (channel, guide) whatever the method, so the generic

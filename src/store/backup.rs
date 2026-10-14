@@ -123,11 +123,14 @@ pub struct FeatureBackup {
     /// `store::guide_fix::export` (G-core): time shifts and dismissals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guide_fix: Option<serde_json::Value>,
+    /// Watchlists, their ranges, skips and restart boundaries (DESIGN §42).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watchlists: Option<serde_json::Value>,
 }
 
 impl FeatureBackup {
     pub fn is_empty(&self) -> bool {
-        self.queue.is_none() && self.follow.is_none() && self.spoiler.is_none() && self.guide_fix.is_none()
+        self.queue.is_none() && self.follow.is_none() && self.spoiler.is_none() && self.guide_fix.is_none() && self.watchlists.is_none()
     }
 }
 
@@ -270,6 +273,7 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             follow: crate::store::follow::export(conn)?,
             spoiler: crate::store::spoiler::export(conn)?,
             guide_fix: crate::store::guide_fix::export(conn)?,
+            watchlists: crate::store::watchlist::export(conn)?,
         },
         config: config_toml,
     })
@@ -337,7 +341,7 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         for e in crate::store::sources::list_epg_sources(&tx)? {
             crate::store::sources::purge_epg_source(&tx, e.id)?;
         }
-        tx.execute_batch("DELETE FROM fav_item; DELETE FROM fav_list WHERE is_default = 0; DELETE FROM history;")?;
+        tx.execute_batch("DELETE FROM watchlist_item; DELETE FROM watchlist WHERE is_default=0; UPDATE watchlist SET note=NULL,play_order='any',since=0,last_played_at=NULL WHERE is_default=1; DELETE FROM meta WHERE key IN ('queue:context','queue:context_agent') OR key LIKE 'watchlist:%'; DELETE FROM fav_item; DELETE FROM fav_list WHERE is_default = 0; DELETE FROM history;")?;
     }
 
     // ---- sources
@@ -465,6 +469,8 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         )?;
     }
 
+    crate::store::watchlist::move_favourites(&tx)?;
+
     // ---- overrides
     for o in &b.item_overrides {
         let Some(item) = remap(&o.item) else { continue };
@@ -581,8 +587,14 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         )?;
     }
     // ---- the batch features (each owner remaps its own refs; rule ids never carry over)
+    let watchlists = if let Some(v) = &b.features.watchlists {
+        crate::store::watchlist::import_mode(&tx, v, &remap, mode == RestoreMode::Merge)?
+    } else {
+        crate::store::watchlist::ImportResult::default()
+    };
+    rows += watchlists.rows;
     if let Some(v) = &b.features.queue {
-        rows += crate::store::queue::import(&tx, v, &remap)?;
+        rows += crate::store::queue::import_with_watchlists(&tx, v, &remap, &watchlists.entries)?;
     }
     if let Some(v) = &b.features.follow {
         rows += crate::store::follow::import(&tx, v, &remap)?;
@@ -621,4 +633,20 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     crate::store::sources::register_secrets(conn)?;
     report.user_rows = rows as u32;
     Ok(report)
+}
+
+/// One small user-data backup, without credentials or catalogue rows. Migration itself is
+/// transactional; the caller logs an I/O failure and still performs the move.
+pub(crate) fn before_watchlists(conn: &Connection) -> Result<()> {
+    let path: String = conn.query_row("SELECT file FROM pragma_database_list WHERE name='main'", [], |r| r.get(0))?;
+    if path.is_empty() {
+        return Ok(());
+    }
+    let original = Path::new(&path);
+    let backup = original.with_file_name("before-watchlists.json");
+    if backup.exists() {
+        return Ok(());
+    }
+    let data = export(conn, BackupOptions { include_history: true, ..Default::default() }, None, crate::model::now())?;
+    write_file(&backup, &data)
 }

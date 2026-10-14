@@ -660,6 +660,7 @@ pub fn write_series_episodes(conn: &mut Connection, imp: &CatalogueImport, batch
 pub fn apply_key_moves(conn: &Connection, moves: &[KeyMove]) -> Result<u32> {
     let mut held: HashMap<SourceId, HashSet<(ItemKind, ItemKey)>> = HashMap::new();
     let mut moved = 0;
+    let mut reclassified = false;
     for m in moves.iter().filter(|m| m.from != m.to) {
         let keys = match held.entry(m.from.source) {
             Entry::Occupied(e) => e.into_mut(),
@@ -672,8 +673,14 @@ pub fn apply_key_moves(conn: &Connection, moves: &[KeyMove]) -> Result<u32> {
             crate::store::user::move_user_data(conn, &m.from, &m.to)?;
         } else {
             move_across_kinds(conn, &m.from, &m.to)?;
+            reclassified |= m.to.kind != ItemKind::Channel;
         }
         moved += 1;
+    }
+    // Legacy M3U films were stored as channels. Move their saved rows only after the whole
+    // batch has changed kind, retaining each favourites list's order (DESIGN §42 §4.1).
+    if reclassified {
+        crate::store::watchlist::move_favourites(conn)?;
     }
     Ok(moved)
 }
@@ -682,6 +689,7 @@ pub fn apply_key_moves(conn: &Connection, moves: &[KeyMove]) -> Result<u32> {
 fn user_data_keys(conn: &Connection, source: SourceId) -> Result<HashSet<(ItemKind, ItemKey)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT kind, item_key FROM fav_item WHERE source_id = ?1
+         UNION SELECT kind, item_key FROM watchlist_item WHERE source_id = ?1
          UNION SELECT kind, item_key FROM item_override WHERE source_id = ?1
          UNION SELECT kind, item_key FROM watch_progress WHERE source_id = ?1
          UNION SELECT kind, item_key FROM history WHERE source_id = ?1
@@ -707,6 +715,17 @@ fn move_across_kinds(conn: &Connection, from: &ItemRef, to: &ItemRef) -> Result<
             params![f.0, f.1, f.2, t.0, t.1, t.2, fp],
         )?;
         conn.execute(&format!("DELETE FROM {table} WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3"), params![f.0, f.1, f.2])?;
+    }
+    if from.kind != ItemKind::Channel {
+        if to.kind == ItemKind::Channel {
+            // Watchlists cannot hold live TV. Keep the saved title as a placeholder.
+            conn.execute(
+                "UPDATE watchlist_item SET source_id=NULL,item_key=NULL WHERE source_id=?1 AND kind=?2 AND item_key=?3",
+                params![f.0, f.1, f.2],
+            )?;
+        } else {
+            conn.execute("UPDATE watchlist_item SET source_id=?4,kind=?5,item_key=?6,fp=COALESCE(?7,fp),orphaned_since=NULL,season_from=NULL,season_to=NULL WHERE source_id=?1 AND kind=?2 AND item_key=?3",params![f.0,f.1,f.2,t.0,t.1,t.2,fp])?;
+        }
     }
     conn.execute(
         "UPDATE history SET source_id = ?4, kind = ?5, item_key = ?6 WHERE source_id = ?1 AND kind = ?2 AND item_key = ?3",
@@ -881,6 +900,7 @@ pub fn finish_catalogue_with(
 ) -> Result<ImportSummary> {
     let kinds = [ItemKind::Channel, ItemKind::Movie, ItemKind::Series];
     let mut removed: HashMap<ItemKind, u32> = HashMap::new();
+    crate::store::watchlist::before_source_delete(conn, imp.source)?;
     let mut groups_removed = 0u32;
     for kind in kinds.into_iter().filter(|k| completed.contains(k)) {
         removed.insert(kind, sweep_kind(conn, imp, kind)?);
@@ -954,6 +974,7 @@ pub fn finish_catalogue_with(
 
     let reattach_kinds: &[ItemKind] = if opts.m3u { &[ItemKind::Channel, ItemKind::Movie, ItemKind::Series, ItemKind::Episode] } else { &kinds };
     let (outcomes, newly_orphaned) = reattach(&tx, imp.source, reattach_kinds, now)?;
+    crate::store::watchlist::match_placeholders(&tx)?;
     if completed.contains(&ItemKind::Channel) {
         carry_video_sizes(&tx, imp.source)?;
         // trust evidence (DESIGN §13.0.1) of channel names the provider no longer lists
@@ -1286,6 +1307,7 @@ pub fn store_series_details(conn: &mut Connection, series: crate::model::SeriesI
     )?;
     let mut outcomes = Vec::new();
     reattach_kind(&tx, source, ItemKind::Episode, Some((series, &norm)), now, &mut outcomes)?;
+    crate::store::watchlist::match_placeholders(&tx)?;
     tx.commit()?;
     Ok(())
 }

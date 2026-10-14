@@ -28,6 +28,7 @@ pub mod search;
 pub mod spoiler_menu;
 pub mod spoiler_rule;
 pub mod tracks;
+pub mod watchlists;
 
 use eframe::egui;
 
@@ -81,6 +82,8 @@ pub enum RenameTarget {
         key: GroupKey,
     },
     FavList(FavListId),
+    Watchlist(crate::model::WatchlistId),
+    DuplicateWatchlist(crate::model::WatchlistId),
     Source(SourceId),
 }
 
@@ -113,6 +116,7 @@ pub struct ResumeSpec {
     pub queue: Option<QueueResume>,
     /// "Cast to…" (DESIGN §40 §3.1): the answer plays on this TV (`UiCtx::cast_with`).
     pub cast: Option<crate::ui::casting::CastDest>,
+    pub watchlist: Option<WatchlistResume>,
 }
 
 /// The Resume prompt over an Up next row (up-next-design §3 "Resume"): "Resume from" and
@@ -122,6 +126,14 @@ pub struct ResumeSpec {
 pub struct QueueResume {
     pub id: crate::model::QueueId,
     pub fullscreen: bool,
+}
+
+/// Resume an entry while preserving its list context (DESIGN §42 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchlistResume {
+    pub list: crate::model::WatchlistId,
+    pub from: Option<crate::model::WatchlistItemId>,
+    pub just_one: bool,
 }
 
 /// What an overlay reports back to the screen that opened it.
@@ -167,6 +179,9 @@ pub trait Overlay {
 /// Build an overlay for a request (every variant wired; frozen).
 pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
     match req {
+        OverlayRequest::WatchlistFind { entry, kind, title } => Box::new(watchlists::Find::new(entry, kind, title)),
+        OverlayRequest::WatchlistPicker(spec) => Box::new(watchlists::Picker::new(spec)),
+        OverlayRequest::WatchlistsMoved(names) => Box::new(watchlists::Moved::new(names)),
         OverlayRequest::Search { initial } => Box::new(search::SearchOverlay::new(initial)),
         OverlayRequest::Help => Box::new(help::HelpOverlay::new()),
         OverlayRequest::Jobs => Box::new(jobs::JobsOverlay::default()),

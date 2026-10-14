@@ -444,10 +444,28 @@ fn cancelled_import_neither_sweeps_nor_bumps_generation() {
 
 // ------------------------------------------------------------------ reattach (§8.3)
 
+/// Save a VOD title to My list, using the same title identity as Ctrl+F.
+fn save_title(c: &Connection, item: &ItemRef) -> tuner::error::Result<()> {
+    let lib = library::load(c)?;
+    tuner::store::watchlist::add(
+        c,
+        &lib,
+        tuner::store::watchlist::default_list(c)?,
+        &[tuner::store::watchlist::new_entry(c, item)?],
+        tuner::watchlist::Insert::End,
+        NOW,
+    )?;
+    Ok(())
+}
+
 /// Attach every kind of user data to `item`.
 fn attach_all(c: &mut Connection, item: &ItemRef, epg_src: EpgSourceId) -> tuner::error::Result<()> {
     let list = user::default_fav_list(c)?;
-    user::set_favourite(c, list, item, true, NOW)?;
+    if item.kind == ItemKind::Channel {
+        user::set_favourite(c, list, item, true, NOW)?;
+    } else {
+        save_title(c, item)?;
+    }
     user::set_item_override(c, item, &ItemOverride { rename: Some("Mine".into()), ..Default::default() })?;
     user::save_progress(
         c,
@@ -1492,26 +1510,24 @@ fn combined_actions_write_per_copy_and_undo_restores_the_rows() {
     let r = s.reader().unwrap();
     let (a1, b1) = (mref(a, "a1"), mref(b, "b1"));
     let both = vec![a1.clone(), b1.clone()];
-    let list = user::default_fav_list(&r).unwrap();
-    let favs = || user::fav_items(&r, list).unwrap();
+    let list = tuner::store::watchlist::default_list(&r).unwrap();
+    let saved = || tuner::store::watchlist::entries(&r, list).unwrap();
     let undo = |u: copies::Undo| w(&s, move |c| copies::undo(c, &u));
 
-    // ★
-    let (all, plays) = (both.clone(), a1.clone());
-    w(&s, move |c| copies::favourite(c, list, &all, &plays, true, NOW));
-    assert_eq!(favs().iter().map(|f| &f.item).collect::<Vec<_>>(), [&a1]);
-    let (all, plays) = (both.clone(), b1.clone());
-    w(&s, move |c| copies::favourite(c, list, &all, &plays, true, NOW + 1));
-    assert_eq!(favs().len(), 1, "a copy already is a favourite");
-    let other = b1.clone();
-    w(&s, move |c| user::set_favourite(c, list, &other, true, NOW + 2));
-    let before = favs();
-    let all = both.clone();
-    let u = w(&s, move |c| copies::favourite(c, list, &all, &all[0], false, NOW + 3));
-    assert!(favs().is_empty(), "removed from every copy");
-    assert_eq!(u.scope(), tuner::msg::DataScope::Favourites);
-    undo(u);
-    assert_eq!(favs(), before, "positions, times and fingerprints back");
+    // ★ is My list (DESIGN §42): one title, whichever copy was used to save it.
+    let plays = a1.clone();
+    w(&s, move |c| save_title(c, &plays));
+    assert_eq!(saved().iter().filter_map(|e| e.item.as_ref()).collect::<Vec<_>>(), [&a1]);
+    let plays = b1.clone();
+    w(&s, move |c| save_title(c, &plays));
+    assert_eq!(saved().len(), 1, "another copy does not duplicate the title");
+    let before = saved();
+    let plays = b1.clone();
+    let (on, u) = w(&s, move |c| tuner::store::watchlist::toggle_my_list(c, &library::load(c)?, &plays, NOW + 3));
+    assert!(!on);
+    assert!(saved().is_empty(), "remove follows title identity");
+    w(&s, move |c| tuner::store::watchlist::undo(c, &u));
+    assert_eq!(saved(), before, "positions, times and fingerprints back");
 
     // ✓
     let p = WatchProgress {
@@ -1738,7 +1754,7 @@ fn deleting_a_playlist_moves_favourites_and_progress_to_matched_copies() {
     };
     w(&s, move |c| {
         for k in ["a1", "a2", "a3", "a4", "a5"] {
-            user::set_favourite(c, list, &mref(a, k), true, NOW)?;
+            save_title(c, &mref(a, k))?;
         }
         user::set_favourite(c, list, &ItemRef { source: a, kind: ItemKind::Channel, key: ItemKey("c1".into()) }, true, NOW)?;
         user::save_progress(c, &prog(a, ItemKind::Movie, "a1", 2480.0, NOW - 10))?;
@@ -1785,10 +1801,16 @@ fn deleting_a_playlist_moves_favourites_and_progress_to_matched_copies() {
     // Dune plays on in TV while the dialog is open: the move takes the progress as it is then
     w(&s, move |c| user::save_progress(c, &prog(a, ItemKind::Movie, "a1", 3000.0, NOW - 2)));
     let done = w(&s, move |c| copies::move_titles(c, &items));
-    assert_eq!(done, copies::Moved { favourites: 2, progress: 2 }, "Gold's favourite lands on Dune, already there");
+    assert_eq!(done, copies::Moved { favourites: 0, watchlists: 3, progress: 2 }, "watchlist entries move with their matched title");
     w(&s, move |c| sources::delete_source(c, a));
-    let favs: Vec<String> = user::fav_items(&r, list).unwrap().into_iter().map(|e| e.item.key.0).collect();
-    assert_eq!(favs, ["b1", "b5"], "TV's favourites now on TV 2's copies, in their places (Gold's lands on Dune, already there)");
+    let saved = tuner::store::watchlist::entries(&r, tuner::store::watchlist::default_list(&r).unwrap()).unwrap();
+    assert_eq!(
+        saved.iter().filter_map(|e| e.item.as_ref().map(|i| i.key.as_str())).collect::<Vec<_>>(),
+        ["b1", "b1", "b5"],
+        "matched entries keep their individual places after a user join"
+    );
+    assert_eq!(saved.iter().filter(|e| e.item.is_none()).count(), 2, "unmatched entries stay as placeholders");
+    assert!(user::fav_items(&r, list).unwrap().is_empty(), "channel favourite goes with the deleted playlist");
     let pos = |kind: ItemKind, key: &str| user::progress(&r, &ItemRef { source: b, kind, key: ItemKey(key.into()) }).unwrap().map(|p| p.position_s);
     assert_eq!(pos(ItemKind::Movie, "b1"), Some(3000.0), "newer progress (as it was at Delete) moved over the older");
     assert_eq!(pos(ItemKind::Movie, "b4"), Some(900.0), "split copy untouched");
@@ -2511,8 +2533,7 @@ fn titles_in_other_languages_hide_but_never_favourites_or_started_ones() {
         (Some("NL"), Some("QC"), Some("AR-SUBS"), Some("SUBS"))
     );
     w(&s, move |c| {
-        let list = user::default_fav_list(c)?;
-        user::set_favourite(c, list, &mref(tv, "fav"), true, NOW)?;
+        save_title(c, &mref(tv, "fav"))?;
         user::save_progress(
             c,
             &WatchProgress {

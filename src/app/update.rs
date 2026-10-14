@@ -61,6 +61,6 @@ fn view_of(route: &Route) -> Option<ViewArg> {
         Route::Movies { .. } | Route::MovieDetail(_) => ViewArg::Movies,
         Route::Series { .. } | Route::SeriesDetail(_) => ViewArg::Series,
         Route::Settings(_) | Route::EditPlaylist(_) | Route::Logs | Route::EpgMapping { .. } => ViewArg::Settings,
-        Route::Onboarding(_) | Route::Queue => return None,
+        Route::Onboarding(_) | Route::Queue | Route::Watchlists { .. } => return None,
     })
 }

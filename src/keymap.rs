@@ -87,12 +87,15 @@ pub enum KeyContext {
     /// picture (`[MultiView, PlayerLive]`, `[PlayerOsd, MultiView, PlayerLive]`, `[List,
     /// MultiView, PlayerLive]`, `[PopOut, MultiView, PlayerLive]`); unbound keys fall through.
     MultiView,
+    /// Watchlist entries and list controls (DESIGN §42 §2.4).
+    Watchlists,
 }
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 20] = [
+    pub const ALL: [KeyContext; 21] = [
         KeyContext::Global,
+        KeyContext::Watchlists,
         KeyContext::List,
         KeyContext::ListFiltering,
         KeyContext::Checklist,
@@ -117,6 +120,7 @@ impl KeyContext {
     pub fn title(self) -> &'static str {
         match self {
             KeyContext::Global => "Everywhere",
+            KeyContext::Watchlists => "Watchlists",
             KeyContext::List => "Lists",
             KeyContext::ListFiltering => "Lists while filtering",
             KeyContext::PosterGrid => "Movies & series grid",
@@ -299,6 +303,11 @@ pub enum Action {
     QueuePlayNext,
     /// Alt+6: the Up next screen.
     GoQueue,
+    GoWatchlists,
+    WatchlistOne,
+    WatchlistSkip,
+    WatchlistOrder,
+    WatchlistNew,
     /// `u` in the player: the Up next panel.
     QueuePanel,
     /// `n` / `N` in the player: next / previous Up next item (multi-view: "Up next waits").
@@ -481,6 +490,7 @@ pub static GLOBAL: &[Binding] = &[
     b(C::alt(Key::Num4), A::GoMovies, "Movies"),
     b(C::alt(Key::Num5), A::GoSeries, "Series"),
     b(C::alt(Key::Num6), A::GoQueue, "Up next"),
+    b(C::alt(Key::Num7), A::GoWatchlists, "Watchlists"),
     b(C::ctrl(Key::Comma), A::GoSettings, "Settings"),
     b(C::alt(Key::Num0), A::GoSettings, "Settings"),
     b(C::alt(Key::ArrowLeft), A::Back, "Back"),
@@ -509,8 +519,8 @@ pub static GLOBAL: &[Binding] = &[
 /// Shared by List / ListFiltering / PosterGrid(Filtering) / Detail: item actions on Ctrl
 /// chords and Delete (Search has its own subset, [`SEARCH_ITEM_ACTIONS`]).
 pub static ITEM_ACTIONS: &[Binding] = &[
-    b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
-    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
+    b(C::ctrl(Key::F), A::ToggleFavourite, "Save to / remove from My list (channels: Favourites)"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Watchlists… (channels: Favourites lists…)"),
     b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide"),
     b(C::key(Key::F2), A::Rename, "Rename"),
     b(C::ctrl(Key::L), A::ToggleLock, "Lock with PIN / unlock"),
@@ -693,7 +703,7 @@ pub static GUIDE: &[Binding] = &[
     b(C::ch('8'), A::Digit(8), "Jump to channel number"),
     b(C::ch('9'), A::Digit(9), "Jump to channel number"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add channel to Favourites"),
-    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists…"),
     b(C::ctrl(Key::E), A::AssignEpg, "Assign guide channel"),
     b(C::ctrl(Key::I), A::ShowDetails, "Edit channel information"),
     b(C::key(Key::F2), A::Rename, "Rename channel"),
@@ -741,7 +751,8 @@ pub static PLAYER_COMMON: &[Binding] = &[
     b(C::ch('n'), A::QueueNext, "Next / previous in Up next"),
     b(C::ch('N'), A::QueuePrev, "Next / previous in Up next"),
     b(C::ctrl(Key::M), A::WatchAlongside, "Watch alongside… (choose the channel)"),
-    b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
+    b(C::ctrl(Key::F), A::ToggleFavourite, "Save to / remove from My list (channels: Favourites)"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Watchlists… (channels: Favourites lists…)"),
     b(C::key(Key::Escape), A::Back, "Back (hide banner, then leave; keeps playing in the mini player)"),
     b(C::ch('/'), A::OpenSearch, "Search everything"),
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
@@ -869,8 +880,8 @@ pub static SEARCH: &[Binding] = &[
 /// The item shortcuts the search overlay acts on (no reorder, sort or remove there: a hit
 /// list has no order of its own and nothing to remove from).
 pub static SEARCH_ITEM_ACTIONS: &[Binding] = &[
-    b(C::ctrl(Key::F), A::ToggleFavourite, "Add to / remove from Favourites"),
-    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists… (add, new list)"),
+    b(C::ctrl(Key::F), A::ToggleFavourite, "Save to / remove from My list (channels: Favourites)"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Watchlists… (channels: Favourites lists…)"),
     b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide"),
     b(C::key(Key::F2), A::Rename, "Rename"),
     b(C::ctrl(Key::L), A::ToggleLock, "Lock with PIN / unlock"),
@@ -957,6 +968,15 @@ pub static PANEL: &[Binding] = &[
     b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
 ];
 
+/// Watchlist play order and entry actions (DESIGN §42 §2.4).
+pub static WATCHLISTS: &[Binding] = &[
+    b(C::key(Key::ArrowRight), A::Right, "Open entries / move right"),
+    b(C::ctrl_shift(Key::Enter), A::WatchlistOne, "Play just this one"),
+    b(C::ch('s'), A::WatchlistSkip, "Skip in this list / unskip"),
+    b(C::ch('o'), A::WatchlistOrder, "In order / Any order"),
+    b(C::ch('+'), A::WatchlistNew, "New list…"),
+];
+
 /// The help overlay. Every printable key types into its filter (`?` too: it closes the overlay
 /// only while the filter is empty), so no letter shortcut can fire while help is open.
 pub static HELP: &[Binding] = &[
@@ -979,6 +999,7 @@ pub static HELP: &[Binding] = &[
 pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
     match ctx {
         KeyContext::Global => vec![GLOBAL],
+        KeyContext::Watchlists => vec![WATCHLISTS],
         KeyContext::List => vec![LIST, ITEM_ACTIONS],
         KeyContext::ListFiltering => vec![LIST_FILTERING, ITEM_ACTIONS],
         KeyContext::PosterGrid => vec![POSTER_GRID, ITEM_ACTIONS],

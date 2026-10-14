@@ -33,6 +33,7 @@ pub const ITEMS: &[SidebarItem] = &[
     SidebarItem { id: ScreenId::Series, glyph: glyphs::SERIES, label: "Series" },
     // only while Up next has items to go, with their count (DESIGN §32)
     SidebarItem { id: ScreenId::Queue, glyph: glyphs::UP_NEXT, label: "Up next" },
+    SidebarItem { id: ScreenId::Watchlists, glyph: glyphs::FAV_LIST, label: "Watchlists" },
     SidebarItem { id: ScreenId::Settings, glyph: glyphs::SETTINGS, label: "Settings" },
 ];
 
@@ -213,13 +214,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(labels(false, true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Settings"]);
-        assert_eq!(labels(false, false, None), ["Search", "Home", "Live TV", "Guide", "Settings"]);
-        assert_eq!(labels(false, true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Settings"]);
-        assert_eq!(labels(false, false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Settings"]);
+        assert_eq!(labels(false, true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Watchlists", "Settings"]);
+        assert_eq!(labels(false, false, None), ["Search", "Home", "Live TV", "Guide", "Watchlists", "Settings"]);
+        assert_eq!(labels(false, true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Settings"]);
+        assert_eq!(labels(false, false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Watchlists", "Settings"]);
         // Play on heads the list when shown, and is no screen
-        assert_eq!(labels(true, false, None), ["Play on", "Search", "Home", "Live TV", "Guide", "Settings"]);
-        assert_eq!(labels(true, true, Some(2)), ["Play on", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Settings"]);
+        assert_eq!(labels(true, false, None), ["Play on", "Search", "Home", "Live TV", "Guide", "Watchlists", "Settings"]);
+        assert_eq!(labels(true, true, Some(2)), ["Play on", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Settings"]);
         assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
         assert!(!is_current(ScreenId::Live, ScreenId::Guide));
     }

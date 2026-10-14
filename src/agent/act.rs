@@ -651,7 +651,7 @@ pub struct StatusMore {
 /// [`status`] with Up next, multi-view, the playlists' streams and the sleep timer.
 pub fn status_with(q: &Q, snap: &PlayerSnapshot, more: &StatusMore) -> Out<StatusOut> {
     let mut out = status(q, snap)?;
-    let queue = &more.queue;
+    let queue = super::queue::visible_snapshot(q, &more.queue);
     if queue.pending() > 0 {
         let next = queue.next.and_then(|id| queue.row(id)).map(|r| QueueNextOut { item: item_ref(&r.entry.item), title: clean(&r.entry.title) });
         out.queue = Some(QueueStatusOut {
@@ -660,6 +660,32 @@ pub fn status_with(q: &Q, snap: &PlayerSnapshot, more: &StatusMore) -> Out<Statu
             left: queue.pending() as u32,
             eta_end: queue.eta_end.map(|(t, _)| fmt_time(t)),
             playing: queue.driving,
+        });
+    }
+    if let Some(context) = &queue.watchlist
+        && let Some(view) = crate::store::watchlist::view_with_preferences(
+            q.conn,
+            q.lib,
+            context.id,
+            q.view.unlocked,
+            true,
+            q.view.hides_explicit,
+            q.cfg.interface.copy_order,
+        )?
+    {
+        // Counts and position come from the live view even if a parental timer relocked while
+        // the queue snapshot waited for the next frame (DESIGN §42 §6).
+        let current_entry = queue.current.and_then(|id| queue.row(id)).and_then(|r| r.entry.watchlist_item_id);
+        let position = current_entry
+            .and_then(|id| view.place(id))
+            .map(|(position, _)| position)
+            .or_else(|| view.next.and_then(|id| view.place(id)).map(|(position, _)| position))
+            .unwrap_or(view.total);
+        out.watchlist = Some(super::proto::WatchlistStatusOut {
+            name: clean(&view.list.name),
+            position: position as u32,
+            total: view.total as u32,
+            playing_through: context.playing_through,
         });
     }
     let mut snaps: Vec<(crate::model::TileId, &PlayerSnapshot)> = vec![(crate::model::TileId::A, snap)];
@@ -789,6 +815,7 @@ pub fn status(q: &Q, snap: &PlayerSnapshot) -> Out<StatusOut> {
         parental_locked: q.view.pin_active && !q.view.unlocked,
         scheduled: scheduled(q)?,
         queue: None,
+        watchlist: None,
         multiview: None,
         streams: Vec::new(),
         sleep_timer: None,

@@ -411,6 +411,9 @@ pub struct FavEditOut {
     pub removed: u32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<Refused>,
+    /// Non-channel saves belong to Watchlists (DESIGN §42 §4.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_watchlist: Option<&'static str>,
 }
 
 /// What `favourites_edit` writes.
@@ -474,6 +477,12 @@ fn plan_fav(q: &Q, p: &FavouritesEdit) -> Out<FavPlan> {
     };
     let mut plan = FavPlan { list, name, add: Vec::new(), remove: Vec::new(), refused: Vec::new() };
     for s in &p.add {
+        if let Ok(AgentRef::Item(r)) = parse_ref(s)
+            && r.kind != ItemKind::Channel
+        {
+            plan.refused.push(Refused { item: s.clone(), error: "use_watchlist".into() });
+            continue;
+        }
         match visible_item(q, s) {
             // locked items are never added, whatever the session: a list is a way in
             Ok((_, true)) => plan.refused.push(Refused { item: s.clone(), error: crate::queue::Refusal::Locked.code().into() }),
@@ -483,11 +492,14 @@ fn plan_fav(q: &Q, p: &FavouritesEdit) -> Out<FavPlan> {
     }
     for s in &p.remove {
         match parse_ref(s) {
+            Ok(AgentRef::Item(r)) if r.kind != ItemKind::Channel => {
+                plan.refused.push(Refused { item: s.clone(), error: "use_watchlist".into() });
+            }
             Ok(AgentRef::Item(r)) if !q.conceals(&r) => plan.remove.push(r),
             _ => plan.refused.push(Refused { item: s.clone(), error: "not_found".into() }),
         }
     }
-    if plan.add.is_empty() && plan.remove.is_empty() && p.create.is_none() {
+    if plan.add.is_empty() && plan.remove.is_empty() && plan.refused.is_empty() && p.create.is_none() {
         return Err(Fail::bad("nothing to do: give add, remove or create"));
     }
     Ok(plan)
@@ -497,6 +509,9 @@ pub(super) async fn favourites_edit(h: &Arc<Inner>, p: FavouritesEdit) -> Out<Va
     let plan = h.run(true, move |q| plan_fav(q, &p)).await?;
     let now = crate::model::now();
     let FavPlan { list, name, add, remove, refused } = plan;
+    if add.is_empty() && remove.is_empty() && !refused.is_empty() && refused.iter().all(|r| r.error == "use_watchlist") {
+        return to_value(&FavEditOut { list: clean(&name), created: false, added: 0, removed: 0, refused, use_watchlist: Some("watchlist") });
+    }
     let created = list.is_none();
     let list_name = name.clone();
     let (added, removed) = h
@@ -520,7 +535,8 @@ pub(super) async fn favourites_edit(h: &Arc<Inner>, p: FavouritesEdit) -> Out<Va
         })
         .await?;
     tracing::info!("agent: favourites_edit → +{added} −{removed} ({} refused)", refused.len());
-    to_value(&FavEditOut { list: clean(&list_name), created, added, removed, refused })
+    let use_watchlist = refused.iter().any(|r| r.error == "use_watchlist").then_some("watchlist");
+    to_value(&FavEditOut { list: clean(&list_name), created, added, removed, refused, use_watchlist })
 }
 
 // ------------------------------------------------------------------ parental_status / lock

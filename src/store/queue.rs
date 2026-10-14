@@ -43,7 +43,7 @@ pub struct Added {
     pub full: usize,
 }
 
-const COLS: &str = "id, source_id, kind, item_key, any_copy, prog_start, prog_stop, catchup_id, title, subtitle, duration_s, from_start, state, added_by, orphaned_since";
+const COLS: &str = "id, source_id, kind, item_key, any_copy, prog_start, prog_stop, catchup_id, title, subtitle, duration_s, from_start, state, added_by, orphaned_since, watchlist_item_id, list_context";
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
     let start: Option<Timestamp> = r.get(5)?;
@@ -62,13 +62,27 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
         state: RowState::parse(&state).unwrap_or_default(),
         by_agent: r.get::<_, String>(13)? == "agent",
         orphaned: r.get::<_, Option<Timestamp>>(14)?.is_some(),
+        watchlist_item_id: r.get(15)?,
+        list_context: r.get(16)?,
     })
 }
 
 /// Every row in list order.
 pub fn load(conn: &Connection) -> Result<Vec<QueueEntry>> {
-    let mut stmt = conn.prepare_cached(&format!("SELECT {COLS} FROM queue_item ORDER BY position, id"))?;
+    // The user-data backup is also read immediately before migration 0015.
+    let cols = if crate::store::migrations::has_column(conn, "queue_item", "watchlist_item_id")? {
+        COLS.to_owned()
+    } else {
+        COLS.replace("watchlist_item_id, list_context", "NULL, 0")
+    };
+    let mut stmt = conn.prepare_cached(&format!("SELECT {cols} FROM queue_item ORDER BY position, id"))?;
     Ok(stmt.query_map([], entry_from_row)?.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Mark a row as fed by a watchlist (DESIGN §42 §3), in the add's transaction.
+pub fn link_watchlist(conn: &Connection, id: QueueId, entry: crate::model::WatchlistItemId, context: bool) -> Result<()> {
+    conn.execute("UPDATE queue_item SET watchlist_item_id = ?2, list_context = ?3 WHERE id = ?1", params![id, entry, context])?;
+    Ok(())
 }
 
 /// (id, state) of every row in list order.
@@ -84,6 +98,14 @@ fn write_order(conn: &Connection, ids: &[QueueId]) -> Result<()> {
     for (i, id) in ids.iter().enumerate() {
         stmt.execute(params![id, i as i64])?;
     }
+    Ok(())
+}
+
+/// Reuse an interrupted/context-fed row with the freshly selected copy and resume state.
+pub(crate) fn refresh_list_row(c: &Connection, id: QueueId, row: &NewRow) -> Result<()> {
+    let fp = crate::store::user::fingerprint_of(c, &row.item)?;
+    c.execute("UPDATE queue_item SET source_id=?2,kind=?3,item_key=?4,any_copy=?5,title=?6,subtitle=?7,duration_s=?8,from_start=?9,added_by=?10,fp=?11,orphaned_since=NULL WHERE id=?1",
+        params![id, row.item.source, row.item.kind.as_str(), row.item.key.as_str(), row.any_copy, row.title, row.subtitle, row.duration_s, row.from_start, if row.by == AddedBy::Agent { "agent" } else { "app" }, fp_to_json(&fp)])?;
     Ok(())
 }
 
@@ -274,6 +296,10 @@ struct BackupRow {
     duration_s: Option<f64>,
     from_start: bool,
     by_agent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watchlist_item_id: Option<crate::model::WatchlistItemId>,
+    #[serde(default)]
+    list_context: bool,
 }
 
 /// The queue for a backup (`None`: nothing to keep). Unplayed rows in list order.
@@ -292,6 +318,8 @@ pub fn export(conn: &Connection) -> Result<Option<serde_json::Value>> {
             duration_s: e.duration_s,
             from_start: e.from_start,
             by_agent: e.by_agent,
+            watchlist_item_id: e.watchlist_item_id,
+            list_context: e.list_context,
         })
         .collect();
     if rows.is_empty() {
@@ -304,6 +332,16 @@ pub fn export(conn: &Connection) -> Result<Option<serde_json::Value>> {
 /// Rows are appended as pending; ones already pending here (same item and slot) are skipped,
 /// and so is everything past [`MAX_ROWS`]. Returns the rows added.
 pub fn import(conn: &Connection, v: &serde_json::Value, remap: &dyn Fn(&ItemRef) -> Option<ItemRef>) -> Result<usize> {
+    import_with_watchlists(conn, v, remap, &std::collections::HashMap::new())
+}
+
+/// Watchlist row ids are local to the database; a restore remaps chips with their entries.
+pub fn import_with_watchlists(
+    conn: &Connection,
+    v: &serde_json::Value,
+    remap: &dyn Fn(&ItemRef) -> Option<ItemRef>,
+    watchlist_entries: &std::collections::HashMap<crate::model::WatchlistItemId, crate::model::WatchlistItemId>,
+) -> Result<usize> {
     let rows: Vec<BackupRow> = match v.get("rows").cloned().map(serde_json::from_value) {
         Some(Ok(r)) => r,
         Some(Err(e)) => {
@@ -314,6 +352,7 @@ pub fn import(conn: &Connection, v: &serde_json::Value, remap: &dyn Fn(&ItemRef)
     };
     let now = crate::model::now();
     let mut new = Vec::new();
+    let mut links = Vec::new();
     for r in rows {
         let Some(item) = remap(&r.item) else { continue };
         if (item.kind == ItemKind::Channel) != (r.start.is_some() && r.stop.is_some()) {
@@ -339,6 +378,15 @@ pub fn import(conn: &Connection, v: &serde_json::Value, remap: &dyn Fn(&ItemRef)
             from_start: r.from_start,
             by: if r.by_agent { AddedBy::Agent } else { AddedBy::App },
         });
+        links.push((r.watchlist_item_id.and_then(|id| watchlist_entries.get(&id).copied()), r.list_context));
     }
-    Ok(add(conn, &new, Insert::End, now)?.ids.len())
+    atomic(conn, |c| {
+        let added = add(c, &new, Insert::End, now)?;
+        for (id, (entry, context)) in added.ids.iter().zip(links) {
+            if let Some(entry) = entry {
+                link_watchlist(c, *id, entry, context)?;
+            }
+        }
+        Ok(added.ids.len())
+    })
 }

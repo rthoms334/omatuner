@@ -2,7 +2,7 @@
 name: series
 description: Continue, recap or find episodes of a series in Tuner. "Carry on with X", "next episode", "where am I in X", "previously on", "recap season 1 before season 2", "which episode is the one where…", "which shows have I stalled on", "next 3 then stop", "marathon season 2".
 when_to_use: Use for anything about a TV series in the user's Tuner library: progress, the next episode, recaps, finding an episode, or queueing episodes. For when a new episode airs on live TV, use plan.
-allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__episodes mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue mcp__plugin_omatuner_tuner__sleep_timer mcp__plugin_omatuner_tuner__spoiler_guard
+allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__episodes mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue mcp__plugin_omatuner_tuner__watchlist mcp__plugin_omatuner_tuner__sleep_timer mcp__plugin_omatuner_tuner__spoiler_guard
 ---
 
 # Series: carry on, recap, find an episode
@@ -18,6 +18,14 @@ spoiler territory: use `spoiler_safe: true` until you know where they are.
    the next season. `episodes.next_episode` is what `play` on the series would start.
 3. Confirm only when you'd skip an unfinished episode or switch to another copy. Then `play`
    the episode ref (or the series ref).
+
+## Series in a watchlist
+
+For “carry on with my Star Wars shows”, use `watchlist lists` / `show` to find the list,
+then `watchlist next`; name the episode and resume point before `status` → `watchlist play` with that entry’s
+`id`. A series range stays within its seasons. Playing carries on through the list unless
+the user says “just the one” (`just_one: true`). “Where am I in Star Wars” reads `show`.
+Ask which list when the name is ambiguous; never skip a locked entry without saying why.
 
 ## Recap
 

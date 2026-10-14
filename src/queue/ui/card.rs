@@ -22,6 +22,8 @@ pub enum Card {
         place: Option<(usize, usize)>,
         /// The live slot that ended / the item that failed.
         before: Option<String>,
+        list: Option<(String, bool)>,
+        context: bool,
     },
     /// "Up next is locked · You Only Live Twice".
     Locked { title: String },
@@ -41,6 +43,7 @@ pub enum Button {
     PlayNow,
     List,
     Cancel,
+    StopList,
     KeepWatching,
     EnterPin,
     Skip,
@@ -57,6 +60,7 @@ impl Button {
         match self {
             Button::PlayNow => (g::PLAY, "Play now", "Enter"),
             Button::List => (g::UP_NEXT, "List", "u"),
+            Button::StopList => (g::STOP, "Stop the list", "Esc"),
             Button::Cancel => (g::CLOSE, "Cancel", "Esc"),
             Button::KeepWatching => (g::CLOSE, "Keep watching", "Esc"),
             Button::EnterPin => (g::LOCK, "Enter PIN", "Enter"),
@@ -106,7 +110,13 @@ impl Card {
                 }
                 _ => None,
             };
-            return Some(Card::Countdown { why: c.why, next, detail, left, place: c.id.and_then(|id| s.place(id)), before });
+            let list =
+                c.id.and_then(|id| s.row(id))
+                    .and_then(|r| r.entry.watchlist_item_id)
+                    .and_then(|id| s.watchlist_chips.get(&id))
+                    .map(|w| (w.name.clone(), w.any_order));
+            let context = s.context.is_some() && c.id.and_then(|id| s.row(id)).is_some_and(|r| r.entry.list_context);
+            return Some(Card::Countdown { why: c.why, next, detail, left, place: c.id.and_then(|id| s.place(id)), before, list, context });
         }
         if let Some(b) = s.blocked {
             let row = s.blocked_id.and_then(|id| s.row(id));
@@ -123,6 +133,7 @@ impl Card {
         }
         let f = s.finished?;
         let text = match f {
+            FinishedWhy::EndOfList(_) => format!("That was {} ✓", s.finished_watchlist.as_deref().unwrap_or("your watchlist")),
             FinishedWhy::EndOfQueue => "That was Up next.".to_owned(),
             FinishedWhy::StopAfter(id) => match title_of(s, Some(id)) {
                 Some(t) => format!("Stopped after {t}, as asked"),
@@ -141,20 +152,24 @@ impl Card {
     pub fn lines(&self, now: Timestamp, h24: bool) -> (String, Option<String>) {
         let secs = |left: Option<i64>| left.map(|l| format!(" in {l} s")).unwrap_or_default();
         match self {
-            Card::Countdown { why, next, detail, left, place, before } => {
+            Card::Countdown { why, next, detail, left, place, before, list, .. } => {
                 let of = place.map(|(k, n)| format!(" · {k} of {n}")).unwrap_or_default();
-                let head = match why {
-                    CountdownWhy::NextEpisode => format!("Next episode{}", secs(*left)),
-                    CountdownWhy::SlotEnded => match (before, next) {
-                        (Some(b), Some(_)) => format!("{b} has ended — up next{}", secs(*left)),
-                        (Some(b), None) => format!("{b} has ended"),
-                        (None, _) => format!("Up next{}", secs(*left)),
-                    },
-                    CountdownWhy::Failed => match before {
-                        Some(b) => format!("Couldn't play {b} — next{}", secs(*left)),
-                        None => format!("Couldn't play that — next{}", secs(*left)),
-                    },
-                    CountdownWhy::Ended => format!("Up next{}{of}", secs(*left)),
+                let head = if let Some((name, any)) = list {
+                    if *any { format!("Another from {name}{}", secs(*left)) } else { format!("Next in {name}{}", secs(*left)) }
+                } else {
+                    match why {
+                        CountdownWhy::NextEpisode => format!("Next episode{}", secs(*left)),
+                        CountdownWhy::SlotEnded => match (before, next) {
+                            (Some(b), Some(_)) => format!("{b} has ended — up next{}", secs(*left)),
+                            (Some(b), None) => format!("{b} has ended"),
+                            (None, _) => format!("Up next{}", secs(*left)),
+                        },
+                        CountdownWhy::Failed => match before {
+                            Some(b) => format!("Couldn't play {b} — next{}", secs(*left)),
+                            None => format!("Couldn't play that — next{}", secs(*left)),
+                        },
+                        CountdownWhy::Ended => format!("Up next{}{of}", secs(*left)),
+                    }
                 };
                 let line = match (next, detail) {
                     (Some(n), Some(d)) => Some(format!("{n} · {d}")),
@@ -169,7 +184,10 @@ impl Card {
                 let wait = crate::ui::epg_grid::time_left((*start - now).max(0));
                 (format!("Up next: {title} at {at} — {wait}"), detail.clone())
             }
-            Card::Paused => ("Up next paused: 3 items failed in a row".into(), Some("Provider trouble? It carries on when you say.".into())),
+            Card::Paused => (
+                "Up next paused: 3 items failed in a row".into(),
+                Some("Provider trouble? Choose a title or start the list again when you’re ready.".into()),
+            ),
             Card::MultiView => ("Up next waits while multi-view is on".into(), None),
             Card::Finished { text, offer } => (text.clone(), offer.as_ref().map(|(_, l)| format!("Next episode: {l}"))),
         }
@@ -191,6 +209,7 @@ impl Card {
 
     pub fn buttons(&self) -> Vec<Button> {
         match self {
+            Card::Countdown { context: true, .. } => vec![Button::PlayNow, Button::List, Button::StopList],
             Card::Countdown { why: CountdownWhy::SlotEnded, next: Some(_), .. } => vec![Button::PlayNow, Button::KeepWatching],
             Card::Countdown { why: CountdownWhy::SlotEnded, next: None, .. } => vec![Button::KeepWatching],
             Card::Countdown { why: CountdownWhy::NextEpisode, .. } => vec![Button::PlayNow, Button::Cancel],
@@ -207,6 +226,7 @@ impl Card {
     /// A button's step.
     pub fn press(&self, b: Button) -> Step {
         match b {
+            Button::StopList => Step::Send(QueueCommand::StopList),
             Button::PlayNow => Step::Send(QueueCommand::Now),
             Button::List => Step::List,
             Button::Cancel | Button::KeepWatching | Button::Close => Step::Send(QueueCommand::Cancel),
@@ -237,7 +257,7 @@ impl Card {
             },
             Action::QueuePanel => Button::List,
             // Esc in controls focus mode too: the card is the rung before leaving the controls
-            Action::Back | Action::LeaveOsdControls => first(&[Button::Cancel, Button::KeepWatching, Button::Close])?,
+            Action::Back | Action::LeaveOsdControls => first(&[Button::Cancel, Button::StopList, Button::KeepWatching, Button::Close])?,
             _ => return None,
         };
         Some(self.press(b))
@@ -294,5 +314,26 @@ mod tests {
         assert_eq!(c.key(Action::Activate), Some(Step::PlayEpisode(EpisodeId(9))), "the next episode is offered, no countdown");
         assert!(!c.counts_down());
         assert_eq!(c.short(100), None, "the mini chip leaves the end card to the player");
+    }
+    #[test]
+    fn watchlist_countdown_names_its_own_list_and_only_context_rows_can_stop_it() {
+        let mut s = snap(&[(1, RowState::Pending)]);
+        let mut rows = s.rows.to_vec();
+        let entry = crate::model::WatchlistItemId(10);
+        rows[0].entry.watchlist_item_id = Some(entry);
+        s.rows = rows.into();
+        s.watchlist_chips.insert(entry, crate::queue::WatchlistChip { name: "Christmas films".into(), any_order: true, position: 1, total: 2 });
+        s.context = Some(crate::model::WatchlistId(99));
+        s.countdown = Some(Countdown { id: Some(QueueId(1)), at: Some(108), why: CountdownWhy::Ended });
+        let c = Card::of(&s, 100).unwrap();
+        assert_eq!(c.lines(100, true), ("Another from Christmas films in 8 s".into(), Some("Movie 1".into())));
+        assert!(c.buttons().contains(&Button::List));
+        assert!(!c.buttons().contains(&Button::StopList));
+        let mut rows = s.rows.to_vec();
+        rows[0].entry.list_context = true;
+        s.rows = rows.into();
+        let c = Card::of(&s, 100).unwrap();
+        assert!(c.buttons().contains(&Button::List));
+        assert_eq!(c.key(Action::Back), Some(Step::Send(QueueCommand::StopList)));
     }
 }

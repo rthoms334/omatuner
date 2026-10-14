@@ -399,7 +399,10 @@ impl QueueList {
         let icon = FontId::proportional(theme.font(TypeToken::Icon));
         let pad = theme.space(SpaceToken::RowPaddingX).min(row_h / 2.0);
         let mut first = true;
-        let outcome = virtual_list(ui, theme, ("queue-list", mode == Mode::Panel), &mut self.list, row_h, |ui, rc| {
+        let then_h = snap.watchlist.as_ref().map_or(0.0, |w| (w.then.len().min(3) as f32 + 2.2) * row_h).min(rect.height() * 0.45);
+        let rows_rect = Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() - then_h));
+        let mut rows_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
+        let outcome = virtual_list(&mut rows_ui, theme, ("queue-list", mode == Mode::Panel), &mut self.list, row_h, |ui, rc| {
             if std::mem::take(&mut first) && scroll != 0.0 {
                 ui.scroll_with_delta(egui::vec2(0.0, scroll));
                 ui.ctx().request_repaint();
@@ -488,6 +491,12 @@ impl QueueList {
                             remove = Some(e.id);
                         }
                         right = xr.left() - pad / 2.0;
+                    }
+                    if let Some(chip) = e.watchlist_item_id.and_then(|id| snap.watchlist_chips.get(&id)) {
+                        let label = format!("{} · {}/{}", chip.name, chip.position, chip.total);
+                        let g =
+                            osd_text(&p, egui::pos2(right, r.center().y), Align2::RIGHT_CENTER, &label, small.clone(), look.accent, r.width() / 3.0);
+                        right = g.left() - pad;
                     }
                     let late = late_from.is_some_and(|l| rc.index >= l) && pending;
                     let note = row.note.clone().or_else(|| late.then(|| format!("{} late", glyphs::WARNING)));
@@ -595,6 +604,20 @@ impl QueueList {
             ui.ctx().request_repaint();
         } else if self.drag.is_some() && ui.input(|i| !i.pointer.any_down()) {
             self.drag = None;
+        }
+        if let Some(w) = &snap.watchlist {
+            let then_rect = Rect::from_min_max(egui::pos2(rect.left(), rows_rect.bottom()), rect.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(then_rect), |ui| {
+                ui.separator();
+                ui.label(egui::RichText::new(format!("Then from {}", w.name)).color(look.accent));
+                for e in w.then.iter().take(3) {
+                    let episode = e.season.zip(e.episode).map(|(s, n)| format!(" · S{s}E{n}")).unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("{}{}{episode}", if e.locked { "󰌾 " } else { "" }, e.title)).color(look.dim));
+                }
+                if ui.button("Stop after the queue").clicked() {
+                    out = Out::Send(vec![QueueCommand::StopList]);
+                }
+            });
         }
         out
     }

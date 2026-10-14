@@ -1261,7 +1261,7 @@ impl SettingsScreen {
                 v.push(Row::Choice(&IFACE_C[6]));
             }
             SettingsPage::Favourites => {
-                v.push(Row::Section("Favourites lists".into()));
+                v.push(Row::Section("Channel favourites lists".into()));
                 for l in &ctx.favs.lists {
                     // explicit titles parental control hides don't count (DESIGN §20.3)
                     let n = ctx.favs.items(l.id).iter().filter(|r| !ctx.lib.conceals(r)).count();
@@ -2069,7 +2069,8 @@ impl SettingsScreen {
             let token = self.token(Pending::UsePlaylist(e.original.id));
             ctx.open(OverlayRequest::Confirm(ConfirmSpec {
                 title: "Use the playlist instead of the Xtream login?".into(),
-                body: "Movies and series not in the playlist will be removed. Favourites carry over where the playlist has them.".into(),
+                body: "Movies and series not in the playlist will be removed. Watchlist entries stay and attach when a matching copy is available."
+                    .into(),
                 confirm_label: "Use playlist".into(),
                 destructive: false,
                 token,

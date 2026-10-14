@@ -325,6 +325,24 @@ impl PlayerScreen {
                 items.push(menu_item(icon, label, Action::ToggleFavourite, true, k));
             }
         }
+        if let Some(item) = snap.playable.as_ref().and_then(|p| p.item.as_ref()) {
+            if item.kind != crate::model::ItemKind::Channel {
+                items.push(menu_item(
+                    glyphs::FAVOURITE,
+                    if ctx.favs.is_fav(item) { "Remove from My list" } else { "Save to My list" },
+                    Action::ToggleFavourite,
+                    true,
+                    k,
+                ));
+            }
+            items.push(menu_item(
+                glyphs::FAV_LIST,
+                if item.kind == crate::model::ItemKind::Channel { "Favourites lists…" } else { "Watchlists…" },
+                Action::AddToList,
+                true,
+                k,
+            ));
+        }
         // the TV has its own picture, tracks and window (DESIGN §40 §3.3)
         let casting = snap.cast.is_some();
         if !casting {
@@ -579,8 +597,17 @@ impl Screen for PlayerScreen {
                 None => self.play_from_menu(ctx),
             },
             Action::ToggleFavourite => {
-                if let Some(ch) = playing_channel(ctx.player).and_then(|id| ctx.lib.live.get(id).cloned()) {
-                    live::toggle_favourite(ctx, live::channel_ref(&ch), &ch.name);
+                if let Some((item, title)) = ctx.player.playable.as_ref().and_then(|p| p.item.clone().map(|item| (item, p.title.clone()))) {
+                    if item.kind == crate::model::ItemKind::Channel {
+                        live::toggle_favourite(ctx, item, &title);
+                    } else {
+                        crate::ui::watchlists::toggle_my_list(ctx, &item);
+                    }
+                }
+            }
+            Action::AddToList => {
+                if let Some((item, title)) = ctx.player.playable.as_ref().and_then(|p| p.item.clone().map(|i| (i, p.title.clone()))) {
+                    crate::ui::screens::home::kit::list_picker(ctx, &item, &title);
                 }
             }
             Action::Back => {
@@ -1565,5 +1592,31 @@ mod tests {
         h.get_by_label("Pair").click();
         h.run_steps(2);
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPair { device: TV, then_cast: true })]);
+    }
+    #[test]
+    fn watchlist_ctrl_f_keeps_catchup_ended_and_failed_channels_in_favourites() {
+        use crate::ui::screens::home::testkit::{channels, seed, source};
+        for state in [
+            PlayerState::Playing,
+            PlayerState::Ended,
+            PlayerState::Error(crate::player::PlayerError { kind: crate::player::PlayerErrorKind::Network, message: "failed".into() }),
+        ] {
+            let (mut t, one) = rig();
+            let (id, item) = seed(&mut t, |c| {
+                let src = source(c, "TV")?;
+                let id = channels(c, src, 1)?[0];
+                let channel = crate::store::live::channel(c, id)?;
+                Ok((id, crate::model::ItemRef { source: src, kind: crate::model::ItemKind::Channel, key: channel.key }))
+            });
+            let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+            let mut pl = (*playable()).clone();
+            pl.item = Some(item.clone());
+            pl.media = MediaRef::Catchup { channel: id, start: 100, stop: 200, catchup_id: None };
+            pl.kind = PlayableKind::Catchup { start: 100, stop: 200 };
+            h.state_mut().t.snapshot = Arc::new(PlayerSnapshot { state, playable: Some(Arc::new(pl)), ..Default::default() });
+            h.state_mut().act(Action::ToggleFavourite);
+            until(&mut h, "channel saved", |h| h.state().t.db.query_row("SELECT count(*) FROM fav_item", [], |r| r.get::<_, i64>(0)).unwrap() == 1);
+            assert_eq!(h.state().t.db.query_row("SELECT count(*) FROM watchlist_item", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
     }
 }

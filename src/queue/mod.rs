@@ -18,8 +18,8 @@ pub mod service;
 pub mod ui;
 
 pub use model::{
-    AddTarget, AddedBy, Blocked, Countdown, CountdownWhy, FinishedWhy, Insert, NextEpisode, PlayReply, QueueCommand, QueueEntry, QueueReply,
-    QueueRow, QueueSnapshot, Refusal, RowState, Slot,
+    AddTarget, AddedBy, Blocked, Countdown, CountdownWhy, FinishedWhy, Insert, ListContext, ListPreview, NextEpisode, PlayReply, QueueCommand,
+    QueueEntry, QueueReply, QueueRow, QueueSnapshot, Refusal, RowState, Slot, WatchlistChip,
 };
 pub use service::{EngineDeps, PlayerPort, QueueHandle};
 
