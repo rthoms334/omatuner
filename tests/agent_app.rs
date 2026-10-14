@@ -2012,6 +2012,7 @@ fn watchlists_agent_edits_and_reads_the_same_derived_lists_as_the_app() {
     let missing = shown["items"][1]["id"].as_i64().unwrap();
     let film = shown["items"][0]["id"].as_i64().unwrap();
     let duplicate = w.ok("watchlist", json!({"action": "add", "list": list, "refs": [movie]}));
+    assert_eq!(duplicate["list"], "Star Wars");
     assert!(duplicate["added"].as_array().unwrap().is_empty());
     assert_eq!(duplicate["refused"].as_array().unwrap().len(), 1);
     let range = w.ok("watchlist", json!({"action": "add", "list": list, "refs": [series], "seasons": {"from": 1, "to": 1}, "at": "next"}));
@@ -2023,6 +2024,10 @@ fn watchlists_agent_edits_and_reads_the_same_derived_lists_as_the_app() {
     let next = w.ok("watchlist", json!({"action": "next", "list": list}));
     assert_eq!(next["item"]["id"], film);
     assert_eq!(next["passed_over"][0]["why"], "not in your playlists");
+    let moved = w.ok("watchlist", json!({"action": "move", "list": "SW", "ids": [missing], "to": "next"}));
+    assert_eq!(moved["list"], "Star Wars");
+    let moved_order = w.ok("watchlist", json!({"action": "show", "list": list}));
+    assert_eq!(moved_order["items"][1]["id"], missing, "move next accounts for removing earlier entries");
     w.ok("watchlist", json!({"action": "skip", "list": list, "ids": [film]}));
     let next = w.ok("watchlist", json!({"action": "next", "list": list}));
     assert_eq!(next["item"]["id"], series_id);
@@ -2036,7 +2041,11 @@ fn watchlists_agent_edits_and_reads_the_same_derived_lists_as_the_app() {
     let ambiguous = w.ok("watchlist", json!({"action": "show", "list": "star"}));
     assert_eq!(ambiguous["ambiguous"].as_array().unwrap().len(), 2);
     assert!(ambiguous.get("items").is_none());
-    w.ok("watchlist", json!({"action": "remove", "list": list, "ids": [missing]}));
+    w.ok("watchlist", json!({"action": "create", "name": "Marvel in release order"}));
+    let near = w.ok("watchlist", json!({"action": "add", "list": "Mario", "refs": [movie]}));
+    assert!(near["did_you_mean"].is_array());
+    assert!(near.get("added").is_none());
+    assert_eq!(w.ok("watchlist", json!({"action": "remove", "list": list, "ids": [missing]}))["list"], "Star Wars");
     w.ok("watchlist", json!({"action": "rename", "list": list, "name": "Space films", "play_order": "any"}));
     assert_eq!(w.ok("watchlist", json!({"action": "show", "list": list}))["list"]["play_order"], "any");
     assert_eq!(w.err("watchlist", json!({"action": "rename", "list": "My list", "name": "Mine"})), ErrorCode::Unavailable);
@@ -2112,6 +2121,7 @@ fn watchlists_agent_conceals_counts_refuses_locked_and_never_returns_addresses()
                     by_agent: false,
                     orphaned: false,
                     watchlist_item_id: Some(entry.id),
+                    list_context: true,
                 },
                 locked: false,
                 eta: None,
@@ -2147,6 +2157,9 @@ fn watchlists_agent_conceals_counts_refuses_locked_and_never_returns_addresses()
     assert!(!mentions(&shown, "adult"));
     assert_eq!(shown["items"][0]["state"], "locked");
     let lists = w.ok("watchlist", json!({"action": "lists"}));
+    let evening = lists.as_array().unwrap().iter().find(|l| l["id"] == list).unwrap();
+    assert_eq!(evening["next"]["locked"], true);
+    assert_eq!(evening["next"]["title"], "Locked Film");
     assert!(!mentions(&lists, "Private list"));
     assert_eq!(w.err("watchlist", json!({"action": "show", "list": explicit_list})), ErrorCode::NotFound);
     assert_eq!(w.err("watchlist", json!({"action": "play", "list": list, "id": locked_id})), ErrorCode::Unavailable);
@@ -2175,4 +2188,61 @@ fn watchlists_agent_conceals_counts_refuses_locked_and_never_returns_addresses()
         ErrorCode::Unavailable,
         "MCP never starts a locked list entry, even in an unlocked session"
     );
+}
+
+#[test]
+fn watchlist_play_and_stop_echo_the_list_and_the_title_being_stopped() {
+    use tuner::model::{PlayOrigin, Playable, PlayableKind};
+    use tuner::player::{PlayerSnapshot, PlayerState};
+
+    struct QuietPlayer;
+    impl tuner::queue::PlayerPort for QuietPlayer {
+        fn send(&self, _: tuner::player::PlayerCommand) {}
+    }
+    let mut w = World::new(Config::default());
+    w.publish(Visibility::ALL);
+    assert_eq!(w.err("watchlist", json!({"action": "stop"})), ErrorCode::Unavailable);
+    let s = w.ui.services();
+    let snaps = tokio::sync::watch::Sender::new(Arc::new(PlayerSnapshot::default()));
+    s.agent.set_main_player(snaps.subscribe());
+    let engine = tuner::queue::service::spawn(
+        s.rt.handle(),
+        s.agent.clone(),
+        tuner::queue::EngineDeps { store: s.store.clone(), config: s.config.clone(), player: Arc::new(QuietPlayer), bus: s.bus.clone(), jobs: None },
+    );
+    s.agent.set_queue_handle(Some(engine));
+    let created = w.ok("watchlist", json!({"action": "create", "name": "Evening films", "refs": ["movie:1:m3u:airplane"]}));
+    let played = w.ok("watchlist", json!({"action": "play", "list": created["list"]["id"]}));
+    assert_eq!(played["list"], "Evening films");
+    let shared = w.ui.services().agent.clone();
+    let row = shared.queue().rows.iter().find(|r| r.entry.state == tuner::queue::RowState::Current).unwrap().entry.clone();
+    snaps.send_replace(Arc::new(PlayerSnapshot {
+        state: PlayerState::Playing,
+        origin: Some(PlayOrigin::Queue),
+        load_generation: 1,
+        playable: Some(Arc::new(Playable {
+            media: MediaRef::Movie(tuner::model::MovieId(1)),
+            kind: PlayableKind::Movie,
+            source_id: Some(row.item.source),
+            item: Some(row.item),
+            title: row.title,
+            subtitle: None,
+            logo: None,
+            number: None,
+            url: tuner::redact::Secret::new("http://unused".into()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        })),
+        ..Default::default()
+    }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !shared.queue().driving {
+        assert!(Instant::now() < deadline, "queue never accepted the playing snapshot");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stopped = w.ok("watchlist", json!({"action": "stop"}));
+    assert_eq!(stopped["list"], "Evening films");
+    assert!(stopped["stopped_after"].as_str().is_some_and(|title| title.contains("Airplane")), "{stopped}");
+    assert_eq!(w.err("watchlist", json!({"action": "stop"})), ErrorCode::Unavailable);
 }

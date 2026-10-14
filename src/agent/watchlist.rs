@@ -15,28 +15,27 @@ use crate::queue::{PlayReply, QueueCommand, QueueReply};
 use crate::store::watchlist as store;
 use crate::watchlist::{EntryState, EntryStatus, Insert, ListView, NewEntry, PlayOrder};
 
-/// Exact names win; initials and fuzzy subsequences never choose between competing names.
+/// Exact names, initials and prefixes of whole words are safe automatic resolutions.
 fn matching(name: &str, query: &str) -> bool {
     let name = name.to_lowercase();
     let query = query.to_lowercase();
-    if name.contains(&query) {
-        return true;
-    }
-    let initials: String = name.split(|c: char| !c.is_alphanumeric()).filter_map(|w| w.chars().next()).collect();
-    if initials == query {
-        return true;
-    }
-    let mut chars = name.chars();
-    query.chars().filter(|c| c.is_alphanumeric()).all(|wanted| chars.any(|c| c == wanted))
+    let words: Vec<_> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let query_words: Vec<_> = query.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let initials: String = words.iter().filter_map(|w| w.chars().next()).collect();
+    !query_words.is_empty()
+        && (initials == query
+            || words.windows(query_words.len()).any(|window| window.iter().zip(&query_words).all(|(word, prefix)| word.starts_with(prefix))))
 }
 
 enum Selection {
     Found(Box<ListView>),
     Ambiguous(Vec<String>),
+    DidYouMean(Vec<String>),
 }
 
 fn select(q: &Q, selector: &WatchlistSelector) -> Out<Selection> {
     let snapshot = store::snapshot_with_preferences(q.conn, q.lib, q.view.unlocked, true, q.view.hides_explicit, q.cfg.interface.copy_order)?;
+    let suggestions: Vec<_> = snapshot.lists.iter().map(|l| clean(&l.list.name)).collect();
     let mut hits = match selector {
         WatchlistSelector::Id(id) => snapshot.lists.into_iter().filter(|l| l.list.id.0 == *id).collect::<Vec<_>>(),
         WatchlistSelector::Name(name) => {
@@ -46,6 +45,7 @@ fn select(q: &Q, selector: &WatchlistSelector) -> Out<Selection> {
         }
     };
     match hits.len() {
+        0 if matches!(selector, WatchlistSelector::Name(_)) && !suggestions.is_empty() => Ok(Selection::DidYouMean(suggestions)),
         0 => Err(Fail::not_found("watchlist")),
         1 => Ok(Selection::Found(Box::new(hits.remove(0)))),
         _ => Ok(Selection::Ambiguous(hits.iter().map(|l| clean(&l.list.name)).collect())),
@@ -89,7 +89,13 @@ fn list_out(view: &ListView) -> Value {
         "id": view.list.id.0, "name": clean(&view.list.name), "note": view.list.note.as_deref().map(clean),
         "play_order": view.list.play_order.as_str(), "done": view.done, "total": view.total,
     });
-    if let Some(next) = view.next_entry() {
+    let next = view
+        .entries
+        .iter()
+        .find(|e| !e.done() && e.status != EntryStatus::Missing)
+        .filter(|e| e.locked && (view.list.play_order == PlayOrder::Ordered || view.next.is_none()))
+        .or_else(|| view.next_entry());
+    if let Some(next) = next {
         out["next"] = entry_out(next);
     }
     out
@@ -125,19 +131,16 @@ fn next_out(q: &Q, view: &ListView) -> Out<Value> {
     Ok(out)
 }
 
-/// A next episode may be in a series whose details have never been opened. Load its copies
+/// A next episode may be in a series whose details have never been opened. Load the planned copy
 /// as `episodes` does, before claiming which episode is next (DESIGN §42 §3, §7).
 fn pending_series(q: &Q, view: &ListView) -> Out<Vec<crate::jobs::JobKind>> {
-    let Some(next) = view.next_entry().filter(|e| e.entry.kind == ItemKind::Series) else { return Ok(Vec::new()) };
-    let Some(item) = &next.entry.item else { return Ok(Vec::new()) };
+    let Some(item) = view.next_entry().and_then(|e| e.playable.as_ref()).filter(|item| item.kind == ItemKind::Series) else { return Ok(Vec::new()) };
     let Some(idx) = q.vod_index(item)? else { return Ok(Vec::new()) };
+    let crate::model::VodKind::Series(id) = q.lib.vod.series[idx as usize].kind else { return Ok(Vec::new()) };
+    let series = crate::store::vod::series(q.conn, id)?;
     let mut jobs = Vec::new();
-    for id in q.series_copies(idx) {
-        let series = crate::store::vod::series(q.conn, id)?;
-        if series.details_loaded_at.is_none() && q.lib.source(series.source_id).is_some_and(|source| source.kind == crate::model::SourceKind::Xtream)
-        {
-            jobs.push(crate::jobs::JobKind::LoadSeriesDetails(id));
-        }
+    if series.details_loaded_at.is_none() && q.lib.source(series.source_id).is_some_and(|source| source.kind == crate::model::SourceKind::Xtream) {
+        jobs.push(crate::jobs::JobKind::LoadSeriesDetails(id));
     }
     Ok(jobs)
 }
@@ -345,10 +348,26 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
             .await;
     }
     if action == WatchlistAction::Stop {
-        let current = h.shared.queue().current.map(|id| id.0);
+        let snapshot = h.shared.queue();
+        let context = snapshot
+            .watchlist
+            .as_ref()
+            .filter(|list| list.playing_through)
+            .ok_or_else(|| Fail::new(ErrorCode::Unavailable, "No watchlist is playing"))?;
+        let list = context.id;
+        let current = snapshot.current.filter(|_| snapshot.driving).and_then(|id| snapshot.row(id)).map(|row| row.entry.clone());
+        let (list, current) = h
+            .run(true, move |q| {
+                let view =
+                    store::view_with_preferences(q.conn, q.lib, list, q.view.unlocked, true, q.view.hides_explicit, q.cfg.interface.copy_order)?
+                        .ok_or_else(|| Fail::not_found("watchlist"))?;
+                let title = current.filter(|row| !q.conceals(&row.item)).map(|row| clean(&row.title));
+                Ok((clean(&view.list.name), title))
+            })
+            .await?;
         ask(h, QueueCommand::StopList).await?;
         tracing::info!("agent: watchlist stop");
-        return Ok(json!({"stopped_after": current}));
+        return Ok(json!({"list": clean(&list), "stopped_after": current}));
     }
     if action == WatchlistAction::Create {
         let name = text("name", p.name.as_deref().ok_or_else(|| Fail::bad("create needs name"))?)?.to_owned();
@@ -381,9 +400,11 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
     let selector = p.list.clone().ok_or_else(|| Fail::bad("give a list name or id"))?;
     let view = match h.run(true, move |q| select(q, &selector)).await? {
         Selection::Ambiguous(names) => return Ok(json!({"ambiguous": names})),
+        Selection::DidYouMean(names) => return Ok(json!({"did_you_mean": names})),
         Selection::Found(view) => view,
     };
     let list = view.list.id;
+    let list_name = clean(&view.list.name);
     match action {
         WatchlistAction::Show => Ok(show_out(&view, p.include_done.unwrap_or(false))),
         WatchlistAction::Next => resolve_next(h, *view).await,
@@ -408,6 +429,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
                 QueueReply::Play(PlayReply::Waiting(_, reason)) => json!({"waiting": format!("{reason:?}").to_lowercase()}),
                 _ => json!({"playing": null}),
             };
+            out["list"] = json!(list_name);
             if let Some(opened) = opened {
                 out["opened_in"] = json!(opened);
             }
@@ -428,7 +450,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
             let result = h.write(DataScope::Watchlists, move |c| store::add(c, &lib, list, &entries, at, crate::model::now())).await?;
             refused.extend(result.refused.into_iter().map(|(index, why)| json!({"index": index, "error": clean(&why)})));
             tracing::info!("agent: watchlist add #{} → {} added", list.0, result.added.len());
-            Ok(json!({"added": result.added.iter().map(|id| id.0).collect::<Vec<_>>(), "refused": refused}))
+            Ok(json!({"list": list_name, "added": result.added.iter().map(|id| id.0).collect::<Vec<_>>(), "refused": refused}))
         }
         WatchlistAction::Move | WatchlistAction::Remove | WatchlistAction::Skip => {
             let ids = selected_ids(&view, &p)?;
@@ -436,7 +458,10 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
             let to = if action == WatchlistAction::Move {
                 match position(Some(p.to.as_deref().ok_or_else(|| Fail::bad("move needs to"))?))? {
                     Insert::End => usize::MAX,
-                    Insert::Next => view.next_entry().map_or(0, |e| e.entry.position + 1),
+                    Insert::Next => view.next_entry().map_or(0, |next| {
+                        next.entry.position + 1
+                            - view.entries.iter().filter(|e| e.entry.position <= next.entry.position && ids.contains(&e.entry.id)).count()
+                    }),
                     Insert::Index(index) => view.entries.get(index).map_or(usize::MAX, |e| e.entry.position),
                 }
             } else {
@@ -460,7 +485,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
             })
             .await?;
             tracing::info!("agent: watchlist edit #{} → {} entries", list.0, returned.len());
-            Ok(json!({"items": returned}))
+            Ok(json!({"list": list_name, "items": returned}))
         }
         WatchlistAction::Restart | WatchlistAction::Rename | WatchlistAction::Delete => {
             let name = p.name.as_deref().map(|s| text("name", s).map(str::to_owned)).transpose()?;
@@ -517,7 +542,10 @@ mod tests {
     fn names_accept_initials_and_partial_words_without_choosing_between_hits() {
         assert!(matching("Star Wars", "SW"));
         assert!(matching("Star Wars", "star wars"));
-        assert!(matching("Star Wars in story order", "str wrs"));
+        assert!(!matching("Star Wars in story order", "str wrs"));
+        assert!(!matching("Marvel in release order", "Mario"));
+        assert!(matching("Star Wars in story order", "sta wa"));
+        assert!(!matching("Star Wars", "ars"));
         assert!(matching("Star Wars", "star"));
         assert!(matching("Star Trek", "star"));
         assert!(!matching("Christmas films", "SW"));

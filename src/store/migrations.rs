@@ -57,8 +57,12 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     cast_hint_failures(conn, current)?;
     for (i, (name, sql)) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         tracing::info!("applying migration {name}");
-        if *name == "0015_watchlists" {
-            crate::store::backup::before_watchlists(conn)?;
+        if *name == "0015_watchlists"
+            && current == 14
+            && conn.query_row("SELECT EXISTS(SELECT 1 FROM fav_item WHERE kind IN ('movie','series'))", [], |r| r.get::<_, bool>(0))?
+            && let Err(e) = crate::store::backup::before_watchlists(conn)
+        {
+            tracing::warn!("watchlists: could not back up user data before migration: {e}");
         }
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
@@ -165,6 +169,7 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
         "0013_agent_names" => agent_names(conn),
         "0015_watchlists" => {
             add_column_if_missing(conn, "queue_item", "watchlist_item_id", "INTEGER")?;
+            add_column_if_missing(conn, "queue_item", "list_context", "INTEGER NOT NULL DEFAULT 0")?;
             crate::store::watchlist::move_favourites(conn).map(|_| ())
         }
         _ => Ok(()),
@@ -897,5 +902,45 @@ mod tests {
                 assert_eq!(n, 1, "{t}.{col}");
             }
         }
+    }
+    #[test]
+    fn watchlists_backup_is_small_once_only_and_failure_does_not_block_migration() {
+        for (favourites, fail) in [(false, false), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tuner.db");
+            let old = migrated_to(14);
+            old.execute_batch("INSERT INTO source(id,name,kind,created_at,xt_server,xt_username,xt_password) VALUES (1,'TV','xtream',0,'http://example.com','me','secret-password');
+                INSERT INTO movie(source_id,key,name,clean_name,norm_name,year,stream,provider_order,seen_gen) VALUES (1,'film','Film','Film','film',2000,'{}',0,1);") .unwrap();
+            if favourites {
+                old.execute_batch("INSERT INTO fav_item(list_id,source_id,kind,item_key,position,added_at,fp) VALUES(1,1,'movie','film',0,1,'{}');")
+                    .unwrap();
+            }
+            old.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).unwrap();
+            if fail {
+                std::fs::create_dir(dir.path().join("before-watchlists.json.part")).unwrap();
+            }
+            let mut c = Connection::open(&path).unwrap();
+            migrate(&mut c).unwrap();
+            assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 15);
+            let backup = dir.path().join("before-watchlists.json");
+            assert_eq!(backup.exists(), favourites && !fail);
+            if backup.exists() {
+                let bytes = std::fs::read_to_string(&backup).unwrap();
+                assert!(!bytes.contains("secret-password"));
+                assert!(bytes.len() < 50_000);
+                let exported = crate::store::backup::read_file(&backup).unwrap();
+                assert_eq!(exported.fav_items.len(), 1);
+                assert!(exported.features.watchlists.is_none());
+                migrate(&mut c).unwrap();
+                assert_eq!(std::fs::read_to_string(backup).unwrap(), bytes);
+            }
+            if favourites {
+                assert_eq!(c.query_row("SELECT count(*) FROM watchlist_item", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut fresh = Connection::open(dir.path().join("fresh.db")).unwrap();
+        migrate(&mut fresh).unwrap();
+        assert!(!dir.path().join("before-watchlists.json").exists());
     }
 }

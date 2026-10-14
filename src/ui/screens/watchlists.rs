@@ -37,6 +37,7 @@ const QUEUE: u8 = 214;
 const QUEUE_NEXT: u8 = 215;
 const MOVE_UP: u8 = 216;
 const MOVE_DOWN: u8 = 217;
+const SHOW_WATCHED: u8 = 218;
 
 #[derive(Default)]
 pub struct WatchlistsScreen {
@@ -54,6 +55,7 @@ pub struct WatchlistsScreen {
     opening: bool,
     fetch: crate::ui::copies::EpisodeFetch,
     pending_mark: Option<(EntryState, bool)>,
+    pending_focus: Option<(WatchlistItemId, usize)>,
 }
 impl WatchlistsScreen {
     fn view(&self) -> Option<&ListView> {
@@ -71,6 +73,7 @@ impl WatchlistsScreen {
         self.shown().get(self.cursor).copied().cloned()
     }
     fn select(&mut self, id: WatchlistId) {
+        self.pending_focus = None;
         self.selected = Some(id);
         self.cursor = self.view().and_then(|v| v.next).and_then(|id| self.shown().iter().position(|e| e.entry.id == id)).unwrap_or(0);
         self.scroll = true;
@@ -86,10 +89,18 @@ impl WatchlistsScreen {
         {
             self.select(id);
         }
+        if let Some((id, position)) = self.pending_focus
+            && let Some(index) = self.shown().iter().position(|e| e.entry.id == id && e.entry.position == position)
+        {
+            self.cursor = index;
+            self.pending_focus = None;
+            self.scroll = true;
+        }
         self.cursor = self.cursor.min(self.shown().len().saturating_sub(1));
     }
     fn new_list(&self, ctx: &mut UiCtx<'_>) {
         ctx.open(OverlayRequest::WatchlistPicker(crate::ui::overlays::watchlists::PickerSpec {
+            omitted: (0, 0),
             items: vec![],
             title: String::new(),
             edit: None,
@@ -108,7 +119,7 @@ impl WatchlistsScreen {
             store::move_entries(c, list, &[id], to)?;
             Ok(None)
         });
-        self.cursor = to.min(self.shown().len().saturating_sub(1));
+        self.pending_focus = Some((id, to));
         self.scroll = true;
     }
     fn list_move_target(&self, down: bool) -> Option<WatchlistId> {
@@ -153,6 +164,7 @@ impl WatchlistsScreen {
                 v.list.name.clone(),
                 vec![
                     mi("Play", PLAY, true),
+                    mi(if v.show_watched { "Hide watched" } else { "Show watched" }, SHOW_WATCHED, true),
                     mi("Start again…", START_AGAIN, true),
                     mi("Duplicate…", DUPLICATE, true),
                     mi("Move earlier", MOVE_UP, self.list_move_target(false).is_some()),
@@ -194,6 +206,13 @@ impl WatchlistsScreen {
             PLAY => self.play(ctx, false),
             ONE => self.play(ctx, true),
             NEW => self.new_list(ctx),
+            SHOW_WATCHED => {
+                let show = !v.show_watched;
+                shared::write(ctx, "Watched entries updated", move |c| {
+                    store::set_show_watched(c, id, show)?;
+                    Ok(None)
+                });
+            }
             RENAME if !v.list.is_default => ctx.open(OverlayRequest::Rename(RenameSpec {
                 title: "Rename watchlist".into(),
                 initial: v.list.name.clone(),
@@ -242,6 +261,7 @@ impl WatchlistsScreen {
             SEASONS => {
                 if let Some(e) = self.entry() {
                     ctx.open(OverlayRequest::WatchlistPicker(crate::ui::overlays::watchlists::PickerSpec {
+                        omitted: (0, 0),
                         items: e.entry.item.into_iter().collect(),
                         title: e.entry.title,
                         edit: Some(e.entry.id),
@@ -336,7 +356,6 @@ impl WatchlistsScreen {
     fn lists(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         let mut select = None;
         let mut menu = false;
-        let mut play = false;
         self.list_drag_to = None;
         if self.list_drag.is_some()
             && let Some(p) = ui.input(|i| i.pointer.interact_pos())
@@ -388,7 +407,6 @@ impl WatchlistsScreen {
             let r = row.inner;
             if crate::ui::widgets::fresh_click(&r) {
                 select = Some(v.list.id);
-                play = true;
                 self.lists_focus = false;
             }
             if r.secondary_clicked() {
@@ -412,9 +430,6 @@ impl WatchlistsScreen {
         }
         if let Some(id) = select {
             self.select(id);
-            if play {
-                shared::play(ctx, id, None, false);
-            }
         }
         if menu {
             self.menu(ctx);
@@ -424,6 +439,7 @@ impl WatchlistsScreen {
         }
     }
     fn entries_ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        self.drag_to = None;
         let Some(v) = self.view().cloned() else { return };
         let theme = ctx.theme;
         let mut order = false;
@@ -446,7 +462,15 @@ impl WatchlistsScreen {
             self.on_action(ctx, Action::WatchlistOrder);
         }
         let watched = v.entries.iter().filter(|e| e.status == EntryStatus::Done).count();
-        if watched > 0 && ui.button(format!("✓ {watched} watched · {}", if v.show_watched { "hide ▴" } else { "show ▾" })).clicked() {
+        if watched > 0
+            && ui
+                .button(format!(
+                    "✓ {}{watched} watched · {}",
+                    if v.finished() { "All " } else { "" },
+                    if v.show_watched { "Hide watched" } else { "Show watched" }
+                ))
+                .clicked()
+        {
             shared::write(ctx, "Watched entries updated", move |c| {
                 store::set_show_watched(c, v.list.id, !v.show_watched)?;
                 Ok(None)
@@ -454,7 +478,9 @@ impl WatchlistsScreen {
         }
         let entries: Vec<_> = self.shown().into_iter().cloned().collect();
         if entries.is_empty() {
-            ui.label("Save films and series here with Ctrl+Shift+F.");
+            if !v.finished() {
+                ui.label(if v.list.is_default { "Save films and series here with Ctrl+F." } else { "Save films and series here with Ctrl+Shift+F." });
+            }
             return;
         }
         let height = (54.0 * theme.rem()).round();
@@ -505,7 +531,7 @@ impl WatchlistsScreen {
                     self.cursor = i;
                     self.lists_focus = false;
                 }
-                if self.drag.is_some() && ui.input(|x| x.pointer.interact_pos()).is_some_and(|p| rect.contains(p)) {
+                if self.drag.is_some() && ui.input(|x| x.pointer.interact_pos()).is_some_and(|p| rect.intersect(ui.clip_rect()).contains(p)) {
                     self.drag_to = Some(e.entry.position);
                     ui.painter().hline(rect.x_range(), rect.top(), egui::Stroke::new(2.0, t.accent));
                 }
@@ -635,6 +661,7 @@ impl Screen for WatchlistsScreen {
             Action::Parent | Action::Left => self.lists_focus = true,
             Action::Right => self.lists_focus = false,
             Action::FocusNext | Action::FocusPrev if ctx.layout != LayoutClass::Wide => {
+                self.lists_focus = false;
                 let n = self.snapshot.lists.len();
                 if n > 0 {
                     let i = self.selected.and_then(|id| self.snapshot.lists.iter().position(|l| l.list.id == id)).unwrap_or(0);
@@ -657,10 +684,11 @@ impl Screen for WatchlistsScreen {
                     self.scroll = true;
                 }
             }
+            Action::Activate | Action::ActivateAlt if self.lists_focus => self.lists_focus = false,
             Action::Activate | Action::ActivateAlt => self.play(ctx, false),
-            Action::WatchlistOne => self.play(ctx, true),
+            Action::WatchlistOne if !self.lists_focus => self.play(ctx, true),
             Action::WatchlistNew => self.new_list(ctx),
-            Action::WatchlistSkip => self.choose(ctx, SKIP),
+            Action::WatchlistSkip if !self.lists_focus => self.choose(ctx, SKIP),
             Action::WatchlistOrder => {
                 if let Some(v) = self.view() {
                     let id = v.list.id;
@@ -685,8 +713,8 @@ impl Screen for WatchlistsScreen {
             Action::Remove => self.remove(ctx),
             Action::Rename if self.lists_focus => self.choose(ctx, RENAME),
             Action::ContextMenu => self.menu(ctx),
-            Action::PlayFrom => self.copies(ctx),
-            Action::QueueAdd | Action::QueuePlayNext => {
+            Action::PlayFrom if !self.lists_focus => self.copies(ctx),
+            Action::QueueAdd | Action::QueuePlayNext if !self.lists_focus => {
                 if let Some(e) = self.entry() {
                     crate::queue::ui::send(
                         ctx,
@@ -698,7 +726,7 @@ impl Screen for WatchlistsScreen {
                     );
                 }
             }
-            Action::MarkWatched => self.mark(ctx),
+            Action::MarkWatched if !self.lists_focus => self.mark(ctx),
             _ => return false,
         }
         true
@@ -755,6 +783,11 @@ impl Screen for WatchlistsScreen {
             }
         }
         section::page_header(ui, ctx, "Watchlists", |_| {});
+        if shared::loading() && self.snapshot.lists.is_empty() {
+            ui.spinner();
+            ui.label("Loading watchlists…");
+            return;
+        }
         if self.fetch.busy() {
             ui.label("Loading episodes to mark them watched…");
         }
@@ -771,7 +804,21 @@ impl Screen for WatchlistsScreen {
             ui.advance_cursor_after_rect(rect);
         } else {
             let selected = self.view().map(|v| v.list.name.clone()).unwrap_or_else(|| "Watchlists".into());
-            egui::ComboBox::from_id_salt("watchlist-switcher").selected_text(format!("{selected} ▾")).show_ui(ui, |ui| self.lists(ui, ctx));
+            let mut selected_id = None;
+            let switcher = egui::ComboBox::from_id_salt("watchlist-switcher").selected_text(selected).show_ui(ui, |ui| {
+                for list in &self.snapshot.lists {
+                    if ui.selectable_label(self.selected == Some(list.list.id), &list.list.name).clicked() {
+                        selected_id = Some(list.list.id);
+                    }
+                }
+            });
+            if self.lists_focus {
+                switcher.response.request_focus();
+            }
+            if let Some(id) = selected_id {
+                self.select(id);
+                self.lists_focus = false;
+            }
             self.entries_ui(ui, ctx);
         }
     }
@@ -908,6 +955,7 @@ mod tests {
         };
         until(&mut h, "keyboard order", |h| order(h) == ["Movie 0", "Movie 2", "Movie 1"]);
         until(&mut h, "updated rows", |h| h.state().s.shown().first().is_some_and(|e| e.entry.title == "Movie 2"));
+        assert_eq!(h.state().s.entry().unwrap().entry.title, "Movie 1", "focus follows the moved id while watched rows are folded");
         // Move back, then perform the same move by its drag-only handle.
         let id = h.state().s.view().unwrap().entries.iter().find(|e| e.entry.title == "Movie 1").unwrap().entry.id;
         h.state_mut().t.services().store.writer().blocking(move |c| store::move_entries(c, list, &[id], 1)).unwrap();
@@ -927,5 +975,53 @@ mod tests {
         h.drop_at(egui::pos2(from.x, row.center().y));
         h.run_steps(2);
         until(&mut h, "drag order", |h| order(h) == ["Movie 0", "Movie 2", "Movie 1"]);
+        until(&mut h, "dragged rows refreshed", |h| h.state().s.shown().first().is_some_and(|e| e.entry.title == "Movie 2"));
+        let from = h.get_by_label(&format!("Drag {}", label(&h, "Movie 1"))).rect().center();
+        let to = h.get_by_label(&label(&h, "Movie 2")).rect().center();
+        h.hover_at(from);
+        h.drag_at(from);
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(2);
+        let outside = egui::pos2(1390.0, 790.0);
+        h.hover_at(outside);
+        h.run_steps(2);
+        h.drop_at(outside);
+        h.run_steps(2);
+        h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
+        assert_eq!(order(&h), ["Movie 0", "Movie 2", "Movie 1"], "dropping outside rows cancels the move");
+    }
+    #[test]
+    fn watchlists_pane_navigation_and_hidden_cursor_keys_work_at_each_width() {
+        for width in [1400.0, 1000.0, 600.0] {
+            let (mut t, one) = rig();
+            let list = seed(&mut t, |c| {
+                let src = testkit::source(c, "TV")?;
+                testkit::movies(c, src, 1)?;
+                let lib = crate::store::library::load(c)?;
+                let list = store::create(c, "Saga", None, PlayOrder::Ordered, "app", 1)?;
+                store::add(c, &lib, list, &[store::new_entry(c, &movie(src, 0))?], crate::watchlist::Insert::End, 1)?;
+                Ok(list)
+            });
+            let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(width, 800.0));
+            h.state_mut().enter(Route::Watchlists { list: Some(list) });
+            until(&mut h, "list", |h| h.state().s.entry().is_some());
+            h.state_mut().act(Action::Left);
+            assert!(h.state().s.lists_focus);
+            for action in [Action::MarkWatched, Action::WatchlistSkip, Action::QueueAdd, Action::PlayFrom, Action::WatchlistOne] {
+                h.state_mut().act(action);
+            }
+            h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
+            assert!(!store::entries(&h.state().t.db, list).unwrap()[0].skipped);
+            assert_eq!(h.state().t.db.query_row("SELECT count(*) FROM watch_progress", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            h.state_mut().act(Action::Activate);
+            assert!(!h.state().s.lists_focus);
+            h.state_mut().act(Action::Left);
+            h.state_mut().act(Action::Right);
+            assert!(!h.state().s.lists_focus);
+            h.state_mut().act(Action::Left);
+            h.state_mut().act(Action::FocusNext);
+            assert!(!h.state().s.lists_focus);
+        }
     }
 }

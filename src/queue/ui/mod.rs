@@ -58,7 +58,7 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
     let sp = crate::ui::widgets::spoiler::Spoilers::of(ctx);
     let visible = crate::ui::watchlists::snapshot(ctx);
     let hides = ctx.parental.hides_explicit(&ctx.config.parental);
-    let key = (ctx.now / 60, sp.stamp(), ctx.lib.generation, hides, Arc::as_ptr(&visible) as usize);
+    let key = (ctx.now / 60, sp.stamp(), ctx.lib.generation, hides, crate::ui::watchlists::revision());
     GUARDED.with_borrow_mut(|g| {
         if let Some((w, k, s)) = g.as_ref()
             && *k == key
@@ -115,7 +115,7 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
 }
 
 /// The guarded snapshot of (the raw one, the minute and guard stamp it was made for).
-type Guarded = (Weak<QueueSnapshot>, (i64, (u64, u64), u64, bool, usize), Arc<QueueSnapshot>);
+type Guarded = (Weak<QueueSnapshot>, (i64, (u64, u64), u64, bool, u64), Arc<QueueSnapshot>);
 
 /// `raw` with its rows' and next episode's text through the guard.
 fn guard_snapshot(sp: &crate::ui::widgets::spoiler::Spoilers, raw: &QueueSnapshot) -> QueueSnapshot {
@@ -773,6 +773,7 @@ pub(crate) mod tests {
             by_agent: false,
             orphaned: false,
             watchlist_item_id: None,
+            list_context: false,
         }
     }
 

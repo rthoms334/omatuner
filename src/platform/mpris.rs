@@ -254,7 +254,7 @@ impl Commands for TileRouter {
         snap.origin == Some(PlayOrigin::Queue)
             && self.queue.as_ref().is_some_and(|q| {
                 let s = q.snapshot();
-                s.driving && s.next.is_some()
+                s.driving && (s.next.is_some() || s.watchlist.as_ref().is_some_and(|list| !list.then.is_empty()))
             })
     }
     fn guard(&self) -> Guard {
@@ -697,6 +697,32 @@ mod tests {
         assert_eq!(router.queue_step(&from_queue, true), Some(false), "waits while multi-view is on");
         shared.publish_tiles(TilesState::default());
         assert_eq!(router.queue_step(&from_queue, true), Some(true));
+
+        // A watchlist has a next item before it materialises as a pending queue row.
+        let mut snapshot = (*shared.queue()).clone();
+        snapshot.watchlist = Some(crate::queue::ListContext {
+            id: crate::model::WatchlistId(1),
+            name: "Saga".into(),
+            any_order: false,
+            position: 1,
+            total: 2,
+            playing_through: true,
+            then: vec![crate::queue::ListPreview {
+                id: crate::model::WatchlistItemId(2),
+                kind: crate::model::ItemKind::Movie,
+                title: "Second film".into(),
+                series: None,
+                season: None,
+                episode: None,
+                locked: false,
+            }],
+        });
+        shared.publish_queue(Arc::new(snapshot.clone()));
+        assert!(router.queue_has_next(&from_queue));
+        assert!(!router.queue_has_next(&live(None)), "an unrelated picture does not use the list");
+        snapshot.watchlist.as_mut().unwrap().then.clear();
+        shared.publish_queue(Arc::new(snapshot));
+        assert!(!router.queue_has_next(&from_queue), "the last list entry has no next");
 
         // MPRIS shows the focused picture, and follows a focus change
         let shown = router.follow_focus(rt.handle());

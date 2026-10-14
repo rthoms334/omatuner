@@ -33,7 +33,7 @@ pub fn undo(services: &crate::services::Services, n: u16) -> bool {
 
 /// Run a combined write on the store writer; when it succeeds, toast `text` with an Undo
 /// button for the rows it found.
-fn write_with_undo(
+pub(crate) fn write_with_undo(
     ctx: &crate::ui::UiCtx<'_>,
     scope: DataScope,
     text: String,

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS watchlist_item (
   season_from INTEGER,
   season_to INTEGER,
   title TEXT NOT NULL,
+  match_title TEXT, -- provider title, independent of the display rename
   year INTEGER,
   tmdb_id INTEGER,  -- episodes: parent series identity, together with year
   series_title TEXT,
@@ -41,5 +42,7 @@ CREATE INDEX IF NOT EXISTS watchlist_item_ref ON watchlist_item(source_id, kind,
 CREATE TRIGGER IF NOT EXISTS watchlist_source_deleted BEFORE DELETE ON source BEGIN
   UPDATE watchlist_item SET source_id = NULL, item_key = NULL WHERE source_id = OLD.id;
 END;
+CREATE INDEX IF NOT EXISTS watchlist_movie_hash ON movie(match_hash) WHERE match_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS watchlist_series_hash ON series(match_hash) WHERE match_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS watchlist_movie_tmdb ON movie(tmdb_id);
 CREATE INDEX IF NOT EXISTS watchlist_series_tmdb ON series(tmdb_id);

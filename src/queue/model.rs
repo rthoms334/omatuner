@@ -71,6 +71,8 @@ pub struct QueueEntry {
     pub orphaned: bool,
     /// The watchlist entry that fed this row (DESIGN §42 §3); rows outlive their list.
     pub watchlist_item_id: Option<WatchlistItemId>,
+    /// Automatically fed by the context; distinct from a user-added list row.
+    pub list_context: bool,
 }
 
 /// One visible row of the snapshot (concealed rows are never in it, nor counted).
@@ -134,6 +136,7 @@ pub enum FinishedWhy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchlistChip {
     pub name: String,
+    pub any_order: bool,
     pub position: usize,
     pub total: usize,
 }

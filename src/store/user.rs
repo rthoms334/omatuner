@@ -915,6 +915,10 @@ pub(crate) fn holders_for(kind: ItemKind) -> impl Iterator<Item = (&'static str,
 pub fn forget_orphan(conn: &mut Connection, item: &ItemRef) -> Result<()> {
     let tx = conn.transaction()?;
     for (table, key, extra) in holders_for(item.kind) {
+        if table == "watchlist_item" {
+            tx.execute(&format!("UPDATE {table} SET source_id=NULL,item_key=NULL,orphaned_since=NULL WHERE source_id=?1 AND {key}=?2 AND orphaned_since IS NOT NULL{extra}"), params![item.source, item.key.as_str()])?;
+            continue;
+        }
         tx.execute(
             &format!("DELETE FROM {table} WHERE source_id = ?1 AND {key} = ?2 AND orphaned_since IS NOT NULL{extra}"),
             params![item.source, item.key.as_str()],
@@ -942,6 +946,7 @@ pub(crate) fn mark_orphaned(conn: &Connection, item: &ItemRef, now: Timestamp) -
 /// The item exists: clear `orphaned_since` and refresh the stored fingerprint. Returns true if
 /// any row was orphaned before.
 pub(crate) fn mark_attached(conn: &Connection, item: &ItemRef, fp: &Fingerprint) -> Result<bool> {
+    crate::store::watchlist::repair_attached(conn, item, item)?;
     let fp = fp_opt(fp);
     let mut was_orphan = false;
     for (table, key, extra) in holders_for(item.kind) {
@@ -968,6 +973,7 @@ pub(crate) fn move_user_data(conn: &Connection, from: &ItemRef, to: &ItemRef) ->
     if from == to {
         return Ok(());
     }
+    crate::store::watchlist::repair_attached(conn, from, to)?;
     let fp = fp_opt(&fingerprint_of(conn, to)?);
     if from.kind == ItemKind::Channel {
         // `channel_epg_map` is keyed per (channel, guide) whatever the method, so the generic

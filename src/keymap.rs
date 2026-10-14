@@ -682,7 +682,7 @@ pub static GUIDE: &[Binding] = &[
     b(C::ch('8'), A::Digit(8), "Jump to channel number"),
     b(C::ch('9'), A::Digit(9), "Jump to channel number"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Add channel to Favourites"),
-    b(C::ctrl_shift(Key::F), A::AddToList, "Watchlists… (channels: Favourites lists…)"),
+    b(C::ctrl_shift(Key::F), A::AddToList, "Favourites lists…"),
     b(C::ctrl(Key::E), A::AssignEpg, "Assign guide channel"),
     b(C::ctrl(Key::I), A::ShowDetails, "Edit channel information"),
     b(C::key(Key::F2), A::Rename, "Rename channel"),
@@ -948,6 +948,7 @@ pub static PANEL: &[Binding] = &[
 
 /// Watchlist play order and entry actions (DESIGN §42 §2.4).
 pub static WATCHLISTS: &[Binding] = &[
+    b(C::key(Key::ArrowRight), A::Right, "Open entries / move right"),
     b(C::ctrl_shift(Key::Enter), A::WatchlistOne, "Play just this one"),
     b(C::ch('s'), A::WatchlistSkip, "Skip in this list / unskip"),
     b(C::ch('o'), A::WatchlistOrder, "In order / Any order"),

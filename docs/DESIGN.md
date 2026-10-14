@@ -2395,6 +2395,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 
 | Keys | Action |
 |---|---|
+| `→` | Open entries / move right |
 | `Ctrl+Shift+Enter` | Play just this one |
 | `s` | Skip in this list / unskip |
 | `o` | In order / Any order |
@@ -2609,7 +2610,7 @@ global chord (Ctrl+Shift+C is the terminal's copy).
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
-| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
+| `Ctrl+Shift+F` | Favourites lists… |
 | `Ctrl+E` | Assign guide channel |
 | `Ctrl+I` | Edit channel information |
 | `F2` | Rename channel |
@@ -6747,6 +6748,10 @@ Alt+7 opens Watchlists; the sidebar entry is always present. Ctrl+F saves a film
 episode to My list; Ctrl+Shift+F opens Watchlists… with season ranges and insertion position.
 Only My list puts a star on posters. Home's Your watchlists rail follows Continue watching;
 detail pages show list membership. Favourites and their Settings page now hold channels only.
+In the lists pane, Enter, → and a click select the list and open its entries; Play remains in
+its menu, header and Home tile. A ticked list toggles off a single title or the exact series
+range with Undo. Batch additions skip duplicates and report “N already there”. Save Up next
+keeps pending film/series/episode rows and reports live or unavailable rows left out.
 
 ### 42.2 Playing through Up next
 `QueueCommand::PlayList` sets `QueueMachine.context` and adds one entry. When the queue's
@@ -6755,12 +6760,23 @@ Rows added with Ctrl+N play first. Chips identify list entries; Then from … pr
 without creating queue rows. The PIN, copies, resume, playback placement and media keys use
 Up next's existing paths. A foreign play steps aside and retains the context; a restart never
 auto-plays. Stop the list, just one, the sleep timer's end-of-queue and three failures end the
-context; exhausting it shows That was … ✓.
+context; exhausting it shows That was … ✓. Ending the context discards only its automatic
+pending rows, preserving Ctrl+N additions. Timed sleep stops and cancelling an unrelated
+next-episode countdown retain the context. An ended movie or episode is excluded for the
+rest of that run even if it did not reach watched_pct or has no duration; watched state is
+unchanged. Series details load through jobs; an unavailable series is passed over and named
+once for the run. A countdown's row is pre-resolved when it starts: reordering during it
+changes the following pick. In order missing/agent-locked notices occur once per run; Any
+order does not report entries merely preceding its random pick.
 
 ### 42.3 Storage and agents
 Migration 0015 creates `watchlist` and `watchlist_item`, links queue rows to entries and moves
-saved films and series out of favourites in one transaction, after a private database backup.
-The next launch explains the move once. Fingerprints, HOLDERS, import matching and backups
+saved films and series out of favourites in one transaction. Only upgrades from v14 with
+film/series favourites make one small `before-watchlists.json` user-data export, without
+credentials or catalogue rows. Backup failure is logged and does not block the transaction.
+Fresh installs and restores do not make that backup. Legacy restores merge same-name lists,
+skip duplicate titles, and repair fallback identities when the catalogue attaches them.
+The next launch explains the move once; OK, Open Watchlists or Esc acknowledges the card. Fingerprints, HOLDERS, import matching and backups
 preserve lists across refreshes, re-keyed copies and playlist deletion.
 
 The `watchlist` MCP tool reads and edits lists and starts or stops their playback;

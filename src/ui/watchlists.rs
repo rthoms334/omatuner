@@ -17,8 +17,10 @@ struct Cache {
     key: Option<(std::path::PathBuf, u64, bool, u64, bool, crate::config::CopyOrder)>,
     snapshot: Arc<WatchlistsSnapshot>,
     pending: Option<Loader<WatchlistsSnapshot>>,
+    revision: u64,
 }
 thread_local! { static CACHE: RefCell<Cache> = RefCell::default(); }
+static SNAPSHOTS: AtomicU64 = AtomicU64::new(1);
 static REVISION: AtomicU64 = AtomicU64::new(1);
 static UNDOS: Mutex<Vec<(u16, Undo)>> = Mutex::new(Vec::new());
 static NEXT_UNDO: AtomicU64 = AtomicU64::new(0);
@@ -61,10 +63,14 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<WatchlistsSnapshot> {
                 l.total != 0 || was_empty
             });
             c.snapshot = Arc::new(visible);
+            c.revision = SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(result) = kit::poll(&mut c.pending) {
             match result {
-                Ok(s) => c.snapshot = Arc::new(s),
+                Ok(s) => {
+                    c.snapshot = Arc::new(s);
+                    c.revision = SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(e) => tracing::warn!("watchlist read: {e}"),
             }
         }
@@ -72,13 +78,24 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<WatchlistsSnapshot> {
     })
 }
 
+pub fn revision() -> u64 {
+    CACHE.with(|c| c.borrow().revision)
+}
+pub fn loading() -> bool {
+    CACHE.with(|c| c.borrow().pending.is_some())
+}
+
 /// Writes own their error and optional Undo toast, even after the opener closes.
 pub fn write(ctx: &UiCtx<'_>, text: impl Into<String>, f: impl FnOnce(&mut rusqlite::Connection) -> Result<Option<Undo>> + Send + 'static) {
     let text = text.into();
+    write_result(ctx, move |c| f(c).map(|undo| (text, undo)));
+}
+
+pub fn write_result(ctx: &UiCtx<'_>, f: impl FnOnce(&mut rusqlite::Connection) -> Result<(String, Option<Undo>)> + Send + 'static) {
     let bus = ctx.services.bus.clone();
     let _ = ctx.services.store.writer().submit(move |c| {
         match f(c) {
-            Ok(undo) => {
+            Ok((text, undo)) => {
                 invalidate();
                 bus.data_changed(DataScope::Watchlists);
                 let mut toast = Toast::info(text);
@@ -144,7 +161,13 @@ pub fn toggle_my_list_of(ctx: &mut UiCtx<'_>, item: &ItemRef, copies: &[ItemRef]
 }
 
 pub fn picker(ctx: &mut UiCtx<'_>, items: Vec<ItemRef>, title: &str) {
-    ctx.open(OverlayRequest::WatchlistPicker(crate::ui::overlays::watchlists::PickerSpec { items, title: title.into(), edit: None, create: false }));
+    ctx.open(OverlayRequest::WatchlistPicker(crate::ui::overlays::watchlists::PickerSpec {
+        omitted: (0, 0),
+        items,
+        title: title.into(),
+        edit: None,
+        create: false,
+    }));
 }
 
 type Memberships = Vec<(crate::watchlist::List, usize, usize)>;
@@ -266,8 +289,7 @@ pub fn mark_watched(ctx: &UiCtx<'_>, e: EntryState, on: bool) {
     let Some(item) = e.entry.item else { return };
     let lib = ctx.lib.clone();
     let now = ctx.now;
-    let bus = ctx.services.bus.clone();
-    write(ctx, if on { "Marked as watched" } else { "Marked unwatched" }, move |c| {
+    crate::ui::copies::write_with_undo(ctx, DataScope::Progress, if on { "Marked as watched" } else { "Marked unwatched" }.into(), move |c| {
         let copies = store::title_copies(c, &lib, &item)?;
         let mut items = Vec::new();
         if item.kind == ItemKind::Series {
@@ -283,8 +305,6 @@ pub fn mark_watched(ctx: &UiCtx<'_>, e: EntryState, on: bool) {
         } else {
             items.extend(copies.into_iter().map(|r| (r, e.entry.title.clone())));
         }
-        crate::store::user::mark_watched(c, &items, on, now)?;
-        bus.data_changed(DataScope::Progress);
-        Ok(None)
+        crate::store::copies::watched_items(c, &items, on, now)
     });
 }

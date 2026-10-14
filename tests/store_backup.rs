@@ -651,8 +651,15 @@ fn restoring_legacy_favourites_moves_films_to_watchlists() {
     assert_eq!(rows[0].fingerprint.norm_name, "missingfilm");
     assert_eq!(rows[0].orphaned_since, Some(NOW - 100));
     assert_eq!(tuner::store::watchlist::moved_card(&c).unwrap(), ["My list"]);
-    assert!(
-        std::fs::read_dir(restored.path().parent().unwrap()).unwrap().any(|p| p.unwrap().file_name().to_string_lossy().contains("before-watchlists")),
-        "a backup precedes the one-way restore move"
-    );
+    assert!(!restored.path().parent().unwrap().join("before-watchlists.json").exists(), "the backup is only for a v14 upgrade");
+    let item = rows[0].item.clone().unwrap();
+    let id = rows[0].id;
+    drop(c);
+    w(&restored, move |c| {
+        c.execute("INSERT INTO movie(source_id,key,name,clean_name,norm_name,year,tmdb_id,stream,provider_order,seen_gen) VALUES (?1,?2,'Missing Film','Missing Film','missingfilm',2001,'77','{}',0,1)", rusqlite::params![item.source, item.key.as_str()])?;
+        import::reattach_user_data(c, item.source, NOW + 1)?;
+        let repaired = tuner::store::watchlist::entry(c, id)?.unwrap();
+        assert_eq!((repaired.title.as_str(), repaired.year, repaired.tmdb_id), ("Missing Film", Some(2001), Some(77)));
+        Ok(())
+    });
 }

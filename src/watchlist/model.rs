@@ -56,6 +56,9 @@ pub struct Entry {
     pub episode: Option<u32>,
     pub skipped: bool,
     pub added_at: Timestamp,
+    /// Provider name used to reattach a renamed title.
+    #[serde(default)]
+    pub match_title: Option<String>,
     pub fingerprint: Fingerprint,
     pub orphaned_since: Option<Timestamp>,
     /// Last known explicit status, kept when a deleted playlist leaves a placeholder.

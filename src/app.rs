@@ -370,7 +370,6 @@ impl TunerApp {
             && !names.is_empty()
         {
             app.nav.push(NavRequest::Open(OverlayRequest::WatchlistsMoved(names)));
-            let _ = app.services().store.writer().submit(|c| crate::store::watchlist::dismiss_moved_card(c));
         }
         app
     }

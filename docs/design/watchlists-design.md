@@ -63,7 +63,7 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 | **Detail pages** (film, series, episode) | A `[󰐕 Watchlist ▾]` button. When the title is in one or more lists, a line reads "In Star Wars (5 of 15) · Marvel" |
 | **Up next rows** | A chip with the list's name and the entry's place ("Star Wars · 5/15") |
 | **Up next screen and panel** | While a list plays, a "Then from Star Wars" section follows the queue's rows and shows the list's next few entries (greyed; they aren't rows yet) with "Stop after the queue" |
-| **Up next card** between list items | "Next in Star Wars in 8 s · *Solo*" [Play now] [Stop the list · Esc]. Any order: "Another from Christmas films: *Elf*". At the end: "That was Star Wars ✓" |
+| **Up next card** between list items | "Next in Star Wars in 8 s · *Solo*" [Play now] [Stop the list · Esc]. Any order: "Another from Christmas films in 8 s · *Elf*". Both modes offer Play now, List (`u`) and, for a context-fed row, Stop the list. At the end: "That was Star Wars ✓" |
 | **Search** (`Ctrl+K`) | Watchlist names are hits: Enter opens the list |
 
 ### 2.2 Watchlists screen, Wide
@@ -84,7 +84,7 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 - **List mode.** The header shows `In order ▾` / `Any order ▾` (click or `o`). An Any order list hides the number column, shows unwatched first, and Enter on the header plays a pick.
-- **Lists pane.** You arrange the lists yourself (`Alt+↑↓` or drag; stored in `sort_index`). My list is always first. Finished lists sink to the bottom as "✓ … (done)". Only the Home rail sorts by most recently played (decided 2026-10-14). `+` (or Ctrl+↵ › New list…) asks for a name.
+- **Lists pane.** Enter, → or a click selects a list and moves to its entries; it does not start playback. Play is available in the list menu, header button and Home tile. You arrange the lists yourself (`Alt+↑↓` or drag; stored in `sort_index`). My list is always first. Finished lists sink to the bottom as "✓ … (done)". Only the Home rail sorts by most recently played (decided 2026-10-14). `+` (or Ctrl+↵ › New list…) asks for a name.
 - **My list** is always first in the lists pane and can't be deleted or renamed. It starts as Any order.
 - **Entries pane.** The number column is the play order. Watched entries fold into one "✓ 4" row by default (the toggle is remembered per list).
 - **The "next" entry** is the first unfinished one (§3). The cursor opens on it.
@@ -105,10 +105,10 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 │         ○ Choose position…                  │
 └─────────────────────────────────────────────┘
 ```
-- A film or episode that's already in the chosen list gets the toast "Already in Star Wars (7th)". A series can be added again as a separate range.
+- For one title, Enter on a ticked list removes it with Undo. For a series, the tick and removal apply to the exact chosen range; a different, non-overlapping range is added. For several titles, duplicates are left in place and the rest are saved: "Saved 11 to Star Wars · 1 already there".
 - **"Add the N shown to a watchlist, by year"** on the Movies grid menu (≤ 50 shown). It mirrors Up next's "Add the N shown".
 - **Ticks toggle.** Lists the title is already in show ✓, and Enter on one removes it (with Undo), the same way the favourites lists dialog works for channels.
-- **Up next's menu** gets "Save as a watchlist…".
+- **Up next's menu** gets "Save as a watchlist…". It saves pending film, series and episode rows, counting omitted live programmes and unavailable rows in the result.
 
 ### 2.4 Keyboard
 | Context | Key | Action |
@@ -145,10 +145,11 @@ The mouse gets a menu item or a button for every key, the same as Up next.
 | **Watching outside the list** | It counts. Done is derived from `watch_progress` at read time, so there is no "played from the list" bookkeeping. |
 | **Unwatching** | Ctrl+W (unwatched) on a title makes it "not done" in every list. The list's cursor moves back. |
 | **Start again** | Sets `list.since = now` and clears the list's skips. History is untouched. Undo restores both. |
-| **Playing a list** (decided) | Playing **from a list** (Enter on a list, an entry or a Home tile, or the agent's `watchlist play`) makes that list Up next's **context**. The entry goes in as Up next's next row and plays. When Up next has no pending rows left, the engine takes the list's next entry (§3, Next), adds it as a row and counts down as usual. Like a music app: rows you add to Up next play first, then the list carries on. |
-| **What ends a list** | The list runs out ("That was Star Wars ✓"), Esc or "Stop the list" on the card, "Play just this one", the agent's `stop_after`, the sleep timer's `end_of_queue`, or starting another list (it replaces the context). Playing something else steps aside as Up next does today ("Up next paused · Alt+6 to carry on"), and the context is kept. |
+| **Playing a list** (decided) | Playing **from a list** (Play in the list menu/header, Enter on an entry or a Home tile, or the agent's `watchlist play`) makes that list Up next's **context**. The entry goes in as Up next's next row and plays. When Up next has no pending rows left, the engine takes the list's next entry (§3, Next), adds it as a row and counts down as usual. Like a music app: rows you add to Up next play first, then the list carries on. |
+| **Ended without being watched** | A movie or episode that ends is excluded for the rest of this context run, even if EOF comes before `watched_pct` or the duration is unknown. This never marks it watched; a series can continue to its other episodes. |
+| **What ends a list** | The list runs out ("That was Star Wars ✓"), Esc or "Stop the list" on the card, "Play just this one", the agent's `stop_after`, the sleep timer's `end_of_queue`, three failures in a row, or starting another list (it replaces the context). Ending a context discards its automatic pending rows, preserving rows the user added with Ctrl+N. A timed sleep stop retains the context. Esc on an unrelated next-episode card also retains it. Playing something else steps aside as Up next does today ("Up next paused · Alt+6 to carry on"), and the context is kept. |
 | **Playing elsewhere** | The same film played from Movies, Search or a detail page has no context, so nothing follows it, exactly as today. |
-| **Up next link** | Rows added from a list carry `watchlist_item_id` (the chip). Removing the list ends the context and leaves its rows in Up next without their chip. |
+| **Up next link** | Rows added from a list carry `watchlist_item_id` (the chip). Removing the list ends the context, discards its automatic pending row, and leaves the playing row and user-added rows in Up next without their chip. |
 | **Restart** | Nothing auto-plays after a restart (as in §32). The Home tile reads "Resume Star Wars" and carries on with the context. |
 | **Finished list** | When nothing is left, the list shows "✓ Done" and leaves the Home rail. It's never deleted automatically. |
 | **Caps** | 100 lists, 300 entries per list, 50 per add. |
@@ -185,7 +186,8 @@ CREATE TABLE IF NOT EXISTS watchlist_item (
   any_copy     INTEGER NOT NULL DEFAULT 1,
   season_from  INTEGER,                          -- series ranges; NULL = whole series
   season_to    INTEGER,
-  title        TEXT    NOT NULL,                 -- display + placeholder matching; never logged at INFO
+  title        TEXT    NOT NULL,                 -- display; never logged at INFO
+  match_title  TEXT,                             -- provider name for placeholder matching
   year         INTEGER,
   tmdb_id      INTEGER,                          -- episodes: parent series id (year is also the series year)
   series_title TEXT,                             -- episode identity, independent of its display title
@@ -201,24 +203,28 @@ CREATE TABLE IF NOT EXISTS watchlist_item (
 CREATE INDEX IF NOT EXISTS watchlist_item_order ON watchlist_item(list_id, position);
 CREATE INDEX IF NOT EXISTS watchlist_item_ref ON watchlist_item(source_id, kind, item_key);
 
+CREATE INDEX IF NOT EXISTS watchlist_movie_hash ON movie(match_hash) WHERE match_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS watchlist_series_hash ON series(match_hash) WHERE match_hash IS NOT NULL;
+
 ALTER TABLE queue_item ADD COLUMN watchlist_item_id INTEGER;  -- the Up next chip; no FK (rows outlive lists)
+ALTER TABLE queue_item ADD COLUMN list_context INTEGER NOT NULL DEFAULT 0; -- automatic context row, not Ctrl+N
 -- Up next's context (the list playing after the queue's rows): `meta` row 'queue:context' =
 -- the watchlist id, or absent. Kept across a restart for the "Resume Star Wars" tile.
 ```
 - **Deleting a playlist** sets `source_id` to NULL, which turns the entry into a placeholder (it isn't deleted). The next refresh, or P3's "move to matched copies", reattaches it by title.
-- **Placeholder matching** runs after every catalogue import (`titles::refresh_source` already computes `match_hash`). A film or series placeholder matches when its `tmdb_id`, or its (kind, folded title, year), matches. Playlists carry no TMDB id for episodes, so an episode placeholder stores its series (title, year, `tmdb_id`) and its season and episode number: it matches when the series matches that way and the episode with that S/E exists (decided 2026-10-14). If there are several matches, the copy plan picks one. The matching cost is one indexed lookup per placeholder, and there are at most a few hundred.
+- **Placeholder matching** runs after every catalogue import (`titles::refresh_source` already computes `match_hash`). A film or series placeholder matches when its positive `tmdb_id`, or its (kind, folded provider title, year), matches. Zero and non-numeric TMDB ids never establish identity. Playlists carry no TMDB id for episodes, so an episode placeholder stores its series (title, year, `tmdb_id`) and its season and episode number: it matches when the series matches that way and the episode with that S/E exists (decided 2026-10-14). If there are several matches, the copy plan picks one. The matching cost is one indexed lookup per placeholder, and there are at most a few hundred.
 - **Store module** `src/store/watchlist.rs`: CRUD, dense positions, and `progress(list) -> Vec<EntryState>`. That function makes one query per list, joining `watch_progress` over the copies of each entry; episodes are counted per range with `GROUP BY`. HOLDERS gets a "watchlist" row. `store::backup` exports both tables.
 - **Model.** `row_id!(WatchlistId)` and `row_id!(WatchlistItemId)`. `ItemRef` is unchanged.
 
 ### 4.1 Favourites become channels only (decided)
 
-**A one-time move**, done in the Rust step of migration 0015 in one transaction, after `store::backup` writes a backup file:
+**A one-time move**, done in the Rust step of migration 0015 in one transaction. Only a database upgrading from v14 with film or series favourites gets a pre-migration backup: one `before-watchlists.json` user-data export, without credentials, catalogue rows or repeated timestamped copies. A backup I/O failure is logged and the transactional move still runs. Fresh installs and legacy backup restores do not create this file:
 1. Create **My list** (`is_default = 1`, Any order).
 2. Films, series and episodes in the default **Favourites** list go to My list, in the same order.
-3. Every other favourites list that holds films or series becomes an Any order watchlist with the **same name and order** ("Trending", "Mission Impossible"). If the name is taken, it becomes "Trending (favourites)".
+3. Every other favourites list that holds films or series becomes an Any order watchlist with the **same name and order** ("Trending", "Mission Impossible"). A repeated legacy restore merges into the same named watchlist and skips titles already there. A non-default favourites list named My list uses "My list (favourites)" to keep it separate from the default list.
 4. The film and series rows are deleted from `fav_item`. A list left with no channels is deleted (the default Favourites list is always kept).
-5. `fp` and `orphaned_since` move with the rows, so orphans stay orphans and can still reattach.
-6. Once, on the next launch, a card says: "Films and series you'd saved are now in Watchlists: My list, Trending, Mission Impossible. Favourites are for channels." with [Open Watchlists] [OK].
+5. `fp` and `orphaned_since` move with the rows, so orphans stay orphans and can still reattach. When an attached entry has only the legacy folded fallback name and no year, its display title and identity are repaired from the catalogue. Display renames are kept separately from the provider name used for matching.
+6. Once, on the next launch, a card says: "Films and series you'd saved are now in Watchlists: My list, Trending, Mission Impossible. Favourites are for channels." with [Open Watchlists] [OK]. The notice is acknowledged only on either button or Esc.
 
 **What changes afterwards**
 | Place | Before | After |
@@ -250,7 +256,8 @@ Watchlists don't need an engine of their own. A list's state is derived when it'
 ```
 - **`QueueMachine` gains `context: Option<WatchlistId>`.** The new inputs are `PlayList`, `StopList` and a "list next" answer from the store. Pure and unit-tested like the rest of the machine.
 - **Everything about playing is reused:** the PIN card, copy fallback, the three-failures pause, B1 placement (`open_in`), the mini player, the pop-out, the hidden window and MPRIS Next.
-- **One row at a time.** The list's entries aren't copied into Up next ahead of time, so reordering the list, or watching something elsewhere, changes what plays next straight away.
+- **One row at a time.** The list's entries aren't copied into Up next ahead of time, the row is pre-resolved when its countdown starts. Reordering or watching something elsewhere during that countdown affects the following pick; the countdown keeps its selected row.
+- **Details and skipped notices.** An entry whose series details are unavailable is excluded for this run, named once in a toast, and loaded through the jobs task without blocking the queue engine. In order lists name missing placeholders and agent-locked entries at most once per run. Any order lists do not report entries merely positioned before a random pick.
 - **The view is computed per screen open and per player `Ended`, never per frame.** `WatchlistsSnapshot` is cached in the UI and invalidated by a `watch_progress` write, a list edit or a library swap. There are no catalogue scans: progress reads are indexed on `(source_id, kind, item_key)`.
 - **The Home rail** reads the same snapshot.
 
@@ -328,7 +335,7 @@ Following the one-feature-per-workflow rule, this ships as **one feature**. It i
 | Track | Files | Size |
 |---|---|---|
 | **W0 skeleton** | `0015_watchlists.sql`, `src/watchlist/{mod,model}.rs` (types, `WatchlistsSnapshot`), `model/ids.rs`, keymap (`GoWatchlists`; `Ctrl+F` / `Ctrl+Shift+F` routing by kind), `QueueCommand::{PlayList, StopList}` | ~300 |
-| **W-core** | `src/store/watchlist.rs` (+ tests), the favourites move (§4.1) in `migrations.rs`, placeholder matching in `titles::refresh_source`, HOLDERS, backup, `queue::machine` context + `queue::service` list resolve | ~1,500 |
+| **W-core** | `src/store/watchlist.rs` (+ tests), the favourites move (§4.1) in `migrations.rs`, indexed placeholder matching at import completion and series-detail storage, HOLDERS, backup, `queue::machine` context + `queue::service` list resolve | ~1,500 |
 | **W-ui** | `src/ui/screens/watchlists.rs`, the Watchlists… dialog, detail-page button and line, Home rails (watchlists in, film favourites out), stack-card ★, sidebar entry, Up next chip and "Then from Star Wars" section, list card texts, the one-time "moved" card, Settings ▸ Favourites channels-only | ~1,400 |
 | **W-agent** | `agent/proto.rs`, `agent/watchlist.rs`, `tools.rs`, `favourites` channel-only, skills (pick, series, discover, watch) + RULES.md | ~550 + md |
 | **Docs** | DESIGN §42, §15 tables (`keymap_md`), MANUAL_CHECKLIST, README feature line | ~150 |

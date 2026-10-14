@@ -331,9 +331,6 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         return Err(Error::BadPayload("not a supported Tuner backup".into()));
     }
     let now = crate::model::now();
-    if b.fav_items.iter().any(|e| e.item.kind != crate::model::ItemKind::Channel) {
-        before_watchlists(conn)?;
-    }
     let tx = conn.transaction()?;
     let mut report = RestoreReport::default();
 
@@ -591,7 +588,7 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     }
     // ---- the batch features (each owner remaps its own refs; rule ids never carry over)
     let watchlists = if let Some(v) = &b.features.watchlists {
-        crate::store::watchlist::import(&tx, v, &remap)?
+        crate::store::watchlist::import_mode(&tx, v, &remap, mode == RestoreMode::Merge)?
     } else {
         crate::store::watchlist::ImportResult::default()
     };
@@ -638,20 +635,18 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     Ok(report)
 }
 
-/// An exact pre-migration safety copy, including the old catalogue and credentials. SQLite
-/// snapshots the live WAL via VACUUM INTO; a failed backup prevents the move (DESIGN §42 §4.1).
-/// In-memory test databases have no file to preserve.
+/// One small user-data backup, without credentials or catalogue rows. Migration itself is
+/// transactional; the caller logs an I/O failure and still performs the move.
 pub(crate) fn before_watchlists(conn: &Connection) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let path: String = conn.query_row("SELECT file FROM pragma_database_list WHERE name='main'", [], |r| r.get(0))?;
     if path.is_empty() {
         return Ok(());
     }
-    let original = std::path::Path::new(&path);
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(Error::other)?.as_nanos();
-    let backup = original.with_file_name(format!("{}.before-watchlists-{stamp}.db", original.file_name().unwrap_or_default().to_string_lossy()));
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&backup).map_err(|e| Error::io(&backup, e))?;
-    conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
-    std::fs::File::open(&backup).and_then(|f| f.sync_all()).map_err(|e| Error::io(&backup, e))?;
-    Ok(())
+    let original = Path::new(&path);
+    let backup = original.with_file_name("before-watchlists.json");
+    if backup.exists() {
+        return Ok(());
+    }
+    let data = export(conn, BackupOptions { include_history: true, ..Default::default() }, None, crate::model::now())?;
+    write_file(&backup, &data)
 }

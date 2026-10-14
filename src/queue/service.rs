@@ -118,6 +118,7 @@ pub fn spawn(rt: &tokio::runtime::Handle, shared: Arc<AppShared>, deps: EngineDe
         reply: None,
         sent: None,
         lists: HashMap::new(),
+        reported: Default::default(),
     };
     rt.spawn(engine.run(rx));
     QueueHandle { tx, shared }
@@ -137,6 +138,7 @@ struct Engine {
     sent: Option<crate::model::QueueId>,
     /// Derived once per edit, library swap or end; never per frame or position tick.
     lists: HashMap<WatchlistId, crate::watchlist::model::ListView>,
+    reported: std::collections::HashSet<WatchlistItemId>,
 }
 
 /// Wait for a change of an optional watch (pending forever without one).
@@ -229,8 +231,15 @@ impl Engine {
         let mut snap = self.machine.snapshot().clone();
         for list in self.lists.values() {
             for (position, entry) in list.entries.iter().enumerate() {
-                snap.watchlist_chips
-                    .insert(entry.entry.id, crate::queue::WatchlistChip { name: list.list.name.clone(), position: position + 1, total: list.total });
+                snap.watchlist_chips.insert(
+                    entry.entry.id,
+                    crate::queue::WatchlistChip {
+                        name: list.list.name.clone(),
+                        any_order: list.list.play_order == crate::watchlist::PlayOrder::Any,
+                        position: position + 1,
+                        total: list.total,
+                    },
+                );
             }
         }
         snap.watchlist = snap.context.and_then(|id| self.lists.get(&id)).map(|list| {
@@ -239,7 +248,7 @@ impl Engine {
             let then = list
                 .entries
                 .iter()
-                .filter(|e| !e.done() && e.playable.is_some() && Some(e.entry.id) != current_entry)
+                .filter(|e| !e.done() && e.playable.is_some())
                 .take(3)
                 .map(|e| crate::queue::ListPreview {
                     id: e.entry.id,
@@ -299,6 +308,7 @@ impl Engine {
 
     async fn refresh_lists(&mut self) {
         let context = self.machine.context;
+        let (excluded, ended, agent) = self.machine.preview_exclusions();
         let finished = match self.machine.snapshot().finished {
             Some(crate::queue::FinishedWhy::EndOfList(id)) => Some(id),
             _ => None,
@@ -315,15 +325,23 @@ impl Engine {
                 ids.dedup();
                 let mut lists = HashMap::new();
                 for id in ids {
-                    if let Some(list) = crate::store::watchlist::view_with_preferences(
+                    if let Some(mut list) = crate::store::watchlist::view_for_run(
                         c,
                         lib,
                         id,
                         view.unlocked,
-                        false,
+                        context == Some(id) && agent,
                         view.hides_explicit,
                         cfg.interface.copy_order,
+                        if context == Some(id) { &ended } else { &[] },
                     )? {
+                        if context == Some(id) {
+                            for entry in &mut list.entries {
+                                if excluded.contains(&entry.entry.id) {
+                                    entry.playable = None;
+                                }
+                            }
+                        }
                         lists.insert(id, list);
                     }
                 }
@@ -339,12 +357,14 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn list_row(
         &mut self,
         list: WatchlistId,
         from: Option<WatchlistItemId>,
         by: AddedBy,
-        excluded: Vec<WatchlistItemId>,
+        mut excluded: Vec<WatchlistItemId>,
+        ended: Vec<ItemRef>,
         queue_at: Option<Insert>,
     ) -> Vec<Input> {
         // The player submits its final progress before publishing Ended. Drain those writes
@@ -352,14 +372,14 @@ impl Engine {
         if let Err(e) = self.deps.store.writer().run(|_| Ok(())).await {
             return self.list_error(e, queue_at.is_none());
         }
-        let mut fetched = std::collections::HashSet::new();
-        let mut reported = std::collections::HashSet::new();
+        let mut from = from;
         loop {
-            let excluded = excluded.clone();
+            let excluded_pick = excluded.clone();
+            let ended = ended.clone();
             let guard = self.shared.guard();
             let selection = self
                 .read(move |c, lib, view, cfg| {
-                    let Some(list_view) = crate::store::watchlist::view_with_preferences(
+                    let Some(list_view) = crate::store::watchlist::view_for_run(
                         c,
                         lib,
                         list,
@@ -367,8 +387,12 @@ impl Engine {
                         by == AddedBy::Agent,
                         view.hides_explicit,
                         cfg.interface.copy_order,
+                        &ended,
                     )?
                     else {
+                        if from.is_some() {
+                            return Err(crate::error::Error::other("This watchlist entry is no longer available"));
+                        }
                         return Ok((None, Vec::new()));
                     };
                     let mut passed = list_view.passed_over.clone();
@@ -385,28 +409,37 @@ impl Engine {
                                 .unwrap_or_else(|| format!("{series} S{season}E{episode}"));
                         }
                     }
-                    let selected = list_pick(&list_view, from, &excluded, by);
-                    let Some(entry) = selected else { return Ok((None, passed)) };
+                    let selected = list_pick(&list_view, from, &excluded_pick, by);
+                    let Some(entry) = selected else {
+                        if let Some(id) = from {
+                            let why = match list_view.entries.iter().find(|e| e.entry.id == id) {
+                                Some(e) if e.locked => "This entry is locked: it needs your PIN in Tuner",
+                                _ => "This entry is no longer in your playlists",
+                            };
+                            return Err(crate::error::Error::other(why));
+                        }
+                        return Ok((None, passed));
+                    };
                     let Some(item) = entry.playable.clone() else { return Ok((None, passed)) };
                     if item.kind == ItemKind::Series {
                         let id = c
                             .prepare_cached("SELECT id FROM series WHERE source_id=?1 AND key=?2")?
                             .query_row(params![item.source, item.key.as_str()], |r| r.get::<_, SeriesId>(0))
                             .optional()?;
-                        return Ok((id.map(ListPick::Load), passed));
+                        return Ok((id.map(|id| ListPick::Load(entry.entry.id, id, entry.entry.title.clone())), passed));
                     }
                     let target = AddTarget { item, programme: None, from_start: entry.progress.is_none(), any_copy: entry.entry.any_copy };
                     let row = new_row(c, lib, view, target, by, cfg.interface.clock_24h, now())?;
                     match row {
                         Ok(row) => Ok((Some(ListPick::Row(entry.entry.id, row)), passed)),
-                        Err(_) => Ok((None, passed)),
+                        Err(why) => Err(crate::error::Error::other(format!("This watchlist entry cannot play: {why:?}"))),
                     }
                 })
                 .await;
             let selection = match selection {
                 Ok((pick, passed)) => {
                     for item in passed {
-                        if queue_at.is_none() && reported.insert(item.id) {
+                        if queue_at.is_none() && self.reported.insert(item.id) {
                             self.deps.bus.toast(Toast::info(format!("Skipping {}: {}", item.title, item.why)));
                         }
                     }
@@ -415,17 +448,19 @@ impl Engine {
                 Err(e) => return self.list_error(e, queue_at.is_none()),
             };
             match selection {
-                Some(ListPick::Load(series)) => {
-                    let Some(jobs) = &self.deps.jobs else {
-                        return self.list_error(crate::error::Error::other("The series' episodes aren't loaded"), queue_at.is_none());
-                    };
-                    if !fetched.insert(series) {
-                        return self.list_error(crate::error::Error::other("This series has no episodes in that season range"), queue_at.is_none());
+                Some(ListPick::Load(entry, series, title)) => {
+                    if let Some(jobs) = &self.deps.jobs {
+                        jobs.submit(crate::jobs::JobKind::LoadSeriesDetails(series));
                     }
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    if let Err(e) = crate::jobs::details::load_series(jobs.context(), series, &crate::jobs::Progress::detached(), &cancel).await {
-                        return self.list_error(e, queue_at.is_none());
+                    if queue_at.is_some() {
+                        return self.list_error(crate::error::Error::other("Loading this series' episodes; try again shortly"), false);
                     }
+                    if self.reported.insert(entry) {
+                        self.deps.bus.toast(Toast::info(format!("Skipping {title}: episodes aren't loaded yet")));
+                    }
+                    self.machine.step(Input::ListPassed(entry), now());
+                    excluded.push(entry);
+                    from = None;
                 }
                 Some(ListPick::Row(entry, row)) => {
                     let item = row.item.clone();
@@ -434,7 +469,7 @@ impl Engine {
                             .machine
                             .rows()
                             .iter()
-                            .position(|r| r.state == crate::queue::RowState::Pending && r.watchlist_item_id.is_some())
+                            .position(|r| r.state == crate::queue::RowState::Pending && r.list_context)
                             .map_or(Insert::End, Insert::Index),
                         Some(at) => at,
                         None => Insert::Next,
@@ -445,15 +480,22 @@ impl Engine {
                         .writer()
                         .run(move |c| {
                             crate::store::sql::atomic(c, |c| {
-                                if queue_at.is_some() {
-                                    let rows = crate::store::queue::load(c)?;
-                                    if let Some(existing) = rows.iter().find(|r| !r.state.is_done() && r.item == row.item) {
+                                let rows = crate::store::queue::load(c)?;
+                                let existing = rows.iter().find(|r| {
+                                    !r.state.is_done() && if queue_at.is_some() { r.item == row.item } else { r.watchlist_item_id == Some(entry) }
+                                });
+                                let id = if let Some(existing) = existing {
+                                    if queue_at.is_some() {
                                         return Ok((existing.id, rows, false));
                                     }
-                                }
-                                let added = crate::store::queue::add(c, &[row], at, now())?;
-                                let Some(id) = added.ids.first().copied() else { return Err(crate::error::Error::other("Up next is full")) };
-                                crate::store::queue::link_watchlist(c, id, entry)?;
+                                    crate::store::queue::refresh_list_row(c, existing.id, &row)?;
+                                    existing.id
+                                } else {
+                                    let added = crate::store::queue::add(c, &[row], at, now())?;
+                                    let Some(id) = added.ids.first().copied() else { return Err(crate::error::Error::other("Up next is full")) };
+                                    id
+                                };
+                                crate::store::queue::link_watchlist(c, id, entry, queue_at.is_none())?;
                                 if queue_at.is_none() {
                                     crate::store::watchlist::played(c, list, now())?;
                                     crate::store::watchlist::consume_next(c, list, entry)?;
@@ -497,7 +539,7 @@ impl Engine {
         tracing::warn!("queue: watchlist: {e}");
         self.deps.bus.toast(Toast::error(format!("Couldn't {} the watchlist entry: {e}", if playing { "play" } else { "add" })));
         self.reply = Some(QueueReply::Error(e.to_string()));
-        if playing { vec![Input::Command(QueueCommand::Cancel)] } else { Vec::new() }
+        if playing { vec![Input::Command(QueueCommand::StopList)] } else { Vec::new() }
     }
 
     /// Re-read the rows (a reader: an idle engine never waits on the writer's queue).
@@ -582,9 +624,10 @@ impl Engine {
 
     async fn effect(&mut self, e: Effect) -> Vec<Input> {
         match e {
-            Effect::LookupList { list, from, by, excluded } => self.list_row(list, from, by, excluded, None).await,
-            Effect::AddListEntry { list, entry, at } => self.list_row(list, Some(entry), AddedBy::App, Vec::new(), Some(at)).await,
+            Effect::LookupList { list, from, by, excluded, ended } => self.list_row(list, from, by, excluded, ended, None).await,
+            Effect::AddListEntry { list, entry, at } => self.list_row(list, Some(entry), AddedBy::App, Vec::new(), Vec::new(), Some(at)).await,
             Effect::Context(context) => {
+                self.reported.clear();
                 let r = self
                     .deps
                     .store
@@ -748,7 +791,7 @@ impl Engine {
         // A list's countdown may already have materialised its next row. A Ctrl+N made on
         // that card still joins the user's queue before the list (DESIGN §42 §3).
         let at = if at == Insert::End && self.machine.context.is_some() {
-            existing.iter().position(|r| r.state == crate::queue::RowState::Pending && r.watchlist_item_id.is_some()).map_or(at, Insert::Index)
+            existing.iter().position(|r| r.state == crate::queue::RowState::Pending && r.list_context).map_or(at, Insert::Index)
         } else {
             at
         };
@@ -800,7 +843,7 @@ impl Engine {
 }
 
 enum ListPick {
-    Load(SeriesId),
+    Load(WatchlistItemId, SeriesId, String),
     Row(WatchlistItemId, NewRow),
 }
 

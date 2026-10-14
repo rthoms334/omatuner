@@ -460,19 +460,22 @@ async fn run(h: SleepHandle, mut player: watch::Receiver<Arc<PlayerSnapshot>>, m
     let (mut player_open, mut queue_open) = (true, true);
     loop {
         let w = Watch::of(&player.borrow_and_update(), &queue.borrow_and_update(), crate::model::now());
-        let (step, armed) = {
+        let (step, armed, end_of_queue) = {
             let mut st = h.lock();
+            let end_of_queue = st.run.as_ref().is_some_and(|r| r.timer.when == SleepWhen::EndOfQueue);
             let step = st.run.as_mut().and_then(|r| r.step(&w));
             if matches!(step, Some(SleepStep::Fire(_))) {
                 st.run = None;
             }
-            (step, st.run.is_some())
+            (step, st.run.is_some(), end_of_queue)
         };
         match step {
             Some(SleepStep::Warn { at }) => h.bus.send(AppEvent::Reminder(super::ReminderEvent::SleepWarn { at })),
             Some(SleepStep::Fire(action)) => {
                 tracing::info!("sleep timer: {action:?}");
-                h.queue_command(crate::queue::QueueCommand::Cancel);
+                if end_of_queue {
+                    h.queue_command(crate::queue::QueueCommand::StopList);
+                }
                 h.queue_command(crate::queue::QueueCommand::EndAfterQueue(false));
                 act(action);
                 h.bus.send(AppEvent::Reminder(super::ReminderEvent::SleepNow { action }));
@@ -629,6 +632,7 @@ mod tests {
                 by_agent: false,
                 orphaned: false,
                 watchlist_item_id: None,
+                list_context: false,
             },
             locked: false,
             eta: None,

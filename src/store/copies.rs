@@ -623,6 +623,21 @@ pub fn move_plan(conn: &Connection, from: SourceId) -> Result<MovePlan> {
         let what = if channels == 1 { "1 channel favourite".to_owned() } else { format!("{channels} channel favourites") };
         plan.cannot.push(CantMove { what, why: "channels aren't matched across playlists".to_owned(), title_ref: None });
     }
+    let pinned = conn
+        .prepare_cached("SELECT title,source_id,kind,item_key FROM watchlist_item WHERE source_id=?1 AND any_copy=0")?
+        .query_map([from], |r| {
+            Ok(CantMove {
+                what: r.get(0)?,
+                why: "watchlist entry is pinned to this copy".into(),
+                title_ref: Some(ItemRef {
+                    source: r.get(1)?,
+                    kind: crate::store::sql::kind_from_sql(&r.get::<_, String>(2)?)?,
+                    key: ItemKey(r.get(3)?),
+                }),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    plan.cannot.extend(pinned);
     let watchlist_refs: Vec<ItemRef> = conn
         .prepare_cached("SELECT DISTINCT source_id,kind,item_key FROM watchlist_item WHERE source_id=?1 AND any_copy=1 ORDER BY list_id,position,id")?
         .query_map([from], |r| {
@@ -967,6 +982,18 @@ pub fn watched(conn: &Connection, copies: &[ItemRef], plays: (&ItemRef, &str), o
             for r in copies {
                 del.execute(params![r.source, r.kind.as_str(), r.key.as_str()])?;
             }
+        }
+        Ok(before)
+    })
+}
+
+/// Mark an explicit set of film/episode references, preserving their progress for Undo.
+pub fn watched_items(conn: &Connection, items: &[(ItemRef, String)], on: bool, now: Timestamp) -> Result<Undo> {
+    atomic(conn, |c| {
+        let refs = items.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>();
+        let before = snapshot(c, Table::Progress, &refs)?;
+        for (item, title) in items {
+            watched(c, std::slice::from_ref(item), (item, title), on, now)?;
         }
         Ok(before)
     })

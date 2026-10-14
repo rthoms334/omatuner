@@ -494,7 +494,7 @@ struct RailsKey {
     generation: u64,
     favs: u64,
     continue_gen: u64,
-    watchlists: usize,
+    watchlists: u64,
     /// Copies of one title are one tile (`interface.same_title`).
     combine: bool,
     /// Up next's tile: (items to go, the row it resumes) while nothing plays.
@@ -544,7 +544,7 @@ impl HomeScreen {
             generation: ctx.lib.generation,
             favs: favs_signature(ctx.favs),
             continue_gen: self.continue_gen,
-            watchlists: Arc::as_ptr(&watchlists) as usize,
+            watchlists: crate::ui::watchlists::revision(),
             combine,
             up_next: up_next_key(ctx),
         };

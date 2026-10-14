@@ -167,8 +167,19 @@ impl QueueScreen {
         let ids = if self.list.marks.contains(&id) { self.list.targets() } else { vec![id] };
         let cmd = match c {
             code::SAVE_LIST => {
-                let items = s.rows.iter().map(|r| r.entry.item.clone()).collect();
+                let mut items = Vec::new();
+                let mut omitted = (0, 0);
+                for row in s.rows.iter().filter(|r| r.entry.state == crate::queue::RowState::Pending) {
+                    if row.entry.programme.is_some() || row.entry.item.kind == crate::model::ItemKind::Channel {
+                        omitted.0 += 1;
+                    } else if row.entry.orphaned {
+                        omitted.1 += 1;
+                    } else {
+                        items.push(row.entry.item.clone());
+                    }
+                }
                 ctx.open(OverlayRequest::WatchlistPicker(crate::ui::overlays::watchlists::PickerSpec {
+                    omitted,
                     items,
                     title: "Save Up next".into(),
                     edit: None,

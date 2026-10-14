@@ -18,6 +18,8 @@ use eframe::egui;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PickerSpec {
     pub items: Vec<ItemRef>,
+    /// Live and unavailable queue rows left out before opening the picker.
+    pub omitted: (usize, usize),
     pub title: String,
     /// Seasons… edits this entry instead of adding another range.
     pub edit: Option<WatchlistItemId>,
@@ -39,6 +41,7 @@ pub struct Picker {
     loaded_last: bool,
     loaded_edit: bool,
     focus: usize,
+    copies: Vec<ItemRef>,
 }
 impl Picker {
     pub fn new(spec: PickerSpec) -> Self {
@@ -57,11 +60,15 @@ impl Picker {
             loaded_last: false,
             loaded_edit: false,
             focus: 0,
+            copies: Vec::new(),
         }
     }
     fn init(&mut self, ctx: &UiCtx<'_>) {
         if !self.loaded_edit {
             self.loaded_edit = true;
+            if let Some(item) = self.spec.items.first() {
+                self.copies = store::title_copies(ctx.db, ctx.lib, item).unwrap_or_default();
+            }
             if let Some(e) = self.spec.edit.and_then(|id| store::entry(ctx.db, id).ok().flatten()) {
                 self.whole = e.season_from.is_none();
                 self.from = e.season_from.unwrap_or(1);
@@ -123,28 +130,20 @@ impl Picker {
             }
         }
         let at = self.insertion();
-        shared::write(ctx, format!("Saved to {name}"), move |c| {
+        let omitted = self.spec.omitted;
+        shared::write_result(ctx, move |c| {
             crate::store::sql::atomic(c, |c| {
-                let mut entries = refs.iter().map(|r| store::new_entry(c, r)).collect::<crate::error::Result<Vec<_>>>()?;
-                if let Some((a, b)) = range {
-                    entries[0].season_from = Some(a);
-                    entries[0].season_to = Some(b);
+                let (mut entries, omitted) = additions(c, &refs, omitted)?;
+                if let Some((a, b)) = range
+                    && let Some(entry) = entries.first_mut()
+                {
+                    entry.season_from = Some(a);
+                    entry.season_to = Some(b);
                 }
                 let added = store::add(c, &lib, list_id, &entries, at, now)?;
-                if let Some((index, reason)) = added.refused.first() {
-                    if reason == "duplicate" {
-                        let ids = store::matching_entries(c, &lib, list_id, &refs[*index], a, b)?;
-                        let pos = ids.first().and_then(|id| store::entry(c, *id).ok().flatten()).map_or(1, |e| e.position + 1);
-                        return Err(crate::error::Error::other(format!("Already in {name} ({})", ordinal(pos))));
-                    }
-                    return Err(crate::error::Error::other(if reason == "overlapping_seasons" {
-                        "Those seasons are already in this list".to_owned()
-                    } else {
-                        reason.clone()
-                    }));
-                }
+                check_refusals(&added)?;
                 c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('watchlist:last_used',?1)", [list_id.0.to_string()])?;
-                Ok(None)
+                Ok((saved_text(&name, added.added.len(), added.refused.len(), omitted), None))
             })
         });
     }
@@ -161,26 +160,27 @@ impl Picker {
         let lib = ctx.lib.clone();
         let now = ctx.now;
         let range = (!self.whole && self.series()).then_some((self.from, self.to.max(self.from)));
-        shared::write(ctx, format!("Created {name}"), move |c| {
+        let omitted = self.spec.omitted;
+        shared::write_result(ctx, move |c| {
             crate::store::sql::atomic(c, |c| {
                 let list = store::create(c, &name, None, PlayOrder::Ordered, "app", now)?;
-                let mut entries = refs.iter().map(|r| store::new_entry(c, r)).collect::<crate::error::Result<Vec<_>>>()?;
-                if let Some((a, b)) = range {
-                    entries[0].season_from = Some(a);
-                    entries[0].season_to = Some(b);
+                let (mut entries, omitted) = additions(c, &refs, omitted)?;
+                if let Some((a, b)) = range
+                    && let Some(entry) = entries.first_mut()
+                {
+                    entry.season_from = Some(a);
+                    entry.season_to = Some(b);
                 }
+                let (mut saved, mut duplicates) = (0, 0);
                 for chunk in entries.chunks(50) {
                     let result = store::add(c, &lib, list, chunk, Insert::End, now)?;
-                    if let Some((_, why)) = result.refused.iter().find(|(_, why)| why != "duplicate") {
-                        return Err(crate::error::Error::other(match why.as_str() {
-                            "overlapping_seasons" => "Those seasons are already in this list",
-                            "full" => "A watchlist can hold up to 300 entries",
-                            "invalid_seasons" => "Choose a valid season range",
-                            other => other,
-                        }));
-                    }
+                    check_refusals(&result)?;
+                    saved += result.added.len();
+                    duplicates += result.refused.len();
                 }
-                Ok(None)
+                let text =
+                    if refs.is_empty() && omitted == (0, 0) { format!("Created {name}") } else { saved_text(&name, saved, duplicates, omitted) };
+                Ok((text, None))
             })
         });
         OverlayOutcome::Close
@@ -230,7 +230,6 @@ impl Overlay for Picker {
             return OverlayOutcome::Close;
         }
         let snap = shared::snapshot(ctx);
-        let members = self.spec.items.first().map(|r| shared::memberships(ctx, r)).unwrap_or_default();
         if !self.loaded_last {
             self.loaded_last = true;
             self.last_used = ctx.db.query_row("SELECT value FROM meta WHERE key='watchlist:last_used'", [], |r| r.get::<_, String>(0)).ok();
@@ -257,7 +256,13 @@ impl Overlay for Picker {
                 } else {
                     egui::ScrollArea::vertical().max_height(320.0 * theme.rem()).show(ui, |ui| {
                         for (i, l) in snap.lists.iter().enumerate() {
-                            let tick = members.iter().any(|(m, _, _)| m.id == l.list.id);
+                            let tick = self.spec.items.len() == 1
+                                && l.entries.iter().any(|e| {
+                                    e.entry.item.as_ref().is_some_and(|item| self.copies.contains(item))
+                                        && (!self.series()
+                                            || (e.entry.season_from, e.entry.season_to)
+                                                == if self.whole { (None, None) } else { (Some(self.from), Some(self.to)) })
+                                });
                             let label = format!(
                                 "{}{}{}",
                                 l.list.name,
@@ -332,8 +337,13 @@ impl Overlay for Moved {
     fn key_contexts(&self) -> Vec<KeyContext> {
         vec![KeyContext::Modal]
     }
-    fn on_action(&mut self, _ctx: &mut UiCtx<'_>, a: Action) -> OverlayOutcome {
-        if matches!(a, Action::Back | Action::Activate) { OverlayOutcome::Close } else { OverlayOutcome::Ignored }
+    fn on_action(&mut self, ctx: &mut UiCtx<'_>, a: Action) -> OverlayOutcome {
+        if matches!(a, Action::Back | Action::Activate) {
+            dismiss_moved(ctx);
+            OverlayOutcome::Close
+        } else {
+            OverlayOutcome::Ignored
+        }
     }
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         let mut open = false;
@@ -355,7 +365,12 @@ impl Overlay for Moved {
         if open {
             ctx.push(Route::Watchlists { list: None });
         }
-        if open || done { OverlayOutcome::Close } else { OverlayOutcome::Keep }
+        if open || done {
+            dismiss_moved(ctx);
+            OverlayOutcome::Close
+        } else {
+            OverlayOutcome::Keep
+        }
     }
 }
 
@@ -471,18 +486,44 @@ impl Overlay for Find {
     }
 }
 
-fn ordinal(n: usize) -> String {
-    let suffix = if (11..=13).contains(&(n % 100)) {
-        "th"
-    } else {
-        match n % 10 {
-            1 => "st",
-            2 => "nd",
-            3 => "rd",
-            _ => "th",
+fn dismiss_moved(ctx: &UiCtx<'_>) {
+    let _ = ctx.services.store.writer().submit(|c| store::dismiss_moved_card(c));
+}
+
+type Additions = (Vec<crate::watchlist::NewEntry>, (usize, usize));
+fn additions(c: &rusqlite::Connection, refs: &[ItemRef], mut omitted: (usize, usize)) -> crate::error::Result<Additions> {
+    let mut entries = Vec::new();
+    for item in refs {
+        if item.kind == ItemKind::Channel {
+            omitted.0 += 1;
+        } else {
+            match store::new_entry(c, item) {
+                Ok(entry) => entries.push(entry),
+                Err(crate::error::Error::Other(_)) => omitted.1 += 1,
+                Err(e) => return Err(e),
+            }
         }
-    };
-    format!("{n}{suffix}")
+    }
+    Ok((entries, omitted))
+}
+fn check_refusals(result: &crate::watchlist::AddResult) -> crate::error::Result<()> {
+    if let Some((_, reason)) = result.refused.iter().find(|(_, reason)| !matches!(reason.as_str(), "duplicate" | "overlapping_seasons")) {
+        return Err(crate::error::Error::other(reason.clone()));
+    }
+    Ok(())
+}
+fn saved_text(name: &str, saved: usize, duplicates: usize, omitted: (usize, usize)) -> String {
+    let mut text = format!("Saved {saved} to {name}");
+    if duplicates > 0 {
+        text.push_str(&format!(" · {duplicates} already there"));
+    }
+    if omitted.0 > 0 {
+        text.push_str(&format!(" · {} live programmes left out", omitted.0));
+    }
+    if omitted.1 > 0 {
+        text.push_str(&format!(" · {} unavailable titles left out", omitted.1));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -516,5 +557,73 @@ mod tests {
         h.state_mut().act(Action::FocusNext);
         h.state_mut().act(Action::Right);
         assert_eq!(h.state().o.place, 1, "After the next is keyboard-accessible");
+    }
+    #[test]
+    fn watchlist_batch_save_keeps_new_titles_and_single_range_toggles() {
+        let (mut t, one) = rig();
+        let (src, list, series) = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::movies(c, src, 2)?;
+            let series = testkit::series(c, src, 1, 3, 2)?[0];
+            let series = crate::store::vod::series(c, series)?;
+            let series = ItemRef { source: src, kind: ItemKind::Series, key: series.key };
+            let lib = crate::store::library::load(c)?;
+            let list = store::default_list(c)?;
+            let item = ItemRef { source: src, kind: ItemKind::Movie, key: crate::model::ItemKey("m3u:movie0000000000".into()) };
+            store::add(c, &lib, list, &[store::new_entry(c, &item)?], Insert::End, 1)?;
+            Ok((src, list, series))
+        });
+        let film = |n| ItemRef { source: src, kind: ItemKind::Movie, key: crate::model::ItemKey(format!("m3u:movie{n:010}")) };
+        let spec = PickerSpec { items: vec![film(0), film(1)], omitted: (0, 0), title: "Two films".into(), edit: None, create: false };
+        let mut h = overlay_harness(t, one, Picker::new(spec), egui::vec2(1000.0, 800.0));
+        testkit::until_ov(&mut h, "loaded", |h| h.state_mut().t.with_ctx(|ctx| !shared::snapshot(ctx).lists.is_empty()));
+        h.state_mut().act(Action::Activate);
+        testkit::until_ov(&mut h, "batch saved", |h| store::entries(&h.state().t.db, list).unwrap().len() == 2);
+        h.state_mut().o.spec.items = vec![series.clone()];
+        h.state_mut().o.whole = false;
+        h.state_mut().o.from = 1;
+        h.state_mut().o.to = 1;
+        h.state_mut().act(Action::Activate);
+        testkit::until_ov(&mut h, "range saved", |h| store::entries(&h.state().t.db, list).unwrap().len() == 3);
+        h.state_mut().act(Action::Activate);
+        testkit::until_ov(&mut h, "range removed", |h| store::entries(&h.state().t.db, list).unwrap().len() == 2);
+        h.state_mut().o.from = 2;
+        h.state_mut().o.to = 2;
+        h.state_mut().act(Action::Activate);
+        testkit::until_ov(&mut h, "different range saved", |h| {
+            store::entries(&h.state().t.db, list).unwrap().iter().any(|e| e.season_from == Some(2))
+        });
+    }
+
+    #[test]
+    fn watchlists_moved_notice_is_acknowledged_only_on_dismissal() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            c.execute("INSERT INTO meta(key,value) VALUES ('watchlists:moved','[\"My list\"]')", [])?;
+            Ok(())
+        });
+        let mut h = overlay_harness(t, one, Moved::new(vec!["My list".into()]), egui::vec2(1000.0, 800.0));
+        assert_eq!(store::moved_card(&h.state().t.db).unwrap(), ["My list"]);
+        h.state_mut().act(Action::Back);
+        h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
+        assert!(store::moved_card(&h.state().t.db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn watchlist_save_skips_live_and_unavailable_titles() {
+        let (mut t, _one) = rig();
+        seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::movies(c, src, 1)?;
+            let item = |kind, key: &str| ItemRef { source: src, kind, key: crate::model::ItemKey(key.into()) };
+            let refs = [item(ItemKind::Channel, "live"), item(ItemKind::Movie, "gone"), item(ItemKind::Movie, "m3u:movie0000000000")];
+            let (entries, omitted) = additions(c, &refs, (0, 0))?;
+            let list = store::create(c, "Tonight", None, PlayOrder::Ordered, "app", 1)?;
+            let added = store::add(c, &crate::store::library::load(c)?, list, &entries, Insert::End, 1)?;
+            assert_eq!(added.added.len(), 1);
+            assert_eq!(omitted, (1, 1));
+            assert_eq!(saved_text("Tonight", 1, 0, omitted), "Saved 1 to Tonight · 1 live programmes left out · 1 unavailable titles left out");
+            Ok(())
+        });
     }
 }

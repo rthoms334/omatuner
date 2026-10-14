@@ -567,3 +567,181 @@ fn watchlist_add_to_queue_resolves_the_entry_without_starting_its_context() {
     assert!(matches!(add(), QueueReply::Added { added, refused } if added.is_empty() && refused[0].1==Refusal::Duplicate));
     assert_eq!(rig.queue.snapshot().rows.len(), 1);
 }
+#[test]
+fn watchlist_interrupted_rows_are_reused_or_retired_and_pending_feeds_are_cancelled() {
+    use tuner::store::watchlist as wl;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    let movies = w(&s, move |c| seed::seed_movies(c, src, 3));
+    let (list, entries) = w(&s, move |c| {
+        let lib = tuner::store::library::load(c)?;
+        let list = wl::create(c, "Saga", None, tuner::watchlist::PlayOrder::Ordered, "app", NOW)?;
+        let rows = (0..3).map(|i| wl::new_entry(c, &movie_ref(src, i))).collect::<tuner::error::Result<Vec<_>>>()?;
+        Ok((list, wl::add(c, &lib, list, &rows, tuner::watchlist::Insert::End, NOW)?.added))
+    });
+    let mut cfg = Config::default();
+    cfg.queue.ask = true;
+    let rig = Rig::new(&rt, s.clone(), cfg);
+    let req = |cmd| rt.block_on(rig.queue.request(cmd));
+    req(QueueCommand::PlayList { list, from: None, just_one: false });
+    let first = rig.queue.snapshot().current.unwrap();
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(movies[0]), PlayOrigin::Queue, PlayerState::Playing, 1);
+    until("playing", || rig.queue.snapshot().driving);
+    rig.snaps.send_replace(Arc::new(PlayerSnapshot::default()));
+    until("stopped", || rig.queue.snapshot().interrupted);
+    w(&s, move |c| {
+        c.execute("INSERT INTO watch_progress(source_id,kind,item_key,position_s,duration_s,finished,updated_at,title) VALUES (?1,'movie',?2,100,600,0,?3,'First')", rusqlite::params![src, movie_ref(src, 0).key.as_str(), NOW])?;
+        Ok(())
+    });
+    req(QueueCommand::Next);
+    assert_eq!(rig.queue.snapshot().current, Some(first));
+    assert!(!rig.queue.snapshot().row(first).unwrap().entry.from_start, "reused row resumes the new progress");
+    assert_eq!(q::load(&s.reader().unwrap()).unwrap().len(), 1, "Next reuses the stopped row");
+    req(QueueCommand::PlayListAgent { list, from: Some(entries[1]), just_one: false });
+    assert_eq!(rig.queue.snapshot().row(first).unwrap().entry.state, RowState::Skipped);
+    assert_eq!(rig.queue.snapshot().pending(), 1, "old Current cannot become Pending again");
+    rig.player(&movie_ref(src, 1), MediaRef::Movie(movies[1]), PlayOrigin::Queue, PlayerState::Playing, 2);
+    until("second playing", || rig.queue.snapshot().driving);
+    rig.player(&movie_ref(src, 1), MediaRef::Movie(movies[1]), PlayOrigin::Queue, PlayerState::Ended, 2);
+    until("list countdown", || rig.queue.snapshot().countdown.is_some());
+    let pending = rig.queue.snapshot().countdown.as_ref().unwrap().id.unwrap();
+    req(QueueCommand::PlayList { list, from: Some(entries[0]), just_one: false });
+    assert_eq!(rig.queue.snapshot().current, Some(pending), "starting the same pending entry reuses its row");
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(movies[0]), PlayOrigin::Queue, PlayerState::Playing, 3);
+    until("first replay playing", || rig.queue.snapshot().driving);
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(movies[0]), PlayOrigin::Queue, PlayerState::Ended, 3);
+    until("new list countdown", || rig.queue.snapshot().countdown.is_some());
+    let pending = rig.queue.snapshot().countdown.as_ref().unwrap().id.unwrap();
+    req(QueueCommand::AddListEntry { list, entry: entries[2], at: Insert::End });
+    let manual = rig.queue.snapshot().rows.iter().find(|r| r.entry.watchlist_item_id == Some(entries[2]) && !r.entry.list_context).unwrap().entry.id;
+    req(QueueCommand::StopList);
+    let snap = rig.queue.snapshot();
+    assert_eq!(snap.context, None);
+    assert_ne!(snap.countdown.as_ref().and_then(|c| c.id), Some(pending));
+    assert_eq!(snap.row(pending).unwrap().entry.state, RowState::Skipped);
+    assert_eq!(snap.row(manual).unwrap().entry.state, RowState::Pending);
+}
+
+#[test]
+fn watchlist_eof_without_watched_progress_moves_on_and_reports_a_placeholder_once() {
+    use tuner::store::watchlist as wl;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    let movies = w(&s, move |c| seed::seed_movies(c, src, 2));
+    let list = w(&s, move |c| {
+        let lib = tuner::store::library::load(c)?;
+        let list = wl::create(c, "Saga", None, tuner::watchlist::PlayOrder::Ordered, "app", NOW)?;
+        let mut placeholder = wl::new_entry(c, &movie_ref(src, 0))?;
+        placeholder.item = None;
+        placeholder.title = "Missing title".into();
+        placeholder.year = Some(1900);
+        let rows = [placeholder, wl::new_entry(c, &movie_ref(src, 0))?, wl::new_entry(c, &movie_ref(src, 1))?];
+        wl::add(c, &lib, list, &rows, tuner::watchlist::Insert::End, NOW)?;
+        Ok(list)
+    });
+    let mut cfg = Config::default();
+    cfg.queue.countdown_s = 0;
+    let rig = Rig::new(&rt, s.clone(), cfg);
+    rt.block_on(rig.queue.request(QueueCommand::PlayList { list, from: None, just_one: false }));
+    for (i, movie) in movies.iter().enumerate() {
+        rig.player(&movie_ref(src, i), MediaRef::Movie(*movie), PlayOrigin::Queue, PlayerState::Playing, i as u64 + 1);
+        until("playing", || rig.queue.snapshot().driving);
+        rig.player(&movie_ref(src, i), MediaRef::Movie(*movie), PlayOrigin::Queue, PlayerState::Ended, i as u64 + 1);
+        if i == 0 {
+            until("second film", || rig.player.plays().len() == 2);
+        }
+    }
+    until("list ended", || rig.queue.snapshot().context.is_none());
+    assert_eq!(rig.player.plays().len(), 2);
+    assert!(tuner::store::user::progress(&s.reader().unwrap(), &movie_ref(src, 0)).unwrap().is_none());
+    let skipped = rig.events.try_iter().filter(|e| matches!(e, tuner::msg::AppEvent::Toast(t) if t.text.contains("Skipping Missing title"))).count();
+    assert_eq!(skipped, 1);
+}
+
+#[test]
+fn watchlist_unloaded_series_passes_to_the_next_film_and_missing_selection_reports_error() {
+    use tuner::store::watchlist as wl;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    let movies = w(&s, move |c| seed::seed_movies(c, src, 1));
+    let (list, series) = w(&s, move |c| {
+        c.execute("UPDATE source SET kind='xtream',xt_server='http://localhost',xt_username='test',xt_password='test' WHERE id=?1", [src])?;
+        c.execute("INSERT INTO series(source_id,key,name,clean_name,norm_name,provider_order,seen_gen) VALUES (?1,'show','Unopened show','Unopened show','unopenedshow',0,1)", [src])?;
+        let lib = tuner::store::library::load(c)?;
+        let list = wl::create(c, "Saga", None, tuner::watchlist::PlayOrder::Ordered, "app", NOW)?;
+        let show = ItemRef { source: src, kind: ItemKind::Series, key: ItemKey("show".into()) };
+        let ids =
+            wl::add(c, &lib, list, &[wl::new_entry(c, &show)?, wl::new_entry(c, &movie_ref(src, 0))?], tuner::watchlist::Insert::End, NOW)?.added;
+        Ok((list, ids[0]))
+    });
+    let rig = Rig::new(&rt, s.clone(), Config::default());
+    let reply = rt.block_on(rig.queue.request(QueueCommand::PlayList { list, from: None, just_one: false }));
+    assert!(matches!(reply, QueueReply::Play(PlayReply::Playing(_))), "{reply:?}");
+    assert_eq!(rig.player.plays()[0].0, MediaRef::Movie(movies[0]));
+    assert!(rig.events.try_iter().any(|e| matches!(e, tuner::msg::AppEvent::Toast(t) if t.text.contains("Skipping Unopened show"))));
+    w(&s, move |c| wl::remove(c, list, &[series]).map(|_| ()));
+    let reply = rt.block_on(rig.queue.request(QueueCommand::PlayList { list, from: Some(series), just_one: false }));
+    assert!(matches!(reply, QueueReply::Error(ref message) if message.contains("no longer")), "{reply:?}");
+    assert!(rig.queue.snapshot().finished.is_none());
+}
+
+#[test]
+fn watchlist_timed_sleep_keeps_context_but_end_of_queue_ends_it() {
+    use tuner::reminders::sleep::{SleepAction, SleepService, SleepWhen};
+    use tuner::store::watchlist as wl;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    let movies = w(&s, move |c| seed::seed_movies(c, src, 2));
+    let list = w(&s, move |c| {
+        let lib = tuner::store::library::load(c)?;
+        let list = wl::create(c, "Saga", None, tuner::watchlist::PlayOrder::Ordered, "app", NOW)?;
+        let rows = (0..2).map(|i| wl::new_entry(c, &movie_ref(src, i))).collect::<tuner::error::Result<Vec<_>>>()?;
+        wl::add(c, &lib, list, &rows, tuner::watchlist::Insert::End, NOW)?;
+        Ok(list)
+    });
+    let mut cfg = Config::default();
+    cfg.queue.ask = true;
+    let rig = Rig::new(&rt, s, cfg);
+    let req = |cmd| rt.block_on(rig.queue.request(cmd));
+    req(QueueCommand::PlayList { list, from: None, just_one: false });
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(movies[0]), PlayOrigin::Queue, PlayerState::Playing, 1);
+    until("first playing", || rig.queue.snapshot().driving);
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(movies[0]), PlayOrigin::Queue, PlayerState::Ended, 1);
+    until("countdown", || rig.queue.snapshot().countdown.is_some());
+    let pending = rig.queue.snapshot().countdown.as_ref().unwrap().id.unwrap();
+    let (bus, _events) = tuner::msg::EventBus::new(None);
+    let fired = Arc::new(Mutex::new(0));
+    let count = fired.clone();
+    let snaps = rig.snaps.clone();
+    let sleep = SleepService::start(
+        rt.handle(),
+        rig.snaps.subscribe(),
+        rig.queue.subscribe(),
+        Arc::new(move |_| {
+            snaps.send_replace(Arc::new(PlayerSnapshot::default()));
+            *count.lock().unwrap() += 1;
+        }),
+        bus,
+    );
+    sleep.connect_queue(Some(rig.queue.clone()));
+    sleep.set(SleepWhen::At(tuner::model::now() + 1), SleepAction::Stop, 0, None).unwrap();
+    until("timed stop", || *fired.lock().unwrap() == 1);
+    until("stopped countdown", || rig.queue.snapshot().countdown.is_none());
+    req(QueueCommand::EndAfterQueue(false));
+    assert_eq!(rig.queue.snapshot().context, Some(list));
+    assert_eq!(rig.queue.snapshot().row(pending).unwrap().entry.state, RowState::Pending);
+
+    req(QueueCommand::Next);
+    rig.player(&movie_ref(src, 1), MediaRef::Movie(movies[1]), PlayOrigin::Queue, PlayerState::Playing, 2);
+    until("next playing", || rig.queue.snapshot().driving);
+    sleep.set(SleepWhen::EndOfQueue, SleepAction::Stop, 0, None).unwrap();
+    req(QueueCommand::EndAfterQueue(true)); // wait until the engine knows to stop feeding
+    assert_eq!(rig.queue.snapshot().context, Some(list), "arming alone keeps the current context");
+    rig.player(&movie_ref(src, 1), MediaRef::Movie(movies[1]), PlayOrigin::Queue, PlayerState::Ended, 2);
+    until("end-of-queue stop", || *fired.lock().unwrap() == 2);
+    until("end-of-queue clears context", || rig.queue.snapshot().context.is_none());
+}

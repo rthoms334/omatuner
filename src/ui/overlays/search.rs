@@ -104,7 +104,7 @@ pub struct SearchOverlay {
     top: Option<f32>,
     last_top: Option<f32>,
     scroll_to_cursor: bool,
-    watchlists_key: usize,
+    watchlists_key: u64,
 }
 
 impl SearchOverlay {
@@ -644,8 +644,8 @@ impl Overlay for SearchOverlay {
     }
 
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
-        let lists = crate::ui::watchlists::snapshot(ctx);
-        let key = Arc::as_ptr(&lists) as usize;
+        crate::ui::watchlists::snapshot(ctx);
+        let key = crate::ui::watchlists::revision();
         if self.watchlists_key != key {
             self.watchlists_key = key;
             self.rows_key = None;
