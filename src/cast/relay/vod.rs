@@ -738,18 +738,8 @@ impl OnDemand {
                 _ = caps.tick() => suspended = self.caps(&child, &run, suspended).await,
             }
         };
-        if exit == ffmpeg::Exit::Failed && !self.ctx.feed.failed() {
-            let why = child.failure();
-            let k = run.made();
-            tracing::info!(
-                "{}: ffmpeg stopped with an error making segment {k}, at {:.1} s into the item: {}",
-                self.ctx.label,
-                self.map.start(k),
-                why.text(self.ctx.feed.resumes() > 0)
-            );
-        }
-        // whatever it finished (its last listed segment too, when it ended by itself)
-        self.scan(&run, &mut seen, exit == ffmpeg::Exit::Done).await;
+        let why = (exit == ffmpeg::Exit::Failed && !self.ctx.feed.failed()).then(|| child.failure());
+        self.wind_up(&run, &mut seen, exit, why).await;
         let state = match exit {
             ffmpeg::Exit::Done => DONE,
             ffmpeg::Exit::Failed => FAILED,
@@ -758,6 +748,23 @@ impl OnDemand {
         run.state.store(state, Ordering::Release);
         let _ = tokio::fs::remove_dir_all(&run.dir).await;
         self.changed.notify_waiters();
+    }
+
+    /// A run's end: publish whatever it finished (its last listed segment too, when it ended by
+    /// itself), then, for an ffmpeg error (`why`), say where it stopped: the segment after the
+    /// last one published. In that order: the list and files it wrote after the last 100 ms scan
+    /// count, or the position reported would be a segment or more behind.
+    async fn wind_up(&self, run: &RunCtx, seen: &mut usize, exit: ffmpeg::Exit, why: Option<ffmpeg::Failure>) {
+        self.scan(run, seen, exit == ffmpeg::Exit::Done).await;
+        if let Some(why) = why {
+            let k = run.made();
+            tracing::info!(
+                "{}: ffmpeg stopped with an error making segment {k}, at {:.1} s into the item: {}",
+                self.ctx.label,
+                self.map.start(k),
+                why.text(self.ctx.feed.resumes() > 0)
+            );
+        }
     }
 
     /// Publish the segments `run` has finished since `seen` (module docs, "Publishing");
@@ -1162,6 +1169,60 @@ mod tests {
         assert!(!keeps(&m, 0, made, made + 1, 100.0, made + 1));
         // a run restarted at 300 s has a fresh burst
         assert!(keeps(&m, 50, 50, m.len(), 1.0, 53));
+    }
+
+    /// A run that failed between two scans: the segments it listed and finished since the last
+    /// one are published first, and the stop is reported after them (segment 2 at 12 s), not
+    /// where the last scan left it (segment 0).
+    #[test]
+    fn a_failed_run_reports_where_it_stopped_after_publishing_what_it_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("served");
+        let run_dir = dir.path().join("r1");
+        for d in [&served, &run_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // what ffmpeg left behind: two listed segments and the start of a third
+        let at = |s: f64| s + ffmpeg::RUN_OFFSET_S;
+        std::fs::write(run_dir.join(ffmpeg::RUN_LIST), format!("s0.ts,{:.6},{:.6}\ns1.ts,{:.6},{:.6}\n", at(0.0), at(6.0), at(6.0), at(12.0)))
+            .unwrap();
+        for k in 0..3 {
+            std::fs::write(run_dir.join(format!("s{k}.ts")), b"ts").unwrap();
+        }
+        let ((), log) = super::super::tests::logged(async {
+            let proxy = super::super::upstream::Proxy::start().await.unwrap();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let generation = Arc::new(AtomicU64::new(1));
+            let label: Arc<str> = "cast session t".into();
+            let fctx = super::super::upstream::FeedCtx { generation: generation.clone(), tx: tx.clone(), label: label.clone() };
+            let feed = proxy.feed(fctx, &Secret::new("http://provider.invalid/film.mp4".into()), &Default::default(), "Tuner");
+            let plan = Plan {
+                level: crate::model::CastLevel::Repackaged,
+                video: super::super::plan::Video::Copy,
+                audio: super::super::plan::Audio::Copy,
+                segments: super::super::plan::Segments::Ts,
+                surround: None,
+            };
+            let spec =
+                Spec { ffmpeg: "/nonexistent".into(), url: Secret::new(String::new()), plan, hevc: false, fps: None, audio_index: None, idr: None };
+            let map = Map::grid(60.0, 6.0, 0.0).unwrap();
+            let od = OnDemand::new(map, Layout::Ts, dir.path().to_path_buf(), vec![served.clone()], spec, Ctx { feed, tx, generation, label });
+            let run = RunCtx {
+                dir: run_dir.clone(),
+                born: Instant::now(),
+                first: 0,
+                limit: 10,
+                made: AtomicU64::new(0),
+                state: AtomicU8::new(RUNNING),
+                stop: CancellationToken::new(),
+            };
+            let why = ffmpeg::Failure { status: "exit status: 1".into(), lines: vec!["Conversion failed!".into()], media_s: None };
+            od.wind_up(&run, &mut 0, ffmpeg::Exit::Failed, Some(why)).await;
+            assert_eq!(run.made(), 2);
+            proxy.shutdown();
+        });
+        assert!(served.join("s0.ts").exists() && served.join("s1.ts").exists() && !served.join("s2.ts").exists());
+        assert!(log.contains("cast session t: ffmpeg stopped with an error making segment 2, at 12.0 s into the item: exit status: 1"), "{log}");
     }
 
     #[test]

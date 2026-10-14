@@ -1347,6 +1347,8 @@ struct Watch {
 /// generation is over), the VOD cap. Before the TV has the pipeline (`LOADING`), `load` decides
 /// what an exit means; after (`READY`), the monitor reports it: `UpstreamEof` for a clean end,
 /// then the feed's `UpstreamClosed` either way (the `Http` of a provider failure is already out).
+/// An ffmpeg error is logged with its status and last stderr lines in either phase: `launch`
+/// keeps only `Fail::Exited` of a start that failed, the commonest failure of all.
 async fn monitor(mut child: ffmpeg::Child, w: Watch) {
     let mut cap = tokio::time::interval(VOD_CAP_POLL);
     cap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1376,24 +1378,22 @@ async fn monitor(mut child: ffmpeg::Child, w: Watch) {
             }
         }
     };
+    // why, before `launch` hears of the exit (a provider failure has its own events)
+    if exit == ffmpeg::Exit::Failed && !w.feed.as_ref().is_some_and(|f| f.failed()) {
+        let why = child.failure();
+        tracing::warn!("{}: ffmpeg stopped with an error: {}", w.label, why.text(w.feed.as_ref().is_some_and(|f| f.resumes() > 0)));
+        if let Some(at) = why.at() {
+            tracing::info!("{}: ffmpeg stopped at about {at} into the item", w.label);
+        }
+    }
     let _ = w.exit.send(Some(exit));
     if w.phase.compare_exchange(LOADING, ENDED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
         return;
     }
     let Some(feed) = &w.feed else { return };
-    match exit {
-        ffmpeg::Exit::Done if !feed.failed() => {
-            tracing::debug!("{}: the input ended", w.label);
-            let _ = w.tx.send(RelayEvent::UpstreamEof { generation: w.generation.load(Ordering::Relaxed) });
-        }
-        ffmpeg::Exit::Failed if !feed.failed() => {
-            let why = child.failure();
-            tracing::warn!("{}: ffmpeg stopped with an error: {}", w.label, why.text(feed.resumes() > 0));
-            if let Some(at) = why.at() {
-                tracing::info!("{}: ffmpeg stopped at about {at} into the item", w.label);
-            }
-        }
-        _ => {}
+    if exit == ffmpeg::Exit::Done && !feed.failed() {
+        tracing::debug!("{}: the input ended", w.label);
+        let _ = w.tx.send(RelayEvent::UpstreamEof { generation: w.generation.load(Ordering::Relaxed) });
     }
     feed.close(false).await;
 }
@@ -1465,4 +1465,75 @@ async fn lead_s(out: &server::Output) -> Option<f64> {
 /// missing: the UI says converting is off).
 pub async fn check_ffmpeg() -> Result<bool, CastErrorKind> {
     ffmpeg::caps().await.map(|c| c.l3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bytes a test subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(b);
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` on a current-thread runtime (every task it spawns runs on this thread) and return
+    /// what it logged at INFO and above, as the log file would show it.
+    pub(super) fn logged<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        let buf = Captured::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || sink.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish();
+        let out = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime").block_on(f)
+        });
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+        (out, text)
+    }
+
+    /// ffmpeg failing before the first playlists are ready (`LOADING`): `launch` decides what the
+    /// exit means and keeps only `Fail::Exited`, so the monitor says why first — the status and
+    /// ffmpeg's last words, as after `READY`.
+    #[test]
+    fn an_ffmpeg_that_fails_while_loading_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let ((), log) = logged(async {
+            let progress = ffmpeg::Progress { base_s: 0.0, watch_speed: false, on_slow: Box::new(|| {}) };
+            let script = "echo '[vost#0:0 @ 0x1] Unknown encoder libfoo' >&2; exit 1";
+            let child = ffmpeg::spawn(Path::new("/bin/sh"), &["-c".into(), script.into()], "cast session t".into(), progress).unwrap();
+            let generation = Arc::new(AtomicU64::new(1));
+            let rendition = Rendition::new(None, dir.path().to_path_buf(), None, "video/mp2t");
+            let out = Arc::new(server::Output::new(dir.path().to_path_buf(), false, generation.clone(), vec![rendition]));
+            let (exit, mut exits) = watch::channel(None);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let phase = Arc::new(AtomicU8::new(LOADING));
+            let w = Watch {
+                feed: None,
+                phase: phase.clone(),
+                stop: CancellationToken::new(),
+                exit,
+                tx,
+                generation,
+                live: true,
+                out,
+                label: "cast session t".into(),
+            };
+            monitor(child, w).await;
+            assert_eq!(*exits.borrow_and_update(), Some(ffmpeg::Exit::Failed));
+            assert_eq!(phase.load(Ordering::Acquire), ENDED, "launch decides what it means");
+        });
+        assert!(
+            log.contains("WARN")
+                && log.contains("cast session t: ffmpeg stopped with an error: exit status: 1; last stderr: [vost#0:0 @ 0x1] Unknown encoder libfoo"),
+            "{log}"
+        );
+    }
 }
