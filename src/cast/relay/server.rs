@@ -416,8 +416,8 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
 }
 
 /// The TV's first picture segment under a full-length token that says where to start
-/// (`EXT-X-START`): one from well before there means the TV started from the beginning (§8.5).
-/// Reported once per session; the relay serves views from then on.
+/// (`EXT-X-START`): one before there means the TV started from the beginning (§8.5,
+/// [`start_ignored`]). Reported once per session; the relay serves views from then on.
 fn started_where_told(srv: &Shared, tok: &str, od: &vod::OnDemand, n: u64, generation: u64) {
     let start = {
         let mut grants = srv.grants.lock().unwrap_or_else(|e| e.into_inner());
@@ -428,10 +428,24 @@ fn started_where_told(srv: &Shared, tok: &str, od: &vod::OnDemand, n: u64, gener
         g.value.start
     };
     let Some(at) = start else { return };
-    if n + 1 < od.map.segment_at(at) && !srv.start_ignored.swap(true, Ordering::Relaxed) {
+    if start_ignored(&od.map, at, n) && !srv.start_ignored.swap(true, Ordering::Relaxed) {
         tracing::info!("{}: the TV started at segment {n}, not where the playlist says ({at:.0} s): views from now on", srv.label);
         let _ = srv.tx.send(RelayEvent::StartIgnored { generation, at_s: at });
     }
+}
+
+/// A start this close after a cut may be taken for the segment before it: the TV finds where
+/// `EXT-X-START` falls by adding up the `EXTINF`s, and both are rounded in the playlist (§8.5;
+/// the offset to 3 decimals), with players free in how they place a start on a cut.
+const START_SLACK_S: f64 = 0.5;
+
+/// Does a first picture segment `n` say the TV ignored `EXT-X-START` at `at` (§8.5)? It should
+/// be the segment holding `at`, or the one before when `at` is just after their cut
+/// ([`START_SLACK_S`]); anything earlier is a start from the beginning. Not "more than one
+/// before": that let a start in segment 1 that played from segment 0 pass as honoured (a
+/// resume 10 s in starting at 0).
+fn start_ignored(map: &vod::Map, at: f64, n: u64) -> bool {
+    n < map.segment_at((at - START_SLACK_S).max(0.0))
 }
 
 /// The grant's first playlist fetch (the firewall watchdog's evidence).
@@ -729,6 +743,29 @@ mod tests {
         ] {
             assert_eq!(route(&bad), None, "{bad}");
         }
+    }
+
+    /// A first segment before the one holding the start is a start from the beginning, the
+    /// segment just before a cut the start sits on is rounding; the target in segment 1 is no
+    /// exception (the old "more than one before" rule took segment 0 for honoured there).
+    #[test]
+    fn a_first_segment_before_the_start_means_it_was_ignored() {
+        let m = vod::Map::grid(60.0, 6.0, 0.0).unwrap();
+        // a resume 10 s in (segment 1) that fetched segment 0: ignored
+        assert!(start_ignored(&m, 10.0, 0));
+        assert!(!start_ignored(&m, 10.0, 1));
+        // 40 s in (segment 6): 6 or later is honoured, 5 and before aren't
+        assert!(start_ignored(&m, 40.0, 0));
+        assert!(start_ignored(&m, 40.0, 5));
+        assert!(!start_ignored(&m, 40.0, 6));
+        // on a cut (36 s, or a hair after): the segment before it may be the TV's rounding
+        assert!(!start_ignored(&m, 36.0, 5));
+        assert!(!start_ignored(&m, 36.2, 5));
+        assert!(start_ignored(&m, 36.2, 4));
+        assert!(!start_ignored(&m, 6.1, 0), "a start just after the first cut");
+        // a start in segment 0 can't be told from the beginning, nor needs to be
+        assert!(!start_ignored(&m, 3.0, 0));
+        assert!(!start_ignored(&m, 0.2, 0));
     }
 
     #[test]
