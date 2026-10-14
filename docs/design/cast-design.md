@@ -1191,7 +1191,7 @@ TV ◀──────── LAN server <lan-ip>:47800 /c/<tok>/… (token, pe
 - Spawned through `tokio::process` with `kill_on_drop` and `PR_SET_PDEATHSIG`.
 - Its environment is cleared except `LC_ALL=C`.
 - Its argv holds only the loopback URL and the output directory.
-- stderr is redacted and logged at debug, capped.
+- stderr is redacted and logged at debug, capped. Independently of that cap, the last 8 meaningful lines (no progress or `Resumed reading` noise) are kept per child; when ffmpeg exits with an error the WARN carries its status, those lines and, if they show the input broke (`Connection reset`, `End of file`, `Invalid data found` after a mid-body resume), the upstream named in plain words; INFO adds the media time it reached.
 - `-progress pipe:1` gives `speed=`. A live speed below 0.98× for 20 s gives `CpuTooSlow`.
 - Capabilities are checked once per run (`ffmpeg -hide_banner -encoders` for `libx264` and `aac`). If either is missing, L3 is off and the UI says so.
 

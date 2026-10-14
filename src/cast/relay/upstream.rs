@@ -546,6 +546,12 @@ impl Feed {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).failed
     }
 
+    /// The proxy has resumed a broken provider stream this many times (module docs): context for
+    /// reading what ffmpeg said when it stopped.
+    pub fn resumes(&self) -> u32 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).resumes
+    }
+
     /// Resolves once the feed has failed.
     pub async fn wait_failed(&self) {
         loop {
