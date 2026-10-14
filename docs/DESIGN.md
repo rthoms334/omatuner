@@ -1334,7 +1334,8 @@ CPU, video resumes; fullscreen toggling; 1-hour soak; HDR/10-bit sample.
 ### 11.2 Event pump & controller (implemented)
 `events::EventPump` observes properties (pause, paused-for-cache, cache-buffering-state,
 core-idle, time-pos, duration, demuxer-cache-duration, volume, mute, track-list (JSON), seekable,
-sub-delay, sub-scale, video-params/w,h, hwdec-current, aid, sid, eof-reached), requests `warn`
+sub-delay, sub-scale, audio-device, current-ao, video-params/w,h,
+hwdec-current, aid, sid, eof-reached), requests `warn`
 log messages (redacted; `HTTP error NNN` is parsed for classification) and forwards owned
 `MpvEvent`s. The controller (`player/controller.rs`) multiplexes commands, events and a 250 ms
 tick, feeds `PlayerMachine`, executes `Effect`s (load, stop, emit, save progress, push history,
@@ -2029,6 +2030,32 @@ it). Nothing playing: "Nothing playing · o · Esc" on black, with a "Back to th
 button.
 
 
+### 13.8.1 Lip sync
+
+Local playback remembers one audio offset per output in `player.lip_sync`, a map from the
+output's name to `{ offset_ms, label }`. Negative means sound earlier. `[` / `]` step by 50 ms,
+clamped to ±2000 ms, save immediately and flash “Sound 150 ms earlier · MacBook Air Speakers”
+(at zero, “Lip sync: in step”). The keys are shared by live, VOD and the pop-out; the guide's
+day keys and detail's season keys stay in their own contexts.
+
+The controller uses mpv's explicit `audio-device` when set. With `auto`, it identifies the
+default PipeWire/Pulse sink through `pactl --format=json get-default-sink` and `list sinks`.
+Explicit PipeWire/Pulse devices also get their descriptions from the sink list; other explicit
+devices use their device name. Queries run on the controller thread with a shared 750 ms
+timeout; missing or failed pactl in `auto` uses one “This computer” entry. The controller
+applies the saved `audio-delay` in seconds
+on every local load, on mpv output changes, and checks again every 15 s while playing or
+paused. Changing outputs applies that output's offset (zero when unseen) and flashes
+“Lip sync for ‹label›: ‹offset›”. Every discovered output is remembered, including at zero.
+
+Audio tracks (`A`) has a Lip sync stepper (←/→, earlier/later buttons) and Reset; stream info
+(`I`) shows the offset and output. Settings ▸ Player ▸ Lip sync lists the remembered outputs
+with the current output marked, the usual value-row stepper and a Reset row. Its keys use
+the Settings model: → / l increases, Shift+← / H decreases, Enter on Reset resets; ← / h
+returns to the page list. Config edits apply to every local picture in multi-view. Casting
+has no lip-sync controls and never receives the offset. Lip sync owns `audio-delay` even if
+raw mpv options set it; backups keep this computer's saved outputs.
+
 ### 13.9 Settings
 ```
 ┌────────┬──────────────────────┬─────────────────────────────────────────────────────────────┐
@@ -2080,6 +2107,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Zapping delay | `player.zap_delay_ms` | 300 |
 | | Skip small / big | `player.skip_small_s`, `skip_large_s` | 10 · 60 |
 | | Audio / subtitle languages · subtitle auto · subtitle size | `player.audio_langs`, `sub_langs`, `sub_auto`, `sub_scale` | eng · eng · forced · 1.0 |
+| | Lip sync per audio output (stepper · Reset; §13.8.1) | `player.lip_sync` → `{ offset_ms, label }` | {} (0 ms) |
 | | Reconnect attempts | `player.reconnect_max_attempts` | 8 |
 | | Resume threshold · watched % | `player.resume_min_s`, `watched_pct` | 60 · 92 |
 | | Default User-Agent | `player.user_agent` | VLC/3.0.21 |
@@ -2662,6 +2690,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
+| `[` / `]` | Sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |
@@ -2700,6 +2729,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
+| `[` / `]` | Sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |

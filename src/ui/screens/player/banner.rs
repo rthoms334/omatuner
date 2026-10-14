@@ -11,6 +11,7 @@ pub(super) enum Flash {
     Audio,
     Subtitles,
     SubDelay,
+    LipSync,
     SubSize,
     Volume,
     Aspect,
@@ -32,6 +33,7 @@ pub(super) fn flash_text(f: Flash, snap: &PlayerSnapshot, zoom: &usize) -> Strin
         Flash::Audio => format!("{} {}", glyphs::AUDIO_TRACK, snap.tracks.selected_audio().map_or_else(|| "No audio track".into(), |a| a.label())),
         Flash::Subtitles => format!("{} {}", glyphs::SUBTITLES, snap.tracks.selected_sub().map_or_else(|| "Subtitles off".into(), |a| a.label())),
         Flash::SubDelay => format!("Subtitle delay {:+.1} s", snap.sub_delay),
+        Flash::LipSync => crate::player::audio_output::adjustment_text(&snap.audio_output, snap.lip_sync_ms),
         Flash::SubSize => format!("Subtitle size {:.0} %", snap.sub_scale * 100.0),
         Flash::Volume => {
             if snap.muted {
@@ -82,11 +84,15 @@ impl PlayerScreen {
         let s = scale_of(ui);
         let pad = (theme.space(SpaceToken::PopupPadding) * s).round();
         let font = FontId::monospace((theme.font(TypeToken::Body) * s).round());
-        let lines = match (&snap.cast, &snap.stream_info) {
+        let mut lines = match (&snap.cast, &snap.stream_info) {
             (Some(view), _) => cast_lines(ctx, snap, view),
             (None, Some(i)) => local_lines(ctx, snap, i),
             (None, None) => vec!["Reading stream info…".into()],
         };
+        if snap.cast.is_none() {
+            lines.push(format!("Lip sync {}", crate::player::audio_output::offset_text(snap.lip_sync_ms)));
+            lines.push(format!("Output   {}", snap.audio_output.label));
+        }
         let p = ui.painter_at(rect);
         let lh = font.size * 1.4;
         // the TV's path needs the longer lines

@@ -851,6 +851,15 @@ impl TunerApp {
     }
 
     fn handle_event(&mut self, ev: AppEvent, egui_ctx: &egui::Context) {
+        // Output discovery belongs to every local picture, including one without focus.
+        if let AppEvent::Player(crate::player::PlayerEvent::AudioOutputChanged { output, .. })
+        | AppEvent::Tile(crate::player::tiles::TileEvent::Player(_, crate::player::PlayerEvent::AudioOutputChanged { output, .. })) = &ev
+        {
+            let output = output.clone();
+            self.config_edits.push(Box::new(move |cfg| {
+                cfg.player.lip_sync.entry(output.name).or_default().label = output.label;
+            }));
+        }
         // multi-view: the focused picture's player events are "the player's" for the screens
         // (picture B's arrive as `TileEvent::Player`); the other picture's only toast
         let ev = match ev {

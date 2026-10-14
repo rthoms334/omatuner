@@ -166,6 +166,7 @@ pub fn spawn(
         lease_generation: None,
         local_view: None,
         undelivered: None,
+        last_audio_check: None,
     };
     let name = if tile == TileId::A { "player".to_owned() } else { format!("player-{}", tile.letter().to_ascii_lowercase()) };
     std::thread::Builder::new().name(name).spawn(move || c.run(cmd_rx, evt_rx))
@@ -290,6 +291,8 @@ struct Controller {
     /// longer paired): the failure's Play here plays it here, replacing what still plays here.
     /// Any other play, or a stop, forgets it.
     undelivered: Option<CopyPlay>,
+    /// Last local output lookup (the controller thread owns pactl, never the UI).
+    last_audio_check: Option<Instant>,
 }
 
 /// The state last logged (see [`Controller::log_transition`]).
@@ -362,6 +365,12 @@ impl Controller {
                     self.pending_tick(now);
                     self.waiting_tick();
                     self.video_watchdog(now);
+                    if !self.casting()
+                        && (self.machine.state().is_active() || matches!(self.machine.state(), PlayerState::Paused))
+                        && self.last_audio_check.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(15))
+                    {
+                        self.refresh_audio_output();
+                    }
                     if now.duration_since(self.last_progress) >= PROGRESS_EVERY
                         && matches!(self.machine.state(), PlayerState::Playing)
                     {
@@ -660,6 +669,7 @@ impl Controller {
         if self.casting() {
             return self.load_remote(p);
         }
+        self.refresh_audio_output();
         if self.snap.paused {
             // a new play always plays (mpv's `pause` survives loadfile)
             let _ = self.mpv.set_property("pause", false);
@@ -1544,6 +1554,33 @@ impl Controller {
         self.watched_pct = cfg.player.watched_pct;
         super::mpv::apply_runtime(&self.mpv, cfg, &self.applied, self.tile);
         *self.applied = cfg.clone();
+        if !self.casting() {
+            self.apply_lip_sync();
+        }
+    }
+
+    /// On every local load, output change and periodic check. A new output starts at zero;
+    /// the old output's correction must never carry over to headphones or HDMI.
+    fn refresh_audio_output(&mut self) {
+        let output = super::audio_output::current(&self.mpv);
+        let changed = self.last_audio_check.is_none() || self.snap.audio_output != output;
+        self.last_audio_check = Some(Instant::now());
+        self.snap.audio_output = output;
+        self.apply_lip_sync();
+        if changed {
+            self.emit(PlayerEvent::AudioOutputChanged { output: self.snap.audio_output.clone(), offset_ms: self.snap.lip_sync_ms });
+            self.force_publish = true;
+        }
+    }
+
+    fn apply_lip_sync(&mut self) {
+        let ms = self.applied.player.lip_sync.get(&self.snap.audio_output.name).map_or(0, crate::config::LipSync::offset_ms);
+        if let Err(e) = self.mpv.set_property("audio-delay", f64::from(ms) / 1000.0) {
+            tracing::warn!("{}: couldn't set lip sync: {e}", self.log);
+            return;
+        }
+        self.snap.lip_sync_ms = ms;
+        self.dirty = true;
     }
 
     fn set_aspect(&mut self, a: AspectMode) {
@@ -1680,7 +1717,10 @@ impl Controller {
                 }
                 self.feed(Input::StartFile { entry: entry_id }, now)
             }
-            MpvEvent::FileLoaded => self.feed(Input::FileLoaded, now),
+            MpvEvent::FileLoaded => {
+                self.apply_lip_sync();
+                self.feed(Input::FileLoaded, now)
+            }
             MpvEvent::PlaybackRestart => {
                 // the new stream's size before the Playing publish records it (`record_video`),
                 // whatever order mpv delivers the `video-params` change in
@@ -1725,7 +1765,13 @@ impl Controller {
                 false
             }
             MpvEvent::Prop { id, value } => self.prop(id, value, now),
-            MpvEvent::VideoReconfig | MpvEvent::AudioReconfig | MpvEvent::Seek | MpvEvent::Idle => false,
+            MpvEvent::AudioReconfig => {
+                if self.machine.target().is_some() {
+                    self.refresh_audio_output();
+                }
+                false
+            }
+            MpvEvent::VideoReconfig | MpvEvent::Seek | MpvEvent::Idle => false,
             MpvEvent::QueueOverflow => {
                 tracing::warn!("mpv event queue overflow");
                 false
@@ -1847,6 +1893,11 @@ impl Controller {
                 self.snap.seekable = b(&v) && !live;
             }
             PropId::SubDelay => self.snap.sub_delay = f(&v).unwrap_or(0.0),
+            PropId::AudioDevice | PropId::CurrentAo => {
+                if self.machine.target().is_some() {
+                    self.refresh_audio_output();
+                }
+            }
             PropId::SubScale => self.snap.sub_scale = f(&v).unwrap_or(1.0),
             PropId::VideoParamsW | PropId::VideoParamsH => self.read_video_size(),
             PropId::HwdecCurrent => {

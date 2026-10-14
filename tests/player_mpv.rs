@@ -1130,6 +1130,35 @@ mod casting {
         s.state == PlayerState::Playing && s.cast.as_ref().is_some_and(|c| c.phase == CastPhase::Playing)
     }
 
+    #[test]
+    fn lip_sync_stays_local_and_reapplies_when_playing_here() {
+        let ch = live(1, "av://lavfi:testsrc2=size=160x90:rate=25".into());
+        let (h, sessions) = start_casting(vec![ch.clone()]);
+        let mut cfg = headless_config();
+        cfg.player.mpv_options.insert("audio-device".into(), "null/speakers".into());
+        cfg.player.lip_sync.insert("null/speakers".into(), tuner::config::LipSync { offset_ms: -150, label: "Speakers".into() });
+        h.handle.send(PlayerCommand::ApplyConfig(Box::new(cfg.clone())));
+        h.play(ch.media.clone(), true);
+        h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.lip_sync_ms == -150);
+
+        cast(&h, None);
+        let mut tv = sessions.recv_timeout(LONG).unwrap();
+        let (generation, _, _) = tv.load();
+        tv.start(generation);
+        h.wait_snapshot(LONG, casting_and_playing);
+        cfg.player.lip_sync.get_mut("null/speakers").unwrap().offset_ms = -350;
+        h.handle.send(PlayerCommand::ApplyConfig(Box::new(cfg)));
+        // A snapshot-visible command after ApplyConfig proves the edit has been processed.
+        h.handle.send(PlayerCommand::SetPlayOn(Some(device())));
+        h.wait_snapshot(LONG, |s| s.play_on == Some(device()));
+        assert!(matches!(tv.cmds.try_recv(), Err(TryRecvError::Empty)), "the TV gets no local audio correction");
+
+        h.handle.send(PlayerCommand::StopCasting { play_here: true });
+        assert!(matches!(tv.next(), RemoteCmd::Close { .. }));
+        tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+        h.wait_snapshot(LONG, |s| s.cast.is_none() && s.state == PlayerState::Playing && s.lip_sync_ms == -350);
+    }
+
     /// `CastTo` with what plays: mpv's hints travel with the first load, mpv's stream closes
     /// before the TV's load goes out (one-connection account), the relay's upstream is A's
     /// only lease, and a zap is a new load with a new generation.
