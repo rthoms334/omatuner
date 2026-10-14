@@ -1695,6 +1695,8 @@ pub(crate) mod testkit {
             },
             App { t, s, _one: one },
         );
+        crate::fonts::LoadedFonts::default().install(&h.ctx);
+        crate::theme::egui_style::apply(&h.ctx, &h.state().t.theme);
         h.run_steps(2);
         h
     }
@@ -1744,6 +1746,8 @@ pub(crate) mod testkit {
             },
             OvApp { t, o, last: String::new(), _one: one },
         );
+        crate::fonts::LoadedFonts::default().install(&h.ctx);
+        crate::theme::egui_style::apply(&h.ctx, &h.state().t.theme);
         h.run_steps(2);
         h
     }
@@ -2043,6 +2047,21 @@ mod tests {
     use crate::config::PlaylistOnCards;
     use crate::model::{ItemKey, SourceId, WatchProgress};
     use crate::ui::NavRequest;
+
+    #[test]
+    fn home_action_tile_text_icon_and_padding_click() {
+        use crate::ui::testing::clicks;
+        let mut h = clicks::harness((0, Rect::NOTHING), |ui, (count, rect)| {
+            let r = action_tile(ui, &crate::theme::Theme::fallback(), glyphs::ADD, "Add playlist", false);
+            *count += usize::from(r.clicked());
+            *rect = r.rect;
+        });
+        clicks::click_text(&mut h, "Add playlist");
+        clicks::click_text(&mut h, glyphs::ADD);
+        let padding = h.state().1.left_top() + egui::vec2(2.0, 2.0);
+        clicks::click_at(&mut h, padding);
+        assert_eq!(h.state().0, 3);
+    }
 
     fn channel_ref(s: SourceId, i: usize) -> ItemRef {
         ItemRef { source: s, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) }

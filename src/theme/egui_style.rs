@@ -36,6 +36,9 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
         s.spacing.window_margin = popup_padding;
         s.spacing.menu_margin = margin(theme.space(SpaceToken::Md));
         s.interaction.tooltip_delay = 0.4;
+        // Labels often sit over a row's click target. Text selection would consume the
+        // click before the row sees it; diagnostic text has explicit Copy controls.
+        s.interaction.selectable_labels = false;
         s.text_styles = text_styles.clone();
     });
 }
@@ -111,6 +114,7 @@ mod tests {
             assert_eq!(s.spacing.interact_size.y, 28.0);
             assert_eq!(s.spacing.button_padding, egui::vec2(10.0, 6.0));
             assert_eq!(s.spacing.item_spacing, egui::vec2(8.0, 3.0));
+            assert!(!s.interaction.selectable_labels);
             assert_eq!(s.text_styles[&TextStyle::Heading], FontId::new(16.0, FontFamily::Name(FAMILY_MEDIUM.into())));
             assert_eq!(s.text_styles[&TextStyle::Body].size, 12.0);
         }

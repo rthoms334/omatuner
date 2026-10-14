@@ -349,7 +349,7 @@ impl PlayerScreen {
             }
             StateAction::ShowCommand => ctx.open(OverlayRequest::CastFirewall),
             StateAction::Pair => ctx.open(OverlayRequest::CastPair { device: view.device, then_cast: true }),
-            StateAction::Retry | StateAction::LastChannel | StateAction::OtherCopy | StateAction::Stop => {}
+            StateAction::Retry | StateAction::LastChannel | StateAction::OtherCopy | StateAction::CopyError | StateAction::Stop => {}
         }
         self.show_banner(ctx);
     }

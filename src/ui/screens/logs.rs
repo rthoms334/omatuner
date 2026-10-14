@@ -311,11 +311,11 @@ impl Screen for LogsScreen {
             ui.add_space(theme.space(SpaceToken::Md));
             crate::ui::widgets::card::card(ui, theme, crate::ui::widgets::card::CardKind::Pane, |ui| {
                 egui::ScrollArea::vertical().id_salt("log-detail").max_height(detail_h).show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("{} {} {}", super::home::kit::date(line.at), level_label(line.level), line.target))
-                            .size(theme.font(TypeToken::BodySmall))
-                            .color(t.text_secondary),
-                    );
+                    let heading = format!("{} {} {}", super::home::kit::date(line.at), level_label(line.level), line.target);
+                    if button(ui, theme, Some(glyphs::COPY), "Copy line", ButtonStyle::default()).clicked() {
+                        ui.ctx().copy_text(format!("{heading}\n{}", line.message));
+                    }
+                    ui.label(RichText::new(heading).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                     ui.add(egui::Label::new(RichText::new(&line.message).monospace().size(theme.font(TypeToken::Body)).color(t.fg)).wrap());
                 });
             });
@@ -331,6 +331,23 @@ mod tests {
 
     fn line(level: Level, msg: &str) -> LogLine {
         LogLine { at: 1_791_576_000, level, target: "tuner::test".into(), message: msg.into() }
+    }
+
+    #[test]
+    fn clicking_log_text_expands_it_and_copy_line_copies_details() {
+        use crate::ui::testing::clicks;
+        let (t, one) = rig();
+        t.services().logs.push(line(Level::ERROR, "Couldn't refresh: HTTP 404"));
+        let mut h = harness(t, one, LogsScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::Logs);
+        h.run_steps(2);
+        clicks::click_text(&mut h, "tuner::test: Couldn't refresh: HTTP 404");
+        assert!(h.state().s.expanded.is_some());
+        h.run_steps(2);
+        clicks::click_text(&mut h, "Copy line");
+        let copied = clicks::copied_text(&h).expect("clipboard command");
+        assert!(copied.contains("ERROR tuner::test\nCouldn't refresh: HTTP 404"), "{copied}");
+        assert!(h.state().s.expanded.is_some());
     }
 
     #[test]

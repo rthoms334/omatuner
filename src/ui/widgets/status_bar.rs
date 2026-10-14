@@ -253,6 +253,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn label_chip_text_clicks() {
+        use crate::ui::testing::clicks;
+        let mut h = clicks::harness(0, |ui, count| {
+            *count += usize::from(chip(ui, "Tasks: 2", egui::Color32::WHITE, 12.0, "Tasks").clicked());
+        });
+        clicks::click_text(&mut h, "Tasks: 2");
+        assert_eq!(*h.state(), 1);
+    }
+
+    #[test]
     fn freshness_copy_and_staleness() {
         assert_eq!(guide_freshness(1000, 990), ("Guide updated just now".into(), false));
         assert_eq!(guide_freshness(10_000, 10_000 - 600), ("Guide updated 10 min ago".into(), false));

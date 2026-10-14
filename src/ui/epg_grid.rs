@@ -1091,6 +1091,34 @@ mod tests {
     }
 
     #[test]
+    fn guide_cell_title_click_opens_the_programme() {
+        use crate::ui::screens::home::testkit;
+        use crate::ui::testing::clicks;
+        let (t, _one) = testkit::rig();
+        let state = EpgGridState::new(rows(1), T0 + 600);
+        let mut h = clicks::harness((t, state, Fake { calls: 0 }, GridOutcome::None), |ui, (t, state, reader, outcome)| {
+            t.budget.begin_frame();
+            let result = epg_grid(
+                ui,
+                &t.theme,
+                &mut t.images,
+                reader,
+                &mut t.budget,
+                &t.lib.live,
+                QualityBadges(None),
+                state,
+                GridMetrics::for_layout(LayoutClass::Wide, false, &t.theme),
+                T0 + 600,
+            );
+            if result != GridOutcome::None {
+                *outcome = result;
+            }
+        });
+        clicks::click_text(&mut h, "P0");
+        assert_eq!(h.state().3, GridOutcome::Open { programme: ProgrammeId(1_500_000), channel: ChannelId(1) });
+    }
+
+    #[test]
     fn cache_buckets_dedupe_shift_and_limit_loads() {
         let mut c = ProgrammeCache::default();
         let mut r = Fake { calls: 0 };

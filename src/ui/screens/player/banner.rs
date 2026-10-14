@@ -91,7 +91,11 @@ impl PlayerScreen {
         let lh = font.size * 1.4;
         // the TV's path needs the longer lines
         let w = (if snap.cast.is_some() { 560.0 } else { 420.0 } * s).min(rect.width() - 2.0 * pad);
-        let area = Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad));
+        let button_h = lh + pad;
+        let area =
+            Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad + button_h));
+        // Keep clicks on the panel from reaching the video behind it.
+        ui.interact(area, ui.id().with("stream-info"), egui::Sense::click());
         p.rect_filled(area, t.rounding, t.osd_scrim);
         for (i, l) in lines.iter().enumerate() {
             osd_text(
@@ -103,6 +107,24 @@ impl PlayerScreen {
                 t.osd_text,
                 w - 2.0 * pad,
             );
+        }
+        let copy_rect =
+            Rect::from_min_max(egui::pos2(area.left() + pad, area.bottom() - pad - button_h), egui::pos2(area.right() - pad, area.bottom() - pad));
+        if super::osd::osd_button(
+            ui,
+            &p,
+            theme,
+            copy_rect,
+            ui.id().with("copy-stream-info"),
+            &format!("{}  Copy stream info", crate::ui::widgets::glyphs::COPY),
+            font,
+            "Copy stream info",
+            None,
+            false,
+        )
+        .clicked()
+        {
+            ui.ctx().copy_text(lines.join("\n"));
         }
     }
 }
@@ -282,6 +304,26 @@ mod tests {
     use crate::model::{CastPhase, ChannelId, DeviceId, Playable, ReceiverKind};
     use crate::redact::Secret;
     use crate::ui::screens::home::testkit::{harness, painted, rig};
+
+    #[test]
+    fn stream_info_copy_text_copies_the_displayed_diagnostics() {
+        use crate::ui::testing::clicks;
+        let (mut t, one) = rig();
+        t.snapshot = Arc::new(PlayerSnapshot {
+            state: crate::player::PlayerState::Playing,
+            stream_info: Some(StreamInfo { video_codec: Some("h264".into()), ..Default::default() }),
+            ..Default::default()
+        });
+        let mut h = harness(t, one, PlayerScreen { info: true, ..Default::default() }, egui::vec2(1600.0, 900.0));
+        let expected = {
+            let t = &mut h.state_mut().t;
+            let snap = t.snapshot.clone();
+            t.with_ctx(|ctx| local_lines(ctx, &snap, snap.stream_info.as_ref().unwrap()).join("\n"))
+        };
+        clicks::click_text(&mut h, &format!("{}  Copy stream info", crate::ui::widgets::glyphs::COPY));
+        assert_eq!(clicks::copied_text(&h), Some(expected.as_str()));
+        assert!(h.state().s.info);
+    }
 
     /// Field report: "Info had no effect while casting". The panel shows over the casting card:
     /// the TV and what it is, "Starting on …" until the relay's first report, then what the TV

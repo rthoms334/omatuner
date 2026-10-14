@@ -86,6 +86,8 @@ pub enum StateAction {
     LastChannel,
     /// "Play from TV 2 at 41:20": the title's other copy after a failure (Ctrl+O; DESIGN §29.14).
     OtherCopy,
+    /// Copy the full redacted playback error.
+    CopyError,
     /// Stop the reconnects and close the player (`q`).
     Stop,
     /// The casting card (DESIGN §40 §3.3, §3.4): end casting and go idle.
@@ -439,6 +441,13 @@ impl VideoHost {
             }
             row(bottom, list)
         };
+        let with_copy = |mut buttons: Vec<StateButton>, bottom: f32| {
+            if matches!(snap.state, PlayerState::Error(_)) {
+                let bottom = buttons.iter().map(|b| b.rect.bottom()).fold(bottom, f32::max);
+                buttons.extend(row(bottom, vec![(StateAction::CopyError, format!("{}  Copy error", glyphs::COPY))]));
+            }
+            buttons
+        };
         // casting: the picture is on the TV, so the card stands in for it (DESIGN §40 §3.3)
         if let Some(card) = cast_card(snap, self.cast_ctx.convert_off) {
             p.rect_filled(rect, 0.0, t.osd_scrim);
@@ -448,7 +457,7 @@ impl VideoHost {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
             }
             let list = card.actions().into_iter().map(|a| (a, cast_action_text(a))).collect();
-            return row(bottom + if card.busy() { 24.0 * k } else { 0.0 }, list);
+            return with_copy(row(bottom + if card.busy() { 24.0 * k } else { 0.0 }, list), bottom);
         }
         match &snap.state {
             PlayerState::Idle => {}
@@ -535,7 +544,7 @@ impl VideoHost {
                     (hint, small_font, t.osd_accent),
                 ];
                 let bottom = stacked(&p, rect, &lines, gap);
-                return buttons(bottom, false);
+                return with_copy(buttons(bottom, false), bottom);
             }
             PlayerState::Ended => {
                 p.rect_filled(rect, 0.0, t.osd_scrim);
@@ -931,7 +940,7 @@ impl StateAction {
             StateAction::AllowFirewall => "Allow on firewall",
             StateAction::ShowCommand => "Show command",
             StateAction::Pair => "Pair",
-            StateAction::Retry | StateAction::LastChannel | StateAction::OtherCopy | StateAction::Stop => return None,
+            StateAction::Retry | StateAction::LastChannel | StateAction::OtherCopy | StateAction::CopyError | StateAction::Stop => return None,
         })
     }
 }

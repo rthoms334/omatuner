@@ -184,6 +184,9 @@ fn error_line(ui: &mut egui::Ui, theme: &Theme, error: Option<&str>) {
     if let Some(e) = error {
         ui.add_space(theme.space(SpaceToken::Sm));
         ui.add(egui::Label::new(RichText::new(e).size(theme.font(TypeToken::BodySmall)).color(theme.tokens.urgent)).wrap());
+        if button(ui, theme, Some(glyphs::COPY), "Copy error", ButtonStyle::default()).clicked() {
+            ui.ctx().copy_text(e.to_owned());
+        }
     }
 }
 
@@ -1056,6 +1059,14 @@ pub(crate) fn card_height(ctx: &egui::Context, id: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_error_text_copies_the_full_message() {
+        use crate::ui::testing::clicks;
+        let mut h = clicks::harness((), |ui, ()| error_line(ui, &Theme::fallback(), Some("Could not save\nDatabase is busy")));
+        clicks::click_text(&mut h, "Copy error");
+        assert_eq!(clicks::copied_text(&h), Some("Could not save\nDatabase is busy"));
+    }
 
     /// A confirm dialog in a tall window is as tall as what it says, not the window: its button
     /// row ([`button_row`]) doesn't claim the height a right-to-left layout would centre in.

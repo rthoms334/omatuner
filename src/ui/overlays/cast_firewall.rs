@@ -127,6 +127,7 @@ pub(super) enum Btn {
     /// Cancel a waiting Allow / Remove.
     CancelJob,
     ShowCommand,
+    CopyCommand,
     CheckAgain,
     TryAgain,
     PlayHere,
@@ -141,6 +142,7 @@ impl Btn {
             Btn::Allow => "Allow on firewall",
             Btn::CancelJob => "Cancel",
             Btn::ShowCommand => "Show command",
+            Btn::CopyCommand => "Copy command",
             Btn::CheckAgain => "Check again",
             Btn::TryAgain => "Try again",
             Btn::PlayHere => "Play here",
@@ -242,6 +244,8 @@ impl Watch {
 #[derive(Debug, Default)]
 pub(crate) struct FirewallPanel {
     show_command: bool,
+    commands: Vec<String>,
+    copy: Option<String>,
     watch: Watch,
     /// The outcome already acted on (an Allow that worked re-checks once).
     handled: Option<FirewallJob>,
@@ -307,6 +311,9 @@ impl FirewallPanel {
         if d.is_some_and(|d| !d.tagged.is_empty() || d.net.is_some()) && blocked && !self.show_command {
             v.push(Btn::ShowCommand);
         }
+        if !self.commands.is_empty() {
+            v.push(Btn::CopyCommand);
+        }
         v.push(Btn::CheckAgain);
         if s.casting && !s.wizard {
             v.push(Btn::PlayHere);
@@ -328,6 +335,7 @@ impl FirewallPanel {
             }
             Btn::CancelJob => cast.firewall_cancel(),
             Btn::ShowCommand => self.show_command = true,
+            Btn::CopyCommand => self.copy = Some(self.commands.join("\n")),
             Btn::CheckAgain => cast.firewall_check(),
             Btn::TryAgain => {
                 if let Some(device) = s.retry {
@@ -361,6 +369,9 @@ impl FirewallPanel {
 
     /// Draw the panel's lines and buttons under the card's title; the button clicked.
     pub(super) fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, s: &Subject) -> Option<Btn> {
+        if let Some(text) = self.copy.take() {
+            ui.ctx().copy_text(text);
+        }
         let theme = ctx.theme;
         let t = &theme.tokens;
         let cast = ctx.services.agent.cast();
@@ -423,15 +434,16 @@ impl FirewallPanel {
         if job == FirewallJob::Idle {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         }
+        self.commands.clear();
         if self.show_command
             && let Some(d) = &d
         {
-            let lines = command_lines(d, verb);
+            self.commands = command_lines(d, verb);
             ui.add_space(theme.space(SpaceToken::Sm));
-            if lines.is_empty() {
+            if self.commands.is_empty() {
                 line(ui, "Tuner can't tell which network the TV is on yet: Check again.".into(), t.text_secondary);
             }
-            for l in lines {
+            for l in &self.commands {
                 ui.add(egui::Label::new(RichText::new(l).monospace().size(theme.font(TypeToken::BodySmall)).color(t.fg)).wrap());
             }
         }
@@ -536,6 +548,25 @@ mod tests {
             tagged: Vec::new(),
             port: 47800,
         }
+    }
+
+    #[test]
+    fn firewall_command_text_can_be_copied() {
+        use crate::ui::testing::clicks;
+        let (t, one) = rig();
+        let fake = Arc::new(FakeCast::default());
+        fake.script(|s| s.firewall = Some(detection(FirewallState::Blocked { shadowed: false })));
+        t.services().agent.set_cast(Some(CastHandle::new(fake.clone())));
+        let mut h = overlay_harness(t, one, CastFirewall::new(), egui::vec2(1200.0, 800.0));
+        clicks::click_text(&mut h, "Show command");
+        h.run_steps(2);
+        clicks::click_text(&mut h, "Copy command");
+        h.run_steps(1);
+        assert_eq!(
+            clicks::copied_text(&h),
+            Some("sudo ufw allow in on wlan0 from 192.168.1.0/24 to any port 47800 proto tcp comment 'omatuner cast'")
+        );
+        assert!(fake.take_calls().is_empty(), "copying does not run the command");
     }
 
     /// The button shows for ufw with pkexec when ufw blocks, or right after a cast failed with

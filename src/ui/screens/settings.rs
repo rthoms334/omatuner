@@ -463,6 +463,7 @@ enum Act {
     ImportBackup,
     OpenLogs,
     ExportLog,
+    CopyAbout,
     SaveSource,
     RefreshSource,
     DeleteSource,
@@ -821,6 +822,7 @@ pub struct SettingsScreen {
     spoiler: spoiler::State,
     agents: agents::State,
     cast: cast::State,
+    copy: Option<String>,
     page: SettingsPage,
     pane: Pane,
     /// Focused row (index into the page's rows; only focusable rows are chosen).
@@ -1436,13 +1438,9 @@ impl SettingsScreen {
                 }
             }
             SettingsPage::About => {
-                let p = &ctx.services.paths;
                 v.push(Row::Section("Tuner".into()));
-                v.push(Row::Note(format!("Version {}", env!("CARGO_PKG_VERSION")), false));
-                v.push(Row::Note(format!("Settings: {}", p.config_file().display()), false));
-                v.push(Row::Note(format!("Data: {}", p.data_dir.display()), false));
-                v.push(Row::Note(format!("Cache: {}", p.cache_dir.display()), false));
-                v.push(Row::Note(format!("Log: {}", p.log_file().display()), false));
+                v.extend(Self::about_details(ctx).into_iter().map(|s| Row::Note(s, false)));
+                v.push(Row::Act { act: Act::CopyAbout, icon: glyphs::COPY, label: "Copy app details".into(), danger: false });
                 updates::rows(self, ctx, &mut v);
                 v.push(Row::Section("Logs".into()));
                 v.push(Row::Toggle(&IFACE_T[11]));
@@ -1874,6 +1872,7 @@ impl SettingsScreen {
 
     fn act(&mut self, ctx: &mut UiCtx<'_>, act: Act) {
         match act {
+            Act::CopyAbout => self.copy = Some(Self::about_details(ctx).join("\n")),
             Act::Feature(f, n) => self.feature_act(ctx, f, n),
             Act::DistinctColours => {
                 let theme = ctx.theme;
@@ -2995,6 +2994,9 @@ impl Screen for SettingsScreen {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        if let Some(text) = self.copy.take() {
+            ui.ctx().copy_text(text);
+        }
         self.poll_loaders(ctx);
         agents::frame(self, ui);
         cast::frame(self, ui, ctx);
@@ -3027,6 +3029,17 @@ impl Screen for SettingsScreen {
 }
 
 impl SettingsScreen {
+    fn about_details(ctx: &UiCtx<'_>) -> [String; 5] {
+        let p = &ctx.services.paths;
+        [
+            format!("Version {}", env!("CARGO_PKG_VERSION")),
+            format!("Settings: {}", p.config_file().display()),
+            format!("Data: {}", p.data_dir.display()),
+            format!("Cache: {}", p.cache_dir.display()),
+            format!("Log: {}", p.log_file().display()),
+        ]
+    }
+
     fn poll_loaders(&mut self, ctx: &mut UiCtx<'_>) {
         // `generation`, not `built_at`: two builds within a second (hide, then unhide) share it
         if self.page == SettingsPage::Hidden && self.hidden_built != ctx.lib.generation {
@@ -3525,6 +3538,50 @@ mod tests {
     use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
 
     type H = egui_kittest::Harness<'static, testkit::App<SettingsScreen>>;
+
+    #[test]
+    fn clicking_settings_action_text_opens_the_page() {
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the playlists to load", |h| h.state().s.sources_loader.is_none());
+        // Reproduce egui's default first, with loading finished so the row stays put.
+        h.ctx.all_styles_mut(|s| s.interaction.selectable_labels = true);
+        h.run_steps(2);
+        crate::ui::testing::clicks::click_text(&mut h, "Add playlist…");
+        assert!(h.state_mut().nav().is_empty(), "the selectable child label takes the click");
+        crate::theme::egui_style::apply(&h.ctx, &h.state().t.theme);
+        h.run_steps(30); // the next click is separate, not the second half of a double-click
+        // The same Label's text bounds, not the enclosing row's padding.
+        crate::ui::testing::clicks::click_text(&mut h, "Add playlist…");
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Onboarding(OnboardingStart::AddSource))]);
+    }
+
+    #[test]
+    fn settings_toggle_label_clicks_once_and_about_details_copy() {
+        use crate::ui::testing::clicks;
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Player));
+        h.run_steps(2);
+        let label = "Instant load (less buffering, faster zaps)";
+        clicks::click_text(&mut h, label);
+        h.state_mut().apply_config();
+        assert!(h.state().t.config.player.instant_load);
+        clicks::click_text(&mut h, label);
+        assert!(h.state().t.config_edits.is_empty(), "double-click does not toggle back");
+
+        h.state_mut().enter(Route::Settings(SettingsPage::About));
+        h.run_steps(2);
+        clicks::click_text(&mut h, "Copy app details");
+        h.run_steps(1); // queued by the row's action, like the agent setup Copy actions
+        let copied = clicks::copied_text(&h).expect("clipboard command");
+        assert!(copied.starts_with(&format!("Version {}\nSettings: ", env!("CARGO_PKG_VERSION"))));
+        assert!(copied.contains(&h.state().t.services().paths.config_file().display().to_string()));
+        for label in ["\nData: ", "\nCache: ", "\nLog: "] {
+            assert!(copied.contains(label), "{copied}");
+        }
+    }
 
     /// Focus the content row labelled `label` (by moving with ↓ from the top).
     fn focus(h: &mut H, label: &str) {
