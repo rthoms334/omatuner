@@ -251,7 +251,7 @@ impl Copies {
     }
 
     /// The section: "Copies · N", the mini-cards, how they were matched. Returns a click.
-    pub(super) fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) -> Option<Click> {
+    pub(super) fn show(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, scroll: bool) -> Option<Click> {
         let theme = ctx.theme;
         let t = &theme.tokens;
         if let Some(n) = self.separated.filter(|_| self.members.is_empty()) {
@@ -290,10 +290,11 @@ impl Copies {
             })
             .collect();
         ui.add_space(theme.space(SpaceToken::Xxl));
-        section::section_header(ui, theme, &format!("Copies · {}", self.members.len()));
+        let header = section::section_header(ui, theme, &format!("Copies · {}", self.members.len())).rect;
         ui.add_space(theme.space(SpaceToken::Md));
         let width = (copy_card::CARD_W * theme.rem()).round().min(ui.available_width());
         let mut click = None;
+        let mut target = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(theme.space(SpaceToken::Lg), theme.space(SpaceToken::Lg));
             for (k, (c, facts, status, dimmed)) in rows.iter().enumerate() {
@@ -307,6 +308,9 @@ impl Copies {
                     focused: self.focus == Some(k),
                 };
                 let r = copy_card::copy_card(ui, theme, width, card);
+                if scroll && self.focus == Some(k) {
+                    target = Some(if k == 0 { r.rect.union(header) } else { r.rect });
+                }
                 if r.secondary_clicked() {
                     click = Some(Click::Menu(k));
                 } else if r.clicked() {
@@ -331,6 +335,12 @@ impl Copies {
                 .size(theme.font(TypeToken::BodySmall))
                 .color(t.text_secondary),
         );
+        if let Some(mut rect) = target {
+            if self.focus == Some(rows.len() - 1) {
+                rect.max.y = ui.cursor().min.y;
+            }
+            ui.scroll_to_rect(rect, None);
+        }
         click
     }
 

@@ -1218,39 +1218,56 @@ impl Screen for HomeScreen {
         let rails = std::mem::take(&mut self.rails);
         let playing_vod = self.playing.get(ctx);
         egui::ScrollArea::vertical().id_salt("home-rails").auto_shrink([false, false]).show(ui, |ui| {
+            // No gutter or handle at rest, including on overflowing rails. Keep egui's
+            // wheel handling: horizontal touchpad deltas and Shift+wheel scroll the rail.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+            let mut target = None;
             for (ri, rail) in rails.iter().enumerate() {
+                let top = ui.cursor().min;
                 section::section_header(ui, theme, &rail.title);
                 ui.add_space(theme.space(SpaceToken::Md));
                 let cursor_col = (ri == self.rail).then(|| self.cols.get(ri).map(|c| c.2)).flatten();
-                let rail_rect = egui::ScrollArea::horizontal()
-                    .id_salt(("home-rail", rail.kind as u8, &rail.title))
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xxl);
-                            for (ci, tile) in rail.tiles.iter().enumerate() {
-                                let is_cursor = cursor_col == Some(ci);
-                                let resp = draw_tile(ui, ctx, &self.continue_items, tile, is_cursor, playing_vod);
-                                if is_cursor && scroll {
-                                    ui.scroll_to_rect(resp.rect, None);
-                                }
-                                // a click does what Enter does (the 2nd/3rd click of a
-                                // multi-click: nothing more); hover with motion points
-                                if crate::ui::widgets::fresh_click(&resp) {
-                                    clicked = Some((ri, ci, true));
-                                } else if resp.secondary_clicked() {
-                                    menu = Some((ri, ci));
-                                } else if !resp.clicked() && pointer_moved && resp.hovered() && !is_cursor {
-                                    clicked = Some((ri, ci, false));
-                                }
+                egui::ScrollArea::horizontal().id_salt(("home-rail", rail.kind as u8, &rail.title)).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xxl);
+                        for (ci, tile) in rail.tiles.iter().enumerate() {
+                            let is_cursor = cursor_col == Some(ci);
+                            let resp = draw_tile(ui, ctx, &self.continue_items, tile, is_cursor, playing_vod);
+                            if is_cursor && scroll {
+                                ui.scroll_to_rect(resp.rect, None);
                             }
-                        });
-                    })
-                    .inner_rect;
-                if ri == self.rail && scroll {
-                    ui.scroll_to_rect(rail_rect, None);
-                }
+                            // a click does what Enter does (the 2nd/3rd click of a
+                            // multi-click: nothing more); hover with motion points
+                            if crate::ui::widgets::fresh_click(&resp) {
+                                clicked = Some((ri, ci, true));
+                            } else if resp.secondary_clicked() {
+                                menu = Some((ri, ci));
+                            } else if !resp.clicked() && pointer_moved && resp.hovered() && !is_cursor {
+                                clicked = Some((ri, ci, false));
+                            }
+                        }
+                    });
+                });
                 ui.add_space(theme.space(SpaceToken::Xxl));
+                if ri == self.rail && scroll {
+                    // Measure the laid-out rail: egui 0.36's ScrollAreaOutput::inner_rect
+                    // is captured BEFORE layout. Include the header and trailing space
+                    // so the first/last rail reaches the same page edges as a touchpad.
+                    let rect = Rect::from_min_max(top, egui::pos2(ui.max_rect().right(), ui.cursor().min.y));
+                    let align = if ri == 0 {
+                        Some(egui::Align::TOP)
+                    } else if ri + 1 == rails.len() {
+                        Some(egui::Align::BOTTOM)
+                    } else {
+                        None
+                    };
+                    target = Some((rect, align));
+                }
+            }
+            if let Some((rect, align)) = target {
+                // egui 0.36 consumes both axes of a nested scroll target, even for a
+                // horizontal-only area. Issue the page target after the tile targets.
+                ui.scroll_to_rect(rect, align);
             }
         });
         self.rails = rails;
@@ -2046,6 +2063,121 @@ mod tests {
 
     fn channel_ref(s: SourceId, i: usize) -> ItemRef {
         ItemRef { source: s, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{i:011}")) }
+    }
+
+    fn scrolling_home() -> egui_kittest::Harness<'static, testkit::App<HomeScreen>> {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 12)?;
+            let list = crate::store::user::default_fav_list(c)?;
+            testkit::save_favourite(c, list, &channel_ref(s, 0), true, 1)?;
+            for i in 1..12 {
+                crate::store::user::push_history(
+                    c,
+                    &crate::model::HistoryEntry { item: channel_ref(s, i), title: format!("Channel {i}"), at: i as i64 },
+                )?;
+            }
+            testkit::movies(c, s, 2)?;
+            testkit::series(c, s, 10, 1, 1)?;
+            Ok(())
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(800.0, 500.0));
+        h.state_mut().enter(Route::Home);
+        h.run_steps(30);
+        h
+    }
+
+    #[test]
+    fn keyboard_scroll_reaches_both_page_edges_and_keeps_whole_rails_visible() {
+        let mut h = scrolling_home();
+        let top = h.get_by_label("FAVOURITES").rect().top();
+        let viewport = egui::Rect::from_min_max(egui::pos2(8.0, 8.0), egui::pos2(792.0, 492.0));
+        for (header, tile) in [("RECENTLY WATCHED", "Channel 11"), ("RECENTLY ADDED MOVIES", "Movie 1"), ("RECENTLY UPDATED SERIES", "Series 9")] {
+            h.state_mut().act(Action::Down);
+            h.run_steps(30);
+            let rail = h.get_by_label(header).rect().union(h.get_by_role_and_label(egui::accesskit::Role::Button, tile).rect());
+            assert!(viewport.contains_rect(rail), "{header}: {rail:?} outside {viewport:?}");
+        }
+        let bottom = h.get_by_label("RECENTLY UPDATED SERIES").rect().top();
+        h.event(egui::Event::PointerMoved(egui::pos2(400.0, 250.0)));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -10000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(30);
+        assert!((h.get_by_label("RECENTLY UPDATED SERIES").rect().top() - bottom).abs() < 1.0, "Down must reach the touchpad's bottom");
+        h.event(egui::Event::PointerGone);
+        // Pointer motion may have pointed at another rail. PageDown restores the last one.
+        h.state_mut().act(Action::PageDown);
+        h.run_steps(30);
+        for (header, tile) in [("RECENTLY ADDED MOVIES", "Movie 1"), ("RECENTLY WATCHED", "Channel 11"), ("FAVOURITES", "Channel 0")] {
+            h.state_mut().act(Action::Up);
+            h.run_steps(30);
+            let rail = h.get_by_label(header).rect().union(h.get_by_role_and_label(egui::accesskit::Role::Button, tile).rect());
+            assert!(viewport.contains_rect(rail), "{header}: {rail:?} outside {viewport:?}");
+        }
+        assert!((h.get_by_label("FAVOURITES").rect().top() - top).abs() < 1.0, "Up must reach the top");
+        h.state_mut().act(Action::PageDown);
+        h.run_steps(30);
+        assert!((h.get_by_label("RECENTLY UPDATED SERIES").rect().top() - bottom).abs() < 1.0);
+        h.state_mut().act(Action::PageUp);
+        h.run_steps(30);
+        assert!((h.get_by_label("FAVOURITES").rect().top() - top).abs() < 1.0);
+    }
+
+    /// Check painted handles, not just ScrollBar nodes (egui keeps the hit targets even
+    /// when a floating bar is transparent).
+    fn painted_horizontal_bars(h: &egui_kittest::Harness<'_, testkit::App<HomeScreen>>) -> usize {
+        let bars: Vec<_> = h.query_all_by_role(egui::accesskit::Role::ScrollBar).map(|n| n.rect()).filter(|r| r.width() > r.height()).collect();
+        h.output()
+            .shapes
+            .iter()
+            .filter(|s| {
+                if let egui::Shape::Rect(r) = &s.shape {
+                    r.fill.a() > 0 && s.clip_rect.intersects(r.rect) && bars.iter().any(|b| b.contains_rect(r.rect))
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
+    #[test]
+    fn rails_only_paint_scrollbars_on_hover_and_keep_horizontal_wheel_and_keys() {
+        let mut h = scrolling_home();
+        for (i, (tile, overflows)) in [("Channel 0", false), ("Channel 11", true), ("Movie 1", false), ("Series 9", true)].into_iter().enumerate() {
+            if i > 0 {
+                h.state_mut().act(Action::Down);
+                h.run_steps(30);
+            }
+            assert_eq!(painted_horizontal_bars(&h), 0, "no bar at rest on {tile}");
+            let rect = h.get_by_role_and_label(egui::accesskit::Role::Button, tile).rect();
+            h.event(egui::Event::PointerMoved(rect.center()));
+            h.run_steps(30);
+            assert_eq!(painted_horizontal_bars(&h) > 0, overflows, "hover on {tile}");
+            h.event(egui::Event::PointerGone);
+            h.run_steps(30);
+            assert_eq!(painted_horizontal_bars(&h), 0, "bar fades after leaving {tile}");
+        }
+        let left = h.get_by_label("Series 9").rect().left();
+        h.event(egui::Event::PointerMoved(h.get_by_label("Series 9").rect().center()));
+        for (delta, modifiers) in [(egui::vec2(-100.0, 0.0), egui::Modifiers::NONE), (egui::vec2(0.0, -100.0), egui::Modifiers::SHIFT)] {
+            let before = h.get_by_label("Series 9").rect().left();
+            h.event(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, phase: egui::TouchPhase::Move, modifiers });
+            h.run_steps(30);
+            assert!(h.get_by_label("Series 9").rect().left() < before - 50.0, "horizontal swipe / Shift+wheel");
+        }
+        h.event(egui::Event::PointerGone);
+        h.state_mut().act(Action::End);
+        h.run_steps(30);
+        let last = h.get_by_label("Series 0").rect();
+        assert!(last.left() >= 8.0 && last.right() <= 792.0, "End shows the last tile: {last:?}");
+        h.state_mut().act(Action::Home);
+        h.run_steps(30);
+        assert!((h.get_by_label("Series 9").rect().left() - left).abs() < 1.0, "Home restores the rail's left edge");
     }
 
     /// Delete on a "Recently watched" tile forgets that channel's history (it used to say
