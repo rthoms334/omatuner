@@ -75,8 +75,12 @@ impl Store {
     pub fn open(path: &Path, bus: Option<EventBus>) -> Result<Self> {
         create_private_file(path)?;
         let mut conn = Connection::open(path)?;
+        // a new file gets incremental vacuum before its first table (an existing one is
+        // converted below); only an empty database takes this
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         configure(&conn, false)?;
         migrations::migrate(&mut conn)?;
+        use_incremental_vacuum(&conn);
         // which build last opened it: an older one quotes it when it refuses this schema (§21.7)
         if let Err(e) = migrations::record_app_version(&conn) {
             tracing::warn!("recording the app version in the database: {e}");
@@ -114,6 +118,44 @@ impl Store {
     pub fn close(&self, timeout: Duration) -> bool {
         self.writer.shutdown(timeout)
     }
+}
+
+/// Pages released per [`release_free_pages`] call: 8 MiB, one short write transaction.
+pub const FREE_PAGES_CHUNK: u32 = 2048;
+
+/// Converts a database made before incremental vacuum (DESIGN §7.4): guide refreshes write the
+/// new guide beside the old one, and with `auto_vacuum=NONE` the file never gave that space
+/// back (a 690 MB database was 270 MB free pages). One `VACUUM`, the first time a build with
+/// this opens it (about 2 s for 400 MB). Its scratch copy goes to a temp file, not memory
+/// (`temp_store=MEMORY` would hold the whole database in RAM). A failure (another process
+/// reading, a full disk) is logged and tried again on the next start; nothing depends on it.
+fn use_incremental_vacuum(conn: &Connection) {
+    let mode: i64 = match conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)) {
+        Ok(m) => m,
+        Err(e) => return tracing::warn!("reading the database's vacuum mode: {e}"),
+    };
+    if mode == 2 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let r = conn.execute_batch(
+        "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA temp_store=FILE; VACUUM; PRAGMA temp_store=MEMORY; \
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    );
+    if let Err(e) = r {
+        let _ = conn.execute_batch("PRAGMA temp_store=MEMORY;");
+        return tracing::warn!("compacting the database (tried again next start): {e}");
+    }
+    let size = conn.query_row("SELECT page_count * page_size FROM pragma_page_count, pragma_page_size", [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+    tracing::info!("database compacted to {} MiB in {:.1} s; it now gives free space back", size / (1024 * 1024), started.elapsed().as_secs_f64());
+}
+
+/// Give up to `pages` free pages back to the file system (incremental vacuum) and return how
+/// many are still free. Guide refreshes and prunes free hundreds of MB; callers loop in
+/// [`FREE_PAGES_CHUNK`] steps so the writer is never held long.
+pub fn release_free_pages(conn: &Connection, pages: u32) -> Result<i64> {
+    conn.execute_batch(&format!("PRAGMA incremental_vacuum({pages});"))?;
+    Ok(conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?)
 }
 
 /// Private temp dir (0700) without the `tempfile` crate (dev-only dependency).
@@ -329,5 +371,63 @@ mod tests {
         let n: i64 = conn.query_row("SELECT count(*) FROM meta WHERE key='b'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         assert!(w.blocking(|_| Ok(())).is_err());
+    }
+
+    fn file_pages(c: &Connection) -> (i64, i64, i64) {
+        let q = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        (q("PRAGMA auto_vacuum"), q("PRAGMA page_count"), q("PRAGMA freelist_count"))
+    }
+
+    /// A guide's worth of rows deleted leaves free pages; they go back to the file system.
+    fn fill_and_free(w: &Writer) {
+        w.blocking(|c| {
+            c.execute_batch("CREATE TABLE filler(x BLOB);")?;
+            for _ in 0..2000 {
+                c.execute("INSERT INTO filler VALUES (zeroblob(4000))", [])?;
+            }
+            Ok(c.execute_batch("DROP TABLE filler;")?)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_new_database_gives_freed_pages_back() {
+        let store = Store::open_temp("tuner-vacuum-new", None).unwrap();
+        let w = store.writer().clone();
+        fill_and_free(&w);
+        let (mode, before, free) = w.blocking(|c| Ok(file_pages(c))).unwrap();
+        assert_eq!(mode, 2, "incremental vacuum from the first table on");
+        assert!(free > 1500, "the dropped rows left free pages: {free}");
+        while w.blocking(|c| release_free_pages(c, FREE_PAGES_CHUNK)).unwrap() > 0 {}
+        let (_, after, free) = w.blocking(|c| Ok(file_pages(c))).unwrap();
+        assert_eq!(free, 0);
+        assert!(after < before - 1500, "the file shrank: {before} → {after} pages");
+    }
+
+    #[test]
+    fn an_old_database_is_compacted_once_and_keeps_its_data() {
+        let dir = TempDir::new("tuner-vacuum-old").unwrap();
+        let path = dir.0.join("tuner.db");
+        let store = Store::open(&path, None).unwrap();
+        fill_and_free(store.writer());
+        assert!(store.close(Duration::from_secs(5)));
+        // as a database from before incremental vacuum: auto_vacuum NONE, free pages kept
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("PRAGMA auto_vacuum=NONE; VACUUM; INSERT INTO meta(key,value) VALUES ('kept','1');").unwrap();
+            c.execute_batch("CREATE TABLE filler(x BLOB);").unwrap();
+            for _ in 0..2000 {
+                c.execute("INSERT INTO filler VALUES (zeroblob(4000))", []).unwrap();
+            }
+            c.execute_batch("DROP TABLE filler;").unwrap();
+            let (mode, _, free) = file_pages(&c);
+            assert_eq!(mode, 0);
+            assert!(free > 1500);
+        }
+        let store = Store::open(&path, None).unwrap();
+        let (mode, _, free) = store.writer().blocking(|c| Ok(file_pages(c))).unwrap();
+        assert_eq!((mode, free), (2, 0), "converted, and the free pages went back");
+        let kept: i64 = store.reader().unwrap().query_row("SELECT count(*) FROM meta WHERE key = 'kept'", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1);
     }
 }

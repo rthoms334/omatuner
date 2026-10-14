@@ -39,8 +39,8 @@ pub async fn rebuild_library(ctx: &JobContext) -> Result<Arc<Library>> {
 }
 
 /// Prune programmes older than max(keep_past_days, max catch-up days), sweep inactive EPG
-/// generations, compact the guide search index, prune history, `PRAGMA optimize`,
-/// `wal_checkpoint(TRUNCATE)`.
+/// generations, compact the guide search index, prune history, give free pages back,
+/// `PRAGMA optimize`, `wal_checkpoint(TRUNCATE)`.
 /// Each feature owner's pruning (DESIGN §2.3 of the batch plan): Up next played rows 7 d, the
 /// Following ledger 30 d (show rules 2 y), spoiler-guard seen rows 30 d after the window, the
 /// guide-fix log 90 d / 200 batches. One transaction.
@@ -94,6 +94,8 @@ pub async fn maintenance(ctx: &JobContext, progress: &Progress, cancel: &Cancell
     if orphans > 0 {
         tracing::warn!("maintenance removed {orphans} orphaned guide search rows");
     }
+    // what the prunes and sweeps above freed (DESIGN §7.4)
+    super::import_epg::release_free_space(ctx, cancel).await?;
     let images = ctx.paths.image_cache();
     match blocking(move || crate::images::prune_disk(&images, IMAGE_CACHE_BYTES)).await {
         Ok(0) => {}
