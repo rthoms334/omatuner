@@ -8,7 +8,7 @@
 # Cargo's build output goes to packaging/src/target, so makepkg's RUSTFLAGS don't invalidate the
 # developer's own target/ directory.
 pkgname=omatuner
-pkgver=0.3.1
+pkgver=0.3.2
 pkgrel=1
 pkgdesc="Keyboard-first IPTV player for Omarchy (M3U, Xtream, XMLTV, catch-up)"
 arch=('x86_64' 'aarch64')
