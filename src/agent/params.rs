@@ -87,7 +87,10 @@ pub enum WatchlistSelector {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchlistPlaceholder {
-    pub title: String,
+    pub title: Option<String>,
+    pub series_title: Option<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
     pub year: Option<u16>,
     pub kind: crate::model::ItemKind,
     pub tmdb_id: Option<u64>,

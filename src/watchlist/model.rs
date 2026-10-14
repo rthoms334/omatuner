@@ -46,7 +46,14 @@ pub struct Entry {
     pub season_to: Option<u32>,
     pub title: String,
     pub year: Option<u16>,
+    /// For episodes, year and TMDB id identify the parent series.
     pub tmdb_id: Option<i64>,
+    #[serde(default)]
+    pub series_title: Option<String>,
+    #[serde(default)]
+    pub season: Option<u32>,
+    #[serde(default)]
+    pub episode: Option<u32>,
     pub skipped: bool,
     pub added_at: Timestamp,
     pub fingerprint: Fingerprint,
@@ -115,6 +122,9 @@ pub struct ListView {
     pub show_watched: bool,
 }
 impl ListView {
+    pub fn finished(&self) -> bool {
+        self.total > 0 && self.done == self.total
+    }
     pub fn next_entry(&self) -> Option<&EntryState> {
         self.next.and_then(|id| self.entries.iter().find(|e| e.entry.id == id))
     }
@@ -142,7 +152,11 @@ pub struct NewEntry {
     pub kind: ItemKind,
     pub title: String,
     pub year: Option<u16>,
+    /// For episodes, year and TMDB id identify the parent series.
     pub tmdb_id: Option<i64>,
+    pub series_title: Option<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
     pub season_from: Option<u32>,
     pub season_to: Option<u32>,
 }

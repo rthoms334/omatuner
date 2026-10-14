@@ -46,6 +46,8 @@ pub struct WatchlistsScreen {
     lists_focus: bool,
     drag: Option<WatchlistItemId>,
     drag_to: Option<usize>,
+    list_drag: Option<WatchlistId>,
+    list_drag_to: Option<WatchlistId>,
     copies: Vec<ItemRef>,
     menu_entry: Option<WatchlistItemId>,
     scroll: bool,
@@ -109,6 +111,28 @@ impl WatchlistsScreen {
         self.cursor = to.min(self.shown().len().saturating_sub(1));
         self.scroll = true;
     }
+    fn list_move_target(&self, down: bool) -> Option<WatchlistId> {
+        let v = self.view().filter(|v| !v.list.is_default)?;
+        let group: Vec<_> = self.snapshot.lists.iter().filter(|l| !l.list.is_default && l.finished() == v.finished()).collect();
+        let at = group.iter().position(|l| l.list.id == v.list.id)?;
+        let to = if down { at + 1 } else { at.checked_sub(1)? };
+        group.get(to).map(|l| l.list.id)
+    }
+    fn move_list(&mut self, ctx: &UiCtx<'_>, id: WatchlistId, to: WatchlistId) {
+        let Some(v) = self.snapshot.list(id).filter(|v| !v.list.is_default) else { return };
+        let mut ids: Vec<_> = self.snapshot.lists.iter().filter(|l| !l.list.is_default && l.finished() == v.finished()).map(|l| l.list.id).collect();
+        let Some(from) = ids.iter().position(|i| *i == id) else { return };
+        let Some(to) = ids.iter().position(|i| *i == to) else { return };
+        if from == to {
+            return;
+        }
+        ids.remove(from);
+        ids.insert(to, id);
+        shared::write(ctx, "Moved watchlist", move |c| {
+            store::reorder_lists(c, &ids)?;
+            Ok(None)
+        });
+    }
     fn remove(&self, ctx: &mut UiCtx<'_>) {
         if self.lists_focus {
             self.choose(ctx, DELETE_LIST);
@@ -131,6 +155,8 @@ impl WatchlistsScreen {
                     mi("Play", PLAY, true),
                     mi("Start again…", START_AGAIN, true),
                     mi("Duplicate…", DUPLICATE, true),
+                    mi("Move earlier", MOVE_UP, self.list_move_target(false).is_some()),
+                    mi("Move later", MOVE_DOWN, self.list_move_target(true).is_some()),
                     mi("Rename…", RENAME, !v.list.is_default),
                     mi("Delete…", DELETE_LIST, !v.list.is_default),
                     mi("New list…", NEW, true),
@@ -311,11 +337,55 @@ impl WatchlistsScreen {
         let mut select = None;
         let mut menu = false;
         let mut play = false;
+        self.list_drag_to = None;
+        if self.list_drag.is_some()
+            && let Some(p) = ui.input(|i| i.pointer.interact_pos())
+        {
+            let clip = ui.clip_rect();
+            let edge = 32.0 * ctx.theme.rem();
+            let dy = if p.y < clip.top() + edge {
+                6.0
+            } else if p.y > clip.bottom() - edge {
+                -6.0
+            } else {
+                0.0
+            };
+            if dy != 0.0 {
+                ui.scroll_with_delta(egui::vec2(0.0, dy));
+                ui.ctx().request_repaint();
+            }
+        }
         for v in &self.snapshot.lists {
-            let next = v.next_entry().map(|e| format!("next {}", shared::label(ctx, e))).unwrap_or_else(|| "✓ Done".into());
-            let title = if v.next.is_none() && v.total > 0 { format!("✓ {} (done)", v.list.name) } else { v.list.name.clone() };
+            let next = v
+                .next_entry()
+                .map(|e| format!("next {}", shared::label(ctx, e)))
+                .unwrap_or_else(|| if v.finished() { "✓ Done" } else { "No playable entries" }.into());
+            let title = if v.finished() { format!("✓ {} (done)", v.list.name) } else { v.list.name.clone() };
             let label = format!("{title}   {}/{}\n{next}", v.done, v.total);
-            let r = ui.selectable_label(self.selected == Some(v.list.id), label);
+            let row = ui.horizontal(|ui| {
+                let (grip, drag) = ui.allocate_exact_size(
+                    egui::vec2(24.0 * ctx.theme.rem(), 38.0 * ctx.theme.rem()),
+                    if v.list.is_default { egui::Sense::hover() } else { egui::Sense::drag() },
+                );
+                if !v.list.is_default {
+                    let drag = drag.on_hover_cursor(egui::CursorIcon::Grab);
+                    drag.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Drag watchlist {}", v.list.name)));
+                    ui.painter().text(
+                        grip.center(),
+                        egui::Align2::CENTER_CENTER,
+                        glyphs::REORDER,
+                        egui::FontId::proportional(ctx.theme.font(TypeToken::Body)),
+                        ctx.theme.tokens.text_secondary,
+                    );
+                    if drag.drag_started() {
+                        self.list_drag = Some(v.list.id);
+                        select = Some(v.list.id);
+                        self.lists_focus = true;
+                    }
+                }
+                ui.selectable_label(self.selected == Some(v.list.id), label)
+            });
+            let r = row.inner;
             if crate::ui::widgets::fresh_click(&r) {
                 select = Some(v.list.id);
                 play = true;
@@ -326,6 +396,19 @@ impl WatchlistsScreen {
                 self.lists_focus = true;
                 menu = true;
             }
+            if !v.list.is_default
+                && self.list_drag.and_then(|id| self.snapshot.list(id)).is_some_and(|drag| drag.finished() == v.finished())
+                && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| row.response.rect.intersect(ui.clip_rect()).contains(p))
+            {
+                self.list_drag_to = Some(v.list.id);
+                ui.painter().hline(row.response.rect.x_range(), row.response.rect.top(), egui::Stroke::new(2.0, ctx.theme.tokens.accent));
+            }
+        }
+        if ui.input(|i| i.pointer.any_released())
+            && let Some(id) = self.list_drag.take()
+            && let Some(to) = self.list_drag_to.take()
+        {
+            self.move_list(ctx, id, to);
         }
         if let Some(id) = select {
             self.select(id);
@@ -543,7 +626,9 @@ impl Screen for WatchlistsScreen {
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, a: Action) -> bool {
         self.sync(ctx);
         match a {
-            Action::Back if self.drag.is_some() => {
+            Action::Back if self.drag.is_some() || self.list_drag.is_some() => {
+                self.list_drag = None;
+                self.list_drag_to = None;
                 self.drag = None;
                 self.drag_to = None;
             }
@@ -589,7 +674,9 @@ impl Screen for WatchlistsScreen {
             Action::MoveUp | Action::MoveDown => {
                 let delta = if a == Action::MoveUp { -1 } else { 1 };
                 if self.lists_focus {
-                    return false;
+                    if let Some((id, to)) = self.selected.zip(self.list_move_target(a == Action::MoveDown)) {
+                        self.move_list(ctx, id, to);
+                    }
                 } else if let Some(e) = self.entry() {
                     let n = self.view().map_or(0, |v| v.entries.len());
                     self.move_entry(ctx, e.entry.id, (e.entry.position as isize + delta).clamp(0, n.saturating_sub(1) as isize) as usize);
@@ -734,6 +821,68 @@ mod tests {
         });
         assert_eq!(h.state().t.db.query_row("SELECT count(*) FROM fav_item WHERE kind!='channel'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         assert!(h.state().t.favs.is_fav(&movie(src, 0)));
+    }
+
+    #[test]
+    fn lists_reorder_by_keyboard_and_grip_with_pinned_default_and_done_group() {
+        let (mut t, one) = rig();
+        let (mine, a, b, done) = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::movies(c, src, 3)?;
+            let lib = crate::store::library::load(c)?;
+            let mine = store::default_list(c)?;
+            let mut lists = Vec::new();
+            for (i, name) in ["First", "Second", "Finished"].iter().enumerate() {
+                let id = store::create(c, name, None, PlayOrder::Ordered, "app", 1)?;
+                store::add(c, &lib, id, &[store::new_entry(c, &movie(src, i))?], crate::watchlist::Insert::End, 1)?;
+                lists.push(id);
+            }
+            crate::store::user::mark_watched(c, &[(movie(src, 2), "Movie 2".into())], true, 2)?;
+            store::played(c, lists[1], 10)?;
+            Ok((mine, lists[0], lists[1], lists[2]))
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1400.0, 800.0));
+        h.state_mut().enter(Route::Watchlists { list: Some(a) });
+        let order =
+            |h: &egui_kittest::Harness<'_, testkit::App<WatchlistsScreen>>| h.state().s.snapshot.lists.iter().map(|l| l.list.id).collect::<Vec<_>>();
+        until(&mut h, "manual order", |h| order(h) == [mine, a, b, done]);
+        h.state_mut().act(Action::Left);
+        h.state_mut().act(Action::MoveDown);
+        until(&mut h, "keyboard list order", |h| order(h) == [mine, b, a, done]);
+        assert_eq!(h.state().s.selected, Some(a));
+        assert!(h.state().s.list_move_target(true).is_none(), "unfinished lists cannot move below the done group");
+        h.state_mut().act(Action::MoveUp);
+        until(&mut h, "restored list order", |h| order(h) == [mine, a, b, done]);
+        assert!(h.state().s.list_move_target(false).is_none(), "My list stays first");
+        h.run_steps(2);
+        let from = h.get_by_label("Drag watchlist First").rect().center();
+        let to = h.get_by_label("Drag watchlist Second").rect().center();
+        h.hover_at(from);
+        h.drag_at(from);
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(2);
+        h.drop_at(to);
+        h.run_steps(2);
+        until(&mut h, "grip list order", |h| order(h) == [mine, b, a, done]);
+        assert_eq!(h.state().s.selected, Some(a));
+        assert!(h.state().s.lists_focus);
+        // Escape during a second drag leaves the persisted order alone.
+        let from = h.get_by_label("Drag watchlist First").rect().center();
+        let to = h.get_by_label("Drag watchlist Second").rect().center();
+        h.hover_at(from);
+        h.drag_at(from);
+        h.run_steps(1);
+        h.hover_at(to);
+        h.run_steps(2);
+        h.state_mut().act(Action::Back);
+        h.drop_at(to);
+        h.run_steps(2);
+        assert_eq!(order(&h), [mine, b, a, done]);
+        assert_eq!(store::lists(&h.state().t.db).unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [mine, b, a, done]);
+        h.state_mut().s.select(mine);
+        h.state_mut().act(Action::MoveDown);
+        assert!(h.state().s.list_move_target(true).is_none());
     }
 
     #[test]

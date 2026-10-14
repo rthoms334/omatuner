@@ -80,11 +80,21 @@ Favourites are for channels; save films and series here. No plot text is returne
                     "note": text("create / rename: a short note such as story order (label your own knowledge)."),
                     "play_order": { "type": "string", "enum": ["ordered", "any"], "default": "ordered" },
                     "refs": strings("create / add: film, series or episode refs (≤ 50 including placeholders)."),
-                    "placeholders": { "type": "array", "maxItems": 50, "items": object(json!({
-                        "title": text("Missing title."), "year": {"type": "integer", "minimum": 0, "maximum": 65535},
-                        "kind": {"type": "string", "enum": ["movie", "series", "episode"]},
-                        "tmdb_id": {"type": "integer", "minimum": 1}
-                    }), &["title", "kind"]) },
+                    "placeholders": { "type": "array", "maxItems": 50, "items": { "oneOf": [
+                        object(json!({
+                            "title": text("Missing film or series title."), "year": {"type": "integer", "minimum": 0, "maximum": 65535},
+                            "kind": {"type": "string", "enum": ["movie", "series"]},
+                            "tmdb_id": {"type": "integer", "minimum": 1}
+                        }), &["title", "kind"]),
+                        object(json!({
+                            "kind": {"type": "string", "enum": ["episode"]},
+                            "series_title": text("Parent series title; matched by TMDB id first, else folded title and series year."),
+                            "year": {"type": "integer", "minimum": 0, "maximum": 65535, "description": "Parent series premiere year."},
+                            "tmdb_id": {"type": "integer", "minimum": 1, "description": "Parent series TMDB id."},
+                            "season": {"type": "integer", "minimum": 0},
+                            "episode": {"type": "integer", "minimum": 0}
+                        }), &["kind", "series_title", "year", "season", "episode"])
+                    ] } },
                     "at": {"oneOf": [{"type": "string"}, {"type": "integer", "minimum": 0}], "description": "add: end (default), next (after the next entry), or a zero-based position."},
                     "seasons": object(json!({"from": {"type": "integer", "minimum": 0}, "to": {"type": "integer", "minimum": 0}}), &["from", "to"]),
                     "ids": ids("move / remove / skip: entry ids from show."),

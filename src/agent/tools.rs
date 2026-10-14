@@ -440,6 +440,9 @@ mod tests {
 
     /// A value that fits `schema` (the required properties of an object).
     fn sample(schema: &Value) -> Value {
+        if let Some(branch) = schema["oneOf"].as_array().and_then(|branches| branches.first()) {
+            return sample(branch);
+        }
         match schema["type"].as_str() {
             Some("boolean") => json!(true),
             Some("integer") => json!(schema["minimum"].as_i64().unwrap_or(1).max(1)),
@@ -474,6 +477,19 @@ mod tests {
                 if let Err(e) = Call::from_tool(t.name, Value::Object(args)) {
                     panic!("{}.{name}: {e}", t.name);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn watchlist_placeholder_schemas_accept_movie_series_and_episode_shapes() {
+        let t = tool("watchlist").unwrap();
+        let branches = t.input_schema["properties"]["placeholders"]["items"]["oneOf"].as_array().unwrap();
+        for branch in branches {
+            for kind in branch["properties"]["kind"]["enum"].as_array().unwrap() {
+                let mut placeholder = sample(branch);
+                placeholder["kind"] = kind.clone();
+                assert!(Call::from_tool("watchlist", json!({"action": "add", "list": 1, "placeholders": [placeholder]})).is_ok());
             }
         }
     }

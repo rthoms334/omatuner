@@ -246,7 +246,8 @@ pub fn label(ctx: &UiCtx<'_>, e: &EntryState) -> String {
         let sp = crate::ui::widgets::spoiler::Spoilers::of(ctx);
         let subject = crate::guard::Subject::Episode { series_norm: &norm, season: s as i32, episode: n as i32 };
         title = match sp.text(&subject, crate::guard::Field::EpisodeTitle, &title) {
-            Some(t) => format!("{series} · S{s}E{n} · {t}"),
+            Some(t) if e.entry.item.is_some() => format!("{series} · S{s}E{n} · {t}"),
+            Some(_) => format!("{series} · S{s}E{n}"),
             None => format!("{series} · S{s}E{n}"),
         };
     }

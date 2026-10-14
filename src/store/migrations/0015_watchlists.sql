@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS watchlist_item (
   season_to INTEGER,
   title TEXT NOT NULL,
   year INTEGER,
-  tmdb_id INTEGER,
+  tmdb_id INTEGER,  -- episodes: parent series identity, together with year
+  series_title TEXT,
+  season INTEGER,
+  episode INTEGER,
   skipped INTEGER NOT NULL DEFAULT 0,
   added_at INTEGER NOT NULL,
   fp TEXT NOT NULL DEFAULT '{}',
@@ -40,14 +43,3 @@ CREATE TRIGGER IF NOT EXISTS watchlist_source_deleted BEFORE DELETE ON source BE
 END;
 CREATE INDEX IF NOT EXISTS watchlist_movie_tmdb ON movie(tmdb_id);
 CREATE INDEX IF NOT EXISTS watchlist_series_tmdb ON series(tmdb_id);
-CREATE INDEX IF NOT EXISTS watchlist_episode_title ON episode(title);
--- Episodes have no movie/series match columns. This small derived index supports folded
--- title + the episode's own air-date year, without a scan for each placeholder.
-CREATE TABLE IF NOT EXISTS watchlist_episode_match (
-  episode_id INTEGER PRIMARY KEY REFERENCES episode(id) ON DELETE CASCADE,
-  title_key TEXT NOT NULL,
-  year INTEGER NOT NULL,
-  title TEXT NOT NULL,
-  air_date TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS watchlist_episode_identity ON watchlist_episode_match(title_key,year);

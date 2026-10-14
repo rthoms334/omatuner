@@ -2458,6 +2458,44 @@ mod tests {
         assert!(has_label(&h, "FAVOURITES"));
     }
 
+    #[test]
+    fn watchlist_rail_orders_by_recency_without_changing_manual_list_order() {
+        use crate::store::watchlist as store;
+        use crate::watchlist::{Insert, PlayOrder};
+        let (mut t, one) = rig();
+        let (mine, a, b) = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::movies(c, src, 3)?;
+            let lib = crate::store::library::load(c)?;
+            let mine = store::default_list(c)?;
+            let a = store::create(c, "First", None, PlayOrder::Ordered, "app", 1)?;
+            let b = store::create(c, "Second", None, PlayOrder::Ordered, "app", 1)?;
+            for (i, id) in [mine, a, b].iter().enumerate() {
+                store::add(c, &lib, *id, &[store::new_entry(c, &movie_ref(src, i))?], Insert::End, 1)?;
+            }
+            store::played(c, a, 10)?;
+            store::played(c, b, 20)?;
+            Ok((mine, a, b))
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::Home);
+        let rail_order = |h: &egui_kittest::Harness<'_, testkit::App<HomeScreen>>| {
+            h.state()
+                .s
+                .rails
+                .iter()
+                .filter(|r| r.kind == RailKind::Watchlists)
+                .flat_map(|r| &r.tiles)
+                .filter_map(|t| if let Tile::Watchlist { id, .. } = t { Some(*id) } else { None })
+                .collect::<Vec<_>>()
+        };
+        until(&mut h, "recent watchlists first", |h| rail_order(h) == [b, a, mine]);
+        h.state_mut().t.services().store.writer().blocking(move |c| store::played(c, a, 30)).unwrap();
+        crate::ui::watchlists::invalidate();
+        until(&mut h, "recent play moves Home tile", |h| rail_order(h) == [a, b, mine]);
+        assert_eq!(store::lists(&h.state().t.db).unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [mine, a, b]);
+    }
+
     /// Saved films make one tile per list; channel Favourites never gain film posters.
     #[test]
     fn saved_titles_make_watchlist_tiles_without_film_favourites() {

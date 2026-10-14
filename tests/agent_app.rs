@@ -1946,6 +1946,45 @@ mod casting {
     }
 }
 
+#[test]
+fn watchlist_episode_placeholders_use_series_identity_and_require_coordinates() {
+    let mut w = World::new(Config::default());
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(|c| {
+            c.execute("UPDATE series SET year=2020,tmdb_id='88',match_tags=NULL WHERE key='m3u:show'", [])?;
+            tuner::store::titles::refresh_source(c, SourceId(1))?;
+            Ok(())
+        })
+        .unwrap();
+    w.publish(Visibility::ALL);
+    let created = w.ok(
+        "watchlist",
+        json!({"action": "create", "name": "Episodes", "placeholders": [
+            {"kind": "episode", "series_title": "Translated show", "year": 2000, "tmdb_id": 88, "season": 1, "episode": 1},
+            {"kind": "episode", "series_title": "THE SHOW", "year": 2020, "season": 1, "episode": 2},
+            {"kind": "episode", "series_title": "The Show", "year": 2020, "season": 9, "episode": 1},
+            {"kind": "episode", "series_title": "The Show", "year": 2030, "season": 1, "episode": 3}
+        ]}),
+    );
+    assert_eq!(created["added"].as_array().unwrap().len(), 4, "{created}");
+    let list = created["list"]["id"].as_i64().unwrap();
+    let shown = w.ok("watchlist", json!({"action": "show", "list": list}));
+    let items = shown["items"].as_array().unwrap();
+    assert!(items[0].get("ref").is_some());
+    assert!(items[1].get("ref").is_some());
+    assert_eq!((items[2]["state"].as_str(), items[2]["season"].as_u64(), items[2]["episode"].as_u64()), (Some("missing"), Some(9), Some(1)));
+    assert_eq!(items[3]["state"], "missing");
+    for placeholder in [
+        json!({"kind": "episode", "title": "Episode 1", "year": 2020}),
+        json!({"kind": "episode", "series_title": "The Show", "year": 2020, "season": 1}),
+        json!({"kind": "episode", "year": 2020, "season": 1, "episode": 1}),
+    ] {
+        assert_eq!(w.err("watchlist", json!({"action": "add", "list": list, "placeholders": [placeholder]})), ErrorCode::BadRequest);
+    }
+}
+
 /// DESIGN §42 §7: real list reads and writes, initials, ambiguity, missing titles, ranges,
 /// duplicate refusals and My list's protected name all use the running handler and its store.
 #[test]

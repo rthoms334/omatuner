@@ -1307,7 +1307,6 @@ pub fn store_series_details(conn: &mut Connection, series: crate::model::SeriesI
     )?;
     let mut outcomes = Vec::new();
     reattach_kind(&tx, source, ItemKind::Episode, Some((series, &norm)), now, &mut outcomes)?;
-    crate::store::watchlist::refresh_episode_matches(&tx, Some(source))?;
     crate::store::watchlist::match_placeholders(&tx)?;
     tx.commit()?;
     Ok(())

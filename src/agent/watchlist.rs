@@ -249,12 +249,22 @@ fn additions(q: &Q, p: &Watchlist) -> Out<(Vec<NewEntry>, Vec<Value>)> {
             ItemKind::Episode => ItemKind::Episode,
             _ => {
                 refused.push(
-                    json!({"title": clean(&placeholder.title), "error": "Watchlists hold films and series; use Up next or a reminder for live TV"}),
+                    json!({"title": clean(placeholder.title.as_deref().unwrap_or_default()), "error": "Watchlists hold films and series; use Up next or a reminder for live TV"}),
                 );
                 continue;
             }
         };
-        let title = text("title", &placeholder.title)?;
+        let title = if kind == ItemKind::Episode {
+            if placeholder.year.is_none() || placeholder.season.zip(placeholder.episode).is_none() {
+                return Err(Fail::bad("episode placeholders need year, season and episode"));
+            }
+            text("series_title", placeholder.series_title.as_deref().ok_or_else(|| Fail::bad("episode placeholders need series_title"))?)?
+        } else {
+            if placeholder.series_title.is_some() || placeholder.season.is_some() || placeholder.episode.is_some() {
+                return Err(Fail::bad("series_title, season and episode are for episode placeholders"));
+            }
+            text("title", placeholder.title.as_deref().ok_or_else(|| Fail::bad("movie and series placeholders need title"))?)?
+        };
         let tmdb_id = placeholder.tmdb_id.map(i64::try_from).transpose().map_err(|_| Fail::bad("tmdb_id is too large"))?;
         if p.seasons.is_some() && kind != ItemKind::Series {
             refused.push(json!({"title": clean(title), "error": "seasons are for a series"}));
@@ -266,6 +276,9 @@ fn additions(q: &Q, p: &Watchlist) -> Out<(Vec<NewEntry>, Vec<Value>)> {
             title: title.into(),
             year: placeholder.year,
             tmdb_id,
+            series_title: (kind == ItemKind::Episode).then(|| title.to_owned()),
+            season: placeholder.season,
+            episode: placeholder.episode,
             season_from: p.seasons.as_ref().map(|s| s.from),
             season_to: p.seasons.as_ref().map(|s| s.to),
         };
@@ -285,7 +298,11 @@ fn additions(q: &Q, p: &Watchlist) -> Out<(Vec<NewEntry>, Vec<Value>)> {
                 refused.push(json!({"title": clean(title), "error": "locked: needs your PIN in Tuner"}));
                 continue;
             }
-            entry.item = Some(item);
+            if kind == ItemKind::Episode {
+                entry = store::new_entry(q.conn, &item)?;
+            } else {
+                entry.item = Some(item);
+            }
         }
         entries.push(entry);
     }

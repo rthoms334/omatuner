@@ -171,7 +171,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
   is_default  INTEGER NOT NULL DEFAULT 0,        -- My list: one row, can't be deleted or renamed
   created_at  INTEGER NOT NULL,
   created_by  TEXT    NOT NULL DEFAULT 'app',    -- 'app' or the agent's name (§30.12)
-  last_played_at INTEGER                         -- Home rail / lists pane order
+  last_played_at INTEGER                         -- Home rail order only
 );
 CREATE UNIQUE INDEX IF NOT EXISTS watchlist_name ON watchlist(name COLLATE NOCASE);
 
@@ -187,7 +187,10 @@ CREATE TABLE IF NOT EXISTS watchlist_item (
   season_to    INTEGER,
   title        TEXT    NOT NULL,                 -- display + placeholder matching; never logged at INFO
   year         INTEGER,
-  tmdb_id      INTEGER,
+  tmdb_id      INTEGER,                          -- episodes: parent series id (year is also the series year)
+  series_title TEXT,                             -- episode identity, independent of its display title
+  season       INTEGER,                          -- episode coordinates
+  episode      INTEGER,
   skipped      INTEGER NOT NULL DEFAULT 0,
   added_at     INTEGER NOT NULL,
   fp           TEXT    NOT NULL DEFAULT '{}',
@@ -274,7 +277,7 @@ Watchlists don't need an engine of their own. A list's state is derived when it'
 | `next` | `list` | `{item, episode?, resume_at?, passed_over:[{title, why}]}`. Read-only, so the agent can say what's next before playing it. For an Any order list it returns the pick, and `play` with `id` plays the agent's own choice instead |
 | `play` | `list`, `id?`, `just_one?`, `open_in?` | Plays the list from its next entry (or `id`) and carries on through it. `just_one` stops after it. It replaces current playback, so `status` comes first (RULES 2). Returns `{playing, opened_in, then?}` or `{waiting_for_pin}` |
 | `stop` | — | Ends the list's context after the current item: `{stopped_after}` |
-| `create` | `name`, `note?`, `play_order?`, `refs[]?` + `placeholders[]?` (`{title, year, kind, tmdb_id?}`) | `{list, added, refused}` |
+| `create` | `name`, `note?`, `play_order?`, `refs[]?` + `placeholders[]?` (`{title, year, kind, tmdb_id?}` for films/series; `{kind:"episode", series_title, year, tmdb_id?, season, episode}` for episodes) | `{list, added, refused}` |
 | `add` | `list`, `refs[]` / `placeholders[]`, `at: end\|next\|<index>`, `seasons?` | `{added, refused}` |
 | `move` / `remove` / `skip` | `list`, `ids[]`, … | `{items}` |
 | `restart` / `rename` / `delete` | `list`, … | `{list}` |
@@ -299,7 +302,7 @@ Watchlists don't need an engine of their own. A list's state is derived when it'
 2. A series range: S1–S2 is done only when every S1–S2 episode is finished. S3 progress doesn't count. Two ranges of the same series advance independently.
 3. An Any order list never picks a done, placeholder, concealed or (agent) locked entry, and a partly watched entry wins.
 4. Next passes over placeholders, skips and (for the agent) locked entries, and reports why.
-5. A placeholder attaches after an import that brings in the title (by tmdb_id, and by title + year). Deleting a playlist turns its entries back into placeholders.
+5. A placeholder attaches after an import that brings in the title (by tmdb_id, and by title + year). Episodes match the parent series by tmdb_id first, else folded series title + series year, then require the exact season and episode in a matched copy; episode titles and air years do not participate. Cover unrelated series with identically named episodes, wrong series years, missing S/E, specials, multiple copies and lazy detail imports. Deleting a playlist turns its entries back into placeholders, retaining their series identity and S/E for reattachment; undo and backup round trips retain them too.
 6. A refresh that re-keys a copy reattaches the entry through HOLDERS. Backup round trip. Dense positions after move and remove.
 
 **Playing a list (`QueueMachine`, fake clock)**

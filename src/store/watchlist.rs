@@ -13,8 +13,7 @@ pub const MAX_LISTS: usize = 100;
 pub const MAX_ENTRIES: usize = 300;
 pub const MAX_ADD: usize = 50;
 const LIST_COLS: &str = "id,name,note,play_order,sort_index,since,is_default,created_at,created_by,last_played_at";
-const ENTRY_COLS: &str =
-    "id,list_id,position,kind,source_id,item_key,any_copy,season_from,season_to,title,year,tmdb_id,skipped,added_at,fp,orphaned_since";
+const ENTRY_COLS: &str = "id,list_id,position,kind,source_id,item_key,any_copy,season_from,season_to,title,year,tmdb_id,skipped,added_at,fp,orphaned_since,series_title,season,episode";
 fn list_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<List> {
     Ok(List {
         id: r.get(0)?,
@@ -48,6 +47,9 @@ fn entry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         added_at: r.get(13)?,
         fingerprint: sql::fp_from_json(&r.get::<_, String>(14)?),
         orphaned_since: r.get(15)?,
+        series_title: r.get(16)?,
+        season: r.get(17)?,
+        episode: r.get(18)?,
         explicit: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(14)?)
             .ok()
             .and_then(|v| v["watchlist_explicit"].as_bool())
@@ -55,7 +57,7 @@ fn entry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     })
 }
 pub fn lists(c: &Connection) -> Result<Vec<List>> {
-    Ok(c.prepare_cached(&format!("SELECT {LIST_COLS} FROM watchlist ORDER BY is_default DESC,last_played_at DESC,sort_index,id"))?
+    Ok(c.prepare_cached(&format!("SELECT {LIST_COLS} FROM watchlist ORDER BY is_default DESC,sort_index,id"))?
         .query_map([], list_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
@@ -127,12 +129,25 @@ pub fn new_entry(c: &Connection, item: &ItemRef) -> Result<NewEntry> {
     if item.kind == ItemKind::Channel {
         return Err(Error::other("Watchlists hold films and series; use Up next or a reminder for live TV"));
     }
-    let (title,year,tmdb_id)=if item.kind==ItemKind::Episode {
-        c.query_row("SELECT e.title,CASE WHEN e.air_date GLOB '[0-9][0-9][0-9][0-9]-*' THEN CAST(substr(e.air_date,1,4) AS INTEGER) END,NULL FROM episode e WHERE e.source_id=?1 AND e.key=?2",params![item.source,item.key.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?
-    }else{
-        c.query_row(&format!("SELECT COALESCE(o.rename,t.clean_name),t.year,CAST(t.tmdb_id AS INTEGER) FROM {} t LEFT JOIN item_override o ON o.source_id=t.source_id AND o.kind=?3 AND o.item_key=t.key WHERE t.source_id=?1 AND t.key=?2",item.kind.as_str()),params![item.source,item.key.as_str(),item.kind.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?
-    }.ok_or_else(||Error::other("Title not found"))?;
-    Ok(NewEntry { item: Some(item.clone()), kind: item.kind, title, year, tmdb_id, season_from: None, season_to: None })
+    if item.kind == ItemKind::Episode {
+        return c.query_row(
+            "SELECT e.title,s.clean_name,s.year,CAST(s.tmdb_id AS INTEGER),e.season,e.episode FROM episode e JOIN series s ON s.id=e.series_id WHERE e.source_id=?1 AND e.key=?2",
+            params![item.source, item.key.as_str()],
+            |r| Ok(NewEntry {
+                item: Some(item.clone()), kind: item.kind, title: r.get(0)?,
+                series_title: r.get(1)?, year: r.get(2)?, tmdb_id: r.get(3)?,
+                season: r.get(4)?, episode: r.get(5)?, season_from: None, season_to: None,
+            }),
+        ).optional()?.ok_or_else(|| Error::other("Title not found"));
+    }
+    c.query_row(
+        &format!("SELECT COALESCE(o.rename,t.clean_name),t.year,CAST(t.tmdb_id AS INTEGER) FROM {} t LEFT JOIN item_override o ON o.source_id=t.source_id AND o.kind=?3 AND o.item_key=t.key WHERE t.source_id=?1 AND t.key=?2",item.kind.as_str()),
+        params![item.source,item.key.as_str(),item.kind.as_str()],
+        |r| Ok(NewEntry {
+            item: Some(item.clone()), kind: item.kind, title: r.get(0)?, year: r.get(1)?, tmdb_id: r.get(2)?,
+            series_title: None, season: None, episode: None, season_from: None, season_to: None,
+        }),
+    ).optional()?.ok_or_else(|| Error::other("Title not found"))
 }
 
 /// Stack members include all copies for progress, even when the entry pins one for playback.
@@ -199,10 +214,19 @@ fn same_title(c: &Connection, lib: &Library, a: &Entry, b: &NewEntry) -> Result<
     if let (Some(x), Some(y)) = (&a.item, &b.item) {
         return Ok(title_copies(c, lib, x)?.contains(y));
     }
+    let (a_title, b_title) = if a.kind == ItemKind::Episode {
+        if a.season.zip(a.episode).is_none() || a.season != b.season || a.episode != b.episode {
+            return Ok(false);
+        }
+        let (Some(a), Some(b)) = (&a.series_title, &b.series_title) else { return Ok(false) };
+        (a, b)
+    } else {
+        (&a.title, &b.title)
+    };
     if let (Some(x), Some(y)) = (a.tmdb_id, b.tmdb_id) {
         return Ok(x == y);
     }
-    Ok(a.year == b.year && crate::sources::identity::normalize_name(&a.title) == crate::sources::identity::normalize_name(&b.title))
+    Ok(a.year == b.year && crate::sources::identity::normalize_name(a_title) == crate::sources::identity::normalize_name(b_title))
 }
 fn valid_range(kind: ItemKind, from: Option<u32>, to: Option<u32>) -> bool {
     (kind == ItemKind::Series || (from.is_none() && to.is_none()))
@@ -217,7 +241,7 @@ fn write_entry(c: &Connection, e: &Entry, keep_id: bool) -> Result<WatchlistItem
     fp["watchlist_explicit"] = e.explicit.into();
     let fp = serde_json::to_string(&fp).map_err(Error::other)?;
     let id = if keep_id { e.id } else { WatchlistItemId(next_id(c, "watchlist_item")?) };
-    c.execute("INSERT INTO watchlist_item(id,list_id,position,kind,source_id,item_key,any_copy,season_from,season_to,title,year,tmdb_id,skipped,added_at,fp,orphaned_since) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![id,e.list_id,e.position as i64,e.kind.as_str(),e.item.as_ref().map(|i|i.source),e.item.as_ref().map(|i|i.key.as_str()),e.any_copy,e.season_from,e.season_to,e.title,e.year,e.tmdb_id,e.skipped,e.added_at,fp,e.orphaned_since])?;
+    c.execute("INSERT INTO watchlist_item(id,list_id,position,kind,source_id,item_key,any_copy,season_from,season_to,title,year,tmdb_id,skipped,added_at,fp,orphaned_since,series_title,season,episode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",params![id,e.list_id,e.position as i64,e.kind.as_str(),e.item.as_ref().map(|i|i.source),e.item.as_ref().map(|i|i.key.as_str()),e.any_copy,e.season_from,e.season_to,e.title,e.year,e.tmdb_id,e.skipped,e.added_at,fp,e.orphaned_since,e.series_title,e.season,e.episode])?;
     Ok(id)
 }
 pub fn add(c: &Connection, lib: &Library, id: WatchlistId, targets: &[NewEntry], at: Insert, now: Timestamp) -> Result<AddResult> {
@@ -240,6 +264,10 @@ pub fn add(c: &Connection, lib: &Library, id: WatchlistId, targets: &[NewEntry],
                 Some("Watchlists hold films and series; use Up next or a reminder for live TV")
             } else if !valid_range(t.kind, t.season_from, t.season_to) {
                 Some("invalid_seasons")
+            } else if t.kind == ItemKind::Episode
+                && (t.series_title.as_deref().is_none_or(|s| s.trim().is_empty()) || t.season.zip(t.episode).is_none())
+            {
+                Some("episodes need series_title, season and episode")
             } else if have.len() >= MAX_ENTRIES {
                 Some("full")
             } else {
@@ -272,6 +300,9 @@ pub fn add(c: &Connection, lib: &Library, id: WatchlistId, targets: &[NewEntry],
                 title: t.title.clone(),
                 year: t.year,
                 tmdb_id: t.tmdb_id,
+                series_title: t.series_title.clone(),
+                season: t.season,
+                episode: t.episode,
                 skipped: false,
                 added_at: now,
                 fingerprint: t.item.as_ref().map(|x| user::fingerprint_of(c, x)).transpose()?.unwrap_or_default(),
@@ -471,8 +502,18 @@ pub fn set_seasons(c: &Connection, lib: &Library, id: WatchlistItemId, from: Opt
     if !valid_range(e.kind, from, to) {
         return Err(Error::other("invalid_seasons"));
     }
-    let t =
-        NewEntry { item: e.item.clone(), kind: e.kind, title: e.title.clone(), year: e.year, tmdb_id: e.tmdb_id, season_from: from, season_to: to };
+    let t = NewEntry {
+        item: e.item.clone(),
+        kind: e.kind,
+        title: e.title.clone(),
+        year: e.year,
+        tmdb_id: e.tmdb_id,
+        series_title: e.series_title.clone(),
+        season: e.season,
+        episode: e.episode,
+        season_from: from,
+        season_to: to,
+    };
     for other in entries(c, e.list_id)? {
         if other.id != id && same_title(c, lib, &other, &t)? && overlaps(other.season_from, other.season_to, from, to) {
             return Err(Error::other("overlapping_seasons"));
@@ -482,17 +523,28 @@ pub fn set_seasons(c: &Connection, lib: &Library, id: WatchlistItemId, from: Opt
     Ok(())
 }
 pub fn attach(c: &Connection, id: WatchlistItemId, item: &ItemRef) -> Result<()> {
-    let e = entry(c, id)?.ok_or_else(|| Error::other("Entry not found"))?;
+    let mut e = entry(c, id)?.ok_or_else(|| Error::other("Entry not found"))?;
     if e.kind != item.kind {
         return Err(Error::other("Choose the same kind of title"));
     }
+    if item.kind == ItemKind::Episode {
+        let identity = new_entry(c, item)?;
+        e.title = identity.title;
+        e.series_title = identity.series_title;
+        e.year = identity.year;
+        e.tmdb_id = identity.tmdb_id;
+        e.season = identity.season;
+        e.episode = identity.episode;
+    }
     let fp = user::fingerprint_of(c, item)?;
     c.execute(
-        "UPDATE watchlist_item SET source_id=?2,item_key=?3,fp=?4,orphaned_since=NULL WHERE id=?1",
-        params![id, item.source, item.key.as_str(), sql::fp_to_json(&fp)],
+        "UPDATE watchlist_item SET source_id=?2,item_key=?3,fp=?4,orphaned_since=NULL,
+         title=?5,series_title=?6,year=?7,tmdb_id=?8,season=?9,episode=?10 WHERE id=?1",
+        params![id, item.source, item.key.as_str(), sql::fp_to_json(&fp), e.title, e.series_title, e.year, e.tmdb_id, e.season, e.episode],
     )?;
     Ok(())
 }
+
 pub fn pin(c: &Connection, id: WatchlistItemId, item: &ItemRef) -> Result<()> {
     sql::atomic(c, |c| {
         attach(c, id, item)?;
@@ -509,7 +561,18 @@ pub fn set_show_watched(c: &Connection, id: WatchlistId, show: bool) -> Result<(
 }
 pub fn reorder_lists(c: &Connection, ids: &[WatchlistId]) -> Result<()> {
     sql::atomic(c, |c| {
-        for (i, id) in ids.iter().enumerate() {
+        // Hidden and finished lists keep their slots when a visible group is reordered.
+        // My list is pinned, even if a caller includes it in the requested order.
+        let all = lists(c)?;
+        let mut order = Vec::new();
+        for id in ids {
+            if all.iter().any(|l| l.id == *id && !l.is_default) && !order.contains(id) {
+                order.push(*id);
+            }
+        }
+        let mut moved = order.iter();
+        for (i, l) in all.iter().enumerate() {
+            let id = if order.contains(&l.id) { *moved.next().expect("one id per selected slot") } else { l.id };
             c.execute("UPDATE watchlist SET sort_index=?2 WHERE id=?1", params![id, i as i64])?;
         }
         Ok(())
@@ -844,7 +907,7 @@ pub fn view_with_preferences(
         } else {
             next.and_then(|(_, p)| p.duration)
         };
-        let episode = next.filter(|_| e.kind != ItemKind::Movie).map(|(_, p)| (p.season, p.episode));
+        let episode = next.filter(|_| e.kind != ItemKind::Movie).map(|(_, p)| (p.season, p.episode)).or(e.season.zip(e.episode));
         let copy_name = playable.as_ref().and_then(|p| lib.source(p.source)).map(|s| s.name.clone());
         let series = if e.kind == ItemKind::Episode {
             e.item.as_ref().map(|item| c.query_row("SELECT COALESCE(o.rename,s.clean_name) FROM episode e JOIN series s ON s.id=e.series_id LEFT JOIN item_override o ON o.source_id=s.source_id AND o.kind='series' AND o.item_key=s.key WHERE e.source_id=?1 AND e.key=?2",params![item.source,item.key.as_str()],|r|r.get::<_,String>(0)).optional()).transpose()?.flatten()
@@ -853,6 +916,7 @@ pub fn view_with_preferences(
         } else {
             None
         };
+        let series = series.or_else(|| e.series_title.clone());
         states.push(EntryState {
             entry: e,
             status,
@@ -942,7 +1006,7 @@ pub fn snapshot_with_preferences(
             out.push(v)
         }
     }
-    out.sort_by_key(|v| (!v.list.is_default, v.next.is_none(), std::cmp::Reverse(v.list.last_played_at), v.list.sort_index, v.list.id));
+    out.sort_by_key(|v| (!v.list.is_default, v.finished(), v.list.sort_index, v.list.id));
     Ok(WatchlistsSnapshot { lists: out })
 }
 
@@ -964,6 +1028,9 @@ pub fn match_placeholders(c: &Connection) -> Result<usize> {
             title: e.title.clone(),
             year: e.year,
             tmdb_id: e.tmdb_id,
+            series_title: e.series_title.clone(),
+            season: e.season,
+            episode: e.episode,
             season_from: e.season_from,
             season_to: e.season_to,
         };
@@ -979,11 +1046,26 @@ pub fn match_placeholders(c: &Connection) -> Result<usize> {
 fn placeholder_candidates(c: &Connection, e: &NewEntry) -> Result<Vec<ItemRef>> {
     let mut candidates = Vec::<ItemRef>::new();
     if e.kind == ItemKind::Episode {
-        // The episode's own year is its air date, not the series' premiere year. Episode
-        // TMDB IDs are not in the catalogue, so they cannot be matched (DESIGN §42 §4).
-        if let Some(year) = e.year {
-            candidates=c.prepare_cached("SELECT e.source_id,e.key FROM watchlist_episode_match m JOIN episode e ON e.id=m.episode_id WHERE m.title_key=?1 AND m.year=?2 ORDER BY e.source_id,e.id")?.query_map(params![crate::sources::identity::normalize_name(&e.title),year],|r|Ok(ItemRef{source:r.get(0)?,kind:ItemKind::Episode,key:ItemKey(r.get(1)?)}))?.collect::<rusqlite::Result<_>>()?;
-        }
+        let (Some(title), Some(season), Some(episode)) = (&e.series_title, e.season, e.episode) else { return Ok(candidates) };
+        let hash = e.year.and_then(|year| {
+            crate::sources::vod_match::parse(title, Some(year), &crate::sources::vod_match::PrefixCodes::default()).stack_hash(ItemKind::Series)
+        });
+        // Each branch starts with an indexed series identity, then its indexed S/E.
+        // A known TMDB series without this episode must not fall back to another series.
+        candidates = c
+            .prepare_cached(
+                "SELECT e.source_id,e.key FROM series s JOIN episode e ON e.series_id=s.id
+             WHERE s.tmdb_id=?1 AND e.season=?3 AND e.episode=?4
+             UNION ALL
+             SELECT e.source_id,e.key FROM series s JOIN episode e ON e.series_id=s.id
+             WHERE s.match_hash=?2 AND e.season=?3 AND e.episode=?4
+               AND NOT EXISTS(SELECT 1 FROM series WHERE tmdb_id=?1)
+             ORDER BY 1,2",
+            )?
+            .query_map(params![e.tmdb_id.map(|id| id.to_string()), hash, season, episode], |r| {
+                Ok(ItemRef { source: r.get(0)?, kind: ItemKind::Episode, key: ItemKey(r.get(1)?) })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
     } else {
         if let Some(tmdb) = e.tmdb_id {
             candidates = c
@@ -1017,8 +1099,23 @@ fn pick_placeholder_copy(c: &Connection, candidates: &[ItemRef]) -> Result<Optio
         library::VodIndex,
         stacks::{self, CopyRaw},
     };
-    if candidates.len() < 2 || candidates.first().is_none_or(|i| i.kind == ItemKind::Episode) {
+    if candidates.len() < 2 {
         return Ok(candidates.first().cloned());
+    }
+    if candidates[0].kind == ItemKind::Episode {
+        let parents = candidates
+            .iter()
+            .map(|item| {
+                c.query_row(
+                    "SELECT s.source_id,s.key FROM episode e JOIN series s ON s.id=e.series_id WHERE e.source_id=?1 AND e.key=?2",
+                    params![item.source, item.key.as_str()],
+                    |r| Ok(ItemRef { source: r.get(0)?, kind: ItemKind::Series, key: ItemKey(r.get(1)?) }),
+                )
+                .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let chosen = pick_placeholder_copy(c, &parents)?;
+        return Ok(chosen.and_then(|p| parents.iter().position(|s| *s == p)).map(|i| candidates[i].clone()));
     }
     let mut candidates = candidates.to_vec();
     let order: HashMap<SourceId, i64> =
@@ -1059,28 +1156,6 @@ fn pick_placeholder_copy(c: &Connection, candidates: &[ItemRef]) -> Result<Optio
     };
     let plan = copies::plan(c, &vod, movies, 0, true, Default::default(), crate::model::now())?;
     Ok(plan.first().and_then(|i| candidates.get(i as usize)).cloned())
-}
-
-/// Update the derived episode identity index after imports, including lazy series details.
-/// Rows without an air-date year cannot match a placeholder safely.
-pub(crate) fn refresh_episode_matches(c: &Connection, source: Option<SourceId>) -> Result<()> {
-    if !crate::store::migrations::has_column(c, "watchlist_episode_match", "episode_id")? {
-        return Ok(());
-    }
-    let rows=c.prepare_cached("SELECT e.id,e.title,e.air_date FROM episode e LEFT JOIN watchlist_episode_match m ON m.episode_id=e.id WHERE (?1 IS NULL OR e.source_id=?1) AND (m.episode_id IS NULL OR m.title<>e.title OR m.air_date IS NOT e.air_date)")?.query_map([source],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, title, air_date) in rows {
-        let year = air_date
-            .as_deref()
-            .filter(|date| date.as_bytes().get(4) == Some(&b'-'))
-            .and_then(|date| date.get(..4))
-            .and_then(|year| year.parse::<u16>().ok());
-        if let Some(year) = year {
-            c.execute("INSERT INTO watchlist_episode_match(episode_id,title_key,year,title,air_date) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(episode_id) DO UPDATE SET title_key=excluded.title_key,year=excluded.year,title=excluded.title,air_date=excluded.air_date",params![id,crate::sources::identity::normalize_name(&title),year,title,air_date])?;
-        } else {
-            c.execute("DELETE FROM watchlist_episode_match WHERE episode_id=?1", [id])?;
-        }
-    }
-    Ok(())
 }
 
 /// Before catalogue chunks are deleted, preserve the current explicit decision in each
@@ -1159,7 +1234,10 @@ pub(crate) fn move_favourites(c: &Connection) -> Result<Vec<String>> {
                 season_to: None,
                 title,
                 year: display.as_ref().and_then(|t| t.year),
-                tmdb_id: display.and_then(|t| t.tmdb_id),
+                tmdb_id: display.as_ref().and_then(|t| t.tmdb_id),
+                series_title: display.as_ref().and_then(|t| t.series_title.clone()),
+                season: display.as_ref().and_then(|t| t.season),
+                episode: display.as_ref().and_then(|t| t.episode),
                 skipped: false,
                 added_at: r.added_at,
                 fingerprint: r.fingerprint.clone(),
@@ -1290,7 +1368,14 @@ pub fn import(c: &Connection, v: &serde_json::Value, remap: &dyn Fn(&ItemRef) ->
                     && have.season_from == e.season_from
                     && have.season_to == e.season_to
                     && (have.item.is_some() && have.item == e.item
-                        || have.item.is_none() && e.item.is_none() && have.title == e.title && have.year == e.year && have.tmdb_id == e.tmdb_id)
+                        || have.item.is_none()
+                            && e.item.is_none()
+                            && have.title == e.title
+                            && have.year == e.year
+                            && have.tmdb_id == e.tmdb_id
+                            && have.series_title == e.series_title
+                            && have.season == e.season
+                            && have.episode == e.episode)
             }) {
                 out.entries.insert(original.id, existing.id);
                 continue;
@@ -1536,6 +1621,9 @@ mod tests {
                 tmdb_id: None,
                 season_from: None,
                 season_to: None,
+                series_title: None,
+                season: None,
+                episode: None,
             };
             let mut new = vec![missing];
             for item in [movie(1, "hope"), movie(1, "empire"), movie(1, "elf")] {
@@ -1578,6 +1666,9 @@ mod tests {
                 tmdb_id,
                 season_from: None,
                 season_to: None,
+                series_title: None,
+                season: None,
+                episode: None,
             };
             let ids = add(
                 c,
@@ -1598,6 +1689,188 @@ mod tests {
             assert_eq!(rows.len(), 3);
             assert!(rows.iter().all(|e| e.item.is_none()));
             assert_eq!(rows.iter().map(|e| e.position).collect::<Vec<_>>(), [0, 1, 2]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn episode_placeholders_match_series_identity_and_coordinates() {
+        with_db(|c| {
+            let lib = library::load(c)?;
+            let list = create(c, "Missing episodes", None, PlayOrder::Ordered, "app", 1)?;
+            let new = |series_title: &str, year, tmdb_id, season, episode| NewEntry {
+                item: None,
+                kind: ItemKind::Episode,
+                title: "Episode 1-1".into(),
+                series_title: Some(series_title.into()),
+                year: Some(year),
+                tmdb_id,
+                season: Some(season),
+                episode: Some(episode),
+                season_from: None,
+                season_to: None,
+            };
+            let targets = [
+                new("A translated series name", 2000, Some(88), 1, 1),
+                new("ÁNDOR", 2022, None, 2, 2),
+                new("Andor", 2030, None, 1, 1),
+                new("Unrelated series", 2022, None, 1, 1),
+                new("Andor", 2022, None, 9, 1),
+                new("Andor", 2022, None, 0, 1),
+                new("Andor", 2022, None, 1, 2),
+            ];
+            let ids = add(c, &lib, list, &targets, Insert::End, 1)?.added;
+            assert_eq!(ids.len(), targets.len(), "S/E participates in duplicate identity");
+            assert_eq!(add(c, &lib, list, &targets[1..2], Insert::End, 1)?.refused[0].1, "duplicate");
+            // The episode names are all identical, and their air years differ from the
+            // series year. The pinned matched copy wins; one S/E exists only in copy 1.
+            c.execute_batch(
+                "UPDATE series SET tmdb_id='88'; UPDATE episode SET title='Pilot',air_date='2025-01-01';
+                DELETE FROM episode WHERE source_id=2 AND season=2 AND episode=2;
+                INSERT INTO title_link(source_id,kind,item_key,action,at) VALUES (2,'series','andor2','pin',1)",
+            )?;
+            titles::refresh_source(c, SourceId(1))?;
+            let episode = |source, season, number| ItemRef {
+                source: SourceId(source),
+                kind: ItemKind::Episode,
+                key: ItemKey(format!("s{source}-{season}-{number}")),
+            };
+            assert_eq!(entry(c, ids[0])?.unwrap().item, Some(episode(2, 1, 1)));
+            assert_eq!(entry(c, ids[1])?.unwrap().item, Some(episode(1, 2, 2)));
+            for id in &ids[2..5] {
+                assert!(entry(c, *id)?.unwrap().item.is_none());
+            }
+            assert_eq!(entry(c, ids[5])?.unwrap().item, Some(episode(2, 0, 1)));
+            assert_eq!(entry(c, ids[6])?.unwrap().item, Some(episode(2, 1, 2)));
+            // An existing TMDB series with no requested S/E must not fall back to the
+            // name of a different series that does have it.
+            c.execute_batch(
+                "INSERT INTO series(source_id,key,name,clean_name,norm_name,year,tmdb_id,provider_order,seen_gen)
+                VALUES (1,'other','Other','Other','other',2022,'99',1,1)",
+            )?;
+            assert!(match_placeholder(c, &new("Andor", 2022, Some(99), 1, 1))?.is_none());
+            // With no TMDB match, the folded series title and year are the fallback.
+            assert_eq!(match_placeholder(c, &new("Andor", 2022, Some(100), 1, 1))?, Some(episode(2, 1, 1)));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn episode_identity_survives_deletion_undo_and_backup() {
+        with_db(|c| {
+            let lib = library::load(c)?;
+            let list = create(c, "Episodes", None, PlayOrder::Ordered, "app", 1)?;
+            c.execute("UPDATE series SET tmdb_id='88'", [])?;
+            let refs = [1, 2].map(|n| ItemRef { source: SourceId(1), kind: ItemKind::Episode, key: ItemKey(format!("s1-1-{n}")) });
+            let ids = add_refs(c, &lib, list, &refs)?;
+            let removed = remove(c, list, &ids[1..])?;
+            c.execute("DELETE FROM source WHERE id=1", [])?;
+            undo(c, &removed)?;
+            let original = entries(c, list)?;
+            assert_eq!(original.len(), 2);
+            for e in &original {
+                assert!(e.item.is_none());
+                assert_eq!((e.series_title.as_deref(), e.year, e.tmdb_id, e.season), (Some("Andor"), Some(2022), Some(88), Some(1)));
+            }
+            let saved = export(c)?.unwrap();
+            delete(c, list)?;
+            let restored = import(c, &saved, &|r| Some(r.clone()))?;
+            let restored_list = restored.lists[&list];
+            assert_eq!(entries(c, restored_list)?.len(), 2);
+            assert_eq!(import(c, &saved, &|r| Some(r.clone()))?.rows, 0);
+            titles::refresh_source(c, SourceId(2))?;
+            for (i, e) in entries(c, restored_list)?.iter().enumerate() {
+                assert_eq!(e.item, Some(ItemRef { source: SourceId(2), kind: ItemKind::Episode, key: ItemKey(format!("s2-1-{}", i + 1)) }));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn episode_placeholder_attaches_when_lazy_details_bring_its_number() {
+        with_db(|c| {
+            let lib = library::load(c)?;
+            let list = create(c, "Later episode", None, PlayOrder::Ordered, "app", 1)?;
+            let target = NewEntry {
+                item: None,
+                kind: ItemKind::Episode,
+                title: "Andor".into(),
+                series_title: Some("Andor".into()),
+                year: Some(2022),
+                tmdb_id: None,
+                season: Some(4),
+                episode: Some(1),
+                season_from: None,
+                season_to: None,
+            };
+            let id = add(c, &lib, list, &[target], Insert::End, 1)?.added[0];
+            assert_eq!(match_placeholders(c)?, 0);
+            let d = crate::store::import::SeriesDetails {
+                episodes: vec![crate::store::import::ImportEpisode {
+                    key: ItemKey("later".into()),
+                    provider_id: None,
+                    season: 4,
+                    episode: 1,
+                    title: "A different title".into(),
+                    plot: None,
+                    duration_s: None,
+                    still: None,
+                    air_date: None,
+                    rating: None,
+                    stream: crate::model::StreamLocator::Url { url: "https://example.test/episode".into() },
+                }],
+                tmdb_id: Some(88),
+                ..Default::default()
+            };
+            crate::store::import::store_series_details(c, crate::model::SeriesId(2), &d, 2)?;
+            let e = entry(c, id)?.unwrap();
+            assert_eq!(e.item, Some(ItemRef { source: SourceId(2), kind: ItemKind::Episode, key: ItemKey("later".into()) }));
+            assert_eq!(e.tmdb_id, Some(88));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn lists_keep_manual_order_with_default_first_and_finished_last() {
+        with_db(|c| {
+            let lib = library::load(c)?;
+            let mine = default_list(c)?;
+            let a = create(c, "First", None, PlayOrder::Ordered, "app", 1)?;
+            let done = create(c, "Finished", None, PlayOrder::Ordered, "app", 1)?;
+            let b = create(c, "Last", None, PlayOrder::Ordered, "app", 1)?;
+            add_refs(c, &lib, a, &[movie(1, "hope")])?;
+            add_refs(c, &lib, b, &[movie(1, "elf")])?;
+            add_refs(c, &lib, done, &[movie(1, "empire")])?;
+            progress(c, &movie(1, "empire"), true, 7200.0, 10)?;
+            played(c, b, 20)?;
+            played(c, done, 30)?;
+            let order = |c: &Connection| -> Result<Vec<_>> { Ok(snapshot(c, &lib, false, false)?.lists.iter().map(|l| l.list.id).collect()) };
+            assert_eq!(lists(c)?.iter().map(|l| l.id).collect::<Vec<_>>(), [mine, a, done, b]);
+            assert_eq!(order(c)?, [mine, a, b, done]);
+            reorder_lists(c, &[b, a, mine])?;
+            assert_eq!(order(c)?, [mine, b, a, done]);
+            assert_eq!(lists(c)?.iter().map(|l| l.sort_index).collect::<Vec<_>>(), [0, 1, 2, 3]);
+            played(c, a, 40)?;
+            assert_eq!(order(c)?, [mine, b, a, done]);
+            progress(c, &movie(1, "empire"), false, 0.0, 50)?;
+            assert_eq!(order(c)?, [mine, b, done, a]);
+            // Missing entries are unfinished, even without a next playable entry.
+            let target = NewEntry {
+                item: None,
+                kind: ItemKind::Movie,
+                title: "Missing".into(),
+                year: Some(2000),
+                tmdb_id: None,
+                series_title: None,
+                season: None,
+                episode: None,
+                season_from: None,
+                season_to: None,
+            };
+            add(c, &lib, done, &[target], Insert::End, 1)?;
+            progress(c, &movie(1, "empire"), true, 7200.0, 60)?;
+            assert_eq!(order(c)?, [mine, b, done, a]);
+            assert!(!view(c, &lib, done, false, false)?.unwrap().finished());
             Ok(())
         })
     }

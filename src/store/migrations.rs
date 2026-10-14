@@ -165,7 +165,6 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
         "0013_agent_names" => agent_names(conn),
         "0015_watchlists" => {
             add_column_if_missing(conn, "queue_item", "watchlist_item_id", "INTEGER")?;
-            crate::store::watchlist::refresh_episode_matches(conn, None)?;
             crate::store::watchlist::move_favourites(conn).map(|_| ())
         }
         _ => Ok(()),
