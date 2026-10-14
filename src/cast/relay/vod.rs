@@ -681,7 +681,7 @@ impl OnDemand {
         };
         let argv = ffmpeg::run_argv(&run, &self.spec.plan);
         self.ctx.feed.arm_final_reader();
-        let progress = ffmpeg::Progress { watch_speed: false, on_slow: Box::new(|| {}) };
+        let progress = ffmpeg::Progress { base_s: 0.0, watch_speed: false, on_slow: Box::new(|| {}) };
         let child = ffmpeg::spawn(&self.spec.ffmpeg, &argv, self.ctx.label.clone(), progress)?;
         let ctx = Arc::new(RunCtx {
             dir,
@@ -739,7 +739,14 @@ impl OnDemand {
             }
         };
         if exit == ffmpeg::Exit::Failed && !self.ctx.feed.failed() {
-            tracing::info!("{}: ffmpeg stopped with an error making segment {}", self.ctx.label, run.made());
+            let why = child.failure();
+            let k = run.made();
+            tracing::info!(
+                "{}: ffmpeg stopped with an error making segment {k}, at {:.1} s into the item: {}",
+                self.ctx.label,
+                self.map.start(k),
+                why.text(self.ctx.feed.resumes() > 0)
+            );
         }
         // whatever it finished (its last listed segment too, when it ended by itself)
         self.scan(&run, &mut seen, exit == ffmpeg::Exit::Done).await;

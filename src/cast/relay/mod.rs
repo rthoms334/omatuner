@@ -667,6 +667,7 @@ impl RelaySession {
             let generation = l.generation.clone();
             let label = self.label.clone();
             let progress = ffmpeg::Progress {
+                base_s: l.offset_s,
                 watch_speed: l.watch_speed,
                 on_slow: Box::new(move || {
                     tracing::warn!("{label}: converting runs slower than real time");
@@ -1371,7 +1372,13 @@ async fn monitor(mut child: ffmpeg::Child, w: Watch) {
             tracing::debug!("{}: the input ended", w.label);
             let _ = w.tx.send(RelayEvent::UpstreamEof { generation: w.generation.load(Ordering::Relaxed) });
         }
-        ffmpeg::Exit::Failed if !feed.failed() => tracing::warn!("{}: ffmpeg stopped with an error", w.label),
+        ffmpeg::Exit::Failed if !feed.failed() => {
+            let why = child.failure();
+            tracing::warn!("{}: ffmpeg stopped with an error: {}", w.label, why.text(feed.resumes() > 0));
+            if let Some(at) = why.at() {
+                tracing::info!("{}: ffmpeg stopped at about {at} into the item", w.label);
+            }
+        }
         _ => {}
     }
     feed.close(false).await;

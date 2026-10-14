@@ -1,7 +1,9 @@
 //! The ffmpeg supervisor (DESIGN §40 §8.1.3, §8.4): `tokio::process` with `kill_on_drop` and
 //! `PR_SET_PDEATHSIG` (spawned from a runtime worker, never the blocking pool), environment
 //! cleared but `LC_ALL=C`, argv with only the loopback URL and the output directory, stderr
-//! redacted at debug, `-progress pipe:1` speed → `CpuTooSlow`, encoder check once per run.
+//! redacted at debug, `-progress pipe:1` speed → `CpuTooSlow`, encoder check once per run. A
+//! child that exits with an error leaves its reason ([`Child::failure`]: the status, the last
+//! meaningful stderr lines, the media time reached), so the log says why, not only that.
 //! OWNER: CAST-4.
 //!
 //! **One timeline** (DESIGN §40 §8.4; Apple's HLS authoring spec: alternate audio renditions
@@ -41,10 +43,11 @@
 //! spawned from `async` code on a worker (§5.6), and the pre-exec hook also catches the race where
 //! Tuner died between `fork` and `prctl`.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -72,6 +75,14 @@ pub const SLOW_SPEED: f64 = 0.98;
 pub const SLOW_FOR: Duration = Duration::from_secs(20);
 /// stderr lines logged per child (then one summary line).
 const STDERR_LINES: usize = 64;
+/// Meaningful stderr lines kept per child for the failure report ([`Tail`]), whatever
+/// [`STDERR_LINES`] let through to the debug log.
+const TAIL_LINES: usize = 8;
+/// A kept line is cut at this many characters (ffmpeg's `Last message repeated` lines and
+/// demuxer dumps can be long).
+const TAIL_CHARS: usize = 240;
+/// How long the exit waits for stderr to drain, so the report holds ffmpeg's last words.
+const STDERR_DRAIN: Duration = Duration::from_millis(500);
 /// The test card (§8.5): 15 s of `testsrc2` and a 440 Hz tone.
 const TEST_CARD_S: u32 = 15;
 /// EVENT playlists (VOD, catch-up): ffmpeg reads the first minute as fast as the provider sends
@@ -540,10 +551,136 @@ pub struct Child {
     exit: watch::Receiver<Option<Exit>>,
     pid: Option<u32>,
     started: Instant,
+    seen: Arc<Seen>,
+}
+
+/// What the child's pipes and exit told: shared with the tasks that read them.
+#[derive(Debug, Default)]
+struct Seen {
+    tail: Mutex<Tail>,
+    /// `out_time_us` of the last progress block, in seconds.
+    media_s: Mutex<Option<f64>>,
+    /// The exit status as the OS words it (`exit status: 1`, `signal: 9 (SIGKILL)`).
+    status: Mutex<Option<String>>,
+}
+
+/// Why a child ended with an error: what [`Child::failure`] collected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    /// `exit status: 1`, `signal: 11 (SIGSEGV)`; empty when the OS gave none.
+    pub status: String,
+    /// The last meaningful stderr lines, oldest first, redacted ([`Tail`]).
+    pub lines: Vec<String>,
+    /// Seconds into the item the output had reached (the last progress block plus the input's
+    /// seek), if ffmpeg got far enough to say.
+    pub media_s: Option<f64>,
+}
+
+/// Does `line` say nothing about why ffmpeg stopped? Blank lines, progress (`frame=…`,
+/// `size=…`, `speed=…`), the `-readrate` pacing note and repeat counts.
+pub fn is_noise(line: &str) -> bool {
+    let l = line.trim();
+    l.is_empty()
+        || l.starts_with("frame=")
+        || l.starts_with("size=")
+        || l.starts_with("video:")
+        || l.starts_with("speed=")
+        || l.starts_with("progress=")
+        || l.contains("Resumed reading")
+        || l.contains("Last message repeated")
+}
+
+/// Keep a stderr line out of the log's reach of credentials: the repo's redaction, plus the
+/// loopback URL's bearer token (`http://127.0.0.1:P/u/<token>`), which `redact` can't know.
+fn scrub(line: &str) -> String {
+    let line = redact(line);
+    let mut out = String::with_capacity(line.len());
+    let mut rest: &str = &line;
+    while let Some(i) = rest.find("/u/") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail.find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace() || c == '"' || c == '\'').unwrap_or(tail.len());
+        out.push_str(if end > 0 { "***" } else { "" });
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The last few meaningful stderr lines of one child: bounded by count ([`TAIL_LINES`]) and by
+/// line length, each line scrubbed on the way in ([`scrub`]), so what is held is safe to log.
+#[derive(Debug, Default)]
+pub struct Tail {
+    lines: VecDeque<String>,
+}
+
+impl Tail {
+    /// Keep `line` unless it is noise ([`is_noise`]); the oldest line goes when full.
+    pub fn push(&mut self, line: &str) {
+        if is_noise(line) {
+            return;
+        }
+        let mut kept = scrub(line.trim());
+        if let Some((i, _)) = kept.char_indices().nth(TAIL_CHARS) {
+            kept.truncate(i);
+            kept.push('…');
+        }
+        if self.lines.len() == TAIL_LINES {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(kept);
+    }
+
+    /// Oldest first.
+    pub fn lines(&self) -> Vec<String> {
+        self.lines.iter().cloned().collect()
+    }
+}
+
+/// What ffmpeg's last words say about the input (§8.1): the loopback proxy closing the
+/// connection or the provider dropping it. `resumed`: the proxy had already resumed a broken
+/// provider stream for this feed, which is what makes a bare `Invalid data found` (a cut-off
+/// container) the upstream's doing and not a damaged file.
+pub fn upstream_hint(lines: &[String], resumed: bool) -> Option<&'static str> {
+    const DROPS: [&str; 7] =
+        ["connection reset", "end of file", "i/o error", "broken pipe", "connection timed out", "connection refused", "server returned 5"];
+    let hit = lines.iter().rev().any(|l| {
+        let l = l.to_ascii_lowercase();
+        DROPS.iter().any(|d| l.contains(d)) || (resumed && l.contains("invalid data found"))
+    });
+    hit.then_some("the input stream broke: the provider dropped the connection or the relay's proxy closed it")
+}
+
+impl Failure {
+    /// The text of the WARN line after `ffmpeg stopped with an error`: the status, the upstream
+    /// finding in plain words if the lines show one, and the last stderr lines.
+    pub fn text(&self, resumed: bool) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.status.is_empty() {
+            parts.push(self.status.clone());
+        }
+        if let Some(h) = upstream_hint(&self.lines, resumed) {
+            parts.push(h.to_owned());
+        }
+        if self.lines.is_empty() {
+            parts.push("no stderr".to_owned());
+        } else {
+            parts.push(format!("last stderr: {}", self.lines.join(" | ")));
+        }
+        parts.join("; ")
+    }
+
+    /// `"3652.4 s"` for the INFO line; `None` when ffmpeg never reported progress.
+    pub fn at(&self) -> Option<String> {
+        self.media_s.map(|s| format!("{s:.1} s"))
+    }
 }
 
 /// Progress callbacks (from the supervisor task).
 pub struct Progress {
+    /// Seconds into the item the output starts at (the input's `-ss`): added to the progress
+    /// pipe's `out_time_us` for [`Failure::media_s`].
+    pub base_s: f64,
     /// Watch `speed=` against [`SLOW_SPEED`] (a live conversion).
     pub watch_speed: bool,
     /// Called once when converting stays too slow for [`SLOW_FOR`].
@@ -558,29 +695,36 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
     let pid = child.id();
     let (tx, rx) = watch::channel(None);
     let kill = CancellationToken::new();
-    if let Some(err) = child.stderr.take() {
+    let seen = Arc::new(Seen::default());
+    let drained = child.stderr.take().map(|err| {
         let label = label.clone();
+        let seen = seen.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(err).lines();
             let mut n = 0usize;
             while let Ok(Some(line)) = lines.next_line().await {
                 n += 1;
                 if n <= STDERR_LINES {
-                    tracing::debug!("{label}: ffmpeg: {}", redact(line.trim_end()));
+                    tracing::debug!("{label}: ffmpeg: {}", scrub(line.trim_end()));
                 }
+                seen.tail.lock().unwrap_or_else(|e| e.into_inner()).push(&line);
             }
             if n > STDERR_LINES {
                 tracing::debug!("{label}: ffmpeg: {} more stderr lines not logged", n - STDERR_LINES);
             }
-        });
-    }
+        })
+    });
+    let Progress { base_s, watch_speed, on_slow } = progress;
     if let Some(out) = child.stdout.take() {
-        let Progress { watch_speed, on_slow } = progress;
+        let seen = seen.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(out).lines();
             let mut slow = SpeedWatch::default();
             let mut on_slow = Some(on_slow);
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(s) = line.strip_prefix("out_time_us=").and_then(parse_out_time) {
+                    *seen.media_s.lock().unwrap_or_else(|e| e.into_inner()) = Some(base_s + s);
+                }
                 if !watch_speed {
                     continue;
                 }
@@ -594,16 +738,20 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
         });
     }
     let stop = kill.clone();
+    let shared = seen.clone();
     tokio::spawn(async move {
+        let seen = shared;
         let exit = tokio::select! {
             status = child.wait() => match status {
                 Ok(s) if s.success() => Exit::Done,
                 Ok(s) => {
                     tracing::debug!("{label}: ffmpeg exited: {s}");
+                    *seen.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(s.to_string());
                     Exit::Failed
                 }
                 Err(e) => {
                     tracing::debug!("{label}: ffmpeg wait: {e}");
+                    *seen.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("wait failed: {e}"));
                     Exit::Failed
                 }
             },
@@ -613,9 +761,13 @@ pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progres
                 Exit::Killed
             }
         };
+        // stderr ends with the process: let its last lines land before anyone asks why
+        if let Some(d) = drained {
+            let _ = tokio::time::timeout(STDERR_DRAIN, d).await;
+        }
         let _ = tx.send(Some(exit));
     });
-    Ok(Child { kill, exit: rx, pid, started: Instant::now() })
+    Ok(Child { kill, exit: rx, pid, started: Instant::now(), seen })
 }
 
 impl Child {
@@ -643,6 +795,15 @@ impl Child {
         }
     }
 
+    /// Why it ended with an error (call after [`Child::wait`] returned [`Exit::Failed`]).
+    pub fn failure(&self) -> Failure {
+        Failure {
+            status: self.seen.status.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default(),
+            lines: self.seen.tail.lock().unwrap_or_else(|e| e.into_inner()).lines(),
+            media_s: *self.seen.media_s.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -663,6 +824,11 @@ impl Child {
             }
         }
     }
+}
+
+/// `-progress` `out_time_us=` values (microseconds; `N/A` before the first packet).
+fn parse_out_time(v: &str) -> Option<f64> {
+    v.trim().parse::<i64>().ok().filter(|us| *us >= 0).map(|us| us as f64 / 1e6)
 }
 
 /// `-progress` `speed=` values: `" 0.97x"`, `"1.02x"`, `"N/A"`.
@@ -884,5 +1050,71 @@ mod tests {
     #[test]
     fn the_read_bursts_number_is_the_arguments() {
         assert_eq!(READ_BURST_S.parse::<f64>(), Ok(READ_BURST));
+    }
+
+    #[test]
+    fn the_tail_drops_noise_stays_bounded_and_hides_credentials() {
+        let mut t = Tail::default();
+        for noise in [
+            "",
+            "   ",
+            "frame= 1200 fps= 30 q=-1.0 size=N/A time=00:00:40.00 bitrate=N/A speed=1.0x",
+            "size=    1024kB time=00:00:10.00",
+            "[http @ 0x55] Resumed reading at pos 1048576",
+            "    Last message repeated 14 times",
+        ] {
+            assert!(is_noise(noise), "{noise:?}");
+            t.push(noise);
+        }
+        assert!(t.lines().is_empty());
+        assert!(!is_noise("[mov,mp4 @ 0x1] Invalid data found when processing input"));
+        t.push("http://user:hunter2@provider.example/movie/u/p/443235.mp4: Connection reset by peer");
+        t.push("[tcp @ 0x2] Failed to open http://127.0.0.1:41234/u/abcdefghijklmnop?x=1: End of file");
+        let lines = t.lines();
+        let all = lines.join("\n");
+        assert!(!all.contains("hunter2") && !all.contains("abcdefghijklmnop"), "{all}");
+        assert!(lines[0].contains("***@provider.example"), "{}", lines[0]);
+        assert!(lines[1].contains("/u/***?x=1: End of file"), "{}", lines[1]);
+        for i in 0..100 {
+            t.push(&format!("line {i}"));
+        }
+        let kept = t.lines();
+        assert_eq!(kept.len(), TAIL_LINES);
+        assert_eq!(kept.first().map(String::as_str), Some("line 92"));
+        assert_eq!(kept.last().map(String::as_str), Some("line 99"));
+        t.push(&"x".repeat(5 * TAIL_CHARS));
+        assert_eq!(t.lines().last().map(|l| l.chars().count()), Some(TAIL_CHARS + 1));
+    }
+
+    #[test]
+    fn the_failure_text_names_the_status_the_upstream_and_the_last_lines() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let dropped = Failure {
+            status: "exit status: 1".into(),
+            lines: lines(&["[tcp @ 0x2] Connection reset by peer", "pipe:: Input/output error"]),
+            media_s: Some(722.4),
+        };
+        assert_eq!(
+            dropped.text(false),
+            "exit status: 1; the input stream broke: the provider dropped the connection or the relay's proxy closed it; \
+             last stderr: [tcp @ 0x2] Connection reset by peer | pipe:: Input/output error"
+        );
+        assert_eq!(dropped.at().as_deref(), Some("722.4 s"));
+
+        let bad =
+            Failure { status: "signal: 11 (SIGSEGV)".into(), lines: lines(&["[mov @ 0x1] Invalid data found when processing input"]), media_s: None };
+        assert_eq!(bad.text(false), "signal: 11 (SIGSEGV); last stderr: [mov @ 0x1] Invalid data found when processing input");
+        assert!(bad.text(true).contains("the input stream broke"), "after a resume it is the upstream's doing");
+        assert_eq!(bad.at(), None);
+
+        let silent = Failure { status: String::new(), lines: Vec::new(), media_s: None };
+        assert_eq!(silent.text(true), "no stderr");
+    }
+
+    #[test]
+    fn progress_time_is_microseconds() {
+        assert_eq!(parse_out_time("1500000"), Some(1.5));
+        assert_eq!(parse_out_time("N/A"), None);
+        assert_eq!(parse_out_time("-9223372036854775807"), None);
     }
 }
