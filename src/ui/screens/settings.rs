@@ -1209,7 +1209,7 @@ impl SettingsScreen {
                 v.extend(PLAYER_TEXT[..2].iter().map(Row::Text));
                 v.push(Row::Choice(&PLAYER_SUB));
                 v.push(Row::Number(&PLAYER_N[6]));
-                v.push(Row::Section("Lip sync".into()));
+                v.push(Row::Section("Audio delay".into()));
                 v.push(Row::Note(
                     "Sound earlier / later for each audio output. [ / ] in the player step by 50 ms; negative is earlier.".into(),
                     false,
@@ -3279,9 +3279,8 @@ impl SettingsScreen {
                     }
                     Row::LipSync { output, reset } => {
                         if *reset {
-                            inner.label(
-                                RichText::new(format!("Reset lip sync · {}", output.label)).size(theme.font(TypeToken::Body)).color(label_color),
-                            );
+                            inner
+                                .label(RichText::new(format!("Reset delay · {}", output.label)).size(theme.font(TypeToken::Body)).color(label_color));
                         } else {
                             let playing = std::iter::once(ctx.player).chain(ctx.multiview.snaps.iter().flatten()).any(|snap| {
                                 snap.cast.is_none()

@@ -1,4 +1,4 @@
-//! Audio / subtitle track menu over the video (fixed dark scrim). Audio also has lip sync
+//! Audio / subtitle track menu over the video (fixed dark scrim). Audio also has delay
 //! (−/+ 50 ms) and Reset; subtitles have delay (−/+ 100 ms) and size rows. Owner: WP-11.
 //!
 //! A panel at the right edge of the window, vertically centred (clear of the OSD bars and the
@@ -128,8 +128,8 @@ fn row_label(row: &Row) -> (String, bool) {
         Row::SubsOff { selected } => ("Off".into(), *selected),
         Row::Delay(d) => (format!("Delay  ‹ {:+.1} s ›", d), false),
         Row::Size(s) => (format!("Size  ‹ {:.0} % ›", s * 100.0), false),
-        Row::LipSync(ms) => (format!("Lip sync: {}", crate::player::audio_output::offset_text(*ms)), false),
-        Row::LipSyncReset => ("Reset lip sync".into(), false),
+        Row::LipSync(ms) => (format!("Delay: {}", crate::player::audio_output::offset_text(*ms)), false),
+        Row::LipSyncReset => ("Reset delay".into(), false),
     }
 }
 
@@ -138,7 +138,7 @@ fn stepped(row: &Row) -> Option<(&'static str, String)> {
     match row {
         Row::Delay(d) => Some(("Delay", format!("{:+.1} s", d))),
         Row::Size(s) => Some(("Size", format!("{:.0} %", s * 100.0))),
-        Row::LipSync(ms) => Some(("Lip sync", format!("{ms:+} ms"))),
+        Row::LipSync(ms) => Some(("Delay", format!("{ms:+} ms"))),
         _ => None,
     }
 }
@@ -442,9 +442,9 @@ mod tests {
         draw(true, "[]"); // egui's first Area frame measures it before painting
         let empty = draw(true, "[]");
         assert!(shows(&empty, "No audio tracks"));
-        assert!(shows(&empty, "Lip sync"));
+        assert!(shows(&empty, "Delay"));
         assert!(shows(&empty, "+0 ms"));
-        assert!(shows(&empty, "Reset lip sync"));
+        assert!(shows(&empty, "Reset delay"));
         let tracks = draw(true, r#"[{"id":1,"type":"audio","title":"English"}]"#);
         assert!(!shows(&tracks, "No audio tracks"));
         assert!(shows(&tracks, "English"));

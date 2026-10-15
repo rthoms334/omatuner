@@ -446,7 +446,7 @@ impl Screen for PlayerScreen {
                 if ctx.player.cast.is_none() && previous.name != output.name =>
             {
                 self.flash = None;
-                self.cast_notice(ctx, &format!("Lip sync for {}: {}", output.label, crate::player::audio_output::offset_text(*offset_ms)));
+                self.cast_notice(ctx, &format!("Delay for {}: {}", output.label, crate::player::audio_output::offset_text(*offset_ms)));
             }
             // an episode stopped early (not watched) gets no up-next card
             AppEvent::Player(PlayerEvent::Ended { finished: true, .. }) => self.end_of_playback(ctx),
@@ -944,7 +944,7 @@ mod tests {
         assert!(h.state().s.flash_text.is_none());
         let headphones = AudioOutput { name: "headphones".into(), label: "Headphones".into() };
         event(&mut h, Some(renamed), headphones);
-        assert_eq!(h.state().s.flash_text.as_ref().map(|(text, _)| text.as_str()), Some("Lip sync for Headphones: 150 ms earlier"));
+        assert_eq!(h.state().s.flash_text.as_ref().map(|(text, _)| text.as_str()), Some("Delay for Headphones: 150 ms earlier"));
     }
 
     /// Click at 50 % of the slider → 65 % (of 0–130); a wheel notch over it → +5; the speaker

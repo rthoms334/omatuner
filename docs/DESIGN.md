@@ -2030,12 +2030,12 @@ it). Nothing playing: "Nothing playing · o · Esc" on black, with a "Back to th
 button.
 
 
-### 13.8.1 Lip sync
+### 13.8.1 Delay
 
 Local playback remembers one audio offset per output in `player.lip_sync`, a map from the
 output's name to `{ offset_ms, label }`. Negative means sound earlier. `[` / `]` step by 50 ms,
-clamped to ±2000 ms, apply immediately and flash “Sound 150 ms earlier · MacBook Air Speakers”
-(at zero, “Lip sync: in step”). The keys are shared by live, VOD and the pop-out; the guide's
+clamped to ±2000 ms, apply immediately and flash “Delay: sound 150 ms earlier · MacBook Air Speakers”
+(at zero, “Delay: in step”). The keys are shared by live, VOD and the pop-out; the guide's
 day keys and detail's season keys stay in their own contexts. Saves wait for 500 ms without a
 change, and pending values are saved on exit.
 
@@ -2047,15 +2047,15 @@ one at a time; output events within 1.5 s of the last query are ignored. A faile
 the current output and its last good label; before any identification, `auto` uses one “This
 computer” entry. The controller applies the cached output's saved `audio-delay` in seconds on
 every local load and checks again every 15 s while playing or paused. Changing output names
-applies that output's offset (zero when unseen) and flashes “Lip sync for ‹label›: ‹offset›”.
+applies that output's offset (zero when unseen) and flashes “Delay for ‹label›: ‹offset›”.
 Every discovered output is remembered, including at zero; the first identification is silent.
 
-Audio tracks (`A`) has a Lip sync stepper (←/→, earlier/later buttons) and Reset; stream info
-(`I`) shows the offset and output. Settings ▸ Player ▸ Lip sync lists the remembered outputs
-with the current output marked, the usual value-row stepper and a Reset row. Its keys use
+Audio tracks (`A`) has a Delay stepper (←/→, earlier/later buttons) and Reset delay; stream info
+(`I`) shows “Audio delay: ‹offset›” and the output. Settings ▸ Player ▸ Audio delay lists the
+remembered outputs with the current output marked, the usual value-row stepper and a Reset row. Its keys use
 the Settings model: → / l increases, Shift+← / H decreases, Enter on Reset resets; ← / h
 returns to the page list. Config edits apply to every local picture in multi-view. Casting
-has no lip-sync controls and never receives the offset. Lip sync owns `audio-delay` even if
+has no audio delay controls and never receives the offset. Delay owns `audio-delay` even if
 raw mpv options set it; backups keep this computer's saved outputs.
 
 ### 13.9 Settings
@@ -2109,7 +2109,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Zapping delay | `player.zap_delay_ms` | 300 |
 | | Skip small / big | `player.skip_small_s`, `skip_large_s` | 10 · 60 |
 | | Audio / subtitle languages · subtitle auto · subtitle size | `player.audio_langs`, `sub_langs`, `sub_auto`, `sub_scale` | eng · eng · forced · 1.0 |
-| | Lip sync per audio output (stepper · Reset; §13.8.1) | `player.lip_sync` → `{ offset_ms, label }` | {} (0 ms) |
+| | Audio delay per output (stepper · Reset; §13.8.1) | `player.lip_sync` → `{ offset_ms, label }` | {} (0 ms) |
 | | Reconnect attempts | `player.reconnect_max_attempts` | 8 |
 | | Resume threshold · watched % | `player.resume_min_s`, `watched_pct` | 60 · 92 |
 | | Default User-Agent | `player.user_agent` | VLC/3.0.21 |
@@ -2692,7 +2692,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
-| `[` / `]` | Sound earlier / later (50 ms) |
+| `[` / `]` | Delay: sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |
@@ -2731,7 +2731,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
-| `[` / `]` | Sound earlier / later (50 ms) |
+| `[` / `]` | Delay: sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |

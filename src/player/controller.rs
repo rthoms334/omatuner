@@ -1628,7 +1628,7 @@ impl Controller {
     fn apply_lip_sync(&mut self) {
         let ms = self.applied.player.lip_sync.get(&self.snap.audio_output.name).map_or(0, crate::config::LipSync::offset_ms);
         if let Err(e) = self.mpv.set_property("audio-delay", f64::from(ms) / 1000.0) {
-            tracing::warn!("{}: couldn't set lip sync: {e}", self.log);
+            tracing::warn!("{}: couldn't set audio delay: {e}", self.log);
             return;
         }
         self.snap.lip_sync_ms = ms;

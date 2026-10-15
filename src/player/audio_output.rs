@@ -1,4 +1,4 @@
-//! Local audio output identity for lip sync (DESIGN §13.8.1). A helper thread runs pactl;
+//! Local audio output identity for audio delay (DESIGN §13.8.1). A helper thread runs pactl;
 //! its two queries share a short timeout, including draining their output pipes.
 
 use std::process::Stdio;
@@ -150,7 +150,7 @@ pub fn offset_text(offset_ms: i32) -> String {
 }
 
 pub fn adjustment_text(output: &AudioOutput, offset_ms: i32) -> String {
-    if offset_ms == 0 { "Lip sync: in step".into() } else { format!("Sound {} · {}", offset_text(offset_ms), output.label) }
+    if offset_ms == 0 { "Delay: in step".into() } else { format!("Delay: sound {} · {}", offset_text(offset_ms), output.label) }
 }
 
 #[cfg(test)]

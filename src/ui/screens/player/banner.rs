@@ -90,7 +90,7 @@ impl PlayerScreen {
             (None, None) => vec!["Reading stream info…".into()],
         };
         if snap.cast.is_none() {
-            lines.push(format!("Lip sync {}", crate::player::audio_output::offset_text(snap.lip_sync_ms)));
+            lines.push(format!("Audio delay: {}", crate::player::audio_output::offset_text(snap.lip_sync_ms)));
             lines.push(format!("Output   {}", snap.audio_output.label));
         }
         let p = ui.painter_at(rect);
