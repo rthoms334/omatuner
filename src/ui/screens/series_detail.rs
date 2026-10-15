@@ -56,6 +56,7 @@ enum Btn {
     PlayFrom,
     Favourite,
     SeasonWatched,
+    RemoveContinue,
 }
 
 /// Context-menu choices (echoed back as `Action::Digit`).
@@ -80,6 +81,8 @@ struct Data {
     across: HashMap<ItemKey, WatchProgress>,
     /// The next episode from the copy with the newest progress, as this copy's episode.
     next_across: Option<EpisodeId>,
+    /// An unfinished episode in another copy, including episodes absent from this copy.
+    continuing_others: bool,
 }
 
 impl Data {
@@ -107,6 +110,7 @@ fn load(c: &rusqlite::Connection, id: SeriesId, others: Vec<SeriesId>) -> crate:
         }
     }
     let next = vod::next_episode(c, id)?.map(|e| e.id);
+    let continuing_others = crate::store::copies::series_in_continue_watching(c, &others)?;
     let mut across = progress.clone();
     let (mut next_across, mut unloaded) = (next, Vec::new());
     if !others.is_empty() {
@@ -129,7 +133,7 @@ fn load(c: &rusqlite::Connection, id: SeriesId, others: Vec<SeriesId>) -> crate:
                 if s == id { Some(ep.id) } else { episodes.iter().find(|x| (x.season, x.episode) == (ep.season, ep.episode)).map(|x| x.id).or(next) };
         }
     }
-    Ok(Data { series, seasons, episodes, progress, next, others, unloaded, across, next_across })
+    Ok(Data { series, seasons, episodes, progress, next, others, unloaded, across, next_across, continuing_others })
 }
 
 fn episode_ref(e: &Episode) -> ItemRef {
@@ -290,11 +294,35 @@ impl SeriesDetailScreen {
     }
 
     fn buttons(&self) -> Vec<Btn> {
-        if self.copies.is_stacked() {
+        let mut buttons = if self.copies.is_stacked() {
             vec![Btn::Play, Btn::PlayFrom, Btn::Favourite, Btn::SeasonWatched]
         } else {
             vec![Btn::Play, Btn::Favourite, Btn::SeasonWatched]
+        };
+        if self.in_continue_watching() {
+            buttons.push(Btn::RemoveContinue);
         }
+        buttons
+    }
+
+    fn in_continue_watching(&self) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|d| d.progress.values().any(|p| !p.finished && p.position_s > 0.0) || self.copies.combined() && d.continuing_others)
+    }
+
+    fn remove_continue(&mut self, ctx: &mut UiCtx<'_>) {
+        if !self.in_continue_watching() {
+            return;
+        }
+        if self.copies.combined() {
+            crate::ui::copies::forget_series(ctx, self.copies.plan());
+        } else if let Some(id) = self.id {
+            crate::ui::copies::write_with_undo(ctx, DataScope::Progress, "Removed from Continue watching".into(), move |c| {
+                crate::store::copies::forget_series(c, &[id])
+            });
+        }
+        self.btn = 0;
     }
 
     /// The copy Play uses when it isn't this page's (DESIGN §29.14).
@@ -422,6 +450,7 @@ impl SeriesDetailScreen {
                 let eps = self.current_episodes().into_iter().cloned().collect();
                 self.mark(ctx, eps, on);
             }
+            Btn::RemoveContinue => self.remove_continue(ctx),
         }
     }
 
@@ -578,6 +607,7 @@ impl Screen for SeriesDetailScreen {
                     self.mark(ctx, vec![e], on);
                 }
             }
+            Action::Remove if self.section == Section::Buttons => self.remove_continue(ctx),
             Action::ToggleFavourite if self.section == Section::Episodes => {
                 if let Some(e) = self.focused_episode() {
                     kit::toggle_favourite(ctx, &ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key });
@@ -638,6 +668,11 @@ impl Screen for SeriesDetailScreen {
                     mi(glyphs::CHECK, "Mark season watched", Action::Digit(MENU_SEASON_WATCHED), None),
                     mi(glyphs::CLOSE, "Mark season unwatched", Action::Digit(MENU_SEASON_UNWATCHED), None),
                     episode,
+                ]);
+                if self.in_continue_watching() {
+                    items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, Some("Delete")));
+                }
+                items.extend([
                     mi(glyphs::FAVOURITE, "Save to / remove from My list", Action::ToggleFavourite, Some("Ctrl+F")),
                     mi(glyphs::FAV_LIST, "Watchlists…", Action::AddToList, Some("Ctrl+Shift+F")),
                     mi(glyphs::TAG, if every { "Rename every copy…" } else { "Rename…" }, Action::Rename, Some("F2")),
@@ -673,6 +708,7 @@ impl Screen for SeriesDetailScreen {
         }
         match result {
             OverlayResult::Chosen(Action::PlayFrom) => self.copies.play_from_menu(ctx),
+            OverlayResult::Chosen(Action::Remove) => self.remove_continue(ctx),
             OverlayResult::Chosen(Action::Digit(super::copies::SAME_TITLE)) => {
                 if let Some((item, d)) = self.series_ref().zip(self.data.as_ref()) {
                     let name = d.series.display_name().to_owned();
@@ -871,6 +907,7 @@ impl Screen for SeriesDetailScreen {
                                 false,
                                 season_watched,
                             ),
+                            Btn::RemoveContinue => (glyphs::CLOSE, "Remove from Continue watching".into(), false, false),
                         };
                         let style = ButtonStyle {
                             primary,
@@ -1102,6 +1139,7 @@ mod tests {
                 unloaded: Vec::new(),
                 across: HashMap::new(),
                 next_across: Some(EpisodeId(4)),
+                continuing_others: false,
             }),
             ..Default::default()
         }
@@ -1341,6 +1379,81 @@ mod tests {
             title: String::new(),
             fingerprint: Default::default(),
         }
+    }
+
+    #[test]
+    fn remove_from_continue_watching_series_button_delete_and_undo() {
+        let (mut t, one) = rig();
+        let (id, source) = seed(&mut t, |c| {
+            let source = testkit::source(c, "Alpha")?;
+            let id = testkit::named_series(c, source, &[("EN ★ Severance - 2022", "Severance")], 3)?[0];
+            crate::store::user::save_progress(c, &named_progress(source, 1, 1.0, false, 10))?;
+            crate::store::user::save_progress(c, &named_progress(source, 2, 2700.0, true, 20))?;
+            Ok((id, source))
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        let label = "Remove from Continue watching";
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "series removal", |h| has_label(h, label));
+        // Delete in the episode list leaves the series alone.
+        assert_eq!(h.state().s.section, Section::Episodes);
+        h.state_mut().act(Action::Remove);
+        h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
+        assert!(named_ep(&h, source, 1).is_some());
+        // Tab to buttons, then right past Play, My list and Mark season watched.
+        h.state_mut().act(Action::FocusNext);
+        for _ in 0..3 {
+            h.state_mut().act(Action::Right);
+        }
+        h.state_mut().act(Action::Activate);
+        let toast = h.state_mut().undo_toast().expect("series removal offers Undo");
+        assert_eq!(toast.text, "Removed from Continue watching");
+        assert!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().is_empty());
+        assert!(named_ep(&h, source, 1).is_none() && named_ep(&h, source, 2).is_none());
+        until(&mut h, "series Remove disappears", |h| !has_label(h, label));
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "series Undo", |h| has_label(h, label) && named_ep(h, source, 1).is_some() && named_ep(h, source, 2).is_some());
+        assert_eq!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().len(), 1);
+        h.state_mut().act(Action::Remove);
+        until(&mut h, "Delete with buttons focused", |h| {
+            !has_label(h, label) && crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().is_empty()
+        });
+    }
+
+    #[test]
+    fn remove_from_continue_watching_series_menu_forgets_every_copy() {
+        let (mut t, one) = rig();
+        let (id, a, b) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let id = testkit::named_series(c, a, &[("EN ★ Severance - 2022", "Severance")], 2)?[0];
+            testkit::named_series(c, b, &[("EN - Severance (2022)", "Severance")], 3)?;
+            crate::store::user::save_progress(c, &named_progress(a, 1, 2700.0, true, 30))?;
+            crate::store::user::save_progress(c, &named_progress(b, 1, 600.0, false, 10))?;
+            crate::store::user::save_progress(c, &named_progress(b, 2, 2700.0, true, 40))?;
+            // This episode is absent from Alpha; Bravo's latest progress is finished.
+            crate::store::user::save_progress(c, &named_progress(b, 3, 300.0, false, 20))?;
+            Ok((id, a, b))
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        let label = "Remove from Continue watching";
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "combined series removal", |h| has_label(h, "COPIES · 2") && has_label(h, label));
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::ContextMenu(menu))] = nav.as_slice() else { panic!("{nav:?}") };
+        assert!(menu.items.iter().any(|i| i.label == label && i.action == Action::Remove && i.shortcut.as_deref() == Some("Delete")));
+        // Menu removal works even with the episode list focused.
+        h.state_mut().result(OverlayResult::Chosen(Action::Remove));
+        let toast = h.state_mut().undo_toast().expect("combined series removal offers Undo");
+        assert_eq!(toast.text, "Removed from Continue watching");
+        assert!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().is_empty());
+        assert!([a, b].iter().all(|&s| (1..=3).all(|n| named_ep(&h, s, n).is_none())));
+        until(&mut h, "combined series Remove disappears", |h| !has_label(h, label));
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "combined series Undo", |h| has_label(h, label) && named_ep(h, b, 3).is_some());
+        assert_eq!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().len(), 2);
+        assert!(named_ep(&h, a, 1).unwrap().finished && named_ep(&h, b, 2).unwrap().finished);
     }
 
     /// P3 (DESIGN §29.15): a combined series' page matches episodes across its copies by
