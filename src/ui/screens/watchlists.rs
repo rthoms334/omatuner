@@ -203,7 +203,10 @@ impl WatchlistsScreen {
                 mi("Play just this one", ONE, e.playable.is_some()),
                 mi("Add to Up next", QUEUE, e.playable.is_some()),
                 mi("Play next", QUEUE_NEXT, e.playable.is_some()),
-                MenuItem { shortcut: Some("Ctrl+W".into()), ..mi(&watched, WATCHED, e.entry.item.is_some() && (!current || e.episode.is_some())) },
+                MenuItem {
+                    shortcut: Some("Ctrl+W".into()),
+                    ..mi(&watched, WATCHED, e.entry.item.is_some() && (!current || e.episode.is_some() || e.playable.is_some()))
+                },
             ];
             if series {
                 items.push(mi("Mark all watched", ALL_WATCHED, e.entry.item.is_some()));
@@ -330,9 +333,6 @@ impl WatchlistsScreen {
     fn mark(&mut self, ctx: &mut UiCtx<'_>, all: bool) {
         let Some(e) = self.entry() else { return };
         let on = all || e.status != EntryStatus::Done;
-        if !all && on && e.entry.kind == ItemKind::Series && e.episode.is_none() {
-            return;
-        }
         if matches!(e.entry.kind, ItemKind::Series | ItemKind::Episode)
             && let Some(item) = &e.entry.item
         {
@@ -356,6 +356,7 @@ impl WatchlistsScreen {
             if !unloaded.is_empty() {
                 self.fetch.start(ctx, &unloaded);
                 self.pending_mark = Some((e, on, all));
+                ctx.toast(crate::msg::Toast::info("Loading episodes…"));
                 return;
             }
         }
@@ -849,12 +850,26 @@ impl Screen for WatchlistsScreen {
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         self.sync(ctx);
         if let Some(failed) = self.fetch.poll(ctx, ui.ctx()) {
-            if !failed.is_empty() {
+            if failed.is_empty() {
+                shared::invalidate();
+                self.sync(ctx);
+            } else {
                 ctx.toast(crate::msg::Toast::error("Some copies couldn't load their episodes"));
+                self.pending_mark = None;
             }
-            if let Some((e, on, all)) = self.pending_mark.take()
-                && failed.is_empty()
-            {
+        }
+        if !self.fetch.busy()
+            && !shared::loading()
+            && let Some((e, on, all)) = self.pending_mark.take()
+        {
+            // Keep a known episode fixed while other copies load. If no copy had episodes,
+            // use this entry's current episode from the refreshed view, even after moving.
+            let e = if e.entry.kind == ItemKind::Series && on && !all && e.episode.is_none() {
+                self.snapshot.list(e.entry.list_id).and_then(|v| v.entries.iter().find(|current| current.entry.id == e.entry.id)).cloned()
+            } else {
+                Some(e)
+            };
+            if let Some(e) = e {
                 Self::finish_mark(ctx, e, on, all);
             }
         }
@@ -919,6 +934,105 @@ mod tests {
 
     fn movie(source: SourceId, n: usize) -> ItemRef {
         ItemRef { source, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{n:010}")) }
+    }
+
+    type H = egui_kittest::Harness<'static, testkit::App<WatchlistsScreen>>;
+
+    fn unloaded_series() -> H {
+        let (mut t, one) = rig();
+        let list = seed(&mut t, |c| {
+            for name in ["TV", "TV 2"] {
+                let src = testkit::source(c, name)?;
+                testkit::series(c, src, 1, 2, 4)?;
+                c.execute("UPDATE series SET year=2020, details_at=NULL WHERE source_id=?1", [src])?;
+                c.execute("UPDATE source SET kind='xtream' WHERE id=?1", [src])?;
+                crate::store::titles::refresh_source(c, src)?;
+            }
+            testkit::movies(c, SourceId(1), 1)?;
+            let list = store::create(c, "Unloaded episodes", None, PlayOrder::Ordered, "app", 1)?;
+            let lib = crate::store::library::load(c)?;
+            let series = ItemRef { source: SourceId(1), kind: ItemKind::Series, key: ItemKey("m3u:series000000000".into()) };
+            let mut range = store::new_entry(c, &series)?;
+            range.season_from = Some(2);
+            range.season_to = Some(2);
+            store::add(c, &lib, list, &[range, store::new_entry(c, &movie(SourceId(1), 0))?], crate::watchlist::Insert::End, 1)?;
+            crate::store::user::save_progress(
+                c,
+                &crate::model::WatchProgress {
+                    item: ItemRef { source: SourceId(1), kind: ItemKind::Episode, key: ItemKey("m3u:ep0-2-3".into()) },
+                    position_s: 90.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 2,
+                    finished: false,
+                    title: "Episode 3".into(),
+                    fingerprint: Default::default(),
+                },
+            )?;
+            // The fake load restores these rows when the test chooses; no provider needed.
+            c.execute_batch("CREATE TEMP TABLE unloaded_episodes AS SELECT * FROM episode; DELETE FROM episode;")?;
+            Ok(list)
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::Watchlists { list: Some(list) });
+        until(&mut h, "unloaded series entry", |h| h.state().s.entry().is_some_and(|e| e.entry.kind == ItemKind::Series));
+        assert!(h.state().s.entry().unwrap().episode.is_none());
+        h
+    }
+
+    #[test]
+    fn mark_current_loads_episodes_and_marks_the_refreshed_entry_after_moving_away() {
+        let mut h = unloaded_series();
+        h.state_mut().act(Action::MarkWatched);
+        assert!(h.state().s.fetch.busy());
+        assert!(h.state().t.toasts.iter().any(|t| t.text == "Loading episodes…"));
+        h.state_mut().act(Action::Down);
+        assert_eq!(h.state().s.entry().unwrap().entry.kind, ItemKind::Movie);
+        seed(&mut h.state_mut().t, |c| {
+            c.execute_batch("INSERT INTO episode SELECT * FROM unloaded_episodes; UPDATE series SET details_at=1;")?;
+            Ok(())
+        });
+        until(&mut h, "numbered watched toast", |h| h.state().t.toasts.iter().any(|t| t.text == "Marked S02E03 watched"));
+        let db = &h.state().t.db;
+        for source in [1, 2] {
+            for season in 1..=2 {
+                for episode in 1..=4 {
+                    let item = ItemRef { source: SourceId(source), kind: ItemKind::Episode, key: ItemKey(format!("m3u:ep0-{season}-{episode}")) };
+                    let watched = crate::store::user::progress(db, &item).unwrap().is_some_and(|p| p.finished);
+                    assert_eq!(watched, (season, episode) == (2, 3), "copy {source}, S{season}E{episode}");
+                }
+            }
+        }
+        assert!(crate::store::user::progress(db, &movie(SourceId(1), 0)).unwrap().is_none());
+        assert_eq!(h.state().s.entry().unwrap().entry.kind, ItemKind::Movie);
+        let toast = h.state_mut().undo_toast().unwrap();
+        assert_eq!(toast.text, "Marked S02E03 watched");
+        assert_eq!(toast.action.unwrap().0, "Undo");
+    }
+
+    #[test]
+    fn unloaded_current_episode_menu_is_enabled_and_a_failed_copy_marks_nothing() {
+        let mut h = unloaded_series();
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let Some(crate::ui::NavRequest::Open(OverlayRequest::ContextMenu(menu))) = nav.last() else { panic!("{nav:?}") };
+        let mark = menu.items.iter().find(|m| m.label == "Mark current episode watched").unwrap();
+        assert!(mark.enabled);
+        h.state_mut().result(OverlayResult::Chosen(mark.action));
+        assert!(h.state().s.fetch.busy());
+        assert!(h.state().t.toasts.iter().any(|t| t.text == "Loading episodes…"));
+        seed(&mut h.state_mut().t, |c| {
+            // One copy loads, the other's job ends without episodes.
+            c.execute_batch(
+                "INSERT INTO episode SELECT * FROM unloaded_episodes WHERE source_id=1; UPDATE series SET details_at=1 WHERE source_id=1;",
+            )?;
+            Ok(())
+        });
+        until(&mut h, "load failure toast", |h| h.state().t.toasts.iter().any(|t| t.text == "Some copies couldn't load their episodes"));
+        assert!(h.state().s.pending_mark.is_none());
+        assert!(!h.state().s.fetch.busy());
+        h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
+        assert_eq!(h.state().t.db.query_row("SELECT count(*) FROM watch_progress WHERE finished=1", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert!(!h.state().t.toasts.iter().any(|t| t.text.starts_with("Marked ")));
     }
 
     #[test]

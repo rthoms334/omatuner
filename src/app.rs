@@ -2576,6 +2576,13 @@ impl TunerApp {
             self.entered = Some(route.clone());
             let idx = self.screen_index(route.screen());
             self.with_ctx(|ctx, screens, _| screens[idx].on_enter(ctx, &route));
+            if let Route::SeriesDetailAt { series, .. } = route {
+                // The page now owns the pending episode. Returning from a child route
+                // must keep the user's selection, while a new Episodes… visit applies anew.
+                let route = Route::SeriesDetail(series);
+                *self.routes.last_mut().expect("current route") = route.clone();
+                self.entered = Some(route);
+            }
         }
     }
 
@@ -3907,7 +3914,7 @@ mod tests {
         rig.press(Key::ArrowRight, NONE);
         rig.press(Key::ArrowDown, NONE);
         rig.press(Key::I, CTRL);
-        assert!(matches!(rig.route(), Route::SeriesDetailAt { season: 2, episode: 4, .. }));
+        assert!(matches!(rig.route(), Route::SeriesDetail(_)));
         // The page's focused row owns Ctrl+W. Earlier seasons remain unwatched, so this
         // also proves the route overrides the series' ordinary next episode.
         rig.until("focused S2E4", |r| find(&texts(&r.frame_with(vec![])), "S2E4").is_some());
@@ -3920,7 +3927,7 @@ mod tests {
         assert_eq!(rig.route(), &origin);
         wait_watchlist_episode(&mut rig, list, (2, 5));
         choose_watchlist_menu(&mut rig, "Episodes…");
-        assert!(matches!(rig.route(), Route::SeriesDetailAt { season: 2, episode: 5, .. }));
+        assert!(matches!(rig.route(), Route::SeriesDetail(_)));
         rig.until("focused S2E5", |r| find(&texts(&r.frame_with(vec![])), "S2E5").is_some());
         rig.press(Key::W, CTRL);
         rig.until("last episode watched", |r| {
@@ -3943,6 +3950,43 @@ mod tests {
         rig.press(Key::ArrowUp, NONE);
         rig.press(Key::I, CTRL);
         assert_eq!(rig.route(), &Route::MovieDetail(crate::model::MovieId(1)), "films use the same Details key");
+    }
+
+    #[test]
+    fn watchlist_episodes_keeps_selection_after_a_child_route_and_reapplies_on_a_new_visit() {
+        let (mut rig, _) = watchlist_episode_rig(2);
+        let origin = rig.route().clone();
+        choose_watchlist_menu(&mut rig, "Episodes…");
+        let page = rig.route().clone();
+        assert!(matches!(page, Route::SeriesDetail(_)));
+        let focused = |r: &mut Rig| {
+            let idx = r.app.screen_index(ScreenId::SeriesDetail);
+            let target = r.app.with_ctx(|ctx, screens, _| screens[idx].reveal_target(ctx));
+            match target {
+                Some(crate::ui::item_menu::Target::Episode { episode, .. }) => {
+                    let ep = crate::store::vod::episode(&r.app.db, episode).unwrap();
+                    Some((ep.season, ep.episode))
+                }
+                _ => None,
+            }
+        };
+        rig.until("opened at S2E4", |r| focused(r) == Some((2, 4)));
+        rig.press(Key::ArrowDown, NONE);
+        assert_eq!(focused(&mut rig), Some((2, 5)));
+        rig.app.nav.push(NavRequest::Push(Route::MovieDetail(crate::model::MovieId(1))));
+        rig.frame_with(vec![]);
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &page);
+        assert_eq!(focused(&mut rig), Some((2, 5)), "return keeps the user's episode");
+        rig.press(Key::W, CTRL);
+        rig.until("selected episode watched after returning", |r| {
+            crate::store::user::progress(&r.app.db, &watchlist_episode_ref(1, 2, 5)).unwrap().is_some_and(|p| p.finished)
+        });
+        assert!(!crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 2, 4)).unwrap().unwrap().finished);
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &origin);
+        choose_watchlist_menu(&mut rig, "Episodes…");
+        rig.until("new visit reapplies S2E4", |r| focused(r) == Some((2, 4)));
     }
 
     // ---- key consumption -----------------------------------------------------------------

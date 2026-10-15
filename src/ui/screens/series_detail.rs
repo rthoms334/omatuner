@@ -506,16 +506,19 @@ impl Screen for SeriesDetailScreen {
             self.ep = 0;
             self.btn = 0;
             self.position_pending = true;
+            self.episode_pending = None;
         }
         self.id = Some(*id);
-        self.episode_pending = episode;
         if let Some((season, episode)) = episode {
+            self.episode_pending = Some((season, episode));
             self.section = Section::Episodes;
             self.position_pending = true;
             // Reopening a cached page must focus the requested row before another key
-            // can act, as well as when its refreshed data arrives.
+            // can act. Once applied, a refresh must keep any later user selection.
             if let Some(id) = self.data.as_ref().and_then(|d| d.episodes.iter().find(|e| (e.season, e.episode) == (season, episode))).map(|e| e.id) {
                 self.select_episode(id);
+                self.position_pending = false;
+                self.episode_pending = None;
             }
         }
         self.missing = false;
@@ -1168,6 +1171,27 @@ mod tests {
     fn ep_progress(t: &crate::ui::testing::TestUi, key: &str) -> Option<WatchProgress> {
         let item = ItemRef { source: SourceId(1), kind: ItemKind::Episode, key: ItemKey(key.into()) };
         crate::store::user::progress(&t.services().store.reader().unwrap(), &item).unwrap()
+    }
+
+    #[test]
+    fn returning_during_a_load_keeps_pending_and_cached_episode_selections() {
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            Ok(testkit::series(c, src, 1, 2, 3)?[0])
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::SeriesDetailAt { series: id, season: 2, episode: 3 });
+        // The app consumes the route target immediately, while the page is still loading.
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "requested episode", |h| h.state().s.focused_episode().is_some_and(|e| (e.season, e.episode) == (2, 3)));
+        // A cached page applies the target immediately. Moving before its refresh arrives
+        // must survive that refresh as well as re-entering the consumed route.
+        h.state_mut().enter(Route::SeriesDetailAt { series: id, season: 2, episode: 1 });
+        h.state_mut().act(Action::Down);
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "refreshed page", |h| h.state().s.loader.is_none());
+        assert_eq!(h.state().s.focused_episode().map(|e| (e.season, e.episode)), Some((2, 2)));
     }
 
     #[test]
