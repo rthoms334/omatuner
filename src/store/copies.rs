@@ -999,6 +999,21 @@ pub fn watched_items(conn: &Connection, items: &[(ItemRef, String)], on: bool, n
     })
 }
 
+/// Whether any episode of these series copies appears in Continue watching. Unlike the
+/// merged episode progress, this also sees unfinished copies of an episode watched elsewhere.
+pub fn series_in_continue_watching(conn: &Connection, copies: &[SeriesId]) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM watch_progress p JOIN episode e ON e.source_id = p.source_id AND e.key = p.item_key
+         WHERE p.kind = 'episode' AND e.series_id = ?1 AND p.finished = 0 AND p.position_s > 0 AND p.orphaned_since IS NULL)",
+    )?;
+    for s in copies {
+        if stmt.query_row([s], |r| r.get::<_, bool>(0))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// "Forget" a combined series (remove it from Continue watching): the progress of every
 /// episode of every copy.
 pub fn forget_series(conn: &Connection, copies: &[SeriesId]) -> Result<Undo> {

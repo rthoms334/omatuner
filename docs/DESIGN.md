@@ -1912,6 +1912,13 @@ Movie                                           Series
 Key context `[Detail]` for both pages: ↑/↓/←/→ move between buttons and episodes, `[`/`]`
 switch seasons, Tab cycles sections (buttons · seasons · episodes), Enter plays/resumes,
 Shift+Enter plays from the start, Ctrl+W marks watched, Ctrl+F favourite, Backspace/Esc back.
+When a film or any episode of a series has unfinished progress above zero (Continue watching),
+show **Remove from Continue watching** after **Mark watched** (**Mark season watched** on a
+series). It is part of the button focus walk and the page's menu (Ctrl+Enter / Shift+F10),
+with Delete while the buttons have focus. Removal forgets progress without marking watched;
+for a combined title it covers every copy, and for a series every episode. The toast says
+"Removed from Continue watching" with Undo. Once removed, the button disappears and the
+film's Resume becomes Play; Undo restores the progress and the action.
 With two or more playlists of that kind (Auto, §13.0) the playlist's badge leads the meta
 line — Xtream pages included.
 Details load lazily with a skeleton; failures keep list-level data with a toast. Resume prompt
