@@ -243,8 +243,9 @@ impl Services {
         self.agent.guard().configure(cfg.clone());
         // a restart into an update from a hidden window exits the way a signal does
         let (registry, writer, socket, cast) = (self.tiles.registry(), self.store.writer().clone(), self.socket.clone(), self.cast_stop.clone());
+        let (config, config_file) = (self.config.clone(), self.paths.config_file());
         let cleanup = move || -> futures_util::future::BoxFuture<'static, ()> {
-            Box::pin(direct_exit_cleanup(registry.all(), writer.clone(), socket.clone(), cast.clone()))
+            Box::pin(direct_exit_cleanup(registry.all(), writer.clone(), socket.clone(), cast.clone(), config.clone(), config_file.clone()))
         };
         self.updater.start(crate::update::service::RestartHooks { closing: self.closing.clone(), cleanup: Arc::new(cleanup) });
     }
@@ -455,12 +456,19 @@ impl Services {
     }
 
     /// What the direct exit does instead of [`Services::shutdown`] (the UI thread can't run
-    /// it): stop casting (the TV's stop within 300 ms, ffmpeg and a waiting pkexec killed, the
+    /// it): save current settings, stop casting (the TV's stop within 300 ms, ffmpeg and a waiting pkexec killed, the
     /// session directories wiped), stop the player (its final progress save goes to the writer),
     /// flush the writer queue, remove the IPC socket. mpv and the WAL are left to process exit /
     /// the next open.
     pub(crate) fn exit_cleanup(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        direct_exit_cleanup(self.tiles.handles(), self.store.writer().clone(), self.socket.clone(), self.cast_stop.clone())
+        direct_exit_cleanup(
+            self.tiles.handles(),
+            self.store.writer().clone(),
+            self.socket.clone(),
+            self.cast_stop.clone(),
+            self.config.clone(),
+            self.paths.config_file(),
+        )
     }
 
     /// Orderly shutdown (see module docs). The video surface must already be destroyed.
@@ -501,7 +509,13 @@ async fn direct_exit_cleanup(
     writer: Writer,
     socket: Arc<Mutex<Option<crate::ipc::SocketGuard>>>,
     cast: Arc<Mutex<Option<crate::cast::service::CastStopper>>>,
+    config: SharedConfig,
+    config_file: std::path::PathBuf,
 ) {
+    // A signal or update restart can bypass the UI's pending lip-sync save and on_exit.
+    if let Err(e) = crate::config::current(&config).save(&config_file) {
+        tracing::warn!("saving settings at exit: {e}");
+    }
     let stopper = cast.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(stopper) = stopper {
         stopper.stop_fast().await;

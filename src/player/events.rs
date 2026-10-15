@@ -42,6 +42,8 @@ pub enum PropId {
     Aid = 17,
     Sid = 18,
     EofReached = 19,
+    AudioDevice = 20,
+    CurrentAo = 21,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,8 @@ const OBSERVED: &[(PropId, &str, Fmt)] = &[
     (PropId::Aid, "aid", Fmt::Str),
     (PropId::Sid, "sid", Fmt::Str),
     (PropId::EofReached, "eof-reached", Fmt::Flag),
+    (PropId::AudioDevice, "audio-device", Fmt::Str),
+    (PropId::CurrentAo, "current-ao", Fmt::Str),
 ];
 
 impl PropId {

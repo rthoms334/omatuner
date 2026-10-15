@@ -38,6 +38,7 @@
 //! a picture that isn't placed or rendered suspends on its own. B starts muted
 //! ([`PlayerCommand::SetAudible`]) with smaller demuxer caches (`mpv::create`).
 
+pub mod audio_output;
 pub mod budget;
 pub mod controller;
 pub mod events;
@@ -335,6 +336,9 @@ pub struct PlayerSnapshot {
     pub seekable: bool,
     pub tracks: Tracks,
     pub sub_delay: f64,
+    /// The local audio output and its saved correction (negative = sound earlier).
+    pub audio_output: audio_output::AudioOutput,
+    pub lip_sync_ms: i32,
     pub sub_scale: f64,
     pub aspect: AspectMode,
     pub zoom: f64,
@@ -390,6 +394,8 @@ impl Default for PlayerSnapshot {
             seekable: false,
             tracks: Tracks::default(),
             sub_delay: 0.0,
+            audio_output: audio_output::AudioOutput::default(),
+            lip_sync_ms: 0,
             sub_scale: 1.0,
             aspect: AspectMode::Auto,
             zoom: 0.0,
@@ -424,6 +430,12 @@ pub enum PlayerEvent {
     },
     Failed(PlayerError),
     TracksChanged,
+    /// The local output was identified or changed; only a change from a previous output flashes.
+    AudioOutputChanged {
+        previous: Option<audio_output::AudioOutput>,
+        output: audio_output::AudioOutput,
+        offset_ms: i32,
+    },
     /// The first copy of a title failed before its first frame (`error`) and the player went
     /// on with the next one ([`CopyPlay::fallback`]): the app toasts "TV couldn't play Dune —
     /// playing from TV 2".
@@ -769,6 +781,72 @@ mod tests {
         assert_eq!(mpv.get_property::<f64>("demuxer-readahead-secs").unwrap(), 4.0);
         assert_eq!(mpv.get_property::<f64>("network-timeout").unwrap(), 7.0);
         assert_eq!(mpv.get_property::<String>("user-agent").unwrap(), "ApplyConfig/1");
+    }
+
+    /// Real mpv properties, headless output: every local picture uses the saved offset on
+    /// load, follows device changes, and never carries speakers' correction onto a new output.
+    #[test]
+    fn lip_sync_applies_on_play_and_follows_the_output_in_each_picture() {
+        use crate::config::LipSync;
+        let mut cfg = headless_config();
+        cfg.player.mpv_options.insert("audio-device".into(), "null/speakers".into());
+        cfg.player.lip_sync.insert("null/speakers".into(), LipSync { offset_ms: -150, label: "Speakers".into() });
+        cfg.player.lip_sync.insert("null/headphones".into(), LipSync { offset_ms: 100, label: "Headphones".into() });
+        let budget = budget::SharedBudget::default();
+        let players: Vec<_> = [TileId::A, TileId::B]
+            .into_iter()
+            .map(|tile| {
+                let deps = PlayerDeps {
+                    bus: EventBus::new(None).0,
+                    store: Box::new(NullPlayerStore),
+                    resolver: Box::new(Lavfi(Vec::new(), Vec::new())),
+                    cast: None,
+                };
+                Player::start_tile(&cfg, deps, tile, budget.clone()).unwrap()
+            })
+            .collect();
+        for p in &players {
+            let mpv = p.mpv.as_ref().unwrap();
+            // mpv stores this option as a float; compare at the millisecond precision we save.
+            let delay_ms = || (mpv.get_property::<f64>("audio-delay").unwrap() * 1000.0).round() as i32;
+            let h = p.handle();
+            play(p);
+            assert!(wait_until(Duration::from_secs(5), || h.snapshot().state == PlayerState::Playing && h.snapshot().lip_sync_ms == -150));
+            assert_eq!(delay_ms(), -150);
+            for (name, ms) in [("null/headphones", 100), ("null/hdmi", 0), ("null/speakers", -150)] {
+                // Output triggers within 1.5 s of a lookup are deliberately ignored.
+                std::thread::sleep(Duration::from_millis(1600));
+                mpv.set_property("audio-device", name).unwrap();
+                assert!(
+                    wait_until(Duration::from_secs(5), || {
+                        let s = h.snapshot();
+                        s.audio_output.name == name && s.lip_sync_ms == ms
+                    }),
+                    "output {name}"
+                );
+                assert_eq!(delay_ms(), ms);
+            }
+            // A fresh load restores the saved correction, even if mpv's value was changed.
+            mpv.set_property("audio-delay", 1.0).unwrap();
+            let generation = h.snapshot().load_generation;
+            play(p);
+            assert!(wait_until(Duration::from_secs(5), || h.snapshot().load_generation > generation && h.snapshot().state == PlayerState::Playing));
+            assert_eq!(delay_ms(), -150);
+        }
+        // Settings applies live to each picture; repeated presses add up and clamp.
+        let saved = cfg.player.lip_sync.get_mut("null/speakers").unwrap();
+        saved.adjust(-1);
+        saved.adjust(-1);
+        assert_eq!(saved.offset_ms, -250);
+        saved.adjust(i32::MIN);
+        assert_eq!(saved.offset_ms, -2000);
+        saved.adjust(i32::MAX);
+        assert_eq!(saved.offset_ms, 2000);
+        for p in &players {
+            p.handle().send(PlayerCommand::ApplyConfig(Box::new(cfg.clone())));
+            assert!(wait_until(Duration::from_secs(5), || p.handle().snapshot().lip_sync_ms == 2000));
+            assert_eq!(p.mpv.as_ref().unwrap().get_property::<f64>("audio-delay").unwrap(), 2.0);
+        }
     }
 
     /// Also per picture (multi-view): picture B, still rendered, keeps decoding while A — not
