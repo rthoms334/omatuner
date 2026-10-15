@@ -90,7 +90,7 @@ pub(super) fn runtime_settings(cfg: &Config, tile: TileId) -> Vec<(&'static str,
         ("user-agent", p.user_agent.clone()),
         ("alang", p.audio_langs.join(",")),
         // A matching slang enables ordinary tracks even with subs-fallback-forced=always
-        // (mpv 0.41). Forced-only selection must leave language ranking to mpv.
+        // (mpv 0.41). The controller ranks forced tracks by language after the file loads.
         ("slang", if p.sub_auto == SubtitleAuto::Forced { String::new() } else { p.sub_langs.join(",") }),
         ("sid", if p.sub_auto == SubtitleAuto::Off { "no" } else { "auto" }.into()),
         ("subs-fallback-forced", if p.sub_auto == SubtitleAuto::Forced { "always" } else { "no" }.into()),
