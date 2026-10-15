@@ -720,16 +720,25 @@ impl Overlay for SearchOverlay {
             }
             egui::ScrollArea::vertical().max_height(egui_ctx.content_rect().height() * 0.62).auto_shrink([false, true]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = theme.space(SpaceToken::Xxs);
+                let mut section_top = None;
                 for (i, row) in rows.iter().enumerate() {
                     if let Row::Header(h) = row {
+                        section_top = Some(ui.cursor().min.y);
                         ui.add_space(theme.space(SpaceToken::Sm));
                         section::section_header(ui, theme, h);
                         continue;
                     }
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+                    let header_top = section_top.take();
                     let is_cursor = cursor_row == Some(i);
                     if is_cursor && scroll {
-                        ui.scroll_to_rect(rect, None);
+                        // The first hit in a section must bring its heading along, including
+                        // the leading space at the top of the results.
+                        let mut target = rect;
+                        if let Some(top) = header_top {
+                            target.min.y = top;
+                        }
+                        ui.scroll_to_rect(target, None);
                     }
                     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
@@ -952,6 +961,48 @@ mod tests {
     use crate::model::{Collection, ItemKey, ItemOverride};
     use crate::ui::NavRequest;
     use crate::ui::screens::home::testkit::{self, has_label, overlay_harness, rig, seed, until_ov};
+
+    #[test]
+    fn keyboard_scroll_returns_to_the_first_section_header() {
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            testkit::channels(c, s, 30)?;
+            Ok(())
+        });
+        let mut h = overlay_harness(t, one, SearchOverlay::new("Channel".into()), egui::vec2(800.0, 500.0));
+        until_ov(&mut h, "channel hits", |h| has_label(h, "LIVE"));
+        h.run_steps(30);
+        let top = h.get_by_label("LIVE").rect().top();
+        let n = h.state().o.selectable().len();
+        assert!(n > 10, "more rows than fit");
+        for _ in 1..n {
+            h.state_mut().act(Action::Down);
+            h.run_steps(30);
+        }
+        let bottom = h.get_by_label("LIVE").rect().top();
+        assert!(bottom < top - 200.0, "the results scrolled");
+        h.event(egui::Event::PointerMoved(egui::pos2(400.0, top + 100.0)));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -10000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(30);
+        assert!((h.get_by_label("LIVE").rect().top() - bottom).abs() < 1.0, "keyboard reaches touchpad bottom");
+        h.event(egui::Event::PointerGone);
+        // The pointer may have moved the cursor; PgDn returns it to the last result.
+        for _ in 0..n.div_ceil(10) {
+            h.state_mut().act(Action::PageDown);
+        }
+        for _ in 1..n {
+            h.state_mut().act(Action::Up);
+            h.run_steps(30);
+        }
+        assert!((h.get_by_label("LIVE").rect().top() - top).abs() < 1.0, "Up restores the first section header and the page top");
+    }
 
     #[test]
     fn sections_highlights_actions_and_esc() {
