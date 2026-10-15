@@ -138,6 +138,9 @@ fn create(
     let snap = (**snap_tx.borrow()).clone();
     let TileSetup { tile, budget, audible } = setup;
     Controller {
+        live_cache: super::timeshift::LiveCache::new(deps.cache_dir.as_deref(), tile),
+        cache_ready: false,
+        pending_seek: None,
         machine: PlayerMachine::new(MachineConfig::from_config(cfg)),
         mpv,
         deps,
@@ -230,6 +233,9 @@ struct LocalView {
 }
 
 struct Controller {
+    live_cache: super::timeshift::LiveCache,
+    cache_ready: bool,
+    pending_seek: Option<(f64, Instant)>,
     mpv: Arc<Mpv>,
     machine: PlayerMachine,
     deps: PlayerDeps,
@@ -384,6 +390,7 @@ impl Controller {
                     self.pending_tick(now);
                     self.waiting_tick();
                     self.video_watchdog(now);
+                    self.live_tick();
                     if !self.casting()
                         && (self.machine.state().is_active() || matches!(self.machine.state(), PlayerState::Paused))
                         && self.audio_lookup.due(now, Duration::from_secs(15))
@@ -549,6 +556,8 @@ impl Controller {
                         {
                             self.snap.previous_live = Some(prev.clone());
                         }
+                        self.snap.live_buffer = None;
+                        self.snap.seekable = false;
                         self.snap.playable = Some(p.clone());
                     }
                     self.emit(ev);
@@ -582,6 +591,11 @@ impl Controller {
     /// `Effect::StopMpv` on mpv: stop; the lease is released when the stopped entry's END_FILE
     /// arrives (now, when no entry is open).
     fn stop_local(&mut self) {
+        self.live_cache.clear();
+        self.cache_ready = false;
+        self.snap.live_buffer = None;
+        self.snap.seekable = false;
+        self.pending_seek = None;
         self.pending = None;
         self.waiting = None;
         let _ = self.mpv.command("stop", &[]);
@@ -688,6 +702,10 @@ impl Controller {
         if self.casting() {
             return self.load_remote(p);
         }
+        if p.kind.is_live() && self.snap.video_suspended {
+            let _ = self.mpv.set_property("vid", "auto");
+            self.snap.video_suspended = false;
+        }
         self.apply_lip_sync();
         if self.snap.paused {
             // a new play always plays (mpv's `pause` survives loadfile)
@@ -702,6 +720,11 @@ impl Controller {
         self.snap.tracks = Default::default();
         self.snap.last_error = None;
         let mut args = super::mpv::loadfile_args(&p);
+        self.cache_ready = false;
+        self.snap.live_buffer = None;
+        self.snap.seekable = false;
+        self.pending_seek = None;
+        self.live_cache.prepare(p.kind.is_live(), &mut args);
         if self.light_decode {
             super::mpv::add_light_decode(&mut args);
         }
@@ -937,10 +960,12 @@ impl Controller {
             }
             PlayerCommand::Stop => return self.feed(Input::Stop, Instant::now()),
             PlayerCommand::TogglePause => {
-                let _ = m.command("cycle", &["pause"]);
+                self.live_tick();
+                let _ = self.mpv.command("cycle", &["pause"]);
             }
             PlayerCommand::SetPause(b) => {
-                let _ = m.set_property("pause", b);
+                self.live_tick();
+                let _ = self.mpv.set_property("pause", b);
             }
             PlayerCommand::SeekBy(s) => {
                 self.seek(s, "relative");
@@ -978,6 +1003,14 @@ impl Controller {
                 }
             }
             PlayerCommand::JumpToLive => {
+                if self.live_cache.active {
+                    self.read_seekable();
+                    if let Some(range) = self.snap.live_buffer {
+                        self.seek(range.end, "absolute");
+                        let _ = self.mpv.set_property("pause", false);
+                    }
+                    return false;
+                }
                 self.snap.zap_anchor = None;
                 if let Some(MediaRef::Catchup { channel, .. }) = self.snap.playable.as_ref().map(|p| p.media.clone()) {
                     let req = self.zap_request(MediaRef::Channel(channel), true);
@@ -1569,6 +1602,7 @@ impl Controller {
         self.machine.set_config(MachineConfig::from_config(cfg));
         self.watched_pct = cfg.player.watched_pct;
         super::mpv::apply_runtime(&self.mpv, cfg, &self.applied, self.tile);
+        self.live_cache.apply(&self.mpv);
         *self.applied = cfg.clone();
         if !self.casting() {
             self.apply_lip_sync();
@@ -1692,6 +1726,11 @@ impl Controller {
 
     /// Hidden-window safety net (module docs of `player`).
     fn video_watchdog(&mut self, now: Instant) {
+        // vid=no deselects the video stream in the demuxer, throwing away the pictures
+        // we need for live rewind. Keep it selected while timeshifting, even when hidden.
+        if self.live_cache.active {
+            return;
+        }
         let last = self.render_clock.load(Ordering::Relaxed);
         if last == 0 || self.snap.video_suspended || self.snap.video_size.is_none() {
             return; // no surface yet / nothing to suspend
@@ -1767,6 +1806,7 @@ impl Controller {
                 self.feed(Input::StartFile { entry: entry_id }, now)
             }
             MpvEvent::FileLoaded => {
+                self.cache_ready = true;
                 self.apply_lip_sync();
                 self.read_seekable();
                 self.feed(Input::FileLoaded, now)
@@ -2014,25 +2054,74 @@ impl Controller {
     /// the TV's capabilities while casting. Re-read at local playback boundaries and before
     /// seeking, even when mpv's value stayed true across the transition.
     fn read_seekable(&mut self) {
-        let vod = self.machine.target().is_some_and(|p| !p.kind.is_live());
-        let seekable = vod && self.mpv.get_property::<bool>("seekable").unwrap_or(false);
+        let live = self.machine.target().is_some_and(|p| p.kind.is_live());
+        let playing = matches!(self.machine.state(), PlayerState::Playing | PlayerState::Paused | PlayerState::Buffering { .. });
+        let range = (live && playing && self.cache_ready && self.live_cache.active)
+            .then(|| super::timeshift::CacheState::read(&self.mpv).range(self.live_cache.window()))
+            .flatten();
+        if self.snap.live_buffer != range {
+            self.snap.live_buffer = range;
+            self.dirty = true;
+        }
+        let seekable =
+            if live { range.is_some() } else { self.machine.target().is_some() && self.mpv.get_property::<bool>("seekable").unwrap_or(false) };
         if self.snap.seekable != seekable {
             self.snap.seekable = seekable;
             self.dirty = true;
         }
     }
 
+    /// Keep reading while paused. Advance an expired paused point to the oldest usable
+    /// point; it remains paused there. The extra readahead margin prevents a full window
+    /// from stopping the network reader. Byte-limited memory caches need the idle case too.
+    fn live_tick(&mut self) {
+        if self.casting() || !self.live_cache.active || !self.cache_ready {
+            return;
+        }
+        let state = super::timeshift::CacheState::read(&self.mpv);
+        self.live_cache.maintain(&self.mpv, &state);
+        self.read_seekable();
+        let Some(range) = self.snap.live_buffer else { return };
+        let Some(pos) = self.mpv.get_property::<f64>("time-pos").ok() else { return };
+        let expired = pos < range.start;
+        let full = self.snap.paused && state.idle && !state.eof && range.end - pos > 10.0;
+        if (expired || full) && self.pending_seek.is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(1)) {
+            let target = if expired { range.start } else { (pos + 2.0).min(range.end) };
+            if self.mpv.command("seek", &[&target.to_string(), "absolute+exact"]).is_ok() {
+                self.pending_seek = Some((target, Instant::now()));
+            }
+        }
+    }
+
     fn seek(&mut self, seconds: f64, mode: &str) {
+        if !seconds.is_finite() {
+            return;
+        }
         self.read_seekable();
         let refused = !self.snap.seekable;
-        let failed = !refused && self.mpv.command("seek", &[&seconds.to_string(), mode]).is_err();
+        let current = self.mpv.get_property::<f64>("time-pos").ok().or(self.snap.position).unwrap_or(0.0);
+        let from = self
+            .pending_seek
+            .filter(|(_, at)| {
+                at.elapsed() < Duration::from_secs(1)
+                    && (at.elapsed() < Duration::from_millis(100) || self.mpv.get_property::<bool>("seeking").unwrap_or(false))
+            })
+            .map_or(current, |(t, _)| t);
+        let requested = if mode == "relative" { from + seconds } else { seconds };
+        let target = self
+            .snap
+            .live_buffer
+            .map_or_else(|| self.snap.duration.map_or(requested.max(0.0), |d| requested.clamp(0.0, d.max(0.0))), |r| requested.clamp(r.start, r.end));
+        // Live requests must stay inside the demuxer's cache, even for non-seekable HTTP.
+        // Absolute exact also makes rapid repeated commands add up before mpv echoes time-pos.
+        let failed = !refused && self.mpv.command("seek", &[&target.to_string(), "absolute+exact"]).is_err();
         // one line per skip, so a stream that won't seek says why in the log (formats and
         // numbers only: no URL, no title)
         let num = |p: &str| self.mpv.get_property::<f64>(p).ok().map_or("-".to_owned(), |v| format!("{v:.1}"));
         let text = |p: &str| self.mpv.get_property::<String>(p).unwrap_or_else(|_| "-".to_owned());
         let flag = |p: &str| self.mpv.get_property::<bool>(p).ok().map_or("-", |b| if b { "yes" } else { "no" });
         tracing::info!(
-            "{}: skip {mode} {seconds} s at {} → {}; seekable {} (partly {}), format {}, network {}, cached {} s",
+            "{}: skip {mode} {seconds} s at {} → {target:.1} ({}); seekable {} (partly {}), format {}, network {}, cached {} s",
             self.log,
             num("time-pos"),
             if refused {
@@ -2050,6 +2139,20 @@ impl Controller {
         );
         if refused || failed {
             self.emit(PlayerEvent::SeekUnavailable);
+        } else {
+            self.pending_seek = Some((target, Instant::now()));
+            self.emit(PlayerEvent::Skipped {
+                seconds: if mode == "relative" { seconds } else { target - from },
+                target,
+                live_edge: self.snap.live_buffer.map(|r| r.end),
+            });
+            if let Some(r) = self.snap.live_buffer {
+                if requested < r.start {
+                    self.emit(PlayerEvent::LiveSeekBoundary { oldest: true });
+                } else if !r.behind(target) {
+                    self.emit(PlayerEvent::LiveSeekBoundary { oldest: false });
+                }
+            }
         }
     }
 
@@ -2257,7 +2360,8 @@ mod tests {
         cfg.player.mpv_options.insert("ao".into(), "null".into());
         let mpv = Arc::new(super::super::mpv::create(&cfg, TileId::A).unwrap());
         let (bus, events) = crate::msg::EventBus::new(None);
-        let deps = PlayerDeps { bus, store: Box::new(super::super::NullPlayerStore), resolver: Box::new(UnusedResolver), cast: None };
+        let deps =
+            PlayerDeps { cache_dir: None, bus, store: Box::new(super::super::NullPlayerStore), resolver: Box::new(UnusedResolver), cast: None };
         let (snap_tx, _) = watch::channel(Arc::new(PlayerSnapshot::default()));
         let mut c = create(
             mpv,

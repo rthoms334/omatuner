@@ -135,6 +135,7 @@ pub struct PlayerScreen {
     info_refreshed: Option<Instant>,
     flash: Option<(Flash, Instant)>,
     flash_text: Option<(String, Instant)>,
+    skip_feedback: Option<SkipFeedback>,
     next_episode: Option<NextEpisode>,
     zoom: usize,
     toggle_fullscreen: bool,
@@ -352,8 +353,8 @@ impl PlayerScreen {
             items.push(menu_item(glyphs::SUBTITLES, "Subtitles…", Action::SubtitleMenu, true, k));
         }
         items.push(menu_item(glyphs::INFO, "Stream info", Action::StreamInfo, true, k));
-        if matches!(snap.playable.as_ref().map(|p| &p.kind), Some(PlayableKind::Catchup { .. })) {
-            items.push(menu_item(glyphs::LIVE_DOT, "Jump to live", Action::JumpToLive, true, KeyContext::PlayerVod));
+        if snap.live_buffer.is_some() || matches!(snap.playable.as_ref().map(|p| &p.kind), Some(PlayableKind::Catchup { .. })) {
+            items.push(menu_item(glyphs::LIVE_DOT, "Back to live", Action::JumpToLive, true, k));
         }
         items.extend(self.cast_menu_items(ctx, k));
         if ctx.video_only {
@@ -444,7 +445,14 @@ impl Screen for PlayerScreen {
         match ev {
             AppEvent::Player(PlayerEvent::SeekUnavailable) => {
                 self.flash = None;
+                self.skip_feedback = None;
                 self.cast_notice(ctx, "Can't skip in this stream");
+            }
+            AppEvent::Player(PlayerEvent::Skipped { seconds, target, live_edge }) => {
+                self.show_skip(*seconds, *target, *live_edge);
+            }
+            AppEvent::Player(PlayerEvent::LiveSeekBoundary { oldest }) => {
+                self.cast_notice(ctx, if *oldest { "That's as far back as Tuner has" } else { "Live" });
             }
             AppEvent::Player(PlayerEvent::AudioOutputChanged { previous: Some(previous), output, offset_ms })
                 if ctx.player.cast.is_none() && previous.name != output.name =>
@@ -455,6 +463,7 @@ impl Screen for PlayerScreen {
             // an episode stopped early (not watched) gets no up-next card
             AppEvent::Player(PlayerEvent::Ended { finished: true, .. }) => self.end_of_playback(ctx),
             AppEvent::Player(PlayerEvent::NowPlaying(p)) => {
+                self.skip_feedback = None;
                 self.live_ctx = p.kind.is_live();
                 self.next_episode = None;
                 self.next_lookup = None;
@@ -660,12 +669,12 @@ impl Screen for PlayerScreen {
             Action::ChannelList if live => self.open_panel(ctx, PanelKind::Channels),
             Action::MiniGuide if live => self.open_panel(ctx, PanelKind::MiniGuide),
             Action::Digit(d) if live => self.numeric = Some((char::from(b'0' + d.min(9)).to_string(), Instant::now())),
-            Action::SeekBack if !live => ctx.play(PlayerCommand::SeekBy(-skip_small)),
-            Action::SeekForward if !live => ctx.play(PlayerCommand::SeekBy(skip_small)),
-            Action::SeekBackBig if !live => ctx.play(PlayerCommand::SeekBy(-skip_large)),
-            Action::SeekForwardBig if !live => ctx.play(PlayerCommand::SeekBy(skip_large)),
+            Action::SeekBack => ctx.play(PlayerCommand::SeekBy(-skip_small)),
+            Action::SeekForward => ctx.play(PlayerCommand::SeekBy(skip_small)),
+            Action::SeekBackBig => ctx.play(PlayerCommand::SeekBy(-skip_large)),
+            Action::SeekForwardBig => ctx.play(PlayerCommand::SeekBy(skip_large)),
             Action::JumpToLive => {
-                if matches!(ctx.player.playable.as_ref().map(|p| &p.kind), Some(PlayableKind::Catchup { .. })) {
+                if live || matches!(ctx.player.playable.as_ref().map(|p| &p.kind), Some(PlayableKind::Catchup { .. })) {
                     ctx.play(PlayerCommand::JumpToLive);
                 }
             }
@@ -800,6 +809,7 @@ impl Screen for PlayerScreen {
             // the clock and programme progress move
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
+        self.draw_skip_feedback(ui, ctx, rect);
         self.draw_panel(ui, ctx, rect);
         self.draw_overlays(ui, ctx, rect, &snap);
         self.draw_shield(ui, ctx, rect, &snap);
@@ -1308,6 +1318,93 @@ mod tests {
             shown(h).paused != paused
         });
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::PlayerLive]);
+    }
+
+    #[test]
+    fn centre_controls_visibility_focus_and_keyboard_activation() {
+        let mut h = player(WIDE);
+        assert!(has_label(&h, "Play / pause"));
+        assert!(!has_label(&h, "Back") && !has_label(&h, "Forward"), "no live range yet");
+        let mut snap = (*shown(&h)).clone();
+        snap.seekable = true;
+        snap.live_buffer = Some(crate::player::LiveBufferRange { start: 0.0, end: 100.0 });
+        snap.position = Some(60.0);
+        h.state_mut().t.snapshot = Arc::new(snap);
+        h.run_steps(3);
+        assert!(has_label(&h, "Back") && has_label(&h, "Forward") && has_label(&h, "Back to live"));
+        // Centre buttons occupy the picture, not the bottom controls row.
+        let play = h.get_by_label("Play / pause").rect();
+        assert!(play.center().y > WIDE.y * 0.3 && play.center().y < WIDE.y * 0.65);
+        assert!(play.height() > 60.0);
+        assert!(h.state_mut().act(Action::FocusOsdControls));
+        h.run_steps(2);
+        assert_eq!(h.state().s.visible[h.state().s.control], Control::PlayPause);
+        assert!(h.state_mut().act(Action::Left));
+        assert_eq!(h.state().s.visible[h.state().s.control], Control::SkipBack);
+        assert!(h.state_mut().act(Action::Right));
+        assert!(h.state_mut().act(Action::Right));
+        assert_eq!(h.state().s.visible[h.state().s.control], Control::SkipForward);
+        assert!(h.state_mut().act(Action::FocusPrev));
+        let paused = real(&h).paused;
+        assert!(h.state_mut().act(Action::Activate));
+        until(&mut h, "keyboard paused", |h| real(h).paused != paused);
+        h.state_mut().act(Action::Back);
+        h.state_mut().act(Action::Back);
+        h.hover_at(egui::pos2(1.0, 1.0));
+        h.run_steps(2);
+        // Motion itself reveals controls. Explicit Esc hides them again.
+        h.state_mut().act(Action::Back);
+        h.run_steps(2);
+        assert!(!has_label(&h, "Play / pause"));
+    }
+
+    #[test]
+    fn skip_ripple_accumulates_and_live_boundary_flashes() {
+        use crate::ui::screens::home::testkit::painted;
+        let mut h = player(WIDE);
+        h.state_mut().t.video.begin_frame();
+        for target in [10.0, 20.0, 30.0] {
+            let app = h.state_mut();
+            app.t.with_ctx(|ctx| app.s.on_event(ctx, &AppEvent::Player(PlayerEvent::Skipped { seconds: 10.0, target, live_edge: Some(70.0) })));
+        }
+        h.run_steps(2);
+        let text = painted(&h);
+        assert!(text.iter().any(|t| t == "⟳ 30") && text.iter().any(|t| t == "−00:40"), "{text:?}");
+        // Feedback is paint-only: a click through its picture still dismisses focus mode.
+        h.state_mut().act(Action::FocusOsdControls);
+        press(&h, egui::pos2(WIDE.x * 0.75, WIDE.y / 2.0), egui::PointerButton::Primary);
+        h.run_steps(2);
+        assert!(!h.state().s.osd_focus);
+        let app = h.state_mut();
+        app.t.with_ctx(|ctx| app.s.on_event(ctx, &AppEvent::Player(PlayerEvent::LiveSeekBoundary { oldest: true })));
+        h.run_steps(2);
+        assert!(painted(&h).iter().any(|t| t.contains("That's as far back as Tuner has")));
+        h.state_mut().s.skip_feedback.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+        h.run_steps(2);
+        assert!(!painted(&h).iter().any(|t| t == "⟳ 30"));
+    }
+
+    #[test]
+    fn live_arrow_skips_and_capital_h_opens_history() {
+        let mut h = player(WIDE);
+        h.state_mut().t.video.begin_frame();
+        let key = egui::Event::Key { key: egui::Key::ArrowLeft, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let action = crate::keymap::resolve(&h.state().s.key_contexts(), &key).unwrap();
+        assert_eq!(action, Action::SeekBack);
+        assert!(h.state_mut().act(action));
+        // The empty real mpv rejects it: the command actually reached the controller.
+        until(&mut h, "skip unavailable", |h| {
+            h.state_mut().pump();
+            h.state().s.flash_text.as_ref().is_some_and(|(text, _)| text == "Can't skip in this stream")
+        });
+        let history = crate::keymap::resolve(&h.state().s.key_contexts(), &egui::Event::Text("H".into())).unwrap();
+        assert!(h.state_mut().act(history));
+        h.run_steps(2);
+        assert_eq!(h.state().s.panel.as_ref().unwrap().kind, PanelKind::History);
+        // A panel owns its left arrow and closes without skipping again.
+        assert_eq!(crate::keymap::resolve(&h.state().s.key_contexts(), &key), Some(Action::Parent));
+        assert!(h.state_mut().act(Action::Parent));
+        assert!(h.state().s.panel.is_none());
     }
 
     /// Back (Alt+←, the mouse back button) in controls focus mode leaves it like Esc, then hides

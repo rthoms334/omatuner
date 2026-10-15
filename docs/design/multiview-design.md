@@ -159,7 +159,7 @@ I checked these keys as free in `src/keymap.rs` on main and in the `feat/pane-ar
 | Keys | Action | Notes |
 |---|---|---|
 | `w` | Next picture (focus) | Vim's window key. Free in `PLAYER_COMMON`, `PLAYER_LIVE` and `PLAYER_VOD`. |
-| `Ctrl+←` / `Ctrl+→` / `Ctrl+↑` / `Ctrl+↓` | Focus the picture in that direction | Spatial, matching the pane-arrows idea. Plain ←/→ stay last channel / history (live) and seek (VOD). |
+| `Ctrl+←` / `Ctrl+→` / `Ctrl+↑` / `Ctrl+↓` | Focus the picture in that direction | Spatial, matching the pane-arrows idea. Plain ←/→ skip in both live and VOD; H opens history and Backspace recalls the last channel. |
 | `M` | Sound from this picture | Paired with `m` (mute). |
 | `W` | Swap the pictures' places | |
 | `t` | Layout: side by side → big + small → picture in picture | |

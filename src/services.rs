@@ -140,7 +140,7 @@ impl Services {
             // picture A casts (DESIGN §40 §5.5): through `AppShared`, which answers "casting isn't
             // available" until the cast service publishes its handle
             let cast: Arc<dyn crate::player::remote::CastConnector> = agent.clone();
-            Player::start(&cfg, PlayerDeps { cast: Some(cast), ..player_deps(&store, &config, &bus, &agent) })?
+            Player::start(&cfg, PlayerDeps { cast: Some(cast), ..player_deps(&store, &config, &bus, &agent, &paths) })?
         };
         let mut memory = crate::platform::memory::Maintenance::start();
         memory.watch_player(rt.handle(), TileId::A, player.handle().subscribe());
@@ -300,7 +300,7 @@ impl Services {
     pub fn start_tile_b(&mut self) -> bool {
         let Some(slot) = self.tiles.begin_b() else { return false };
         let cfg = self.config();
-        let deps = player_deps(&self.store, &self.config, &self.bus, &self.agent);
+        let deps = player_deps(&self.store, &self.config, &self.bus, &self.agent, &self.paths);
         let (budget, bus) = (self.tiles.budget().clone(), self.bus.clone());
         self.rt.spawn_blocking(move || {
             let started = Player::start_tile(&cfg, deps, TileId::B, budget).map_err(|e| e.to_string());
@@ -561,8 +561,9 @@ pub fn http_options(cfg: &Config) -> HttpOptions {
 
 /// A player's persistence and resolver (picture A at startup, picture B later on the blocking
 /// pool: each gets its own database reader). No cast connector: only picture A casts.
-fn player_deps(store: &Store, config: &SharedConfig, bus: &EventBus, shared: &Arc<crate::shared::AppShared>) -> PlayerDeps {
+fn player_deps(store: &Store, config: &SharedConfig, bus: &EventBus, shared: &Arc<crate::shared::AppShared>, paths: &AppPaths) -> PlayerDeps {
     PlayerDeps {
+        cache_dir: Some(paths.cache_dir.clone()),
         bus: bus.clone(),
         store: Box::new(WriterPlayerStore(store.writer().clone())),
         resolver: Box::new(DbResolver::new(store.clone(), config.clone()).with_copies(shared.clone())),

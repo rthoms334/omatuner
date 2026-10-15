@@ -107,6 +107,75 @@ fn movie(id: i64, url: String) -> Playable {
 // ---------------------------------------------------------------------------------------------
 // harness
 
+/// A sliding HLS playlist without ENDLIST. All seeks use its existing demuxer; no load or
+/// provider byte-range request is needed. Pausing must keep fetching new live segments.
+#[test]
+fn live_rewind_cache_seek_pause_clamp_and_channel_change() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    live_rewind_behaviour(srv.url("live/index.m3u8"), srv.url("live/index.m3u8"));
+}
+
+/// Same real decoder/cache checks through paced MPEG-TS FIFOs, usable when bind(2) is
+/// prohibited by the sandbox. Each producer is continuous, non-seekable and runs in real time.
+#[test]
+fn live_rewind_local_pipe_seek_pause_clamp_and_channel_change() {
+    let Some((media, _serial)) = setup() else { return };
+    let first = UnseekableStream::start(&media);
+    let second = UnseekableStream::start(&media);
+    live_rewind_behaviour(first.url(), second.url());
+}
+
+fn live_rewind_behaviour(first: String, second: String) {
+    let cache = tempfile::tempdir().unwrap();
+    let mut h = Harness::start_in(headless_config(), vec![live(1, first), live(2, second)], Some(cache.path().into()));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.video_size.is_some());
+    h.player.mark_rendered_for_tests();
+    let s = h.wait_snapshot(Duration::from_secs(25), |s| s.state == PlayerState::Playing && s.live_buffer.is_some_and(|r| r.end - r.start > 12.0));
+    let generation = s.load_generation;
+    assert!(!s.video_suspended, "a hidden live picture must keep caching video");
+    h.handle.send(PlayerCommand::SetPause(true));
+    let paused = h.wait_snapshot(LONG, |s| s.paused);
+    let before = paused.position.unwrap();
+    let edge = paused.live_buffer.unwrap().end;
+    h.wait_snapshot(Duration::from_secs(8), |s| s.live_buffer.is_some_and(|r| r.end > edge + 2.0));
+    assert!((h.snapshot().position.unwrap() - before).abs() < 0.5, "pause preserves the point while buffering");
+
+    h.handle.send(PlayerCommand::SeekBy(-10.0));
+    let back =
+        h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| p < before - 8.5) && s.live_buffer.is_some_and(|r| r.behind(s.position.unwrap())));
+    assert_eq!(back.load_generation, generation);
+
+    // First jump to live, then back and immediately forward: +10 returns to the edge.
+    h.handle.send(PlayerCommand::JumpToLive);
+    h.wait_snapshot(LONG, |s| !s.paused && s.live_buffer.is_some_and(|r| !r.behind(s.position.unwrap_or(0.0))));
+    h.handle.send(PlayerCommand::SetPause(true));
+    h.wait_snapshot(LONG, |s| s.paused);
+    let at_live = h.snapshot().position.unwrap();
+    h.handle.send(PlayerCommand::SeekBy(-10.0));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| p < at_live - 8.5));
+    h.handle.send(PlayerCommand::SeekBy(10.0));
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| !r.behind(s.position.unwrap_or(0.0))));
+
+    let mark = h.mark();
+    h.handle.send(PlayerCommand::SeekBy(-3600.0));
+    assert!(h.wait_event_from(mark, LONG, |e| matches!(e, PlayerEvent::LiveSeekBoundary { oldest: true })).is_some());
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| (s.position.unwrap_or(-100.0) - r.start).abs() < 1.0));
+    assert_eq!(h.snapshot().load_generation, generation, "cached seeks never reload");
+
+    let root = cache.path().join("live-rewind");
+    let dir = std::fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+    // mpv unlinks its file immediately; a stale file also must not survive a new channel.
+    std::fs::write(dir.join("old-buffer"), b"stale").unwrap();
+    h.play(MediaRef::Channel(ChannelId(2)), true);
+    let new = h.wait_snapshot(LONG, |s| s.load_generation > generation && s.state == PlayerState::Playing && s.live_buffer.is_some());
+    assert!(!dir.join("old-buffer").exists());
+    assert!(new.live_buffer.unwrap().end - new.live_buffer.unwrap().start < 8.0, "new channel has no old history");
+    drop(h);
+    assert!(!dir.exists(), "exit removes the private buffer directory");
+}
+
 struct Harness {
     player: Player,
     handle: PlayerHandle,
@@ -125,9 +194,14 @@ fn headless_config() -> Config {
 
 impl Harness {
     fn start(cfg: Config, table: Vec<Playable>) -> Self {
+        Self::start_in(cfg, table, None)
+    }
+
+    fn start_in(cfg: Config, table: Vec<Playable>, cache_dir: Option<PathBuf>) -> Self {
         let (bus, events) = EventBus::new(None);
         let rec = Recorded::default();
         let deps = PlayerDeps {
+            cache_dir,
             bus,
             store: Box::new(RecordingStore(rec.clone())),
             resolver: Box::new(TableResolver(table.into_iter().map(|p| (p.media.clone(), p)).collect())),
@@ -390,7 +464,7 @@ fn skips_between_files(url: impl Fn(&str) -> String, limit: Option<u32>) {
         h.play(p.media.clone(), true);
         h.wait_snapshot(LONG, |s| s.load_generation > generation && s.state == PlayerState::Playing && s.position.is_some());
         if p.kind.is_live() {
-            assert!(!h.snapshot().seekable, "live never offers seeking");
+            h.wait_snapshot(LONG, |s| s.seekable && s.live_buffer.is_some());
         } else {
             assert_small_skips(&h);
         }
@@ -590,6 +664,10 @@ fn skips_from_screen(url: String, seekable: bool) {
         // Repeated skips must add up, rather than seek to fixed timestamps or send a
         // live zap. Both paths exercise +10 and -10 SeekBy commands.
         for button in [true, false] {
+            if button && !seekable {
+                assert!(ui.query_by_label("Back").is_none() && ui.query_by_label("Forward").is_none());
+                continue;
+            }
             for forward in [true, true, false, false] {
                 let before = handle.snapshot().position.unwrap();
                 if button {
@@ -630,6 +708,27 @@ fn skips_from_screen(url: String, seekable: bool) {
                     );
                     std::thread::sleep(Duration::from_millis(50));
                 }
+            }
+        }
+        if seekable {
+            let before = handle.snapshot().position.unwrap();
+            for _ in 0..3 {
+                ui.get_by_label("Forward").click();
+                ui.run_steps(2);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                ui.run_steps(1);
+                let moved = handle.snapshot().position.is_some_and(|p| (p - before - 30.0).abs() < 0.6);
+                let ripple = ui.output().shapes.iter().any(|s| {
+                    matches!(&s.shape,
+                    egui::Shape::Text(t) if t.galley.job.text == "⟳ 30")
+                });
+                if moved && ripple {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "three clicks must seek 30 seconds and paint the total");
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         // The next item uses the same mpv and services.
@@ -1460,6 +1559,7 @@ mod casting {
         let (bus, events) = EventBus::new(None);
         let rec = Recorded::default();
         let deps = PlayerDeps {
+            cache_dir: None,
             bus,
             store: Box::new(RecordingStore(rec.clone())),
             resolver: Box::new(TableResolver(table.into_iter().map(|p| (p.media.clone(), p)).collect())),

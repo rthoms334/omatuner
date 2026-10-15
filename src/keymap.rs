@@ -59,7 +59,7 @@ pub enum KeyContext {
     PlayerLive,
     /// Fullscreen player, seekable content (VOD / catch-up).
     PlayerVod,
-    /// Controls focus mode (entered with Enter / `i` / Tab / click on a control): arrows move
+    /// Controls focus mode (entered with Enter / `i` / Tab): arrows move
     /// between OSD controls; unbound keys fall through to PlayerLive/Vod.
     PlayerOsd,
     /// Typing a channel number (player, guide): digits, Enter, Backspace, Esc.
@@ -774,9 +774,12 @@ pub static PLAYER_LIVE: &[Binding] = &[
     b(C::key(Key::PageUp), A::ZapPrev, "Previous / next channel (in this list)"),
     b(C::key(Key::PageDown), A::ZapNext, "Previous / next channel (in this list)"),
     b(C::key(Key::Backspace), A::LastChannel, "Last channel"),
-    b(C::key(Key::ArrowLeft), A::LastChannel, "Last channel"),
-    b(C::key(Key::ArrowRight), A::ChannelHistory, "Channel history"),
-    b(C::ch('h'), A::ChannelHistory, "Channel history"),
+    b(C::key(Key::ArrowLeft), A::SeekBack, "Skip back / forward (small step)"),
+    b(C::key(Key::ArrowRight), A::SeekForward, "Skip back / forward (small step)"),
+    b(C::shift(Key::ArrowLeft), A::SeekBackBig, "Skip back / forward (big step)"),
+    b(C::shift(Key::ArrowRight), A::SeekForwardBig, "Skip back / forward (big step)"),
+    b(C::ch('H'), A::ChannelHistory, "Channel history"),
+    b(C::ch('L'), A::JumpToLive, "Back to live"),
     b(C::ch('c'), A::ChannelList, "Channel list"),
     b(C::ch('g'), A::MiniGuide, "Mini guide (now / next)"),
     b(C::ch('0'), A::Digit(0), "Type a channel number"),
@@ -1364,8 +1367,8 @@ mod tests {
         let held = |k, shift| key_ev(k, false, false, shift, true);
         assert_eq!(resolve(&[K::ListFiltering], &held(Key::ArrowLeft, false)), None);
         assert_eq!(resolve(&[K::ListFiltering, K::PlayerLive], &held(Key::ArrowLeft, false)), None);
-        assert_eq!(resolve(&[K::PlayerLive], &held(Key::ArrowLeft, false)), None, "no LastChannel flip-flop");
-        assert_eq!(resolve(&[K::PlayerLive], &key(Key::ArrowLeft, false)), Some(Action::LastChannel));
+        assert_eq!(resolve(&[K::PlayerLive], &held(Key::ArrowLeft, false)), Some(Action::SeekBack), "held skips repeat");
+        assert_eq!(resolve(&[K::PlayerLive], &key(Key::ArrowLeft, false)), Some(Action::SeekBack));
         assert_eq!(resolve(&[K::PosterGrid], &held(Key::ArrowLeft, false)), Some(Action::Left));
         assert_eq!(resolve(&[K::Panel], &held(Key::ArrowLeft, true)), Some(Action::Decrease));
     }

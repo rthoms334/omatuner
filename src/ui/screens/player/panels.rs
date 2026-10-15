@@ -237,7 +237,7 @@ impl PlayerScreen {
         let title = match panel.kind {
             PanelKind::Channels => "CHANNELS (c)",
             PanelKind::MiniGuide => "NOW / NEXT (g)",
-            PanelKind::History => "HISTORY (h)",
+            PanelKind::History => "HISTORY (H)",
             PanelKind::Queue => "UP NEXT (u)",
         };
         let head_h = (caption.size * 2.0).round();
