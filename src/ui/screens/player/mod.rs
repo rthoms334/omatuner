@@ -709,6 +709,7 @@ impl Screen for PlayerScreen {
                 StateAction::Retry => ("Retry", "Retry (r)", Some(Action::Retry)),
                 StateAction::LastChannel => ("Last channel", "Last channel (Backspace)", Some(Action::LastChannel)),
                 StateAction::OtherCopy => ("Play from another copy", "Play from another copy (Ctrl+O)", Some(Action::PlayFrom)),
+                StateAction::CopyError => ("Copy error", "Copy error", None),
                 StateAction::Stop => ("Stop", "Stop and close (q)", Some(Action::StopAndClose)),
                 // the casting card's own (DESIGN §40 §3.3, §3.4)
                 cast => {
@@ -720,6 +721,13 @@ impl Screen for PlayerScreen {
                 match action {
                     Some(a) => {
                         self.on_action(ctx, a);
+                    }
+                    None if b.action == StateAction::CopyError => {
+                        if let PlayerState::Error(e) = &snap.state {
+                            let (head, detail) = crate::ui::video_host::error_copy(e.kind, &e.message);
+                            ui.ctx().copy_text(if detail.is_empty() { head } else { format!("{head}\n{detail}") });
+                            ctx.toast(Toast::info("Copied error"));
+                        }
                     }
                     None => self.cast_state_action(ctx, b.action, &snap),
                 }
@@ -1316,6 +1324,24 @@ mod tests {
         h.get_by_label("Leave the player").click();
         h.run_steps(1);
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Back]);
+    }
+
+    #[test]
+    fn error_card_copy_text_copies_redacted_details() {
+        use crate::ui::testing::clicks;
+        let (mut t, one) = rig();
+        let message = "Failed: http://example.com/live/alice/secret/123.ts";
+        t.snapshot = Arc::new(PlayerSnapshot {
+            state: PlayerState::Error(crate::player::PlayerError { kind: crate::player::PlayerErrorKind::Network, message: message.into() }),
+            ..Default::default()
+        });
+        let mut h = harness(t, one, PlayerScreen::default(), WIDE);
+        clicks::click_text(&mut h, &format!("{}  Copy error", glyphs::COPY));
+        let copied = clicks::copied_text(&h).expect("clipboard command");
+        assert_eq!(copied, format!("Network error\n{}", crate::redact::redact(message)));
+        assert!(!copied.contains("alice") && !copied.contains("secret"));
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied error"));
+        assert!(h.state_mut().nav().is_empty());
     }
 
     /// Right-click on the video opens the player menu; "Pop out" from it pops out (the app

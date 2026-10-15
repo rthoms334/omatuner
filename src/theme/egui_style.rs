@@ -36,6 +36,9 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
         s.spacing.window_margin = popup_padding;
         s.spacing.menu_margin = margin(theme.space(SpaceToken::Md));
         s.interaction.tooltip_delay = 0.4;
+        // Labels often sit over a row's click target. Text selection would consume the
+        // click before the row sees it; diagnostic text has explicit Copy controls.
+        s.interaction.selectable_labels = false;
         s.text_styles = text_styles.clone();
     });
 }

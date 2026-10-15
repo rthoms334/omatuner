@@ -1340,11 +1340,16 @@ fn row(ui: &mut egui::Ui, theme: &Theme, focused: bool, scroll: bool, add: impl 
     let pad = theme.space(SpaceToken::RowPaddingX);
     let frame = egui::Frame::NONE.corner_radius(t.rounding).inner_margin(egui::Margin::symmetric(pad as i8, (pad / 2.0) as i8));
     let frame = if focused { frame.fill(t.list_cursor_bg).stroke(egui::Stroke::new(1.0, t.list_cursor_border)) } else { frame };
-    let r = frame.show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(add);
-    });
-    let resp = r.response.interact(egui::Sense::click());
+    // Register the row before its children so arrows, removable chips and text fields
+    // keep their own responses. Making the Frame's response clickable covers them up.
+    let resp = ui
+        .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+            frame.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(add);
+            });
+        })
+        .response;
     if focused && scroll {
         resp.scroll_to_me(None);
     }
@@ -1397,6 +1402,22 @@ pub(crate) mod tests {
     use crate::ui::testing::TestUi;
 
     type H = egui_kittest::Harness<'static, testkit::OvApp<FollowSheet>>;
+
+    #[test]
+    fn framed_value_row_text_and_child_arrows_click() {
+        use crate::ui::testing::clicks;
+        let mut h = clicks::harness(None, |ui, clicked| {
+            value_row(ui, &Theme::fallback(), "Before", "5 min", false, false, F::Lead, clicked);
+        });
+        clicks::click_text(&mut h, "5 min");
+        assert_eq!(*h.state(), Some((F::Lead, 1)));
+        *h.state_mut() = None;
+        clicks::click_text(&mut h, glyphs::CHEVRON_LEFT);
+        assert_eq!(*h.state(), Some((F::Lead, -1)), "the child arrow keeps its own action");
+        *h.state_mut() = None;
+        clicks::click_text(&mut h, "Before");
+        assert_eq!(*h.state(), Some((F::Lead, 1)));
+    }
 
     /// One playlist channel with a guide, and on it, in an hour, a live "Premier League
     /// Football · Arsenal v Chelsea" (Sport, Football); the library is published for the

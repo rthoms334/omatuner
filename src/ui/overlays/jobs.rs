@@ -291,6 +291,7 @@ fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, index: usize, e
     let color = if cursor { t.list_cursor_text } else { t.fg };
     let time = crate::ui::widgets::time::hhmm(line.at, h24);
     let width = ui.available_width();
+    let mut copy_rect = egui::Rect::NOTHING;
     let inner = ui.scope(|ui| {
         let top = ui.cursor().min;
         let bg = ui.painter().add(egui::Shape::Noop);
@@ -308,11 +309,23 @@ fn problem_row(ui: &mut egui::Ui, theme: &Theme, line: &LogLine, index: usize, e
             }
         });
         ui.add_space(theme.space(SpaceToken::Sm));
+        if expanded {
+            copy_rect = ui
+                .allocate_exact_size(egui::vec2(theme.space(SpaceToken::ControlHeight), theme.space(SpaceToken::ControlHeight)), egui::Sense::hover())
+                .0;
+        }
         let rect = egui::Rect::from_min_max(top, egui::pos2(top.x + width, ui.cursor().min.y));
         ui.painter().set(bg, row_bg(theme, rect, cursor));
         rect
     });
-    ui.interact(inner.inner, ui.id().with(("problem", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)
+    let row = ui.interact(inner.inner, ui.id().with(("problem", index)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if expanded {
+        let mut over = ui.new_child(egui::UiBuilder::new().id_salt(("copy-problem", index)).max_rect(copy_rect));
+        if icon_button(&mut over, theme, glyphs::COPY, "Copy error", ButtonStyle::default()).clicked() {
+            ui.ctx().copy_text(line.message.clone());
+        }
+    }
+    row
 }
 
 /// Cursor background for a row whose height is only known after its content was laid out
@@ -324,6 +337,24 @@ fn row_bg(theme: &Theme, rect: egui::Rect, cursor: bool) -> egui::Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn problem_row_text_clicks_and_copy_icon_does_not_collapse_it() {
+        use crate::ui::testing::clicks;
+        let mut h = clicks::harness((false, 0), |ui, (expanded, count)| {
+            let line = line("tuner::jobs", tracing::Level::ERROR, "Couldn't refresh: HTTP 404");
+            if problem_row(ui, &Theme::fallback(), &line, 0, *expanded, false, true).clicked() {
+                *expanded = !*expanded;
+                *count += 1;
+            }
+        });
+        clicks::click_text(&mut h, "Couldn't refresh: HTTP 404");
+        assert_eq!(*h.state(), (true, 1));
+        h.run_steps(2);
+        clicks::click_text(&mut h, glyphs::COPY);
+        assert_eq!(clicks::copied_text(&h), Some("Couldn't refresh: HTTP 404"));
+        assert_eq!(*h.state(), (true, 1), "the copy button keeps its own response");
+    }
 
     fn line(target: &str, level: tracing::Level, msg: &str) -> LogLine {
         LogLine { at: 0, level, target: target.into(), message: msg.into() }
