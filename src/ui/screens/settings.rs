@@ -4074,12 +4074,12 @@ mod tests {
         h.state_mut().act(Action::Right);
         h.state_mut().act(Action::Right);
         focus(&mut h, "Subtitles automatically");
-        h.state_mut().act(Action::Decrease);
+        h.state_mut().act(Action::Increase);
         h.state_mut().apply_config();
         let c = h.state().t.config.clone();
         assert!(c.player.instant_load);
         assert_eq!(c.player.zap_delay_ms, 400);
-        assert_eq!(c.player.sub_auto, SubtitleAuto::Off);
+        assert_eq!(c.player.sub_auto, SubtitleAuto::Forced);
         // a text row: Enter edits ([TextInput, Panel]), typing, Enter commits
         focus(&mut h, "Advanced mpv options");
         h.state_mut().act(Action::Activate);

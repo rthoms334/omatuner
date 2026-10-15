@@ -89,10 +89,12 @@ pub(super) fn runtime_settings(cfg: &Config, tile: TileId) -> Vec<(&'static str,
         ("cache-pause-wait", if p.instant_load { "0.5" } else { "1" }.into()),
         ("user-agent", p.user_agent.clone()),
         ("alang", p.audio_langs.join(",")),
-        ("slang", p.sub_langs.join(",")),
+        // A matching slang enables ordinary tracks even with subs-fallback-forced=always
+        // (mpv 0.41). Forced-only selection must leave language ranking to mpv.
+        ("slang", if p.sub_auto == SubtitleAuto::Forced { String::new() } else { p.sub_langs.join(",") }),
         ("sid", if p.sub_auto == SubtitleAuto::Off { "no" } else { "auto" }.into()),
         ("subs-fallback-forced", if p.sub_auto == SubtitleAuto::Forced { "always" } else { "no" }.into()),
-        ("subs-fallback", if p.sub_auto == SubtitleAuto::Always { "yes" } else { "default" }.into()),
+        ("subs-fallback", if p.sub_auto == SubtitleAuto::Always { "yes" } else { "no" }.into()),
         ("sub-scale", p.sub_scale.to_string()),
     ]
 }
@@ -300,7 +302,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.player.hwdec = "vaapi".into();
         cfg.player.cache_secs = 7;
-        cfg.player.sub_auto = SubtitleAuto::Off;
+        assert_eq!(cfg.player.sub_auto, SubtitleAuto::Off);
         let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
         for name in [
             "hwdec",
@@ -321,10 +323,28 @@ mod tests {
         assert_eq!(s["hwdec"], "vaapi");
         assert_eq!(s["cache-secs"], "7");
         assert_eq!(s["sid"], "no");
+        assert_eq!(s["slang"], "eng,en");
+        assert_eq!(s["subs-fallback-forced"], "no");
+        assert_eq!(s["subs-fallback"], "no");
         cfg.player.instant_load = true;
         let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
         assert_eq!(s["cache-secs"], "1");
         assert_eq!(s["demuxer-readahead-secs"], "1");
+    }
+
+    #[test]
+    fn subtitle_modes_map_to_selection_options() {
+        let mut cfg = Config::default();
+        cfg.player.sub_langs = vec!["fra".into(), "eng".into()];
+        for (mode, slang, sid, forced, fallback) in [
+            (SubtitleAuto::Off, "fra,eng", "no", "no", "no"),
+            (SubtitleAuto::Forced, "", "auto", "always", "no"),
+            (SubtitleAuto::Always, "fra,eng", "auto", "no", "yes"),
+        ] {
+            cfg.player.sub_auto = mode;
+            let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
+            assert_eq!((&*s["slang"], &*s["sid"], &*s["subs-fallback-forced"], &*s["subs-fallback"]), (slang, sid, forced, fallback), "{mode:?}");
+        }
     }
 
     fn headless() -> Mpv {
@@ -432,9 +452,13 @@ mod tests {
         assert_eq!(mpv.get_property::<String>("sid").unwrap(), "3", "track choice kept");
         assert!((mpv.get_property::<f64>("sub-scale").unwrap() - 1.4).abs() < 1e-3, "per-stream sub scale kept");
         // the subtitle mode itself changed: applied
-        let mut off = cfg.clone();
+        let mut always = cfg.clone();
+        always.player.sub_auto = SubtitleAuto::Always;
+        apply_runtime(&mpv, &always, &cfg, TileId::A);
+        assert_eq!(mpv.get_property::<String>("sid").unwrap(), "auto");
+        let mut off = always.clone();
         off.player.sub_auto = SubtitleAuto::Off;
-        apply_runtime(&mpv, &off, &cfg, TileId::A);
+        apply_runtime(&mpv, &off, &always, TileId::A);
         assert_eq!(mpv.get_property::<String>("sid").unwrap(), "no");
     }
 }

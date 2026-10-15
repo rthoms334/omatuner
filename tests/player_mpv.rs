@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use support::media::{Faults, KeepAlive, SessionLimit, TestServer, ensure_media};
-use tuner::config::Config;
+use tuner::config::{Config, SubtitleAuto};
 use tuner::model::{
     ChannelId, Collection, HistoryEntry, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, PlayOrigin, Playable, PlayableKind, SourceId,
-    WatchProgress, ZapList,
+    TileId, WatchProgress, ZapList,
 };
 use tuner::msg::{AppEvent, EventBus};
 use tuner::player::{
@@ -309,6 +309,56 @@ fn is_playing(s: &PlayerState) -> bool {
 
 // ---------------------------------------------------------------------------------------------
 // tests
+
+/// Exercise the production option builder against real track selection, not just option
+/// strings. A matching English slang used to enable ordinary tracks in Forced mode too.
+#[test]
+fn subtitle_auto_selection_respects_track_flags() {
+    use libmpv2::events::Event;
+    use tuner::player::{mpv, tracks::parse_track_list};
+
+    let Some((dir, _serial)) = setup() else { return };
+    for mode in [SubtitleAuto::Off, SubtitleAuto::Forced, SubtitleAuto::Always] {
+        for (flag, forced, default) in [("none", false, false), ("forced", true, false), ("default", false, true)] {
+            let mut cfg = headless_config();
+            cfg.player.sub_auto = mode;
+            // Hold the short file open at its first frame while inspecting the selection.
+            cfg.player.mpv_options.insert("pause".into(), "yes".into());
+            let mpv = mpv::create(&cfg, TileId::A).expect("headless mpv");
+            let path = dir.join(format!("subtitles_{flag}.mkv"));
+            mpv.command("loadfile", &[path.to_str().unwrap()]).unwrap();
+            let deadline = Instant::now() + LONG;
+            loop {
+                assert!(Instant::now() < deadline, "{mode:?}/{flag}: file did not load");
+                if let Some(event) = mpv.wait_event(0.1) {
+                    match event.expect("mpv event") {
+                        Event::FileLoaded => break,
+                        Event::EndFile(reason) => panic!("{mode:?}/{flag}: file ended before loading: {reason:?}"),
+                        _ => {}
+                    }
+                }
+            }
+            let tracks = parse_track_list(&mpv.get_property::<String>("track-list").unwrap());
+            assert_eq!(tracks.subs.len(), 1, "{flag}: one subtitle track");
+            let sub = &tracks.subs[0];
+            assert_eq!(sub.lang.as_deref(), Some("eng"), "{flag}: English matches the configured sub_langs");
+            assert_eq!((sub.forced, sub.default), (forced, default), "{flag}: fixture dispositions");
+            let selected = mode == SubtitleAuto::Always || (mode == SubtitleAuto::Forced && forced);
+            let expected_sid = if selected { sub.id.to_string() } else { "no".into() };
+            assert_eq!(mpv.get_property::<String>("sid").unwrap(), expected_sid, "{mode:?}/{flag}");
+            assert_eq!(sub.selected, selected, "{mode:?}/{flag}: track-list agrees with sid");
+
+            if mode == SubtitleAuto::Off {
+                // Off still allows the commands behind `s` and the `S` track picker.
+                mpv.command("cycle", &["sub"]).unwrap();
+                assert_eq!(mpv.get_property::<i64>("sid").unwrap(), sub.id);
+                mpv.set_property("sid", "no").unwrap();
+                mpv.set_property("sid", sub.id).unwrap();
+                assert_eq!(mpv.get_property::<i64>("sid").unwrap(), sub.id);
+            }
+        }
+    }
+}
 
 #[test]
 fn vod_eof_ends_saves_progress_and_history() {

@@ -1486,6 +1486,21 @@ then user `player.mpv_options`. Per file: `loadfile <url> replace -1
 force-media-title=%n%…,user-agent=…,referrer=…,http-header-fields=…,start=…` (values `%len%`
 quoted). The title never comes from the URL (credentials).
 
+Subtitle auto modes (Settings ▸ Player ▸ **Subtitles automatically**):
+
+| Mode | Meaning | mpv selection options |
+|---|---|---|
+| Off (default) | No automatic subtitle selection; `s` / `S` still select a track manually | `sid=no`, `slang=<sub_langs>`, `subs-fallback-forced=no`, `subs-fallback=no` |
+| Forced only | Only tracks flagged forced; ordinary and default-only tracks stay off | `sid=auto`, `slang=` (empty), `subs-fallback-forced=always`, `subs-fallback=no` |
+| Always | Select subtitles, preferring `sub_langs`, with fallback to another available track | `sid=auto`, `slang=<sub_langs>`, `subs-fallback-forced=no`, `subs-fallback=yes` |
+
+mpv 0.41 uses a matching `slang` to enable ordinary tracks even with forced fallback, so
+Forced only clears it for selection without changing the saved `sub_langs`. mpv chooses
+among multiple forced tracks using its own selection rules; this mapping does not guarantee
+the subtitle or audio language preference. There is no separate forced-track language option.
+New or missing settings default to Off; an explicit `sub_auto = "forced"` remains Forced only
+(no config migration).
+
 ### 11.8 Frame pacing (known limitation)
 UI frames follow the compositor's frame callbacks (§11.1: vsync off, `pre_present_notify`), so
 mpv's update callback is served once per display refresh at most, aligned to the compositor's
@@ -2158,7 +2173,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓. Every edit go
 | | Buffer seconds · instant load · demuxer max MiB · network timeout | `player.cache_secs`, `instant_load`, `demuxer_max_mib`, `network_timeout_s` | 10 · off · 150 · 15 |
 | | Zapping delay | `player.zap_delay_ms` | 300 |
 | | Skip small / big | `player.skip_small_s`, `skip_large_s` | 10 · 60 |
-| | Audio / subtitle languages · subtitle auto · subtitle size | `player.audio_langs`, `sub_langs`, `sub_auto`, `sub_scale` | eng · eng · forced · 1.0 |
+| | Audio / subtitle languages · Subtitles automatically: Off / Forced only / Always (§11.7) · subtitle size | `player.audio_langs`, `sub_langs`, `sub_auto`, `sub_scale` | eng · eng · off · 1.0 |
 | | Audio delay per output (stepper · Reset; §13.8.1) | `player.lip_sync` → `{ offset_ms, label }` | {} (0 ms) |
 | | Reconnect attempts | `player.reconnect_max_attempts` | 8 |
 | | Resume threshold · watched % | `player.resume_min_s`, `watched_pct` | 60 · 92 |

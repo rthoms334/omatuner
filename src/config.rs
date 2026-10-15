@@ -255,9 +255,9 @@ impl Default for InterfaceConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum SubtitleAuto {
     /// Never auto-select subtitles.
-    Off,
-    /// Only forced tracks in the preferred language.
     #[default]
+    Off,
+    /// Only forced tracks; mpv chooses among them without `sub_langs`.
     Forced,
     /// Always select the first subtitle in a preferred language.
     Always,
@@ -285,7 +285,7 @@ pub struct PlayerConfig {
     pub muted: bool,
     /// ISO-639 codes in preference order (`alang`).
     pub audio_langs: Vec<String>,
-    /// ISO-639 codes in preference order (`slang`).
+    /// ISO-639 codes in preference order (`slang`; ignored for forced-only selection).
     pub sub_langs: Vec<String>,
     pub sub_auto: SubtitleAuto,
     pub sub_scale: f64,
@@ -411,7 +411,7 @@ impl Default for PlayerConfig {
             muted: false,
             audio_langs: vec!["eng".into(), "en".into()],
             sub_langs: vec!["eng".into(), "en".into()],
-            sub_auto: SubtitleAuto::Forced,
+            sub_auto: SubtitleAuto::Off,
             sub_scale: 1.0,
             lip_sync: BTreeMap::new(),
             reconnect_max_attempts: 8,
@@ -865,6 +865,20 @@ mod tests {
     fn empty_file_gives_defaults() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn subtitles_default_off_and_preserve_explicit_modes() {
+        assert_eq!(SubtitleAuto::default(), SubtitleAuto::Off);
+        assert_eq!(Config::default().player.sub_auto, SubtitleAuto::Off);
+        let old: Config = toml::from_str("[player]\nsub_langs = [\"fra\"]\n").unwrap();
+        assert_eq!(old.player.sub_auto, SubtitleAuto::Off);
+        for (value, mode) in [("off", SubtitleAuto::Off), ("forced", SubtitleAuto::Forced), ("always", SubtitleAuto::Always)] {
+            let cfg: Config = toml::from_str(&format!("[player]\nsub_auto = \"{value}\"\n")).unwrap();
+            assert_eq!(cfg.player.sub_auto, mode);
+            let saved = toml::to_string_pretty(&cfg).unwrap();
+            assert_eq!(toml::from_str::<Config>(&saved).unwrap().player.sub_auto, mode);
+        }
     }
 
     /// Agents play in the pop-out unless the user chose the full window; a config from before
