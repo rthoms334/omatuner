@@ -384,6 +384,21 @@ fn no_binding_is_shadowed_inside_a_context() {
 }
 
 #[test]
+fn lip_sync_keys_reach_both_players_and_the_pop_out_without_stealing_typing() {
+    for player in [K::PlayerLive, K::PlayerVod] {
+        for mut stack in [vec![], vec![K::PopOut], vec![K::PlayerOsd], vec![K::PopOut, K::MultiView], vec![K::NumericEntry]] {
+            stack.push(player);
+            assert_eq!(resolve(&stack, &text("[")), Some(Action::LipSyncEarlier), "{stack:?}");
+            assert_eq!(resolve(&stack, &text("]")), Some(Action::LipSyncLater), "{stack:?}");
+        }
+        assert_eq!(resolve(&[K::List, player], &text("[")), Some(Action::FilterInput('[')));
+        assert_eq!(resolve(&[K::TextInput, player], &text("]")), None);
+    }
+    assert_eq!(resolve(&[K::Guide], &text("[")), Some(Action::GuidePrevDay));
+    assert_eq!(resolve(&[K::Guide], &text("]")), Some(Action::GuideNextDay));
+}
+
+#[test]
 fn help_is_complete_for_every_context() {
     let mut titles = Vec::new();
     for ctx in K::ALL {

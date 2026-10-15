@@ -472,6 +472,18 @@ impl<'a> UiCtx<'a> {
     pub fn edit_config(&mut self, f: impl FnOnce(&mut Config) + 'static) {
         self.config_edits.push(Box::new(f));
     }
+    /// Adjust a remembered output, or reset it (`None`). Shared by player keys, tracks and
+    /// Settings; edits reach every local picture through ApplyConfig at once, with a debounced save.
+    pub fn edit_lip_sync(&mut self, output: crate::player::audio_output::AudioOutput, steps: Option<i32>) {
+        self.edit_config(move |cfg| {
+            let saved = cfg.player.lip_sync.entry(output.name).or_default();
+            saved.label = output.label;
+            match steps {
+                Some(n) => saved.adjust(n),
+                None => saved.offset_ms = 0,
+            }
+        });
+    }
     /// Send a player command (non-blocking; never call mpv from the UI thread). Single view: to
     /// the picture on screen. Multi-view (DESIGN §35): volume and mute to the picture with the
     /// sound, a channel or catch-up through the copy planner for the focused picture, a film or

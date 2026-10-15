@@ -121,9 +121,23 @@ pub fn spawn(
     epoch: Instant,
     setup: TileSetup,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let mut c = create(mpv, cfg, deps, snap_tx, render_clock, epoch, setup);
+    let name = if c.tile == TileId::A { "player".to_owned() } else { format!("player-{}", c.tile.letter().to_ascii_lowercase()) };
+    std::thread::Builder::new().name(name).spawn(move || c.run(cmd_rx, evt_rx))
+}
+
+fn create(
+    mpv: Arc<Mpv>,
+    cfg: &Config,
+    deps: PlayerDeps,
+    snap_tx: watch::Sender<Arc<PlayerSnapshot>>,
+    render_clock: RenderClock,
+    epoch: Instant,
+    setup: TileSetup,
+) -> Controller {
     let snap = (**snap_tx.borrow()).clone();
     let TileSetup { tile, budget, audible } = setup;
-    let mut c = Controller {
+    Controller {
         machine: PlayerMachine::new(MachineConfig::from_config(cfg)),
         mpv,
         deps,
@@ -166,9 +180,9 @@ pub fn spawn(
         lease_generation: None,
         local_view: None,
         undelivered: None,
-    };
-    let name = if tile == TileId::A { "player".to_owned() } else { format!("player-{}", tile.letter().to_ascii_lowercase()) };
-    std::thread::Builder::new().name(name).spawn(move || c.run(cmd_rx, evt_rx))
+        audio_lookup: Default::default(),
+        audio_identified: false,
+    }
 }
 
 /// A load waiting for the previous stream of the same source to close.
@@ -290,6 +304,9 @@ struct Controller {
     /// longer paired): the failure's Play here plays it here, replacing what still plays here.
     /// Any other play, or a stop, forgets it.
     undelivered: Option<CopyPlay>,
+    audio_lookup: super::audio_output::Lookup,
+    /// A first identification is remembered without flashing an output change.
+    audio_identified: bool,
 }
 
 /// The state last logged (see [`Controller::log_transition`]).
@@ -344,6 +361,11 @@ impl Controller {
                     Ok(MpvEvent::Shutdown) | Err(_) => return,
                     Ok(ev) => state_changed |= self.mpv_event(ev),
                 },
+                recv(self.audio_lookup.results) -> result => {
+                    if let Ok(result) = result {
+                        self.audio_output_result(result);
+                    }
+                },
                 recv(deferred) -> _ => state_changed |= self.flush_deferred_end(),
                 recv(remote) -> ev => state_changed |= match ev {
                     Ok(ev) => self.remote_event(ev),
@@ -362,6 +384,12 @@ impl Controller {
                     self.pending_tick(now);
                     self.waiting_tick();
                     self.video_watchdog(now);
+                    if !self.casting()
+                        && (self.machine.state().is_active() || matches!(self.machine.state(), PlayerState::Paused))
+                        && self.audio_lookup.due(now, Duration::from_secs(15))
+                    {
+                        self.refresh_audio_output(now);
+                    }
                     if now.duration_since(self.last_progress) >= PROGRESS_EVERY
                         && matches!(self.machine.state(), PlayerState::Playing)
                     {
@@ -660,6 +688,7 @@ impl Controller {
         if self.casting() {
             return self.load_remote(p);
         }
+        self.apply_lip_sync();
         if self.snap.paused {
             // a new play always plays (mpv's `pause` survives loadfile)
             let _ = self.mpv.set_property("pause", false);
@@ -1544,6 +1573,66 @@ impl Controller {
         self.watched_pct = cfg.player.watched_pct;
         super::mpv::apply_runtime(&self.mpv, cfg, &self.applied, self.tile);
         *self.applied = cfg.clone();
+        if !self.casting() {
+            self.apply_lip_sync();
+        }
+    }
+
+    /// Reconfig/property events and the periodic check request work without blocking playback.
+    fn refresh_audio_output(&mut self, now: Instant) {
+        if !self.casting()
+            && let Ok(device) = self.mpv.get_property::<String>("audio-device")
+        {
+            self.audio_lookup.request(device, now);
+        }
+    }
+
+    fn audio_output_result(&mut self, result: super::audio_output::LookupResult) {
+        self.audio_lookup.complete();
+        // A result for an old explicit device must not undo a newer selection (or a cast).
+        if self.casting() || self.mpv.get_property::<String>("audio-device").ok().as_deref() != Some(&result.device) {
+            return;
+        }
+        let output = result.output.or_else(|| {
+            if !result.device.is_empty() && result.device != "auto" {
+                let label = if self.audio_identified && self.snap.audio_output.name == result.device {
+                    self.snap.audio_output.label.clone()
+                } else {
+                    self.applied
+                        .player
+                        .lip_sync
+                        .get(&result.device)
+                        .map(|s| s.label.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| result.device.clone())
+                };
+                Some(super::audio_output::AudioOutput { name: result.device, label })
+            } else if self.audio_identified {
+                None
+            } else {
+                Some(Default::default())
+            }
+        });
+        let Some(output) = output else { return };
+        let previous = self.audio_identified.then(|| self.snap.audio_output.clone());
+        let changed = previous.as_ref().is_none_or(|p| p.name != output.name);
+        self.audio_identified = true;
+        self.snap.audio_output = output;
+        self.apply_lip_sync();
+        if changed {
+            self.emit(PlayerEvent::AudioOutputChanged { previous, output: self.snap.audio_output.clone(), offset_ms: self.snap.lip_sync_ms });
+            self.force_publish = true;
+        }
+    }
+
+    fn apply_lip_sync(&mut self) {
+        let ms = self.applied.player.lip_sync.get(&self.snap.audio_output.name).map_or(0, crate::config::LipSync::offset_ms);
+        if let Err(e) = self.mpv.set_property("audio-delay", f64::from(ms) / 1000.0) {
+            tracing::warn!("{}: couldn't set lip sync: {e}", self.log);
+            return;
+        }
+        self.snap.lip_sync_ms = ms;
+        self.dirty = true;
     }
 
     fn set_aspect(&mut self, a: AspectMode) {
@@ -1680,7 +1769,10 @@ impl Controller {
                 }
                 self.feed(Input::StartFile { entry: entry_id }, now)
             }
-            MpvEvent::FileLoaded => self.feed(Input::FileLoaded, now),
+            MpvEvent::FileLoaded => {
+                self.apply_lip_sync();
+                self.feed(Input::FileLoaded, now)
+            }
             MpvEvent::PlaybackRestart => {
                 // the new stream's size before the Playing publish records it (`record_video`),
                 // whatever order mpv delivers the `video-params` change in
@@ -1725,7 +1817,13 @@ impl Controller {
                 false
             }
             MpvEvent::Prop { id, value } => self.prop(id, value, now),
-            MpvEvent::VideoReconfig | MpvEvent::AudioReconfig | MpvEvent::Seek | MpvEvent::Idle => false,
+            MpvEvent::AudioReconfig => {
+                if self.machine.target().is_some() {
+                    self.refresh_audio_output(now);
+                }
+                false
+            }
+            MpvEvent::VideoReconfig | MpvEvent::Seek | MpvEvent::Idle => false,
             MpvEvent::QueueOverflow => {
                 tracing::warn!("mpv event queue overflow");
                 false
@@ -1847,6 +1945,11 @@ impl Controller {
                 self.snap.seekable = b(&v) && !live;
             }
             PropId::SubDelay => self.snap.sub_delay = f(&v).unwrap_or(0.0),
+            PropId::AudioDevice | PropId::CurrentAo => {
+                if self.machine.target().is_some() {
+                    self.refresh_audio_output(now);
+                }
+            }
             PropId::SubScale => self.snap.sub_scale = f(&v).unwrap_or(1.0),
             PropId::VideoParamsW | PropId::VideoParamsH => self.read_video_size(),
             PropId::HwdecCurrent => {
@@ -2094,6 +2197,151 @@ pub fn http_status_in(text: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audio_controller(cfg: &Config, query: super::super::audio_output::Query) -> (Controller, Receiver<AppEvent>) {
+        struct UnusedResolver;
+        impl super::super::MediaResolver for UnusedResolver {
+            fn resolve(&mut self, _: &MediaRef, _: bool) -> Result<Playable, PlayerError> {
+                unreachable!("these tests only change the audio output")
+            }
+            fn skip_on_zap(&mut self, _: ChannelId) -> bool {
+                false
+            }
+            fn is_locked(&mut self, _: ChannelId) -> bool {
+                false
+            }
+        }
+        let mut cfg = cfg.clone();
+        cfg.player.mpv_options.insert("vo".into(), "null".into());
+        cfg.player.mpv_options.insert("ao".into(), "null".into());
+        let mpv = Arc::new(super::super::mpv::create(&cfg, TileId::A).unwrap());
+        let (bus, events) = crate::msg::EventBus::new(None);
+        let deps = PlayerDeps { bus, store: Box::new(super::super::NullPlayerStore), resolver: Box::new(UnusedResolver), cast: None };
+        let (snap_tx, _) = watch::channel(Arc::new(PlayerSnapshot::default()));
+        let mut c = create(
+            mpv,
+            &cfg,
+            deps,
+            snap_tx,
+            Arc::new(AtomicU64::new(0)),
+            Instant::now(),
+            TileSetup { tile: TileId::A, budget: SharedBudget::default(), audible: true },
+        );
+        c.audio_lookup = super::super::audio_output::Lookup::new(query);
+        (c, events)
+    }
+
+    fn identify(c: &mut Controller, now: Instant) {
+        c.refresh_audio_output(now);
+        let result = c.audio_lookup.results.recv_timeout(Duration::from_secs(5)).expect("fake lookup finished");
+        c.audio_output_result(result);
+    }
+
+    #[test]
+    fn lip_sync_failed_lookup_keeps_the_output_offset_and_emits_nothing_to_save() {
+        use super::super::audio_output::AudioOutput;
+        use crate::config::LipSync;
+        let speakers = AudioOutput { name: "speakers".into(), label: "MacBook Air Speakers".into() };
+        let renamed = AudioOutput { label: "Built-in speakers".into(), ..speakers.clone() };
+        let headphones = AudioOutput { name: "headphones".into(), label: "Headphones".into() };
+        let answers =
+            std::sync::Mutex::new(std::collections::VecDeque::from([Some(speakers.clone()), None, Some(renamed.clone()), Some(headphones.clone())]));
+        let mut cfg = Config::default();
+        cfg.player.lip_sync.insert(speakers.name.clone(), LipSync { offset_ms: -150, label: speakers.label.clone() });
+        cfg.player.lip_sync.insert(headphones.name.clone(), LipSync { offset_ms: 100, label: headphones.label.clone() });
+        let (mut c, events) = audio_controller(&cfg, Arc::new(move |_| answers.lock().unwrap().pop_front().unwrap()));
+        let now = Instant::now();
+        identify(&mut c, now);
+        assert!(matches!(events.try_recv().unwrap(), AppEvent::Player(PlayerEvent::AudioOutputChanged {
+            previous: None, output, offset_ms: -150,
+        }) if output == speakers));
+        identify(&mut c, now + Duration::from_secs(2));
+        assert_eq!(c.snap.audio_output, speakers);
+        assert_eq!(c.snap.lip_sync_ms, -150);
+        assert!((c.mpv.get_property::<f64>("audio-delay").unwrap() + 0.15).abs() < 0.001);
+        assert!(events.is_empty(), "a failure must not ask the app to save a new output or flash");
+        // An adjustment during the failure still edits and applies the speakers' entry.
+        cfg.player.lip_sync.get_mut(&c.snap.audio_output.name).unwrap().adjust(-1);
+        c.apply_config(&cfg);
+        assert_eq!(c.snap.lip_sync_ms, -200);
+        assert!(!cfg.player.lip_sync.contains_key("this-computer"));
+        identify(&mut c, now + Duration::from_secs(4));
+        assert_eq!(c.snap.audio_output, renamed);
+        assert!(events.is_empty(), "a label change is not an output switch");
+        identify(&mut c, now + Duration::from_secs(6));
+        assert_eq!(c.snap.lip_sync_ms, 100);
+        assert!(matches!(events.try_recv().unwrap(), AppEvent::Player(PlayerEvent::AudioOutputChanged {
+            previous: Some(previous), output, offset_ms: 100,
+        }) if previous == renamed && output == headphones));
+    }
+
+    #[test]
+    fn lip_sync_failed_explicit_lookup_keeps_the_last_good_label() {
+        use super::super::audio_output::AudioOutput;
+        let output = AudioOutput { name: "pulse/speakers".into(), label: "Laptop speakers".into() };
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from([Some(output.clone()), None]));
+        let mut cfg = Config::default();
+        cfg.player.mpv_options.insert("audio-device".into(), output.name.clone());
+        cfg.player.lip_sync.insert(output.name.clone(), crate::config::LipSync { offset_ms: -100, label: output.label.clone() });
+        let (mut c, events) = audio_controller(&cfg, Arc::new(move |_| answers.lock().unwrap().pop_front().unwrap()));
+        let now = Instant::now();
+        identify(&mut c, now);
+        events.try_recv().unwrap();
+        identify(&mut c, now + Duration::from_secs(2));
+        assert_eq!(c.snap.audio_output, output);
+        assert_eq!(c.snap.lip_sync_ms, -100);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn lip_sync_lookup_does_not_block_commands_and_the_loop_applies_its_result() {
+        use super::super::audio_output::AudioOutput;
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let mut cfg = Config::default();
+        cfg.player.lip_sync.insert("speakers".into(), crate::config::LipSync { offset_ms: -150, label: "Speakers".into() });
+        let (mut c, _) = audio_controller(
+            &cfg,
+            Arc::new(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Some(AudioOutput { name: "speakers".into(), label: "Speakers".into() })
+            }),
+        );
+        let snaps = c.snap_tx.subscribe();
+        c.refresh_audio_output(Instant::now());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (_evt_tx, evt_rx) = crossbeam_channel::unbounded();
+        let thread = std::thread::spawn(move || c.run(cmd_rx, evt_rx));
+        let wait = |pred: fn(&PlayerSnapshot) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !pred(&snaps.borrow()) {
+                assert!(Instant::now() < deadline, "controller didn't publish the change");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        cmd_tx.send(PlayerCommand::SetMute(true)).unwrap();
+        wait(|s| s.muted);
+        release_tx.send(()).unwrap();
+        wait(|s| s.audio_output.name == "speakers" && s.lip_sync_ms == -150);
+        cmd_tx.send(PlayerCommand::Shutdown).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn lip_sync_initial_failure_uses_the_computer_entry_once() {
+        let mut cfg = Config::default();
+        cfg.player.lip_sync.insert("this-computer".into(), crate::config::LipSync { offset_ms: 50, label: "This computer".into() });
+        let (mut c, events) = audio_controller(&cfg, Arc::new(|_| None));
+        let now = Instant::now();
+        identify(&mut c, now);
+        assert_eq!(c.snap.audio_output, Default::default());
+        assert_eq!(c.snap.lip_sync_ms, 50);
+        assert!(matches!(events.try_recv().unwrap(), AppEvent::Player(PlayerEvent::AudioOutputChanged { previous: None, .. })));
+        identify(&mut c, now + Duration::from_secs(2));
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn stop_first_only_for_the_same_source_with_a_limit_of_one_or_unknown() {

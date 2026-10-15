@@ -555,6 +555,7 @@ enum Row {
     Toggle(&'static CfgToggle),
     Choice(&'static CfgChoice),
     Number(&'static CfgNumber),
+    LipSync { output: crate::player::audio_output::AudioOutput, reset: bool },
     Text(&'static CfgText),
     Act { act: Act, icon: &'static str, label: String, danger: bool },
     Item { item: Item, icon: String, color: Option<SourceColor>, label: String, detail: Option<String>, reorder: bool },
@@ -1210,6 +1211,22 @@ impl SettingsScreen {
                 v.extend(PLAYER_TEXT[..2].iter().map(Row::Text));
                 v.push(Row::Choice(&PLAYER_SUB));
                 v.push(Row::Number(&PLAYER_N[6]));
+                v.push(Row::Section("Lip sync".into()));
+                v.push(Row::Note(
+                    "Sound earlier / later for each audio output. [ / ] in the player step by 50 ms; negative is earlier.".into(),
+                    false,
+                ));
+                if ctx.config.player.lip_sync.is_empty() {
+                    v.push(Row::Note("Play something to identify this computer's audio output.".into(), false));
+                }
+                for (name, saved) in &ctx.config.player.lip_sync {
+                    let output = crate::player::audio_output::AudioOutput {
+                        name: name.clone(),
+                        label: if saved.label.is_empty() { name.clone() } else { saved.label.clone() },
+                    };
+                    v.push(Row::LipSync { output: output.clone(), reset: false });
+                    v.push(Row::LipSync { output, reset: true });
+                }
                 v.push(Row::Section("Network".into()));
                 v.push(Row::Text(&PLAYER_TEXT[2]));
                 v.push(Row::Text(&PLAYER_TEXT[3]));
@@ -1789,6 +1806,7 @@ impl SettingsScreen {
                     set(c, ((v / step).round() * step).clamp(min, max));
                 });
             }
+            Row::LipSync { output, reset: false } => ctx.edit_lip_sync(output.clone(), Some(dir)),
             Row::Local { field: Local::SrcUseXtream, .. } => self.set_use_xtream(ctx, dir > 0),
             Row::Local { field, .. } => self.adjust_local(*field, dir),
             Row::Item { item: Item::Epg(id), .. } => self.epg_offset(ctx, *id, dir * 15),
@@ -1816,6 +1834,7 @@ impl SettingsScreen {
                 self.adjust(ctx, row, if cur { -1 } else { 1 });
             }
             Row::Choice(_) | Row::Number(_) => self.adjust(ctx, row, 1),
+            Row::LipSync { output, reset } => ctx.edit_lip_sync(output.clone(), if *reset { None } else { Some(1) }),
             Row::Text(t) => {
                 if self.editing {
                     self.commit_text(ctx, t);
@@ -3273,6 +3292,24 @@ impl SettingsScreen {
                         let value = number_text(n, (n.get)(ctx.config));
                         if let Some(d) = value_row(&mut inner, theme, n.label, &value, label_color) {
                             clicked = Some((i, d));
+                        }
+                    }
+                    Row::LipSync { output, reset } => {
+                        if *reset {
+                            inner.label(
+                                RichText::new(format!("Reset lip sync · {}", output.label)).size(theme.font(TypeToken::Body)).color(label_color),
+                            );
+                        } else {
+                            let playing = std::iter::once(ctx.player).chain(ctx.multiview.snaps.iter().flatten()).any(|snap| {
+                                snap.cast.is_none()
+                                    && (snap.state.is_active() || matches!(snap.state, crate::player::PlayerState::Paused))
+                                    && snap.audio_output.name == output.name
+                            });
+                            let label = format!("{}{}", output.label, if playing { " · Playing now" } else { "" });
+                            let ms = ctx.config.player.lip_sync.get(&output.name).map_or(0, crate::config::LipSync::offset_ms);
+                            if let Some(d) = value_row(&mut inner, theme, &label, &format!("{ms:+} ms"), label_color) {
+                                clicked = Some((i, d));
+                            }
                         }
                     }
                     Row::Text(tx) => {

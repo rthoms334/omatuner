@@ -122,6 +122,8 @@ pub struct TunerApp {
     nav_owner: Vec<(usize, usize)>,
     pending_toasts: Vec<Toast>,
     config_edits: Vec<crate::ui::ConfigEdit>,
+    /// Lip-sync repeats apply live, then save once the keys have been quiet for 500 ms.
+    config_save_at: Option<std::time::Instant>,
     /// Actions resolved in `raw_input_hook`, dispatched at the start of `ui`, with the context
     /// stack they were resolved against.
     pending_actions: Vec<(Action, Vec<KeyContext>)>,
@@ -323,6 +325,7 @@ impl TunerApp {
             nav_owner: Vec::new(),
             pending_toasts: Vec::new(),
             config_edits: Vec::new(),
+            config_save_at: None,
             pending_actions: Vec::new(),
             drop_alt_text: false,
             window_title: crate::APP_NAME.to_owned(),
@@ -851,6 +854,15 @@ impl TunerApp {
     }
 
     fn handle_event(&mut self, ev: AppEvent, egui_ctx: &egui::Context) {
+        // Output discovery belongs to every local picture, including one without focus.
+        if let AppEvent::Player(crate::player::PlayerEvent::AudioOutputChanged { output, .. })
+        | AppEvent::Tile(crate::player::tiles::TileEvent::Player(_, crate::player::PlayerEvent::AudioOutputChanged { output, .. })) = &ev
+        {
+            let output = output.clone();
+            self.config_edits.push(Box::new(move |cfg| {
+                cfg.player.lip_sync.entry(output.name).or_default().label = output.label;
+            }));
+        }
         // multi-view: the focused picture's player events are "the player's" for the screens
         // (picture B's arrive as `TileEvent::Player`); the other picture's only toast
         let ev = match ev {
@@ -2536,9 +2548,30 @@ impl TunerApp {
         }
     }
 
-    /// Apply queued Settings edits: save, swap the shared config, re-apply to the player, the
-    /// integrations and the theme scale (no restart needed for any v1 setting).
     fn apply_config_edits(&mut self, egui_ctx: &egui::Context) {
+        self.apply_pending_config(egui_ctx);
+        if let Some(at) = self.config_save_at {
+            if let Some(wait) = at.checked_duration_since(std::time::Instant::now()).filter(|wait| !wait.is_zero()) {
+                egui_ctx.request_repaint_after(wait);
+            } else {
+                self.save_pending_config();
+            }
+        }
+    }
+
+    fn save_pending_config(&mut self) {
+        if self.config_save_at.take().is_some()
+            && let Some(services) = &self.services
+            && let Err(e) = services.config().save(&services.paths.config_file())
+        {
+            tracing::warn!("saving settings: {e}");
+            self.toast(Toast::error(format!("Couldn't save settings: {e}")));
+        }
+    }
+
+    /// Apply queued Settings edits immediately. Only lip-sync-only edits defer the disk write;
+    /// another setting saves the whole current config, including any pending correction.
+    fn apply_pending_config(&mut self, egui_ctx: &egui::Context) {
         if self.config_edits.is_empty() {
             return;
         }
@@ -2552,7 +2585,15 @@ impl TunerApp {
         if cfg == *old {
             return;
         }
-        let saved = cfg.save(&services.paths.config_file());
+        let mut with_lip_sync = (*old).clone();
+        with_lip_sync.player.lip_sync.clone_from(&cfg.player.lip_sync);
+        let saved = if cfg == with_lip_sync {
+            self.config_save_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+            Ok(())
+        } else {
+            self.config_save_at = None;
+            cfg.save(&services.paths.config_file())
+        };
         let cfg = Arc::new(cfg);
         *services.config.write().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
         services.apply_config(&old, &cfg);
@@ -3092,6 +3133,7 @@ impl eframe::App for TunerApp {
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        self.save_pending_config();
         self.remember_last_screen();
         // SHUTDOWN ORDER: render context (needs GL) → FBO → services (player/mpv, then writer).
         self.video.destroy(gl);
@@ -5750,6 +5792,58 @@ mod tests {
         rig.app.config_edits.push(Box::new(|c: &mut Config| c.interface.ui_scale = 1.5));
         rig.frame_with(vec![]);
         assert!((rig.app.theme.rem() - rem * 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lip_sync_repeats_apply_immediately_save_after_quiet_and_flush_on_exit() {
+        use crate::player::audio_output::AudioOutput;
+        let mut rig = Rig::new();
+        let file = rig.app.services().paths.config_file();
+        let output = AudioOutput { name: "speakers".into(), label: "Laptop speakers".into() };
+        rig.event(AppEvent::Player(crate::player::PlayerEvent::AudioOutputChanged { previous: None, output: output.clone(), offset_ms: 0 }));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert_eq!(rig.app.services().config().player.lip_sync.len(), 1, "discovery is applied");
+        rig.app.config_save_at = Some(Instant::now() - Duration::from_millis(1));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert!(rig.app.config_save_at.is_none(), "the quiet period expired");
+        assert!(file.exists(), "settings saved: {:?}", rig.log().toasts);
+        let saved = Config::load(&file).unwrap();
+        assert_eq!(saved.player.lip_sync.len(), 1);
+        assert_eq!(saved.player.lip_sync["speakers"].label, "Laptop speakers");
+        assert!(!saved.player.lip_sync.contains_key("this-computer"));
+        for step in 1..=4 {
+            let previous_deadline = rig.app.config_save_at;
+            rig.app.with_ctx(|ctx, _, _| ctx.edit_lip_sync(output.clone(), Some(-1)));
+            rig.app.apply_config_edits(&rig.ctx);
+            assert_eq!(rig.app.services().config().player.lip_sync["speakers"].offset_ms, -50 * step);
+            assert!(
+                matches!(rig.log().commands.last(), Some(PlayerCommand::ApplyConfig(cfg)) if cfg.player.lip_sync["speakers"].offset_ms == -50 * step)
+            );
+            assert_eq!(Config::load(&file).unwrap(), saved, "repeats must leave the file alone");
+            assert!(rig.app.config_save_at > previous_deadline, "each change restarts the quiet period");
+        }
+        rig.app.config_save_at = Some(Instant::now() - Duration::from_millis(1));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert_eq!(Config::load(&file).unwrap().player.lip_sync["speakers"].offset_ms, -200);
+        assert!(rig.app.config_save_at.is_none());
+        // Quitting before another quiet period ends must still persist the final value.
+        rig.app.with_ctx(|ctx, _, _| ctx.edit_lip_sync(output, Some(-1)));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert!(rig.app.config_save_at.is_some());
+        rig.app.on_exit(None);
+        assert_eq!(Config::load(&file).unwrap().player.lip_sync["speakers"].offset_ms, -250);
+    }
+
+    #[test]
+    fn lip_sync_pending_save_survives_a_direct_exit_without_another_frame() {
+        let mut rig = Rig::new();
+        let file = rig.app.services().paths.config_file();
+        rig.app.with_ctx(|ctx, _, _| ctx.edit_lip_sync(Default::default(), Some(1)));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert!(rig.app.config_save_at.is_some());
+        let cleanup = rig.app.services().exit_cleanup();
+        rig.app.services().rt.block_on(cleanup);
+        assert_eq!(Config::load(&file).unwrap().player.lip_sync["this-computer"].offset_ms, 50);
     }
 
     #[test]
