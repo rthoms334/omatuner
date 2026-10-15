@@ -3,8 +3,8 @@
 //! Contract:
 //! * Every field has a serde default, so a partial (or empty) file is valid and new fields can be
 //!   added without migrations. Unknown keys are ignored (forward compatible).
-//! * [`Config::save`] writes atomically (tmp file + rename) and is called from the UI thread only
-//!   when the Settings screen commits a change; it is cheap (< 1 ms).
+//! * [`Config::save`] writes atomically (tmp file + rename) for Settings edits and exit flushes;
+//!   it is cheap (< 1 ms). Lip-sync repeats defer the write until the keys are quiet.
 //! * Per-source and per-channel settings live in the database, NOT here (see `model::source`).
 //! * Credentials are NEVER stored here.
 //!

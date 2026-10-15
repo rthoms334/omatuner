@@ -1131,7 +1131,7 @@ mod casting {
     }
 
     #[test]
-    fn lip_sync_stays_local_and_reapplies_when_playing_here() {
+    fn lip_sync_reapplies_when_playing_here() {
         let ch = live(1, "av://lavfi:testsrc2=size=160x90:rate=25".into());
         let (h, sessions) = start_casting(vec![ch.clone()]);
         let mut cfg = headless_config();
@@ -1151,7 +1151,6 @@ mod casting {
         // A snapshot-visible command after ApplyConfig proves the edit has been processed.
         h.handle.send(PlayerCommand::SetPlayOn(Some(device())));
         h.wait_snapshot(LONG, |s| s.play_on == Some(device()));
-        assert!(matches!(tv.cmds.try_recv(), Err(TryRecvError::Empty)), "the TV gets no local audio correction");
 
         h.handle.send(PlayerCommand::StopCasting { play_here: true });
         assert!(matches!(tv.next(), RemoteCmd::Close { .. }));

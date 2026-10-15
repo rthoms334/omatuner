@@ -1,10 +1,11 @@
-//! Local audio output identity for lip sync (DESIGN §13.8.1). Called on the controller thread;
-//! pactl's two queries share a short timeout, including draining their output pipes.
+//! Local audio output identity for lip sync (DESIGN §13.8.1). A helper thread runs pactl;
+//! its two queries share a short timeout, including draining their output pipes.
 
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use libmpv2::Mpv;
+use crossbeam_channel::{Receiver, Sender};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
@@ -20,19 +21,71 @@ impl Default for AudioOutput {
     }
 }
 
-/// mpv's explicit device wins, even if pactl is unavailable or has a different default.
-pub(super) fn current(mpv: &Mpv) -> AudioOutput {
-    if let Ok(name) = mpv.get_property::<String>("audio-device")
-        && !name.is_empty()
-        && name != "auto"
-    {
-        // mpv's device list can probe every backend, even when one was explicitly selected.
-        // For PipeWire/Pulse, the bounded sink query supplies the human-readable description.
-        let sink = name.strip_prefix("pulse/").or_else(|| name.strip_prefix("pipewire/"));
-        let label = sink.and_then(|sink| query_sink(Some(sink))).map_or_else(|| name.clone(), |s| s.label);
-        return AudioOutput { name, label };
+/// The device is read by the controller; only the worker calls pactl. A failed description
+/// lookup stays a failure so the controller can keep the explicit device's last good label.
+fn current(device: &str) -> Option<AudioOutput> {
+    if device != "auto" && !device.is_empty() {
+        let sink = device.strip_prefix("pulse/").or_else(|| device.strip_prefix("pipewire/"));
+        let label = match sink {
+            Some(sink) => query_sink(Some(sink))?.label,
+            None => device.to_owned(),
+        };
+        return Some(AudioOutput { name: device.to_owned(), label });
     }
-    query_sink(None).unwrap_or_default()
+    query_sink(None)
+}
+
+pub(super) type Query = Arc<dyn Fn(&str) -> Option<AudioOutput> + Send + Sync>;
+
+pub(super) struct LookupResult {
+    pub device: String,
+    pub output: Option<AudioOutput>,
+}
+
+/// One bounded lookup at a time; reconfig bursts during a zap share the same check.
+pub(super) struct Lookup {
+    query: Query,
+    tx: Sender<LookupResult>,
+    pub results: Receiver<LookupResult>,
+    pending: bool,
+    last_check: Option<Instant>,
+}
+
+impl Default for Lookup {
+    fn default() -> Self {
+        Self::new(Arc::new(current))
+    }
+}
+
+impl Lookup {
+    pub fn new(query: Query) -> Self {
+        let (tx, results) = crossbeam_channel::unbounded();
+        Self { query, tx, results, pending: false, last_check: None }
+    }
+
+    pub fn due(&self, now: Instant, interval: Duration) -> bool {
+        !self.pending && self.last_check.is_none_or(|at| now.saturating_duration_since(at) >= interval)
+    }
+
+    pub fn request(&mut self, device: String, now: Instant) {
+        if !self.due(now, Duration::from_millis(1500)) {
+            return;
+        }
+        self.last_check = Some(now);
+        let query = self.query.clone();
+        let tx = self.tx.clone();
+        match std::thread::Builder::new().name("audio-output".into()).spawn(move || {
+            let output = query(&device);
+            let _ = tx.send(LookupResult { device, output });
+        }) {
+            Ok(_) => self.pending = true,
+            Err(e) => tracing::warn!("couldn't start audio output lookup: {e}"),
+        }
+    }
+
+    pub fn complete(&mut self) {
+        self.pending = false;
+    }
 }
 
 fn query_sink(explicit: Option<&str>) -> Option<AudioOutput> {
@@ -74,8 +127,8 @@ async fn pactl(args: &[&str], deadline: tokio::time::Instant) -> Option<String> 
 }
 
 /// `get-default-sink` can return a bare name even with `--format=json`; `list sinks` is JSON.
-/// Missing descriptions keep the stable sink name. A missing sink or malformed list falls
-/// back to the computer entry, never to a different sink from the list.
+/// Missing descriptions keep the stable sink name. A missing sink or malformed list
+/// returns no output, never a different sink from the list.
 fn parse_pactl(default: &str, sinks: &str) -> Option<AudioOutput> {
     let default = default.trim();
     let name = if default.starts_with('"') { serde_json::from_str::<String>(default).ok()? } else { default.to_owned() };
@@ -103,6 +156,35 @@ pub fn adjustment_text(output: &AudioOutput, offset_ms: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lip_sync_lookup_runs_off_thread_with_one_in_flight_and_debounces_triggers() {
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let caller = std::thread::current().id();
+        let mut lookup = Lookup::new(Arc::new(move |_| {
+            started_tx.send(std::thread::current().id()).unwrap();
+            release_rx.recv().unwrap();
+            None
+        }));
+        let now = Instant::now();
+        lookup.request("auto".into(), now);
+        assert_ne!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), caller);
+        lookup.request("auto".into(), now + Duration::from_secs(2));
+        assert!(!lookup.due(now + Duration::from_secs(20), Duration::from_secs(15)), "still in flight");
+        release_tx.send(()).unwrap();
+        assert!(lookup.results.recv_timeout(Duration::from_secs(5)).unwrap().output.is_none());
+        lookup.complete();
+        lookup.request("auto".into(), now + Duration::from_millis(1499));
+        assert!(started_rx.is_empty(), "the in-flight and debounced triggers started no workers");
+        assert!(!lookup.due(now + Duration::from_secs(14), Duration::from_secs(15)));
+        assert!(lookup.due(now + Duration::from_secs(15), Duration::from_secs(15)));
+        lookup.request("auto".into(), now + Duration::from_millis(1500));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_tx.send(()).unwrap();
+        lookup.results.recv_timeout(Duration::from_secs(5)).unwrap();
+        lookup.complete();
+    }
 
     #[test]
     fn pactl_selects_the_default_by_name_and_keeps_its_description() {

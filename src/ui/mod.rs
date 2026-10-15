@@ -473,7 +473,7 @@ impl<'a> UiCtx<'a> {
         self.config_edits.push(Box::new(f));
     }
     /// Adjust a remembered output, or reset it (`None`). Shared by player keys, tracks and
-    /// Settings; config edits reach every local picture through ApplyConfig.
+    /// Settings; edits reach every local picture through ApplyConfig at once, with a debounced save.
     pub fn edit_lip_sync(&mut self, output: crate::player::audio_output::AudioOutput, steps: Option<i32>) {
         self.edit_config(move |cfg| {
             let saved = cfg.player.lip_sync.entry(output.name).or_default();

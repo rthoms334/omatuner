@@ -2034,19 +2034,21 @@ button.
 
 Local playback remembers one audio offset per output in `player.lip_sync`, a map from the
 output's name to `{ offset_ms, label }`. Negative means sound earlier. `[` / `]` step by 50 ms,
-clamped to ±2000 ms, save immediately and flash “Sound 150 ms earlier · MacBook Air Speakers”
+clamped to ±2000 ms, apply immediately and flash “Sound 150 ms earlier · MacBook Air Speakers”
 (at zero, “Lip sync: in step”). The keys are shared by live, VOD and the pop-out; the guide's
-day keys and detail's season keys stay in their own contexts.
+day keys and detail's season keys stay in their own contexts. Saves wait for 500 ms without a
+change, and pending values are saved on exit.
 
 The controller uses mpv's explicit `audio-device` when set. With `auto`, it identifies the
 default PipeWire/Pulse sink through `pactl --format=json get-default-sink` and `list sinks`.
 Explicit PipeWire/Pulse devices also get their descriptions from the sink list; other explicit
-devices use their device name. Queries run on the controller thread with a shared 750 ms
-timeout; missing or failed pactl in `auto` uses one “This computer” entry. The controller
-applies the saved `audio-delay` in seconds
-on every local load, on mpv output changes, and checks again every 15 s while playing or
-paused. Changing outputs applies that output's offset (zero when unseen) and flashes
-“Lip sync for ‹label›: ‹offset›”. Every discovered output is remembered, including at zero.
+devices use their device name. Queries run on a helper thread with a shared 750 ms timeout,
+one at a time; output events within 1.5 s of the last query are ignored. A failed lookup keeps
+the current output and its last good label; before any identification, `auto` uses one “This
+computer” entry. The controller applies the cached output's saved `audio-delay` in seconds on
+every local load and checks again every 15 s while playing or paused. Changing output names
+applies that output's offset (zero when unseen) and flashes “Lip sync for ‹label›: ‹offset›”.
+Every discovered output is remembered, including at zero; the first identification is silent.
 
 Audio tracks (`A`) has a Lip sync stepper (←/→, earlier/later buttons) and Reset; stream info
 (`I`) shows the offset and output. Settings ▸ Player ▸ Lip sync lists the remembered outputs

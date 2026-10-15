@@ -430,8 +430,9 @@ pub enum PlayerEvent {
     },
     Failed(PlayerError),
     TracksChanged,
-    /// The local output was identified or changed; remember its label and show its offset.
+    /// The local output was identified or changed; only a change from a previous output flashes.
     AudioOutputChanged {
+        previous: Option<audio_output::AudioOutput>,
         output: audio_output::AudioOutput,
         offset_ms: i32,
     },
@@ -813,6 +814,8 @@ mod tests {
             assert!(wait_until(Duration::from_secs(5), || h.snapshot().state == PlayerState::Playing && h.snapshot().lip_sync_ms == -150));
             assert_eq!(delay_ms(), -150);
             for (name, ms) in [("null/headphones", 100), ("null/hdmi", 0), ("null/speakers", -150)] {
+                // Output triggers within 1.5 s of a lookup are deliberately ignored.
+                std::thread::sleep(Duration::from_millis(1600));
                 mpv.set_property("audio-device", name).unwrap();
                 assert!(
                     wait_until(Duration::from_secs(5), || {

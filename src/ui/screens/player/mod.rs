@@ -442,7 +442,9 @@ impl Screen for PlayerScreen {
             return;
         }
         match ev {
-            AppEvent::Player(PlayerEvent::AudioOutputChanged { output, offset_ms }) if ctx.player.cast.is_none() => {
+            AppEvent::Player(PlayerEvent::AudioOutputChanged { previous: Some(previous), output, offset_ms })
+                if ctx.player.cast.is_none() && previous.name != output.name =>
+            {
                 self.flash = None;
                 self.cast_notice(ctx, &format!("Lip sync for {}: {}", output.label, crate::player::audio_output::offset_text(*offset_ms)));
             }
@@ -922,6 +924,27 @@ mod tests {
         for pressed in [true, false] {
             h.event(egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE });
         }
+    }
+
+    #[test]
+    fn lip_sync_first_identification_is_silent_and_only_a_new_name_flashes() {
+        use crate::player::audio_output::AudioOutput;
+        let mut h = player(WIDE);
+        h.state_mut().t.video.begin_frame();
+        let speakers = AudioOutput { name: "speakers".into(), label: "Speakers".into() };
+        let event = |h: &mut H, previous, output| {
+            let app = h.state_mut();
+            let s = &mut app.s;
+            app.t.with_ctx(|ctx| s.on_event(ctx, &AppEvent::Player(PlayerEvent::AudioOutputChanged { previous, output, offset_ms: -150 })));
+        };
+        event(&mut h, None, speakers.clone());
+        assert!(h.state().s.flash_text.is_none());
+        let renamed = AudioOutput { label: "Laptop speakers".into(), ..speakers.clone() };
+        event(&mut h, Some(speakers), renamed.clone());
+        assert!(h.state().s.flash_text.is_none());
+        let headphones = AudioOutput { name: "headphones".into(), label: "Headphones".into() };
+        event(&mut h, Some(renamed), headphones);
+        assert_eq!(h.state().s.flash_text.as_ref().map(|(text, _)| text.as_str()), Some("Lip sync for Headphones: 150 ms earlier"));
     }
 
     /// Click at 50 % of the slider → 65 % (of 0–130); a wheel notch over it → +5; the speaker

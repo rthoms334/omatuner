@@ -194,7 +194,8 @@ impl Overlay for TracksOverlay {
         let pad = theme.space(SpaceToken::PopupPadding) * s;
         let width = (360.0 * theme.rem() * s).min(screen.width() - 2.0 * pad);
         let title_h = theme.font(TypeToken::Caption) * s * 2.0;
-        let body_h = row_h * rows.len().max(1) as f32;
+        let no_audio = self.audio && snap.tracks.audio.is_empty();
+        let body_h = row_h * (rows.len() + usize::from(no_audio)).max(1) as f32;
         let height = (title_h + body_h + 2.0 * pad).min(screen.height() - 2.0 * pad);
         let panel = Rect::from_min_size(
             egui::pos2(screen.right() - width - pad, screen.center().y - height / 2.0).max(screen.min),
@@ -232,7 +233,7 @@ impl Overlay for TracksOverlay {
             if let Some(c) = look.header(&mut ui, audio, title_h) {
                 click = Some(c);
             }
-            if rows.is_empty() {
+            if no_audio {
                 let (r, _) = ui.allocate_exact_size(egui::vec2(inner.width(), row_h), egui::Sense::hover());
                 let muted = with_alpha(t.osd_text, 0.7);
                 osd_text(
@@ -406,5 +407,48 @@ impl Look<'_> {
             osd_text(ui.painter(), rect.center(), Align2::CENTER_CENTER, text, self.font.clone(), color, rect.width());
         }
         click
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lip_sync_controls_do_not_hide_the_no_audio_tracks_message() {
+        let (mut t, _one) = crate::ui::screens::home::testkit::rig();
+        let ctx = egui::Context::default();
+        let mut overlay = TracksOverlay::new(true);
+        let mut draw = |audio: bool, tracks: &str| {
+            overlay.audio = audio;
+            t.snapshot = std::sync::Arc::new(PlayerSnapshot { tracks: crate::player::tracks::parse_track_list(tracks), ..Default::default() });
+            let mut out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() },
+                |ui| {
+                    t.with_ctx(|ctx| overlay.ui(ui.ctx(), ctx));
+                },
+            );
+            out.textures_delta.clear();
+            out
+        };
+        fn has_text(shape: &egui::epaint::Shape, text: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(t) => t.galley.text() == text,
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|s| has_text(s, text)),
+                _ => false,
+            }
+        }
+        let shows = |out: &egui::FullOutput, text| out.shapes.iter().any(|s| has_text(&s.shape, text));
+        draw(true, "[]"); // egui's first Area frame measures it before painting
+        let empty = draw(true, "[]");
+        assert!(shows(&empty, "No audio tracks"));
+        assert!(shows(&empty, "Lip sync"));
+        assert!(shows(&empty, "+0 ms"));
+        assert!(shows(&empty, "Reset lip sync"));
+        let tracks = draw(true, r#"[{"id":1,"type":"audio","title":"English"}]"#);
+        assert!(!shows(&tracks, "No audio tracks"));
+        assert!(shows(&tracks, "English"));
+        let subtitles = draw(false, "[]");
+        assert!(!shows(&subtitles, "No audio tracks"));
     }
 }
