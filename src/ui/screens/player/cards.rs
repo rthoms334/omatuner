@@ -493,6 +493,125 @@ mod tests {
 
     type H = egui_kittest::Harness<'static, App<PlayerScreen>>;
 
+    #[test]
+    fn watchlist_panel_shows_previews_enter_plays_and_stop_ends_context() {
+        use crate::queue::QueueCommand;
+        use crate::ui::screens::queue::tests::seed_watchlist;
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        let (list, entries) = seed_watchlist(&mut t, "Star Wars", crate::watchlist::PlayOrder::Ordered, 3);
+        let (mut h, rec) = player_on(t, one, false, egui::vec2(1600.0, 900.0));
+        h.state_mut().t.with_ctx(|ctx| crate::queue::ui::send(ctx, QueueCommand::PlayList { list, from: None, just_one: false }));
+        until(&mut h, "list playing", |h| h.state().t.services().agent.queue().current.is_some());
+        h.state_mut().act(Action::QueuePanel);
+        until(&mut h, "panel previews", |h| has_label(h, "Then from Star Wars · 1 of 3") && has_label(h, "Movie 2"));
+        assert!(has_label(&h, "Movie 0 (1980)") && has_label(&h, "Movie 1"));
+        assert!(painted(&h).iter().any(|t| t == "Up next · Star Wars"));
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::Activate);
+        until(&mut h, "Enter plays the preview", |h| {
+            let s = h.state().t.services().agent.queue();
+            s.current.and_then(|id| s.row(id)).is_some_and(|r| r.entry.watchlist_item_id == Some(entries[1]))
+        });
+        assert!(h.state().s.panel.is_none());
+        assert!(
+            rec.0.lock().unwrap().iter().any(|c| matches!(c, PlayerCommand::PlayCopy(c) if c.req.media == MediaRef::Movie(crate::model::MovieId(2))))
+        );
+        h.state_mut().act(Action::QueuePanel);
+        until(&mut h, "stop list button", |h| has_label(h, "Stop the list"));
+        assert!(has_label(&h, "Then from Star Wars · 2 of 3"));
+        h.get_by_label("Stop the list").click();
+        until(&mut h, "context ended", |h| h.state().t.services().agent.queue().context.is_none());
+        h.run_steps(2);
+        assert!(!has_label(&h, "Stop the list"));
+        assert!(!painted(&h).iter().any(|t| t == "Up next · Star Wars"));
+    }
+
+    #[test]
+    fn watchlist_panel_menu_plays_from_here_and_opens_the_list() {
+        use crate::queue::QueueCommand;
+        use crate::ui::screens::queue::tests::seed_watchlist;
+        let (mut t, one) = rig();
+        let (list, entries) = seed_watchlist(&mut t, "Star Wars", crate::watchlist::PlayOrder::Ordered, 3);
+        let (mut h, _) = player_on(t, one, false, egui::vec2(1600.0, 900.0));
+        h.state_mut().t.with_ctx(|ctx| crate::queue::ui::send(ctx, QueueCommand::PlayList { list, from: None, just_one: false }));
+        until(&mut h, "list playing", |h| h.state().t.services().agent.queue().current.is_some());
+        h.state_mut().act(Action::QueuePanel);
+        until(&mut h, "panel previews", |h| has_label(h, "Movie 2"));
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let Some(NavRequest::Open(OverlayRequest::ContextMenu(menu))) = nav.last() else { panic!("{nav:?}") };
+        h.state_mut().result(OverlayResult::Chosen(menu.items[0].action));
+        until(&mut h, "menu plays the preview", |h| {
+            let s = h.state().t.services().agent.queue();
+            s.current.and_then(|id| s.row(id)).is_some_and(|r| r.entry.watchlist_item_id == Some(entries[1]))
+        });
+        h.state_mut().act(Action::QueuePanel);
+        until(&mut h, "remaining preview", |h| has_label(h, "Movie 2"));
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let Some(NavRequest::Open(OverlayRequest::ContextMenu(menu))) = nav.last() else { panic!("{nav:?}") };
+        h.state_mut().result(OverlayResult::Chosen(menu.items[2].action));
+        assert!(h.state().s.panel.is_none());
+        assert!(h.state_mut().nav().iter().any(|n| matches!(n, NavRequest::Push(Route::Watchlists { list: Some(id) }) if *id == list)));
+    }
+
+    #[test]
+    fn empty_queue_panel_explains_how_to_add() {
+        let mut h = player(false, egui::vec2(1200.0, 800.0));
+        h.state_mut().act(Action::QueuePanel);
+        h.run_steps(2);
+        assert!(has_label(&h, "Up next is empty · Ctrl+N adds what you're looking at"));
+    }
+
+    #[test]
+    fn watchlist_panel_without_rows_conceals_entries_and_dims_locked_previews() {
+        use crate::ui::screens::queue::tests::seed_watchlist;
+        let (mut t, one) = rig();
+        let (list, entries) = seed_watchlist(&mut t, "Christmas films", crate::watchlist::PlayOrder::Any, 3);
+        let hidden = entries[2];
+        crate::ui::screens::home::testkit::seed(&mut t, move |c| {
+            c.execute("UPDATE movie SET explicit=1 WHERE key=(SELECT item_key FROM watchlist_item WHERE id=?1)", [hidden])?;
+            Ok(())
+        });
+        let (mut h, _) = player_on(t, one, false, egui::vec2(1200.0, 800.0));
+        h.state().t.services().agent.publish_queue(Arc::new(QueueSnapshot {
+            context: Some(list),
+            watchlist: Some(crate::queue::ListContext {
+                id: list,
+                name: "Christmas films".into(),
+                any_order: true,
+                position: 1,
+                total: 3,
+                playing_through: false,
+                then: entries[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(n, id)| crate::queue::ListPreview {
+                        id: *id,
+                        kind: crate::model::ItemKind::Movie,
+                        title: format!("Movie {}", n + 1),
+                        series: None,
+                        season: None,
+                        episode: None,
+                        locked: n == 0,
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        }));
+        h.state_mut().act(Action::QueuePanel);
+        until(&mut h, "context with no rows", |h| has_label(h, "Another from Christmas films · 1 of 2"));
+        assert!(has_label(&h, "󰌾 Movie 1") && has_label(&h, "Stop the list"));
+        assert!(!has_label(&h, "Movie 2"));
+        assert!(!painted(&h).iter().any(|s| s.contains("Movie 2")));
+        let dim = crate::queue::ui::list::Look::osd(&h.state().t.theme).dim;
+        assert!(h.output().shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
+            if t.galley.job.text == "󰌾 Movie 1" && t.galley.job.sections.iter().all(|s| s.format.color == dim))));
+    }
+
     /// A film playing, the player entered, the engine running.
     fn player(video_only: bool, size: egui::Vec2) -> H {
         let (mut t, one) = rig();

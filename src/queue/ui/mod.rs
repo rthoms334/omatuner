@@ -104,7 +104,8 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
                 l.then.retain(|e| places.contains_key(&e.id));
                 if let Some(v) = visible.list(l.id) {
                     l.total = v.total;
-                    l.position = v.next.and_then(|id| v.place(id)).map_or(0, |p| p.0);
+                    let current = filtered.rows.iter().find(|r| Some(r.entry.id) == filtered.current).and_then(|r| r.entry.watchlist_item_id);
+                    l.position = current.or(v.next).and_then(|id| v.place(id)).map_or(0, |p| p.0);
                 }
             }
         }
