@@ -1503,42 +1503,58 @@ New or missing settings default to Off; an explicit `sub_auto = "forced"` remain
 
 ### 11.7.1 Local live rewind
 
-Only live channels use the timeshift policy (`player/timeshift.rs`); catch-up, VOD and
-casting retain their existing transport. Each picture has a private **0700** folder under
-`cache/live-rewind/`. Separate folders keep multi-view pictures independent; both obey the
-same free-space reserve, checked during playback. A load/channel change/reconnect starts a
-new cache. mpv unlinks its cache files immediately (including crash cleanup); Tuner empties
-the folder on each load and removes it at exit, cleaning crashed-process folders at startup.
+HTTP(S) live `.m3u8` channels use `player/hls/`: one provider fetcher per picture caches
+provider HLS bytes unchanged on disk; mpv reads only a token-protected loopback server.
+There is no probe, remux or second provider reader. Playlist, segment, AES key, init-map
+and selected audio requests are serialized through casting's upstream socket-close
+acknowledgement and existing header handling. The controller's connection lease belongs
+to the recorder, survives local seeks/END_FILE, and is released only after its provider
+socket closes on stop/zap/cast handover/exit. Each multi-view picture owns a separate store.
 
-Per live load: `cache=yes`, `cache-on-disk=yes`, `demuxer-cache-dir=<private folder>`
-(the mpv 0.41 option is **demuxer-cache-dir**, not `cache-dir`),
-`demuxer-seekable-cache=yes`, `force-seekable=yes`, `demuxer-max-back-bytes=32MiB` (metadata, roughly 30 minutes at mpv's typical rate),
-`demuxer-max-bytes=64MiB`, `demuxer-donate-buffer=no`,
-`cache-secs=1810`, `demuxer-readahead-secs=1810`. The seek window is the newest contiguous
-`demuxer-cache-state/seekable-ranges` range, clipped to 30 minutes with a small end guard.
-Forced seeking only enables mpv's cache-seek path; Tuner offers seeking exactly when that
-range exists, and every live seek is clamped inside it. A rewind beyond the start flashes
-"That's as far back as Tuner has"; reaching the edge flashes "Live".
+A private **0700** folder under `cache/live-rewind/` holds numeric segment/key/map names.
+The store prunes before writing: media ending at or before `new_edge - 1800` is removed,
+retaining the segment crossing the cutoff. Media disk use is bounded by **30 minutes ×
+bitrate plus one source segment**, with referenced init maps/keys; slow local readers
+cannot retain unlinked disk files. Folders start empty, are removed on channel change
+and exit, and dead-process folders are cleaned at startup. No provider URLs, credentials,
+titles or arbitrary playlist tags reach names/logs/local playlists.
 
-**mpv limitation / bounded fallback:** [mpv 0.41's disk cache](https://github.com/mpv-player/mpv/blob/v0.41.0/DOCS/man/options.rst)
-is append-only. Its byte limits count packet metadata on disk, not the disk payload, and
-it has no API to reclaim old file blocks. Tuner therefore stops disk writes near **2 GiB**
-(32 MiB headroom) or below **3 GB free**, and continues on the same connection with up to
-**two minutes in memory** until the next load. Initial low disk or an unavailable cache
-folder uses that fallback immediately, logging once per controller. Memory limits are
-128 MiB forward and 128 MiB backward; high bitrates can shorten the available window.
-Already-written disk data remains until the stream closes. This is a bounded fallback,
-**not an indefinitely rolling 30-minute disk recorder**; doing that requires a different
-transport or upstream mpv support. Disk use is checked every 250 ms, so the cap is approximate.
+The local media playlist advances its media sequence and has no ENDLIST while live,
+except at a timestamp discontinuity, where the controller hands off to the next local
+view without discarding the recording or changing the provider connection.
+It uses a private **EVENT** marker for libavformat seeking (not a public RFC EVENT
+publication). To avoid stale decoder playlists after pause and timestamp resets, a seek
+opens a fresh **localhost view at the containing segment**, with `start` set to the offset within it. The view continues growing/rolling;
+the controller maps mpv's relative position to the recorded timeline. Provider recording,
+lease, history and channel generation stay unchanged. −10/+10, the oldest-point clamp
+and "That's as far back as Tuner has", Live / lag text, and Back to live use that timeline.
+Pause records independently; an expired paused point advances to the oldest retained
+point while remaining paused. A half-second edge guard leaves video for exact seeks.
 
-Pause keeps the demuxer reading. The read-ahead margin lets the controller advance an expired
-paused point to the oldest available point while staying paused; a byte-full memory cache
-also advances its reader so incoming data continues. Resume uses the paused point if retained,
-otherwise that oldest point. There is no second fetch/recording connection. Live loads disable
-FFmpeg's internal reconnect in favour of Tuner's existing stop-before-start reconnect path,
-so a reconnect also resets the cache. Live timeshift keeps video selected while hidden:
-`vid=no` would discard the video packets needed for rewind, so hidden live pictures continue
-decoding (VOD retains the existing suspension). Casting has no local rewind.
+Masters select the highest-bandwidth variant with the existing selector and cache its
+separate default audio rendition if present. Relative URLs use the redirected playlist
+base. AES-128 identity keys, explicit/implicit IVs, maps, byte ranges, sequence gaps and
+discontinuities are handled locally. Retry refreshes playlists to replace expired segment
+URLs; 403/404 also refreshes the master. Continuing provider sequences retain the buffer;
+a backwards sequence starts an empty epoch. Sticky retry timing comes from the player.
+
+Below **3 GB free** (or on disk write failure), log once, unlink the recording, and continue
+with a short bounded local segment supply and mpv's **two-minute memory rewind** on the
+same fetcher. The range comes from mpv's packet cache then; 128 MiB forward/backward byte
+limits may shorten it. Disk allocation stays disabled until a new channel. Unavailable
+local storage uses the same fetcher with memory-only storage. A listener failure reports
+an error, without handing the provider URL to mpv.
+
+Raw TS and other live inputs keep `player/timeshift.rs` from 523a89f: mpv's append-only
+30-minute disk cache, stopped near **2 GiB** (32 MiB headroom) or below 3 GB free, followed
+by two minutes in memory. Existing disk data remains until closure; reconnect resets that
+cache. VOD, catch-up and casting retain their transports.
+
+Hidden live playback at the edge suspends video decoding after the existing watchdog
+delay. A paused/rewound picture keeps or restores video selection; HLS recording continues
+either way. Black video until a keyframe after rewinding through a suspended stretch is
+accepted. See [the implementation and test record](design/timeshift-design.md), including
+the strict **0.15 s** production HTTP zap gate and the tests requiring an outside run.
 
 ### 11.8 Frame pacing (known limitation)
 UI frames follow the compositor's frame callbacks (§11.1: vsync off, `pre_present_notify`), so

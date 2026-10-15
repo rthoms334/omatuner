@@ -225,13 +225,13 @@ impl Drop for Proxy {
 /// alive on this runtime means no provider socket open. Ending the runtime (the proxy's shutdown)
 /// drops whatever is left, which closes it.
 #[derive(Clone)]
-struct Net {
+pub(crate) struct Net {
     handle: tokio::runtime::Handle,
 }
 
 impl Net {
     /// Start the thread; it ends (dropping every connection left) when `stop` is cancelled.
-    async fn start(stop: CancellationToken) -> io::Result<Self> {
+    pub(crate) async fn start(stop: CancellationToken) -> io::Result<Self> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new().name("cast-upstream".into()).spawn(move || {
             match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -250,7 +250,7 @@ impl Net {
 
     /// Send `req` from this runtime. Dropping the future aborts the request: its socket closes
     /// with its task, which [`Net::closed`] waits for.
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    pub(crate) async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
         let task = tokio_util::task::AbortOnDropHandle::new(self.handle.spawn(req.send()));
         match task.await {
             Ok(r) => r.map_err(|e| cause(&e)),
@@ -259,7 +259,7 @@ impl Net {
     }
 
     /// Resolves once every provider connection of the session is closed.
-    async fn closed(&self) {
+    pub(crate) async fn closed(&self) {
         while self.handle.metrics().num_alive_tasks() > 0 {
             tokio::time::sleep(CLOSE_POLL).await;
         }
@@ -277,7 +277,7 @@ pub struct Pick {
 
 /// The `User-Agent` (the playlist's, else the configured default), `Referer`, `Origin` and the
 /// extra headers (cookies, tokens: never logged) of a `Playable`.
-fn request_headers(h: &HttpHeaders, default_ua: &str) -> HeaderMap {
+pub(crate) fn request_headers(h: &HttpHeaders, default_ua: &str) -> HeaderMap {
     let mut out = HeaderMap::new();
     let mut put = |name: HeaderName, v: &str| {
         if let Ok(v) = HeaderValue::from_str(v.trim()) {
@@ -1146,7 +1146,7 @@ fn rfc6381_video(c: &str) -> Option<&'static str> {
 }
 
 /// The extension of a URL path when ffmpeg's HLS demuxer accepts it for a segment.
-fn media_ext(path: &str) -> Option<&'static str> {
+pub(crate) fn media_ext(path: &str) -> Option<&'static str> {
     const ALLOWED: &[&str] = &[
         "3gp", "aac", "ac3", "avi", "cmfa", "cmfv", "eac3", "flac", "m2t", "m2ts", "m4a", "m4s", "m4v", "mkv", "mov", "mp2", "mp3", "mp4", "mpeg",
         "mpegts", "mpg", "mts", "oga", "ogg", "ogv", "ts", "vob", "wav",
@@ -1158,7 +1158,7 @@ fn media_ext(path: &str) -> Option<&'static str> {
 }
 
 /// `KEY=VALUE,KEY="quoted, value"` attribute lists (RFC 8216 §4.2).
-fn attributes(s: &str) -> Vec<(&str, &str)> {
+pub(crate) fn attributes(s: &str) -> Vec<(&str, &str)> {
     let mut out = Vec::new();
     let mut rest = s;
     while !rest.is_empty() {

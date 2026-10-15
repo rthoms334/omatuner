@@ -705,6 +705,8 @@ async fn respond(
         Some(t.into_bytes())
     } else if path == "/live/index.m3u8" {
         Some(live_playlist(ctx.epoch.elapsed()).into_bytes())
+    } else if path == "/rolling/index.m3u8" {
+        Some(rolling_playlist(ctx.epoch.elapsed()).into_bytes())
     } else {
         let rel = path.strip_prefix("/live/").map(|f| format!("long/{f}")).unwrap_or_else(|| path.trim_start_matches('/').to_owned());
         if rel.split('/').any(|c| c == ".." || c.is_empty()) { None } else { tokio::fs::read(ctx.dir.join(rel)).await.ok() }
@@ -862,7 +864,7 @@ const LIVE_WINDOW: u64 = 4;
 
 /// Sliding-window live playlist: the newest segment is the one "recorded" in the current
 /// second; wraps around after 60 s with a discontinuity.
-fn live_playlist(elapsed: Duration) -> String {
+pub fn live_playlist(elapsed: Duration) -> String {
     let newest = elapsed.as_secs() + LIVE_WINDOW - 1;
     let first = newest + 1 - LIVE_WINDOW;
     let mut s = format!("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{first}\n");
@@ -874,4 +876,74 @@ fn live_playlist(elapsed: Duration) -> String {
         s.push_str(&format!("#EXTINF:1.000000,\nseg{:03}.ts\n", seq % LIVE_SEGMENTS));
     }
     s
+}
+
+/// Two-second segments with continuous timestamps for the 60+ second rolling-buffer tests.
+/// This fixture is separate so existing test-media caches need not be regenerated.
+pub fn ensure_rolling_media() -> PathBuf {
+    let root = target_dir().join("test-rolling-media");
+    std::fs::create_dir_all(root.join("rolling")).unwrap();
+    let lock = std::fs::File::create(root.join(".lock")).unwrap();
+    lock.lock().unwrap();
+    if !root.join(".complete").exists() {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=25",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=660:sample_rate=48000",
+                "-t",
+                "180",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "50",
+                "-keyint_min",
+                "50",
+                "-sc_threshold",
+                "0",
+                "-c:a",
+                "aac",
+                "-f",
+                "hls",
+                "-hls_time",
+                "2",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_segment_filename",
+            ])
+            .arg(root.join("rolling/seg%03d.ts"))
+            .arg(root.join("rolling/fixture.m3u8"))
+            .status()
+            .expect("ffmpeg required");
+        assert!(status.success());
+        std::fs::write(root.join(".complete"), b"1").unwrap();
+    }
+    root
+}
+
+pub fn rolling_playlist(elapsed: Duration) -> String {
+    let first = elapsed.as_secs() / 2;
+    let mut out =
+        format!("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:{first}\n#EXT-X-DISCONTINUITY-SEQUENCE:{}\n", first / 90);
+    for seq in first..first + 4 {
+        if seq > first && seq % 90 == 0 {
+            out.push_str("#EXT-X-DISCONTINUITY\n");
+        }
+        out.push_str(&format!("#EXTINF:2.000000,\nseg{:03}.ts\n", seq % 90));
+    }
+    out
 }

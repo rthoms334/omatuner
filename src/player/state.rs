@@ -283,6 +283,15 @@ impl PlayerMachine {
     pub fn policy(&self) -> &ReconnectPolicy {
         &self.cfg.policy
     }
+    /// Replace only a localhost HLS reader during a seek. The picture, pause state,
+    /// history, retry policy and provider connection are unchanged.
+    pub(super) fn replace_local_reader(&mut self, entry: Option<i64>) {
+        self.expected_entry = entry;
+        self.current_entry = None;
+        self.awaiting_start = true;
+        self.accept_any_start = entry.is_none();
+    }
+
     /// Is `entry` the playlist entry of the current target (loaded or playing)?
     pub fn owns_entry(&self, entry: i64) -> bool {
         self.current_entry == Some(entry) || self.expected_entry == Some(entry)

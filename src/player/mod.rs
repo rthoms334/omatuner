@@ -42,6 +42,7 @@ pub mod audio_output;
 pub mod budget;
 pub mod controller;
 pub mod events;
+pub mod hls;
 pub mod mpv;
 pub mod mpv_log;
 pub mod reconnect;
@@ -640,6 +641,16 @@ impl Player {
     /// heard before the app gives it the sound) with smaller caches. mpv init takes 30–80 ms:
     /// call it off the UI thread for a picture started while the app runs.
     pub fn start_tile(cfg: &Config, deps: PlayerDeps, tile: TileId, budget: budget::SharedBudget) -> Result<Self> {
+        Self::start_tile_with_window(cfg, deps, tile, budget, hls::WINDOW)
+    }
+
+    /// Scale the recorder window for real decoder integration tests without a global env var.
+    #[doc(hidden)]
+    pub fn start_with_hls_window_for_tests(cfg: &Config, deps: PlayerDeps, window: f64) -> Result<Self> {
+        Self::start_tile_with_window(cfg, deps, TileId::A, budget::SharedBudget::default(), window)
+    }
+
+    fn start_tile_with_window(cfg: &Config, deps: PlayerDeps, tile: TileId, budget: budget::SharedBudget, hls_window: f64) -> Result<Self> {
         let audible = tile == TileId::A;
         let mpv = Arc::new(mpv::create(cfg, tile)?);
         if tile == TileId::A {
@@ -662,7 +673,7 @@ impl Player {
         let pump = events::EventPump::start(mpv.clone(), evt_tx, pump_name).map_err(crate::error::Error::other)?;
         let render_clock: RenderClock = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
-        let setup = controller::TileSetup { tile, budget: budget.clone(), audible };
+        let setup = controller::TileSetup { tile, budget: budget.clone(), audible, hls_window };
         let controller = controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch, setup)
             .map_err(crate::error::Error::other)?;
         Ok(Self {
@@ -901,8 +912,8 @@ mod tests {
     /// placed or not rendered — is suspended.
     #[test]
     fn video_is_suspended_while_nothing_renders_and_resumed_on_request() {
-        // Live timeshift must keep video selected so it remains in the demuxer cache.
-        // This power-saving path is for VOD.
+        // VOD and live at the edge share this power-saving path. Paused/rewound live
+        // pictures are covered by the controller and real-HLS tests.
         let play = |p: &Player| {
             p.handle().send(PlayerCommand::Play(PlayRequest {
                 media: MediaRef::Movie(crate::model::MovieId(1)),

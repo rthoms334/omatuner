@@ -1,4 +1,5 @@
-//! Local live timeshift, using the existing demuxer and connection.
+//! Cache rewind for raw TS and other non-HLS live inputs, using the existing demuxer.
+//! Provider HLS uses the independent rolling recorder in `player/hls/`.
 //!
 //! mpv 0.41's disk cache is append-only; max-back-bytes limits METADATA when on disk.
 //! Therefore we also inspect file-cache-bytes, stop disk writes near 2 GiB, and continue
@@ -189,7 +190,7 @@ fn clear_contents(dir: &Path) {
     }
 }
 
-fn make_dir(cache: &Path, tile: TileId) -> std::io::Result<PathBuf> {
+pub(super) fn make_dir(cache: &Path, tile: TileId) -> std::io::Result<PathBuf> {
     let root = cache.join("live-rewind");
     fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
     if fs::symlink_metadata(&root)?.file_type().is_symlink() {
