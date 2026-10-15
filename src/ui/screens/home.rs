@@ -486,6 +486,14 @@ const RAIL_MAX: usize = 30;
 const CHANNEL_TILE_W: f32 = 230.0;
 /// Poster width in rails (pt × rem).
 const RAIL_POSTER_W: f32 = 120.0;
+const RAIL_BAR_IDLE_S: f64 = 1.5;
+
+/// The app consumes shortcuts before egui sees them, including global shortcuts.
+pub(crate) fn rail_bar_keyboard_input(ctx: &egui::Context, events: &[egui::Event]) {
+    if events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_))) {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("home-rail-keyboard"), true));
+    }
+}
 
 /// What the rails were built from: rebuilt only when one of these changes, never per frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +526,8 @@ pub struct HomeScreen {
     rails: Vec<Rail>,
     rails_key: Option<RailsKey>,
     scroll_to_cursor: bool,
+    /// The rail under the last mouse motion and when it happened (egui time).
+    rail_bar: Option<(egui::Id, f64)>,
     playing: kit::PlayingVod,
 }
 
@@ -1078,6 +1088,7 @@ impl Screen for HomeScreen {
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, _route: &Route) {
         self.reload_continue(ctx);
         self.scroll_to_cursor = true;
+        self.rail_bar = None;
     }
 
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
@@ -1094,6 +1105,7 @@ impl Screen for HomeScreen {
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        self.rail_bar = None;
         if ctx.lib.built_at != 0 && ctx.lib.sources.is_empty() {
             // "No playlists yet": Enter is the "Add playlist" button
             if action == Action::Activate {
@@ -1212,23 +1224,45 @@ impl Screen for HomeScreen {
         }
         self.build_rails(ctx);
         let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        let consumed_key = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("home-rail-keyboard"))).unwrap_or(false);
+        let keyboard =
+            consumed_key || ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_))));
+        let mouse_moved = !keyboard && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        let now = ui.input(|i| i.time);
+        if keyboard || self.rail_bar.is_some_and(|(_, at)| now - at >= RAIL_BAR_IDLE_S) {
+            self.rail_bar = None;
+        }
+        if let Some((_, at)) = self.rail_bar {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(RAIL_BAR_IDLE_S - (now - at)));
+        }
         let mut clicked: Option<(usize, usize, bool)> = None;
         let mut menu: Option<(usize, usize)> = None;
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
         let rails = std::mem::take(&mut self.rails);
         let playing_vod = self.playing.get(ctx);
         egui::ScrollArea::vertical().id_salt("home-rails").auto_shrink([false, false]).show(ui, |ui| {
-            // No gutter or handle at rest, including on overflowing rails. Keep egui's
-            // wheel handling: horizontal touchpad deltas and Shift+wheel scroll the rail.
-            ui.spacing_mut().scroll = egui::style::ScrollStyle::floating();
+            // Only mouse motion over a rail enables its bar, for 1.5 s or until a key.
+            // A stationary pointer must not light up rails scrolling beneath it. Keep
+            // egui's floating fade, horizontal swipe / Shift+wheel, and scroll offsets.
             let mut target = None;
             for (ri, rail) in rails.iter().enumerate() {
                 let top = ui.cursor().min;
                 section::section_header(ui, theme, &rail.title);
                 ui.add_space(theme.space(SpaceToken::Md));
                 let cursor_col = (ri == self.rail).then(|| self.cols.get(ri).map(|c| c.2)).flatten();
-                egui::ScrollArea::horizontal().id_salt(("home-rail", rail.kind as u8, &rail.title)).auto_shrink([false, true]).show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
+                let salt = ("home-rail", rail.kind as u8, &rail.title);
+                // ScrollArea hashes its salt into an IdSalt before making its id.
+                let id = ui.make_persistent_id(egui::IdSalt::new(salt));
+                // egui 0.36 identifies each bar by its scroll area and axis (0 = x).
+                let dragging = ui.ctx().dragged_id() == Some(id.with(0_usize));
+                let show_bar = dragging || self.rail_bar.is_some_and(|(active, _)| active == id);
+                let visibility = if show_bar {
+                    egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+                } else {
+                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+                };
+                egui::ScrollArea::horizontal().id_salt(salt).auto_shrink([false, true]).scroll_bar_visibility(visibility).show(ui, |ui| {
+                    let row = ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xxl);
                         for (ci, tile) in rail.tiles.iter().enumerate() {
                             let is_cursor = cursor_col == Some(ci);
@@ -1247,6 +1281,12 @@ impl Screen for HomeScreen {
                             }
                         }
                     });
+                    // Use the laid-out, clipped row; ScrollArea's pre-layout rect can
+                    // include other rails. Repaint once to enable this rail's bar.
+                    if mouse_moved && ui.rect_contains_pointer(row.response.rect.intersect(ui.clip_rect())) {
+                        self.rail_bar = Some((id, now));
+                        ui.ctx().request_repaint();
+                    }
                 });
                 ui.add_space(theme.space(SpaceToken::Xxl));
                 if ri == self.rail && scroll {
@@ -2146,22 +2186,43 @@ mod tests {
     }
 
     #[test]
-    fn rails_only_paint_scrollbars_on_hover_and_keep_horizontal_wheel_and_keys() {
+    fn rails_only_paint_scrollbars_after_mouse_motion_and_keep_horizontal_wheel_and_keys() {
         let mut h = scrolling_home();
-        for (i, (tile, overflows)) in [("Channel 0", false), ("Channel 11", true), ("Movie 1", false), ("Series 9", true)].into_iter().enumerate() {
-            if i > 0 {
-                h.state_mut().act(Action::Down);
-                h.run_steps(30);
-            }
-            assert_eq!(painted_horizontal_bars(&h), 0, "no bar at rest on {tile}");
-            let rect = h.get_by_role_and_label(egui::accesskit::Role::Button, tile).rect();
-            h.event(egui::Event::PointerMoved(rect.center()));
+        h.ctx.all_styles_mut(|s| s.animation_time = 0.15);
+        // Short rails never need a bar, even after mouse movement.
+        h.event(egui::Event::PointerMoved(h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 0").rect().center()));
+        h.run_steps(30);
+        assert_eq!(painted_horizontal_bars(&h), 0);
+        h.state_mut().act(Action::Down);
+        h.run_steps(30);
+        let pointer = h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().center();
+        h.event(egui::Event::PointerMoved(pointer));
+        h.run_steps(30);
+        assert!(painted_horizontal_bars(&h) > 0, "mouse movement shows the long rail's bar");
+
+        // The reported case: the mouse rests over Recently watched while keys are used.
+        // App shortcuts are consumed before egui sees them, so deliver the actions here.
+        for action in [Action::Right, Action::Left] {
+            h.state_mut().act(action);
             h.run_steps(30);
-            assert_eq!(painted_horizontal_bars(&h) > 0, overflows, "hover on {tile}");
-            h.event(egui::Event::PointerGone);
-            h.run_steps(30);
-            assert_eq!(painted_horizontal_bars(&h), 0, "bar fades after leaving {tile}");
+            assert_eq!(painted_horizontal_bars(&h), 0, "keys hide the bar under a stationary pointer");
         }
+        h.event(egui::Event::PointerMoved(pointer + egui::vec2(1.0, 0.0)));
+        h.run_steps(30);
+        assert!(painted_horizontal_bars(&h) > 0, "new mouse movement shows the bar again");
+        h.run_steps(80);
+        assert_eq!(painted_horizontal_bars(&h), 0, "bar fades after 1.5 s with the pointer still over it");
+
+        // Scrolling the page under that same pointer must not enable another rail's bar.
+        h.state_mut().act(Action::Down);
+        h.run_steps(30);
+        assert_eq!(painted_horizontal_bars(&h), 0);
+        h.event(egui::Event::PointerMoved(h.get_by_label("Movie 1").rect().center()));
+        h.run_steps(30);
+        assert_eq!(painted_horizontal_bars(&h), 0, "short movie rail");
+        h.state_mut().act(Action::Down);
+        h.run_steps(30);
+        assert_eq!(painted_horizontal_bars(&h), 0, "keyboard scrolling cannot light up the series rail");
         let left = h.get_by_label("Series 9").rect().left();
         h.event(egui::Event::PointerMoved(h.get_by_label("Series 9").rect().center()));
         for (delta, modifiers) in [(egui::vec2(-100.0, 0.0), egui::Modifiers::NONE), (egui::vec2(0.0, -100.0), egui::Modifiers::SHIFT)] {
@@ -2178,6 +2239,63 @@ mod tests {
         h.state_mut().act(Action::Home);
         h.run_steps(30);
         assert!((h.get_by_label("Series 9").rect().left() - left).abs() < 1.0, "Home restores the rail's left edge");
+    }
+
+    #[test]
+    fn rail_bar_drag_survives_idle_and_hiding_preserves_the_offset() {
+        let mut h = scrolling_home();
+        h.state_mut().act(Action::Down);
+        h.run_steps(30);
+        h.event(egui::Event::PointerMoved(h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().center()));
+        h.run_steps(30);
+        let bar = h.query_all_by_role(egui::accesskit::Role::ScrollBar).find(|n| n.rect().width() > n.rect().height()).unwrap().rect();
+        let start = egui::pos2(bar.left() + 20.0, bar.center().y);
+        let end = start + egui::vec2(120.0, 0.0);
+        let left = h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().left();
+        h.event(egui::Event::PointerMoved(start));
+        h.event(egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+        h.event(egui::Event::PointerMoved(end));
+        h.run_steps(100);
+        assert!(h.ctx.dragged_id().is_some(), "a scrollbar drag is in progress");
+        assert!(painted_horizontal_bars(&h) > 0, "idle must not hide a bar being dragged");
+        let dragged = h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().left();
+        assert!(dragged < left - 50.0, "dragging the bar scrolls its rail");
+        // Even keyboard input must not interrupt the existing mouse grab.
+        h.key_press(egui::Key::F8);
+        h.run_steps(30);
+        assert!(painted_horizontal_bars(&h) > 0);
+        h.event(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        h.run_steps(30);
+        assert_eq!(painted_horizontal_bars(&h), 0, "released bar hides with the pointer still over it");
+        assert!(
+            (h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().left() - dragged).abs() < 1.0,
+            "hiding preserves the offset"
+        );
+
+        h.event(egui::Event::PointerMoved(end + egui::vec2(1.0, 0.0)));
+        h.run_steps(30);
+        assert!(painted_horizontal_bars(&h) > 0);
+        assert!(
+            (h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().left() - dragged).abs() < 1.0,
+            "showing preserves the offset too"
+        );
+        h.run_steps(80);
+        assert_eq!(painted_horizontal_bars(&h), 0, "idle also hides a scrolled rail's bar");
+        assert!(
+            (h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().left() - dragged).abs() < 1.0,
+            "idle preserves the offset"
+        );
+        h.event(egui::Event::PointerMoved(end + egui::vec2(2.0, 0.0)));
+        h.run_steps(30);
+        assert!(painted_horizontal_bars(&h) > 0);
+        // A global shortcut is consumed by the app, without reaching Home::on_action.
+        rail_bar_keyboard_input(
+            &h.ctx,
+            &[egui::Event::Key { key: egui::Key::F8, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+        );
+        h.run_steps(30);
+        assert_eq!(painted_horizontal_bars(&h), 0, "consumed global keys also hide bars");
+        assert!((h.get_by_role_and_label(egui::accesskit::Role::Button, "Channel 11").rect().left() - dragged).abs() < 1.0);
     }
 
     /// Delete on a "Recently watched" tile forgets that channel's history (it used to say

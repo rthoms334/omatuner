@@ -1805,8 +1805,11 @@ favourites rail per non-empty list. Empty rails are omitted; when fewer than 2 r
 **"Get started" rail** appears: Browse Live TV · Open guide · Add favourites (Ctrl+F) · the
 first group's channels with now/next. An empty library routes to onboarding. The default start
 screen is Home (`StartScreen::Home`; an old `"auto"` loads as Home).
-Rail scroll bars float: no bar or reserved gutter at rest; a thin handle appears only while
-hovering an overflowing rail. Horizontal touchpad swipes and Shift+wheel scroll within it.
+Rail scroll bars float without a reserved gutter. Mouse movement over an overflowing rail
+shows its bar; it fades after about 1.5 s without movement or on keyboard input, even when the
+pointer rests over the rail. A bar being dragged stays visible until release. Keyboard use
+never shows rail bars. Horizontal touchpad swipes and Shift+wheel scroll within the rail;
+hiding its bar preserves its scroll position.
 Keyboard moves reveal the whole rail, including its header. ↑/↓ and PgUp/PgDn reach the
 same page top/bottom as touchpad scrolling; Home/End reach the first/last tile within a rail.
 Medium: rails narrower, same structure.
