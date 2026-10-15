@@ -205,7 +205,11 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     let mut any = false;
     let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
     // a channel that became explicit (or hidden by parental control) since the evaluation
-    let shown = |u: &Upcoming| u.channel.as_ref().is_none_or(|c| !ctx.lib.conceals(c));
+    let shown = |u: &Upcoming| {
+        u.channel
+            .as_ref()
+            .map_or(!s.search_all || kit::unlocked(ctx), |c| !ctx.lib.conceals(c) && (!s.search_all || super::search::searchable_item(ctx, c)))
+    };
     for (i, u) in d.upcoming.iter().enumerate().filter(|(_, u)| u.start < horizon && shown(u)) {
         any = true;
         let mut detail = crate::ui::widgets::time::local(u.start, if h24 { "%a %-d %b %H:%M" } else { "%a %-d %b %-I:%M %p" }, "");

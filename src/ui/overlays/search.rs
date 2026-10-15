@@ -88,7 +88,7 @@ impl Row {
 pub struct SearchOverlay {
     settings_loader: Option<crate::ui::screens::settings::SettingsScreen>,
     settings_rows: Vec<crate::ui::screens::settings::IndexedRow>,
-    settings_visibility: Option<(u64, bool, bool)>,
+    settings_visibility: Option<(u64, bool, bool, bool)>,
 
     query: String,
     section: SearchSection,
@@ -175,7 +175,12 @@ impl SearchOverlay {
         match row {
             Row::Header(_) => OverlayOutcome::Keep,
             Row::Setting(target) => {
-                let visibility = (ctx.lib.generation, ctx.parental.hides_explicit(&ctx.config.parental), ctx.config.parental.pin_hash.is_some());
+                let visibility = (
+                    ctx.lib.generation,
+                    ctx.parental.hides_explicit(&ctx.config.parental),
+                    ctx.config.parental.pin_hash.is_some(),
+                    kit::unlocked(ctx),
+                );
                 if self.settings_visibility != Some(visibility) {
                     self.ensure_settings(ctx);
                     self.build_rows(ctx);
@@ -439,7 +444,8 @@ impl SearchOverlay {
 
     /// Build or refresh the shared index (lazily, also after a lock change).
     fn ensure_settings(&mut self, ctx: &mut UiCtx<'_>) {
-        let visibility = (ctx.lib.generation, ctx.parental.hides_explicit(&ctx.config.parental), ctx.config.parental.pin_hash.is_some());
+        let visibility =
+            (ctx.lib.generation, ctx.parental.hides_explicit(&ctx.config.parental), ctx.config.parental.pin_hash.is_some(), kit::unlocked(ctx));
         if self.settings_visibility != Some(visibility) {
             let mut settings = crate::ui::screens::settings::SettingsScreen::default();
             settings.load_search_pages(ctx);
@@ -451,7 +457,7 @@ impl SearchOverlay {
         if let Some(settings) = &mut self.settings_loader
             && settings.poll_search_pages(ctx)
         {
-            self.settings_rows = settings.indexed_rows(ctx);
+            self.settings_rows = settings.indexed_rows(ctx).into_iter().filter(|row| row.is_setting()).collect();
             self.settings_loader = None;
             self.rows_key = None;
         }
@@ -530,7 +536,7 @@ impl SearchOverlay {
         let exact = settings.first().is_some_and(|(score, _)| *score == 0);
         if exact {
             rows.push(Row::Header("Settings"));
-            rows.extend(settings.iter().filter(|(score, _)| *score == 0).map(|(_, target)| Row::Setting(target.clone())));
+            rows.extend(settings.iter().map(|(_, target)| Row::Setting(target.clone())));
         }
         // one row per stack: its best-matching copy (DESIGN §29.14)
         let mut seen = std::collections::HashSet::new();
@@ -567,10 +573,9 @@ impl SearchOverlay {
             }
             rows.push(Row::Hit(h));
         }
-        let remaining: Vec<_> = settings.into_iter().filter(|(score, _)| *score != 0).collect();
-        if !remaining.is_empty() {
+        if !exact && !settings.is_empty() {
             rows.push(Row::Header("Settings"));
-            rows.extend(remaining.into_iter().map(|(_, target)| Row::Setting(target)));
+            rows.extend(settings.into_iter().map(|(_, target)| Row::Setting(target)));
         }
         if matches!(self.section, SearchSection::All | SearchSection::Guide) {
             let guide = self.guide_hits(ctx);
@@ -1068,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_search_drops_concealed_hits_when_visibility_changes() {
+    fn settings_search_excludes_user_rows_even_when_explicit_content_is_shown() {
         let (mut t, one) = rig();
         seed(&mut t, |c| {
             let src = testkit::source(c, "TV")?;
@@ -1085,7 +1090,8 @@ mod tests {
         cfg.parental.show_explicit = true;
         t.config = Arc::new(cfg);
         let mut h = overlay_harness(t, one, SearchOverlay::new("concealed".into()), egui::vec2(1400.0, 900.0));
-        until_ov(&mut h, "the visible category setting", |h| has_label(h, "Concealed category · Parental"));
+        until_ov(&mut h, "the settings index", |h| h.state().o.settings_loader.is_none());
+        assert!(!has_label(&h, "Concealed category · Parental"));
         let mut cfg = (*h.state().t.config).clone();
         cfg.parental.show_explicit = false;
         h.state_mut().t.config = Arc::new(cfg);
@@ -1095,6 +1101,84 @@ mod tests {
         assert!(!h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(_))));
         until_ov(&mut h, "the rebuilt settings index", |h| h.state().o.settings_loader.is_none());
         assert!(!h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(_))));
+    }
+
+    #[test]
+    fn settings_search_never_indexes_reminders_or_hidden_content() {
+        use crate::model::{Reminder, ReminderId, ReminderState};
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let src = testkit::source(c, "Private playlist")?;
+            testkit::channels(c, src, 2)?;
+            testkit::named_movies(c, src, &[("Private film", "Private film")])?;
+            let channel = ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{:011}", 0)) };
+            crate::store::user::set_item_override(
+                c,
+                &channel,
+                &ItemOverride { locked: true, rename: Some("Private channel".into()), ..Default::default() },
+            )?;
+            let hidden = ItemRef { key: ItemKey(format!("m3u:seed{:011}", 1)), ..channel.clone() };
+            crate::store::user::set_item_override(
+                c,
+                &hidden,
+                &ItemOverride { hidden: true, rename: Some("Private hidden channel".into()), ..Default::default() },
+            )?;
+            let movie = ItemRef { source: src, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
+            crate::store::user::set_item_override(c, &movie, &ItemOverride { hidden: true, ..Default::default() })?;
+            crate::store::user::add_reminder(
+                c,
+                &Reminder {
+                    id: ReminderId(0),
+                    channel,
+                    channel_name: "Private channel".into(),
+                    programme_title: "Private programme".into(),
+                    start: 4_000_000_000,
+                    stop: 4_000_003_600,
+                    lead_s: 120,
+                    state: ReminderState::Pending,
+                    mode: Default::default(),
+                    offset_s: 0,
+                    open_in: None,
+                    rule_id: None,
+                },
+            )?;
+            Ok(())
+        });
+        let mut cfg = (*t.config).clone();
+        cfg.parental.enabled = true;
+        cfg.parental.pin_salt = Some("s".into());
+        cfg.parental.pin_hash = Some(crate::ui::parental::hash_pin("1234", "s"));
+        t.config = Arc::new(cfg);
+        let mut h = overlay_harness(t, one, SearchOverlay::new("private".into()), egui::vec2(1400.0, 900.0));
+        until_ov(&mut h, "settings loaded", |h| h.state().o.settings_loader.is_none());
+        assert!(h.state().o.rows.is_empty(), "locked reminder and hidden items must not leak through Settings");
+        let locked_key = h.state().o.settings_visibility;
+        let app = h.state_mut();
+        assert!(app.t.parental.unlock("1234", &app.t.config.parental));
+        until_ov(&mut h, "unlocked channel", |h| has_label(h, "Private channel"));
+        until_ov(&mut h, "settings reloaded", |h| h.state().o.settings_loader.is_none());
+        assert_ne!(h.state().o.settings_visibility, locked_key);
+        assert!(!h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(_))));
+        assert!(!has_label(&h, "Private film") && !has_label(&h, "Private hidden channel"));
+        h.state_mut().t.parental.lock();
+        until_ov(&mut h, "relocked channel", |h| h.state().o.rows.is_empty());
+    }
+
+    #[test]
+    fn settings_search_exact_and_partial_matches_share_one_header() {
+        let (mut t, one) = rig();
+        let mut cfg = (*t.config).clone();
+        cfg.player.lip_sync.insert("speakers".into(), crate::config::LipSync::default());
+        t.config = Arc::new(cfg);
+        let mut h = overlay_harness(t, one, SearchOverlay::new("audio delay".into()), egui::vec2(1400.0, 900.0));
+        until_ov(&mut h, "audio settings", |h| h.state().o.settings_loader.is_none());
+        for section in [SearchSection::All, SearchSection::Settings] {
+            h.state_mut().o.section = section;
+            h.run_steps(2);
+            assert_eq!(h.state().o.rows.iter().filter(|r| matches!(r, Row::Header("Settings"))).count(), 1);
+            assert!(h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(t) if t.title == "Audio delay")));
+            assert!(h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(t) if t.title == "Reset audio delay")));
+        }
     }
 
     #[test]

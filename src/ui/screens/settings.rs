@@ -824,7 +824,6 @@ pub struct SettingsScreen {
     search_focused: bool,
     release_search_focus: bool,
     search_all: bool,
-    last_input: &'static str,
     jump_pending: Option<SettingTarget>,
     submit_input: &'static str,
 
@@ -1444,7 +1443,7 @@ impl SettingsScreen {
                                 .iter()
                                 .filter(|o| o.action == LinkAction::Join && o.group == l.group && o.item != l.item)
                                 // an explicit partner isn't named while the session is locked
-                                .filter(|o| !ctx.lib.conceals(&o.item))
+                                .filter(|o| !ctx.lib.conceals(&o.item) && (!self.search_all || search::searchable_item(ctx, &o.item)))
                                 .map(|o| {
                                     let n = o.name.clone().unwrap_or_else(|| o.item.key.to_string());
                                     match ctx.lib.source(o.item.source) {
@@ -2766,11 +2765,11 @@ impl Screen for SettingsScreen {
 
     fn key_contexts(&self) -> Vec<KeyContext> {
         if self.editing {
-            vec![KeyContext::TextInput, KeyContext::Panel]
+            vec![KeyContext::TextInput, KeyContext::Settings]
         } else if !self.filter.is_empty() || self.search_focused {
-            vec![KeyContext::ListFiltering, KeyContext::Panel]
+            vec![KeyContext::ListFiltering, KeyContext::Settings]
         } else {
-            vec![KeyContext::Panel]
+            vec![KeyContext::Settings]
         }
     }
 
@@ -2924,7 +2923,6 @@ impl Screen for SettingsScreen {
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         ctx.config_input = crate::config::audit::key_input(action);
-        self.last_input = ctx.config_input;
         if !self.editing && self.filter_action(ctx, action) {
             return true;
         }
@@ -3030,7 +3028,6 @@ impl Screen for SettingsScreen {
     }
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
-        ctx.config_input = self.last_input;
         let pending = self.pending.take();
         match (result, pending) {
             (OverlayResult::Chosen(Action::Digit(code)), Some(Pending::Menu(item))) => self.menu_choice(ctx, item, code),
@@ -3621,7 +3618,6 @@ impl SettingsScreen {
         }
         if let Some((i, how)) = clicked {
             ctx.config_input = "click";
-            self.last_input = "click";
             if let Some(Some(target)) = search_targets.get(i) {
                 if how == 0 || how == 2 {
                     if !self.jump_to(ctx, target) {
@@ -3793,11 +3789,93 @@ mod tests {
         search_type(&mut h, "start scr");
         h.state_mut().act(Action::Activate);
         assert_eq!(h.state().s.page, SettingsPage::Interface);
-        assert!(has_label(&h, "Start screen") || h.state().s.scroll_to_row);
+        let app = h.state_mut();
+        assert!(matches!(app.t.with_ctx(|ctx| app.s.current_row(ctx)), Some(Row::Choice(c)) if c.label == "Start screen"));
         search_type(&mut h, "zzzz-no-setting");
         assert!(has_label(&h, "No settings match “zzzz-no-setting”"));
         h.state_mut().act(Action::FilterDeleteWord);
         assert!(h.state().s.filter.is_empty());
+    }
+
+    #[test]
+    fn settings_search_page_list_returns_to_results_without_editing() {
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        search_type(&mut h, "start");
+        focus(&mut h, "Start screen");
+        let row = h.state().s.row;
+        let before = h.state().t.config.clone();
+        for key in [egui::Key::ArrowRight, egui::Key::Enter] {
+            for key in [egui::Key::ArrowLeft, key] {
+                let action = crate::keymap::resolve(
+                    &h.state().s.key_contexts(),
+                    &egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+                )
+                .unwrap();
+                h.state_mut().act(action);
+                h.run_steps(1);
+            }
+            h.state_mut().apply_config();
+            assert_eq!(h.state().t.config, before);
+            assert_eq!(h.state().s.pane, Pane::Content);
+            assert_eq!(h.state().s.row, row);
+            assert_eq!(h.state().s.filter, "start");
+        }
+        h.state_mut().act(Action::Left);
+        for action in [Action::Increase, Action::Decrease, Action::ContextMenu, Action::Remove] {
+            h.state_mut().act(action);
+            assert_eq!(h.state().s.pane, Pane::Pages);
+            assert_eq!(h.state().s.filter, "start");
+            assert!(h.state().t.config_edits.is_empty());
+            assert!(h.state_mut().nav().is_empty());
+        }
+    }
+
+    #[test]
+    fn settings_search_hides_reminders_on_locked_channels_until_unlock() {
+        let (mut t, _one) = rig();
+        let channel = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::channels(c, src, 1)?;
+            // A group lock must be treated exactly like an individual channel lock.
+            crate::store::user::set_group_override(
+                c,
+                src,
+                ItemKind::Channel,
+                &crate::model::GroupKey("channel:all".into()),
+                &crate::model::GroupOverride { locked: true, ..Default::default() },
+            )?;
+            Ok(ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{:011}", 0)) })
+        });
+        let mut cfg = (*t.config).clone();
+        cfg.parental.enabled = true;
+        cfg.parental.pin_salt = Some("s".into());
+        cfg.parental.pin_hash = Some(crate::ui::parental::hash_pin("1234", "s"));
+        t.config = std::sync::Arc::new(cfg);
+        let s = SettingsScreen {
+            reminders: vec![Reminder {
+                id: ReminderId(1),
+                channel,
+                channel_name: "Channel 0".into(),
+                programme_title: "Private programme".into(),
+                start: 4_000_000_000,
+                stop: 4_000_003_600,
+                lead_s: 120,
+                state: crate::model::ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
+            }],
+            ..Default::default()
+        };
+        let found = |t: &mut crate::ui::testing::TestUi| t.with_ctx(|ctx| s.indexed_rows(ctx).iter().any(|r| r.target.title == "Private programme"));
+        assert!(!found(&mut t));
+        assert!(t.parental.unlock("1234", &t.config.parental));
+        assert!(found(&mut t));
+        t.parental.lock();
+        assert!(!found(&mut t));
     }
 
     #[test]
@@ -3986,7 +4064,7 @@ mod tests {
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Player));
         h.run_steps(2);
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Settings]);
         assert!(has_label(&h, "Hardware decoding") && has_label(&h, "Zapping delay"));
         // Enter toggles; → / Shift+←/→ adjust numbers and choices; everything goes through
         // edit_config
@@ -4007,20 +4085,20 @@ mod tests {
         focus(&mut h, "Advanced mpv options");
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::TextInput, KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::TextInput, KeyContext::Settings]);
         type_text(&mut h, "; profile=fast"); // appended to the headless "ao=null; vo=null"
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
         h.state_mut().apply_config();
         assert_eq!(h.state().t.config.player.mpv_options.get("profile").map(String::as_str), Some("fast"));
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Settings]);
         // Esc leaves a field keeping what was typed (like Tab, and like the form fields)
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
         type_text(&mut h, "; cache=no");
         h.state_mut().act(Action::Back);
         h.run_steps(1);
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Settings]);
         h.state_mut().apply_config();
         assert_eq!(h.state().t.config.player.mpv_options.get("cache").map(String::as_str), Some("no"), "Esc keeps the edit");
         // leaving a field unchanged queues nothing

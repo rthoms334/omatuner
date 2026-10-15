@@ -33,6 +33,33 @@ pub(crate) struct IndexedRow {
     position: usize,
 }
 
+impl IndexedRow {
+    /// Global search finds settings, never programme titles, hidden items or other user data.
+    pub(crate) fn is_setting(&self) -> bool {
+        !matches!(self.row, Row::Item { .. })
+    }
+}
+
+/// Missing items have no trustworthy lock metadata in the snapshot, so only an unlocked
+/// session may search their saved names. Hidden VOD and orphans are included in that case.
+pub(super) fn searchable_item(ctx: &UiCtx<'_>, item: &ItemRef) -> bool {
+    if ctx.lib.conceals(item) {
+        return false;
+    }
+    if kit::unlocked(ctx) {
+        return true;
+    }
+    if item.kind == ItemKind::Channel {
+        return ctx.lib.live.by_ref(item).is_some_and(|id| !kit::channel_locked(ctx, id));
+    }
+    let (items, groups) = if item.kind == ItemKind::Movie {
+        (&ctx.lib.vod.movies, &ctx.lib.vod.movie_groups)
+    } else {
+        (&ctx.lib.vod.series, &ctx.lib.vod.series_groups)
+    };
+    items.iter().find(|v| v.source_id == item.source && v.key == item.key).is_some_and(|v| !v.locked && !kit::any_group_locked(groups, &v.group_ids))
+}
+
 impl Row {
     fn title(&self) -> &str {
         match self {
@@ -115,6 +142,19 @@ impl SettingsScreen {
                         continue;
                     }
                     _ => {}
+                }
+                if let Row::Item { item, .. } = row {
+                    let visible = match item {
+                        Item::Reminder(id) => self.reminders.iter().find(|r| r.id == *id).is_some_and(|r| searchable_item(ctx, &r.channel)),
+                        Item::HiddenChannel(id) => !kit::channel_locked(ctx, *id),
+                        Item::HiddenVod(item) | Item::Orphan(item) | Item::TitleLink(item, _) => searchable_item(ctx, item),
+                        Item::HiddenGroup(id) | Item::Explicit(id) => kit::unlocked(ctx) || !all_groups(ctx).any(|g| g.id == *id && g.locked),
+                        _ => true,
+                    };
+                    if !visible {
+                        intro.clear();
+                        continue;
+                    }
                 }
                 let title = row.title();
                 let key = match row {
@@ -268,6 +308,11 @@ impl SettingsScreen {
     }
 
     pub(super) fn filter_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        if self.pane == Pane::Pages
+            && matches!(action, Action::Activate | Action::Right | Action::Increase | Action::Decrease | Action::ContextMenu | Action::Remove)
+        {
+            return false;
+        }
         let mut query = self.filter.clone();
         match action {
             Action::FilterInput(' ') if query.is_empty() && !self.search_focused => {

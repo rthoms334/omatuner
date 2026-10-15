@@ -85,6 +85,8 @@ struct OpenOverlay {
     /// A menu an overlay opened (search's item menu): the index of that overlay, which gets
     /// the result instead of the screen.
     owner: Option<usize>,
+    /// Retain keyboard submissions that finish during a later UI pass (e.g. the PIN form).
+    input: &'static str,
 }
 
 /// The key the mouse back button stands for.
@@ -2365,7 +2367,13 @@ impl TunerApp {
             return;
         }
         let opener = self.view_screen();
-        self.overlays.push(OpenOverlay { overlay: Box::new(overlays::help::HelpOverlay::with_contexts(contexts)), opener, kind, owner: None });
+        self.overlays.push(OpenOverlay {
+            overlay: Box::new(overlays::help::HelpOverlay::with_contexts(contexts)),
+            opener,
+            kind,
+            owner: None,
+            input: "click",
+        });
     }
 
     /// `owner`: the overlay that asked (its menus answer it); `at`: where a right-click
@@ -2386,7 +2394,7 @@ impl TunerApp {
                     overlay.anchor_at(pos);
                 }
                 let owner = owner.filter(|_| menu);
-                self.overlays.push(OpenOverlay { overlay, opener, kind, owner });
+                self.overlays.push(OpenOverlay { overlay, opener, kind, owner, input: "click" });
             }
         }
     }
@@ -2420,11 +2428,15 @@ impl TunerApp {
                 let outcome = self.as_overlay(top, |app| {
                     app.with_ctx(|ctx, _, ovs| {
                         ctx.config_input = crate::config::audit::key_input(action);
-                        ovs[top].overlay.on_action(ctx, action)
+                        let outcome = ovs[top].overlay.on_action(ctx, action);
+                        if !matches!(outcome, OverlayOutcome::Ignored) {
+                            ovs[top].input = ctx.config_input;
+                        }
+                        outcome
                     })
                 });
                 let ignored = matches!(outcome, OverlayOutcome::Ignored);
-                self.apply_overlay_outcome(outcome);
+                self.apply_overlay_outcome(outcome, crate::config::audit::key_input(action));
                 !ignored
             } else {
                 let idx = self.screen_index(self.view_screen());
@@ -2439,7 +2451,7 @@ impl TunerApp {
         }
     }
 
-    fn apply_overlay_outcome(&mut self, outcome: OverlayOutcome) {
+    fn apply_overlay_outcome(&mut self, outcome: OverlayOutcome, input: &'static str) {
         match outcome {
             OverlayOutcome::Close => {
                 self.overlays.pop();
@@ -2489,13 +2501,22 @@ impl TunerApp {
                     match o.owner {
                         // a menu of the overlay now on top: its answer applies to that overlay
                         Some(owner) if owner + 1 == self.overlays.len() => {
-                            let outcome = self.as_overlay(owner, |app| app.with_ctx(|ctx, _, ovs| ovs[owner].overlay.on_overlay_result(ctx, result)));
-                            self.apply_overlay_outcome(outcome);
+                            let outcome = self.as_overlay(owner, |app| {
+                                app.with_ctx(|ctx, _, ovs| {
+                                    ctx.config_input = input;
+                                    ovs[owner].input = input;
+                                    ovs[owner].overlay.on_overlay_result(ctx, result)
+                                })
+                            });
+                            self.apply_overlay_outcome(outcome, input);
                         }
                         Some(_) => {}
                         None => {
                             let idx = self.screen_index(o.opener);
-                            self.with_ctx(|ctx, screens, _| screens[idx].on_overlay_result(ctx, result));
+                            self.with_ctx(|ctx, screens, _| {
+                                ctx.config_input = input;
+                                screens[idx].on_overlay_result(ctx, result);
+                            });
                         }
                     }
                 }
@@ -2560,6 +2581,9 @@ impl TunerApp {
 
     fn apply_config_edits(&mut self, egui_ctx: &egui::Context) {
         self.apply_pending_config(egui_ctx);
+        if let Some(wait) = self.services().config_audit.flush_ready(std::time::Instant::now()) {
+            egui_ctx.request_repaint_after(wait);
+        }
         if let Some(at) = self.config_save_at {
             if let Some(wait) = at.checked_duration_since(std::time::Instant::now()).filter(|wait| !wait.is_zero()) {
                 egui_ctx.request_repaint_after(wait);
@@ -2572,14 +2596,10 @@ impl TunerApp {
     fn save_pending_config(&mut self) {
         if self.config_save_at.take().is_some()
             && let Some(services) = &self.services
+            && let Err(e) = services.config().save(&services.paths.config_file())
         {
-            match services.config().save(&services.paths.config_file()) {
-                Ok(()) => services.config_audit.flush(),
-                Err(e) => {
-                    tracing::warn!("saving settings: {e}");
-                    self.toast(Toast::error(format!("Couldn't save settings: {e}")));
-                }
-            }
+            tracing::warn!("saving settings: {e}");
+            self.toast(Toast::error(format!("Couldn't save settings: {e}")));
         }
     }
 
@@ -2608,11 +2628,7 @@ impl TunerApp {
             Ok(())
         } else {
             self.config_save_at = None;
-            let result = cfg.save(&services.paths.config_file());
-            if result.is_ok() {
-                services.config_audit.flush();
-            }
-            result
+            cfg.save(&services.paths.config_file())
         };
         let cfg = Arc::new(cfg);
         *services.config.write().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
@@ -3122,8 +3138,17 @@ impl eframe::App for TunerApp {
         }
 
         if let Some(i) = self.overlays.len().checked_sub(1) {
-            let outcome = self.as_overlay(i, |app| app.with_ctx(|ctx, _, ovs| ovs[i].overlay.ui(&egui_ctx, ctx)));
-            self.apply_overlay_outcome(outcome);
+            if egui_ctx.input(|i| i.pointer.any_click()) {
+                self.overlays[i].input = "click";
+            }
+            let input = self.overlays[i].input;
+            let outcome = self.as_overlay(i, |app| {
+                app.with_ctx(|ctx, _, ovs| {
+                    ctx.config_input = input;
+                    ovs[i].overlay.ui(&egui_ctx, ctx)
+                })
+            });
+            self.apply_overlay_outcome(outcome, input);
         }
         for t in std::mem::take(&mut self.pending_toasts) {
             self.toast(t);
@@ -3158,6 +3183,9 @@ impl eframe::App for TunerApp {
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
         self.save_pending_config();
         self.remember_last_screen();
+        if let Some(services) = &self.services {
+            services.config_audit.flush();
+        }
         // SHUTDOWN ORDER: render context (needs GL) → FBO → services (player/mpv, then writer).
         self.video.destroy(gl);
         if let Some(s) = self.services.take() {
@@ -5835,6 +5863,7 @@ mod tests {
         assert!(rig.app.overlays.is_empty());
         let log = crate::config::audit::capture(|| {
             rig.press(Key::ArrowRight, NONE);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
         });
         assert_eq!(rig.app.services().config().general.start_screen, crate::config::StartScreen::Live);
         assert_eq!(log.lines().filter(|line| line.contains("settings:")).count(), 1, "{log}");
@@ -5842,7 +5871,49 @@ mod tests {
         rig.frame_with("open on".chars().map(|c| Event::Text(c.to_string())).collect());
         assert_eq!(rig.app.key_stack().first(), Some(&KeyContext::ListFiltering), "a batch of text, including space, keeps filtering");
         rig.press(Key::Escape, NONE);
-        assert_eq!(rig.app.key_stack().first(), Some(&KeyContext::Panel));
+        assert_eq!(rig.app.key_stack().first(), Some(&KeyContext::Settings));
+    }
+
+    #[test]
+    fn settings_audit_overlay_result_uses_the_key_that_closed_it() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
+        rig.settle();
+        rig.press(Key::ArrowRight, NONE);
+        // Ctrl+S opens the real Live sort menu; Down selects Channel number.
+        rig.press(Key::S, CTRL);
+        assert_eq!(rig.app.overlays.len(), 1);
+        rig.press(Key::ArrowDown, NONE);
+        let log = crate::config::audit::capture(|| {
+            rig.press(Key::Enter, NONE);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(rig.app.services().config().interface.live_sort, crate::model::SortMode::Number);
+        assert!(log.contains("settings: interface live sort provider → number (key Enter)"), "{log}");
+        assert!(!log.contains("(click)"), "{log}");
+    }
+
+    #[test]
+    fn settings_audit_deferred_pin_result_keeps_the_confirming_key() {
+        let mut rig = Rig::with(pin_config(), live(), 1.0, |_| Ok(()));
+        rig.settle();
+        let before = rig.app.services().config().parental.relock_min;
+        rig.press(Key::K, CTRL);
+        rig.frame_with("lock again after".chars().map(|c| Event::Text(c.to_string())).collect());
+        rig.until("the relock setting", |r| {
+            let out = r.frame_with(vec![]);
+            find(&texts(&out), "Lock again after · Parental").is_some()
+        });
+        rig.press(Key::Enter, NONE);
+        rig.press(Key::ArrowRight, NONE);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
+        let log = crate::config::audit::capture(|| {
+            type_pin(&mut rig);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(rig.app.services().config().parental.relock_min, before + 5);
+        assert!(log.contains(&format!("parental relock min {before} → {} (key Enter)", before + 5)), "{log}");
     }
 
     #[test]
@@ -5856,6 +5927,7 @@ mod tests {
             });
             rig.app.apply_config_edits(&rig.ctx);
             rig.app.apply_config_edits(&rig.ctx);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
         });
         assert_eq!(log.lines().filter(|line| line.contains("settings:")).count(), 1, "{log}");
         assert!(log.contains("INFO") && log.contains("settings: start screen Home → Live TV (key →)"), "{log}");
@@ -5874,6 +5946,7 @@ mod tests {
             rig.app.config_save_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
             rig.app.apply_config_edits(&rig.ctx);
             rig.app.apply_config_edits(&rig.ctx);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
         });
         assert_eq!(saved.lines().filter(|line| line.contains("settings:")).count(), 1, "{saved}");
         assert!(saved.contains("audio delay for the current output +0 ms → +200 ms (key ])"), "{saved}");
@@ -5883,6 +5956,7 @@ mod tests {
                 crate::agent::MultiViewSwap::Layout(crate::config::MultiViewLayout::Pip),
             ))));
             rig.app.apply_config_edits(&rig.ctx);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
         });
         assert!(agent.contains("settings:") && agent.contains("(agent)"), "{agent}");
     }
@@ -7160,7 +7234,7 @@ mod tests {
             token: QUIT_TOKEN,
         });
         assert_eq!(rig.overlay_kinds(), [kind(ask)]);
-        rig.app.apply_overlay_outcome(OverlayOutcome::CloseWith(OverlayResult::Confirmed(QUIT_TOKEN)));
+        rig.app.apply_overlay_outcome(OverlayOutcome::CloseWith(OverlayResult::Confirmed(QUIT_TOKEN)), "click");
         let out = rig.frame_with(vec![]);
         assert!(out.viewport_output.values().any(|v| v.commands.contains(&egui::ViewportCommand::Close)));
         rig.close = true;

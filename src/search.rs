@@ -282,7 +282,7 @@ impl SearchIndex {
     /// groups are ordered by their best hit, hits inside a group by score. Guide results come
     /// from [`EpgSearch`] (empty here).
     pub fn results(&self, section: SearchSection, limit: usize) -> Vec<SearchHit> {
-        if section == SearchSection::Guide || limit == 0 || self.query.trim().is_empty() {
+        if matches!(section, SearchSection::Guide | SearchSection::Settings) || limit == 0 || self.query.trim().is_empty() {
             return Vec::new();
         }
         let snap = self.nucleo.snapshot();

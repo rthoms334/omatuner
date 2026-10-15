@@ -3,6 +3,7 @@
 use super::Config;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub fn key_input(action: crate::keymap::Action) -> &'static str {
     use crate::keymap::Action;
@@ -27,42 +28,110 @@ pub fn edit(input: &'static str, apply: impl FnOnce(&mut Config) + 'static) -> E
     Edit { input, apply: Box::new(apply) }
 }
 
-type AudioChanges = BTreeMap<String, (i32, i32, &'static str)>;
+const QUIET: Duration = Duration::from_millis(500);
+
+struct Change<T> {
+    old: T,
+    new: T,
+    input: &'static str,
+    at: Instant,
+}
+
+impl<T> Change<T> {
+    fn update(&mut self, new: T, input: &'static str, at: Instant) {
+        self.new = new;
+        self.input = input;
+        self.at = at;
+    }
+}
+
 #[derive(Default)]
 pub struct Pending {
-    audio: Mutex<AudioChanges>,
+    settings: Mutex<BTreeMap<String, Change<serde_json::Value>>>,
+    audio: Mutex<BTreeMap<String, Change<i32>>>,
 }
 
 impl Pending {
     pub fn record(&self, old: &Config, new: &Config, input: &'static str) {
-        for line in changes(old, new, input) {
-            tracing::info!("{line}");
+        self.record_at(old, new, input, Instant::now());
+    }
+
+    fn record_at(&self, old: &Config, new: &Config, input: &'static str, now: Instant) {
+        self.flush_ready(now);
+        let mut pending = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        for (path, before, after) in changes(old, new) {
+            pending.entry(path).and_modify(|change| change.update(after.clone(), input, now)).or_insert(Change {
+                old: before,
+                new: after,
+                input,
+                at: now,
+            });
         }
         let mut pending = self.audio.lock().unwrap_or_else(|e| e.into_inner());
         for name in old.player.lip_sync.keys().chain(new.player.lip_sync.keys()) {
             let before = old.player.lip_sync.get(name).map_or(0, super::LipSync::offset_ms);
             let after = new.player.lip_sync.get(name).map_or(0, super::LipSync::offset_ms);
             if before != after {
-                let entry = pending.entry(name.clone()).or_insert((before, after, input));
-                entry.1 = after;
-                entry.2 = input;
+                pending.entry(name.clone()).and_modify(|change| change.update(after, input, now)).or_insert(Change {
+                    old: before,
+                    new: after,
+                    input,
+                    at: now,
+                });
             }
         }
     }
 
-    /// Called only after the debounced (or exit) save succeeds, once per changed output.
+    /// Emit settings that have been quiet for 500 ms; return the next pending deadline.
+    pub fn flush_ready(&self, now: Instant) -> Option<Duration> {
+        self.flush_at(Some(now))
+    }
+
+    /// Exit (including signals and update restarts) emits the final values immediately.
     pub fn flush(&self) {
-        for (_, (old, new, input)) in std::mem::take(&mut *self.audio.lock().unwrap_or_else(|e| e.into_inner())) {
-            if old != new {
-                tracing::info!("settings: audio delay for the current output {old:+} ms → {new:+} ms ({input})");
+        self.flush_at(None);
+    }
+
+    fn flush_at(&self, now: Option<Instant>) -> Option<Duration> {
+        let mut wait: Option<Duration> = None;
+        let mut ready = |at: Instant| {
+            if let Some(left) = now.and_then(|now| (at + QUIET).checked_duration_since(now)).filter(|left| !left.is_zero()) {
+                wait = Some(wait.map_or(left, |wait| wait.min(left)));
+                false
+            } else {
+                true
             }
+        };
+        let mut lines = Vec::new();
+        self.settings.lock().unwrap_or_else(|e| e.into_inner()).retain(|path, change| {
+            if !ready(change.at) {
+                return true;
+            }
+            if change.old != change.new {
+                change_line(path, &change.old, &change.new, change.input, &mut lines);
+            }
+            false
+        });
+        self.audio.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, change| {
+            if !ready(change.at) {
+                return true;
+            }
+            if change.old != change.new {
+                let (old, new, input) = (change.old, change.new, change.input);
+                lines.push(format!("settings: audio delay for the current output {old:+} ms → {new:+} ms ({input})"));
+            }
+            false
+        });
+        for line in lines {
+            tracing::info!("{line}");
         }
+        wait
     }
 }
 
 /// Future schema fields get a safe fallback automatically. User-controlled objects are
 /// atomic: their keys (mpv options, output names, paths…) must never become log labels.
-pub(crate) fn changes(old: &Config, new: &Config, input: &str) -> Vec<String> {
+fn changes(old: &Config, new: &Config) -> Vec<(String, serde_json::Value, serde_json::Value)> {
     let old = serde_json::to_value(old).expect("config is serializable");
     let new = serde_json::to_value(new).expect("config is serializable");
     let mut out = Vec::new();
@@ -77,11 +146,11 @@ pub(crate) fn changes(old: &Config, new: &Config, input: &str) -> Vec<String> {
                 for (key, next) in value.as_object().unwrap() {
                     let previous = &before[key];
                     if previous != next {
-                        change_line(&format!("{path}.{key}"), previous, next, input, &mut out);
+                        out.push((format!("{path}.{key}"), previous.clone(), next.clone()));
                     }
                 }
             } else {
-                change_line(&path, before, value, input, &mut out);
+                out.push((path, before.clone(), value.clone()));
             }
         }
     }
@@ -210,6 +279,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_settings_batch_independently_after_500_ms_and_flush_on_exit() {
+        let pending = Pending::default();
+        let start = Instant::now();
+        let old = Config::default();
+        let mut first = old.clone();
+        first.player.cache_secs += 1;
+        first.general.start_screen = super::super::StartScreen::Live;
+        first.player.multiview.layout = super::super::MultiViewLayout::Pip;
+        let mut last = first.clone();
+        last.player.cache_secs += 20;
+        last.general.start_screen = super::super::StartScreen::Guide;
+        let presses = capture(|| {
+            pending.record_at(&old, &first, "key →", start);
+            pending.record_at(&first, &last, "key →", start + Duration::from_millis(400));
+            pending.flush_ready(start + Duration::from_millis(499));
+        });
+        assert!(presses.is_empty(), "{presses}");
+        let layout = capture(|| {
+            pending.flush_ready(start + Duration::from_millis(500));
+        });
+        assert_eq!(layout.lines().count(), 1, "{layout}");
+        assert!(layout.contains("player multiview layout auto → pip"), "{layout}");
+        assert!(
+            capture(|| {
+                pending.flush_ready(start + Duration::from_millis(899));
+            })
+            .is_empty()
+        );
+        let settings = capture(|| {
+            pending.flush_ready(start + Duration::from_millis(900));
+        });
+        assert_eq!(settings.lines().count(), 2, "{settings}");
+        assert!(settings.contains("start screen Home → Guide (key →)"), "{settings}");
+        assert!(settings.contains(&format!("player cache secs {} → {}", old.player.cache_secs, last.player.cache_secs)), "{settings}");
+        assert!(capture(|| pending.flush()).is_empty());
+        let exit = capture(|| {
+            pending.record_at(&last, &first, "key", start + Duration::from_millis(950));
+            pending.flush();
+        });
+        assert_eq!(exit.lines().count(), 2, "{exit}");
+        let no_change = capture(|| {
+            pending.record_at(&old, &first, "key", start);
+            pending.record_at(&first, &old, "key", start + Duration::from_millis(100));
+            pending.flush();
+        });
+        assert!(no_change.is_empty(), "{no_change}");
+    }
+
+    #[test]
     fn redacts_text_maps_devices_and_pin_even_on_restore() {
         let old = Config::default();
         let mut new = old.clone();
@@ -218,7 +336,11 @@ mod tests {
         new.player.mpv_options.insert("private-title".into(), "private-device".into());
         new.parental.pin_hash = Some("private-pin".into());
         new.parental.pin_salt = Some("private-salt".into());
-        let log = capture(|| Pending::default().record(&old, &new, "restore"));
+        let log = capture(|| {
+            let pending = Pending::default();
+            pending.record(&old, &new, "restore");
+            pending.flush();
+        });
         assert!(log.contains("INFO"));
         assert!(log.contains("settings: start screen Home → Live TV (restore)"));
         assert!(log.contains("player user agent changed (restore)"));

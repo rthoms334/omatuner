@@ -2096,7 +2096,7 @@ raw mpv options set it; backups keep this computer's saved outputs.
 **Search settings** sits above the page list. Typing starts a filter from either pane;
 letters, including h/j/k/l and their capitals, type instead of navigating. Backspace deletes
 a character, Ctrl+Backspace a word, Ctrl+U / Esc clears and restores the original page, row
-and pane. While filtering the context is `[ListFiltering, Panel]`; a setting's own focused
+and pane. While filtering the context is `[ListFiltering, Settings]`; a setting's own focused
 text editor still owns typing through `TextInput`. The mouse can focus the visible search
 field. No results: `No settings match “xyz”`.
 
@@ -2297,7 +2297,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   then past with ⟲ when catch-up is possible.
 * **Settings** (`search::SettingDocument`): the visible Settings row builders supply both
   the in-page filter and Ctrl+K. Folded title, description and alias fields are matched by
-  word prefix with that ranking (§13.9); the overlay caches the small index per opening.
+  word prefix with that ranking (§13.9); the overlay caches the small index per opening and
+  rebuilds it when the session lock changes. Ctrl+K indexes settings only, excluding user-data
+  rows such as reminders, hidden items and orphans. The in-page filter retains those rows
+  subject to the same item and group locks as content search.
 * **List filter** (`search::ListFilter`, implemented in the skeleton): per pane,
   `nucleo_matcher` scoring, ties keep list order; < 5 ms for 20k rows; leading spaces ignored;
   Ctrl+Backspace deletes a word. Channel haystacks are `"<number> <name>"`; an all-digit query
@@ -3065,7 +3068,9 @@ the current settings; the onboarding restore always applies them). Machine-speci
   dynamic maps say `changed`; log labels come from the fixed schema, never playlist names,
   URLs, credentials, device names or programme titles. Enum-like strings are allowlisted.
   Per-output corrections say `audio delay for the current output`, with the old/new ms,
-  once after the 500 ms quiet-period save (also flushed on exit), never once per key repeat.
+  once after 500 ms without a change to that output (also flushed on exit). Other config
+  settings batch independently the same way, keeping the first old and last new values,
+  never one line per key repeat.
   Restoring a backup logs each changed preference with `restore`. Agent multi-view layout
   edits use `agent`; asynchronous update-switch edits retain the initiating key/click.
   Playlist editor saves and guide enable/offset changes also log without identifying the
@@ -6086,8 +6091,8 @@ an agent's switches win, then rule priority, then the earlier start; the loser n
   out (repeat)": the rule's name, times and channels only), **Move up / down**, **Delete…**
   ("Delete it and cancel its N reminders" / "keep the reminders as my own").
 * Reorder: Alt+↑/↓, the drag grip (shown with two rules or more) or the menu's Move; the
-  order is saved at once and the guide checked again. The Panel hint's "reorder" covers them.
-* Upcoming rows: Enter, a click or `x` opens the programme's popover (Watch, Cancel reminder =
+  order is saved at once and the guide checked again. The Settings hint's "reorder" covers them.
+* Upcoming rows: Enter, a click or Delete opens the programme's popover (Watch, Cancel reminder =
   skip this one, Follow…).
 
 ## 34. Spoiler guard
