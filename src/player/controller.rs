@@ -943,14 +943,10 @@ impl Controller {
                 let _ = m.set_property("pause", b);
             }
             PlayerCommand::SeekBy(s) => {
-                if self.snap.seekable {
-                    let _ = m.command("seek", &[&format!("{s}"), "relative"]);
-                }
+                self.seek(s, "relative");
             }
             PlayerCommand::SeekTo(t) => {
-                if self.snap.seekable {
-                    let _ = m.command("seek", &[&format!("{t}"), "absolute"]);
-                }
+                self.seek(t, "absolute");
             }
             PlayerCommand::Zap { forward, unlocked } => {
                 if let Some((next, copy)) = self.zap_neighbour(forward, unlocked) {
@@ -1046,6 +1042,7 @@ impl Controller {
                 if self.snap.video_suspended {
                     let _ = m.set_property("vid", "auto");
                     self.snap.video_suspended = false;
+                    self.read_seekable();
                 }
             }
             PlayerCommand::CastTo { device, play } => return self.cast_to(device, play.map(CopyPlay::from)),
@@ -1296,7 +1293,7 @@ impl Controller {
         // mpv's pause from before the cast must not hold the next local play
         let _ = self.mpv.set_property("pause", false);
         self.snap.paused = false;
-        self.snap.seekable = false;
+        self.read_seekable();
         self.snap.stream_info = None;
         self.force_publish = true;
         tracing::info!("{}: casting to device {} ended: {why}", self.log, r.device.short());
@@ -1466,7 +1463,7 @@ impl Controller {
                 send(RemoteCmd::SeekTo(t.max(0.0)));
                 return Some(self.remote_seeked(t.max(0.0)));
             }
-            C::SeekBy(_) | C::SeekTo(_) => {}
+            C::SeekBy(_) | C::SeekTo(_) => self.emit(PlayerEvent::SeekUnavailable),
             C::SetVolume(v) if volume => send(RemoteCmd::SetVolume(v.clamp(0.0, 130.0))),
             C::AdjustVolume(d) if volume => send(RemoteCmd::SetVolume((self.snap.volume + d).clamp(0.0, 130.0))),
             C::SetVolume(_) | C::AdjustVolume(_) | C::ToggleMute | C::SetMute(_) => {}
@@ -1771,12 +1768,14 @@ impl Controller {
             }
             MpvEvent::FileLoaded => {
                 self.apply_lip_sync();
+                self.read_seekable();
                 self.feed(Input::FileLoaded, now)
             }
             MpvEvent::PlaybackRestart => {
                 // the new stream's size before the Playing publish records it (`record_video`),
                 // whatever order mpv delivers the `video-params` change in
                 self.read_video_size();
+                self.read_seekable();
                 self.feed(Input::PlaybackRestart, now)
             }
             MpvEvent::EndFile { reason, error, entry_id, inserted } => {
@@ -1940,9 +1939,8 @@ impl Controller {
                 }
             }
             PropId::Seekable => {
-                // live streams are not seekable in v1 even if the cache is (no live rewind)
-                let live = self.snap.playable.as_ref().map(|p| p.kind.is_live()).unwrap_or(true);
-                self.snap.seekable = b(&v) && !live;
+                // A queued notification can describe the previous file/output.
+                self.read_seekable();
             }
             PropId::SubDelay => self.snap.sub_delay = f(&v).unwrap_or(0.0),
             PropId::AudioDevice | PropId::CurrentAo => {
@@ -2009,6 +2007,49 @@ impl Controller {
         if self.snap.video_size != w.zip(h) {
             self.snap.video_size = w.zip(h);
             self.dirty = true;
+        }
+    }
+
+    /// mpv only notifies on changes; our snapshot also applies the live policy and shows
+    /// the TV's capabilities while casting. Re-read at local playback boundaries and before
+    /// seeking, even when mpv's value stayed true across the transition.
+    fn read_seekable(&mut self) {
+        let vod = self.machine.target().is_some_and(|p| !p.kind.is_live());
+        let seekable = vod && self.mpv.get_property::<bool>("seekable").unwrap_or(false);
+        if self.snap.seekable != seekable {
+            self.snap.seekable = seekable;
+            self.dirty = true;
+        }
+    }
+
+    fn seek(&mut self, seconds: f64, mode: &str) {
+        self.read_seekable();
+        let refused = !self.snap.seekable;
+        let failed = !refused && self.mpv.command("seek", &[&seconds.to_string(), mode]).is_err();
+        // one line per skip, so a stream that won't seek says why in the log (formats and
+        // numbers only: no URL, no title)
+        let num = |p: &str| self.mpv.get_property::<f64>(p).ok().map_or("-".to_owned(), |v| format!("{v:.1}"));
+        let text = |p: &str| self.mpv.get_property::<String>(p).unwrap_or_else(|_| "-".to_owned());
+        let flag = |p: &str| self.mpv.get_property::<bool>(p).ok().map_or("-", |b| if b { "yes" } else { "no" });
+        tracing::info!(
+            "{}: skip {mode} {seconds} s at {} → {}; seekable {} (partly {}), format {}, network {}, cached {} s",
+            self.log,
+            num("time-pos"),
+            if refused {
+                "refused"
+            } else if failed {
+                "mpv error"
+            } else {
+                "sent"
+            },
+            flag("seekable"),
+            flag("partially-seekable"),
+            text("file-format"),
+            flag("demuxer-via-network"),
+            num("demuxer-cache-duration"),
+        );
+        if refused || failed {
+            self.emit(PlayerEvent::SeekUnavailable);
         }
     }
 

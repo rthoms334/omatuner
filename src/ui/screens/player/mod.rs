@@ -442,6 +442,10 @@ impl Screen for PlayerScreen {
             return;
         }
         match ev {
+            AppEvent::Player(PlayerEvent::SeekUnavailable) => {
+                self.flash = None;
+                self.cast_notice(ctx, "Can't skip in this stream");
+            }
             AppEvent::Player(PlayerEvent::AudioOutputChanged { previous: Some(previous), output, offset_ms })
                 if ctx.player.cast.is_none() && previous.name != output.name =>
             {

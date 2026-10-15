@@ -14,8 +14,8 @@ use crossbeam_channel::Receiver;
 use support::media::{Faults, KeepAlive, SessionLimit, TestServer, ensure_media};
 use tuner::config::{Config, SubtitleAuto};
 use tuner::model::{
-    ChannelId, Collection, HistoryEntry, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, PlayOrigin, Playable, PlayableKind, SourceId,
-    TileId, WatchProgress, ZapList,
+    ChannelId, Collection, EpisodeId, HistoryEntry, HttpHeaders, ItemKey, ItemKind, ItemRef, MediaRef, MovieId, PlayOrigin, Playable, PlayableKind,
+    SourceId, TileId, WatchProgress, ZapList,
 };
 use tuner::msg::{AppEvent, EventBus};
 use tuner::player::{
@@ -305,6 +305,336 @@ fn assert_stopped_before_start(log: &[String]) {
 
 fn is_playing(s: &PlayerState) -> bool {
     matches!(s, PlayerState::Playing)
+}
+
+/// Pause so ordinary playback cannot masquerade as a successful forward skip.
+fn pause_vod(h: &Harness) -> f64 {
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.position.is_some());
+    h.handle.send(PlayerCommand::SetPause(true));
+    let s = h.wait_snapshot(LONG, |s| s.paused && s.state == PlayerState::Paused);
+    eprintln!("VOD paused: position={:?}, seekable={}", s.position, s.seekable);
+    s.position.unwrap()
+}
+
+fn assert_skip(h: &Harness, from: f64, delta: f64) -> f64 {
+    let want = (from + delta).max(0.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    h.handle.send(PlayerCommand::SeekBy(delta));
+    loop {
+        let s = h.snapshot();
+        // MPEG-TS can land on a nearby keyframe (the fixture's GOPs are irregular).
+        if s.position.is_some_and(|p| (p - want).abs() < 2.0) {
+            assert!(s.seekable, "successful seek must be reflected in the snapshot");
+            return s.position.unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SeekBy({delta}) from {from}: wanted {want}, got {:?}, seekable={}, state={:?}",
+            s.position,
+            s.seekable,
+            s.state
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_small_skips(h: &Harness) {
+    let from = pause_vod(h);
+    let forward = assert_skip(h, from, 10.0);
+    assert_skip(h, forward, -10.0);
+    h.handle.send(PlayerCommand::SeekTo(4.0));
+    h.wait_snapshot(Duration::from_secs(5), |s| s.position.is_some_and(|p| (p - 4.0).abs() < 0.6));
+}
+
+#[test]
+fn vod_skip_plain_range_sources() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    skips_plain_files(|path| srv.url(path));
+    assert!(srv.requests().iter().any(|r| r.status == 206 && r.headers.iter().any(|(k, _)| k == "range")), "mpv used HTTP Range");
+}
+
+#[test]
+fn vod_skip_local_formats() {
+    let Some((media, _serial)) = setup() else { return };
+    skips_plain_files(|path| media.join(path).to_string_lossy().into_owned());
+}
+
+fn skips_plain_files(url: impl Fn(&str) -> String) {
+    // Indexed files, index-free files and finite HLS: all the provider VOD shapes.
+    for path in ["vod.mp4", "vod.mkv", "vod.ts", "vod_nocues.mkv", "long/index.m3u8"] {
+        eprintln!("plain VOD: {path}");
+        let m = movie(1, url(path));
+        let h = Harness::start(headless_config(), vec![m.clone()]);
+        h.play(m.media, true);
+        assert_small_skips(&h);
+    }
+}
+
+#[test]
+fn vod_skip_second_file_and_after_live() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    skips_between_files(|path| srv.url(path), None);
+}
+
+fn skips_between_files(url: impl Fn(&str) -> String, limit: Option<u32>) {
+    let first = movie(1, url("vod.mp4"));
+    let second = playable(MediaRef::Episode(EpisodeId(2)), PlayableKind::Episode { season: 1, episode: 2 }, url("vod.mkv"));
+    // A seekable transport classified as live must still have live controls.
+    let ch = live(3, url("vod.ts"));
+    let h = Harness::start(headless_config(), vec![first.clone(), second.clone(), ch.clone()]);
+    h.handle.send(PlayerCommand::SetConnectionLimit { source: SourceId(1), max: limit });
+    for p in [first, second.clone(), ch, second] {
+        let generation = h.snapshot().load_generation;
+        h.play(p.media.clone(), true);
+        h.wait_snapshot(LONG, |s| s.load_generation > generation && s.state == PlayerState::Playing && s.position.is_some());
+        if p.kind.is_live() {
+            assert!(!h.snapshot().seekable, "live never offers seeking");
+        } else {
+            assert_small_skips(&h);
+        }
+    }
+}
+
+#[test]
+fn vod_skip_after_video_suspend_resume() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    skips_after_video_suspend(srv.url("vod.mkv"));
+}
+
+#[test]
+fn vod_skip_local_after_video_suspend_resume() {
+    let Some((media, _serial)) = setup() else { return };
+    skips_after_video_suspend(media.join("vod.mkv").to_string_lossy().into_owned());
+}
+
+fn skips_after_video_suspend(url: String) {
+    let m = movie(1, url);
+    let h = Harness::start(headless_config(), vec![m.clone()]);
+    h.play(m.media, true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.video_size.is_some());
+    h.player.mark_rendered_for_tests();
+    h.wait_snapshot(LONG, |s| s.video_suspended);
+    h.player.mark_rendered_for_tests();
+    h.handle.send(PlayerCommand::ResumeVideo);
+    h.wait_snapshot(LONG, |s| !s.video_suspended && s.video_size.is_some());
+    assert_small_skips(&h);
+}
+
+/// Also runs without sockets: property notifications and live/VOD transitions belong to
+/// mpv, independently of the HTTP transport covered above.
+#[test]
+fn vod_skip_local_files_and_after_live() {
+    let Some((media, _serial)) = setup() else { return };
+    skips_between_files(|path| media.join(path).to_string_lossy().into_owned(), None);
+}
+
+#[test]
+fn vod_skip_local_replace_after_live() {
+    let Some((media, _serial)) = setup() else { return };
+    // Two connections allow loadfile to replace directly, without stop-before-start.
+    skips_between_files(|path| media.join(path).to_string_lossy().into_owned(), Some(2));
+}
+
+#[test]
+fn vod_skip_unseekable_reports_why() {
+    let Some((media, _serial)) = setup() else { return };
+    let stream = UnseekableStream::start(&media);
+    let m = movie(1, stream.url());
+    let mut cfg = headless_config();
+    cfg.player.mpv_options.insert("cache".into(), "no".into());
+    let mut h = Harness::start(cfg, vec![m.clone()]);
+    h.play(m.media, true);
+    let before = pause_vod(&h);
+    assert!(!h.snapshot().seekable);
+    for cmd in [PlayerCommand::SeekBy(10.0), PlayerCommand::SeekBy(-10.0), PlayerCommand::SeekTo(10.0)] {
+        let mark = h.mark();
+        h.handle.send(cmd);
+        assert!(
+            h.wait_event_from(mark, Duration::from_secs(3), |e| matches!(e, PlayerEvent::SeekUnavailable)).is_some(),
+            "a refused seek must explain why"
+        );
+        assert!((h.snapshot().position.unwrap() - before).abs() < 0.1);
+    }
+}
+
+/// A pipe cannot provide byte ranges. Disable the demuxer cache in its tests too, so the
+/// refusal is a real mpv limitation, independent of HTTP and its sandbox restrictions.
+struct UnseekableStream {
+    dir: tempfile::TempDir,
+    writer: std::process::Child,
+}
+
+impl UnseekableStream {
+    fn start(media: &std::path::Path) -> Self {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("stream.ts");
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let writer = Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-re", "-stream_loop", "-1", "-i"])
+            .arg(media.join("vod.ts"))
+            .args(["-c", "copy", "-f", "mpegts"])
+            .arg(fifo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { dir, writer }
+    }
+
+    fn url(&self) -> String {
+        self.dir.path().join("stream.ts").to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for UnseekableStream {
+    fn drop(&mut self) {
+        let _ = self.writer.kill();
+        let _ = self.writer.wait();
+    }
+}
+
+/// Real screen input → UiCtx routing → controller → mpv. The resolver reads actual movie
+/// and episode rows, so the screen's PlayerVod context isn't supplied by the test.
+#[test]
+fn vod_skip_osd_buttons_and_arrow_keys() {
+    let Some((media, _serial)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    skips_from_screen(srv.url("vod.mkv"), true);
+}
+
+#[test]
+fn vod_skip_local_osd_buttons_and_arrow_keys() {
+    let Some((media, _serial)) = setup() else { return };
+    skips_from_screen(media.join("vod.mkv").to_string_lossy().into_owned(), true);
+}
+
+#[test]
+fn vod_skip_unseekable_osd_and_keys_flash() {
+    let Some((media, _serial)) = setup() else { return };
+    let stream = UnseekableStream::start(&media);
+    skips_from_screen(stream.url(), false);
+}
+
+fn skips_from_screen(url: String, seekable: bool) {
+    use eframe::egui;
+    use egui_kittest::kittest::Queryable;
+    use tuner::keymap::{self, Action, KeyContext};
+    use tuner::ui::screens::player::PlayerScreen;
+    use tuner::ui::testing::TestUi;
+    use tuner::ui::{Route, Screen};
+
+    let mut cfg = headless_config();
+    if !seekable {
+        cfg.player.mpv_options.insert("cache".into(), "no".into());
+    }
+    let mut t = TestUi::with_config(cfg).expect("headless UI");
+    assert_eq!(t.config.player.skip_small_s, 10);
+    let stream = serde_json::json!({ "t": "url", "url": url }).to_string();
+    let (movie, episode) = t
+        .services()
+        .store
+        .writer()
+        .blocking(move |c| {
+            let source = support::seed::seed_source(c, "VOD")?;
+            let movies = support::seed::seed_movies(c, source, 1)?;
+            support::seed::seed_series_with_episodes(c, source, 1, 1, 1)?;
+            c.execute("UPDATE movie SET stream=?1", [&stream])?;
+            c.execute("UPDATE episode SET stream=?1", [&stream])?;
+            let episode = c.query_row("SELECT id FROM episode", [], |r| r.get::<_, EpisodeId>(0))?;
+            Ok((movies[0], episode))
+        })
+        .unwrap();
+    let handle = t.services().tiles.focused();
+    for media in [MediaRef::Movie(movie), MediaRef::Episode(episode)] {
+        if !seekable && matches!(media, MediaRef::Episode(_)) {
+            break; // the pipe has a single reader
+        }
+        let generation = handle.snapshot().load_generation;
+        handle.send(PlayerCommand::Play(PlayRequest { media, zap: None, origin: PlayOrigin::Fullscreen, resume: false, immediate: true }));
+        let deadline = Instant::now() + LONG;
+        loop {
+            let s = handle.snapshot();
+            if s.load_generation > generation && s.state == PlayerState::Playing && s.position.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "VOD didn't play: {:?}", s.state);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        handle.send(PlayerCommand::SetPause(true));
+        while !handle.snapshot().paused {
+            assert!(Instant::now() < deadline, "VOD didn't pause");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        t.refresh_snapshot();
+        let mut screen = PlayerScreen::default();
+        t.with_ctx(|ctx| screen.on_enter(ctx, &Route::Player));
+        let mut ui = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 900.0)).build_ui_state(
+            |ui, (t, screen): &mut (TestUi, PlayerScreen)| {
+                t.video.begin_frame();
+                t.refresh_snapshot();
+                while let Ok(ev) = t.events.try_recv() {
+                    t.with_ctx(|ctx| screen.on_event(ctx, &ev));
+                }
+                t.with_ctx(|ctx| screen.ui(ui, ctx));
+            },
+            (t, screen),
+        );
+        ui.run_steps(3);
+        assert_eq!(ui.state().1.key_contexts(), vec![KeyContext::PlayerVod]);
+        assert_eq!(handle.snapshot().seekable, seekable);
+        // Repeated skips must add up, rather than seek to fixed timestamps or send a
+        // live zap. Both paths exercise +10 and -10 SeekBy commands.
+        for button in [true, false] {
+            for forward in [true, true, false, false] {
+                let before = handle.snapshot().position.unwrap();
+                if button {
+                    ui.get_by_label(if forward { "Forward" } else { "Back" }).click();
+                } else {
+                    let key = if forward { egui::Key::ArrowRight } else { egui::Key::ArrowLeft };
+                    let event = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+                    let action = keymap::resolve(&ui.state().1.key_contexts(), &event).expect("arrow binding");
+                    assert_eq!(action, if forward { Action::SeekForward } else { Action::SeekBack });
+                    let (t, screen) = ui.state_mut();
+                    assert!(t.with_ctx(|ctx| screen.on_action(ctx, action)));
+                }
+                let want = (before + if forward { 10.0 } else { -10.0 }).max(0.0);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    ui.run_steps(1);
+                    let s = handle.snapshot();
+                    if !seekable {
+                        fn contains_text(shape: &egui::Shape, text: &str) -> bool {
+                            match shape {
+                                egui::Shape::Text(t) => t.galley.job.text.contains(text),
+                                egui::Shape::Vec(v) => v.iter().any(|s| contains_text(s, text)),
+                                _ => false,
+                            }
+                        }
+                        assert!((s.position.unwrap() - before).abs() < 0.1);
+                        if ui.output().shapes.iter().any(|s| contains_text(&s.shape, "Can't skip in this stream")) {
+                            break;
+                        }
+                    } else if s.position.is_some_and(|p| (p - want).abs() < 0.6) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "button={button}, forward={forward}: wanted {want}, got {:?}, seekable={}",
+                        s.position,
+                        s.seekable
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        // The next item uses the same mpv and services.
+        (t, _) = ui.into_state();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1090,13 +1420,16 @@ mod casting {
     }
 
     /// Every `open` hands the new session's far ends to the test.
-    struct FakeConnector(crossbeam_channel::Sender<FakeTv>);
+    struct FakeConnector {
+        opened: crossbeam_channel::Sender<FakeTv>,
+        can_seek: bool,
+    }
 
     impl CastConnector for FakeConnector {
         fn open(&self, device: DeviceId) -> Result<RemoteOutput, PlayerError> {
             let (cmd, cmds) = tokio::sync::mpsc::unbounded_channel();
             let (events, rx) = crossbeam_channel::unbounded();
-            self.0.send(FakeTv { cmds, events }).expect("the test listens");
+            self.opened.send(FakeTv { cmds, events }).expect("the test listens");
             let view = CastView {
                 device,
                 name: "Living Room".into(),
@@ -1105,7 +1438,7 @@ mod casting {
                 level: None,
                 as_is: false,
                 behind_live_s: None,
-                can_seek: true,
+                can_seek: self.can_seek,
                 volume: false,
             };
             Ok(RemoteOutput { cmd, events: rx, view })
@@ -1118,7 +1451,7 @@ mod casting {
 
     fn start_casting(table: Vec<Playable>) -> (Harness, Receiver<FakeTv>) {
         let (opened, sessions) = crossbeam_channel::unbounded();
-        (start_with(table, Arc::new(FakeConnector(opened))), sessions)
+        (start_with(table, Arc::new(FakeConnector { opened, can_seek: true })), sessions)
     }
 
     fn start_with(table: Vec<Playable>, connector: Arc<dyn CastConnector>) -> Harness {
@@ -1178,6 +1511,57 @@ mod casting {
 
     fn casting_and_playing(s: &PlayerSnapshot) -> bool {
         s.state == PlayerState::Playing && s.cast.as_ref().is_some_and(|c| c.phase == CastPhase::Playing)
+    }
+
+    #[test]
+    fn vod_skip_unseekable_tv_reports_why() {
+        let Some((_media, _serial)) = setup() else { return };
+        let m = movie(1, "http://127.0.0.1:9/never-fetched.mp4".into());
+        let (opened, sessions) = crossbeam_channel::unbounded();
+        let mut h = start_with(vec![m.clone()], Arc::new(FakeConnector { opened, can_seek: false }));
+        cast(&h, Some(m.media));
+        let mut tv = sessions.recv_timeout(LONG).unwrap();
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        h.wait_snapshot(LONG, casting_and_playing);
+        assert!(!h.snapshot().seekable);
+        for cmd in [PlayerCommand::SeekBy(10.0), PlayerCommand::SeekTo(10.0)] {
+            let mark = h.mark();
+            h.handle.send(cmd);
+            assert!(h.wait_event_from(mark, Duration::from_secs(3), |e| matches!(e, PlayerEvent::SeekUnavailable)).is_some());
+            assert!(matches!(tv.cmds.try_recv(), Err(TryRecvError::Empty)), "no seek sent to a TV that cannot seek");
+        }
+    }
+
+    #[test]
+    fn vod_skip_after_play_here() {
+        let Some((media, _serial)) = setup() else { return };
+        let srv = TestServer::start(media, Faults::default());
+        skips_after_play_here(srv.url("vod.mkv"));
+    }
+
+    #[test]
+    fn vod_skip_local_after_play_here() {
+        let Some((media, _serial)) = setup() else { return };
+        skips_after_play_here(media.join("vod.mkv").to_string_lossy().into_owned());
+    }
+
+    fn skips_after_play_here(url: String) {
+        let m = movie(1, url);
+        let (h, sessions) = start_casting(vec![m.clone()]);
+        h.play(m.media, true);
+        assert_small_skips(&h);
+        cast(&h, None);
+        let mut tv = sessions.recv_timeout(LONG).expect("a session");
+        let (generation, ..) = tv.load();
+        tv.start(generation);
+        tv.send(RemoteEvent::Position { generation, pos: 5.0, dur: Some(30.0) });
+        h.wait_snapshot(LONG, |s| casting_and_playing(s) && s.position == Some(5.0));
+        h.handle.send(PlayerCommand::StopCasting { play_here: true });
+        assert!(matches!(tv.next(), RemoteCmd::Close { .. }));
+        tv.send(RemoteEvent::UpstreamClosed { generation, at: Instant::now() });
+        h.wait_snapshot(LONG, |s| s.cast.is_none() && s.state == PlayerState::Playing && s.position.is_some());
+        assert_small_skips(&h);
     }
 
     #[test]

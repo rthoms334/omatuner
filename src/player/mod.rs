@@ -126,7 +126,7 @@ pub enum PlayerCommand {
     Stop,
     TogglePause,
     SetPause(bool),
-    /// Relative seek in seconds (negative = back). Ignored for non-seekable live.
+    /// Relative seek in seconds (negative = back). Unavailable seeks emit `SeekUnavailable`.
     SeekBy(f64),
     /// Absolute position in seconds.
     SeekTo(f64),
@@ -456,6 +456,8 @@ pub enum PlayerEvent {
     /// Casting: a catch-up seek past what the relay has loaded stopped at its edge (DESIGN §40
     /// §8.5); the app says "Catch-up can only seek as far as it has loaded".
     SeekClamped,
+    /// The output cannot seek, or rejected the seek command: flash a skip-unavailable notice.
+    SeekUnavailable,
     /// Casting ended without the user asking in Tuner (DESIGN §40 §3.4, §3.8): `kind` is
     /// `StoppedOnTv` (the TV's remote stopped it, or another device took over). The output is
     /// local again and nothing plays; no error state. The app alerts where the user is (the
@@ -651,6 +653,13 @@ impl Player {
     /// The connection budget it shares.
     pub fn budget(&self) -> &budget::SharedBudget {
         &self.budget
+    }
+
+    /// Headless integration tests: stamp a rendered frame without creating a GL surface.
+    /// Leaving this clock alone afterwards exercises the real hidden-window watchdog.
+    #[doc(hidden)]
+    pub fn mark_rendered_for_tests(&self) {
+        self.render_clock.store(self.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
     }
 
     /// Raw core for `VideoSurface::new` ONLY (see module docs: no other mpv access from the UI).
