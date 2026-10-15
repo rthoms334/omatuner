@@ -61,6 +61,17 @@ impl Tracks {
     pub fn selected_sub(&self) -> Option<&Track> {
         self.subs.iter().find(|t| t.selected)
     }
+
+    /// Forced tracks only, ranked by subtitle preferences, selected audio language, then
+    /// file order. Language preferences take priority over the order of the tracks.
+    pub(super) fn preferred_forced_sub(&self, languages: &[String]) -> Option<&Track> {
+        let matching = |lang: &str| self.subs.iter().find(|t| t.forced && t.lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(lang)));
+        languages
+            .iter()
+            .find_map(|lang| matching(lang))
+            .or_else(|| self.selected_audio().and_then(|t| t.lang.as_deref()).and_then(matching))
+            .or_else(|| self.subs.iter().find(|t| t.forced))
+    }
 }
 
 /// Parse mpv's `track-list` (read as STRING ⇒ JSON array).
@@ -200,5 +211,36 @@ impl AspectMode {
             AspectMode::Fill => ("no", 1.0, true),
             AspectMode::Stretch => ("no", 0.0, false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_subtitles_rank_languages_before_track_order() {
+        let mut tracks = parse_track_list(
+            r#"[
+                {"type":"audio","id":1,"lang":"fra"},
+                {"type":"audio","id":2,"lang":"eng","selected":true},
+                {"type":"sub","id":1,"lang":"deu","default":true},
+                {"type":"sub","id":2,"lang":"fra","forced":true},
+                {"type":"sub","id":3,"lang":"eng","forced":true},
+                {"type":"sub","id":4,"lang":"eng","forced":true}
+            ]"#,
+        );
+        for (langs, expected) in [(vec!["eng", "fra"], 3), (vec!["fra", "eng"], 2), (vec!["deu", "ENG"], 3), (vec!["deu"], 3), (vec![], 3)] {
+            let langs = langs.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(tracks.preferred_forced_sub(&langs).map(|t| t.id), Some(expected), "{langs:?}");
+        }
+        tracks.audio[1].lang = Some("deu".into());
+        assert_eq!(tracks.preferred_forced_sub(&[]).unwrap().id, 2, "no language matches: first forced track");
+        tracks.audio.clear();
+        assert_eq!(tracks.preferred_forced_sub(&[]).unwrap().id, 2, "no selected audio: first forced track");
+        tracks.subs.retain(|t| !t.forced);
+        assert!(tracks.preferred_forced_sub(&["deu".into()]).is_none(), "a matching default track is not forced");
+        tracks.subs.clear();
+        assert!(tracks.preferred_forced_sub(&[]).is_none());
     }
 }

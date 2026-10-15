@@ -58,6 +58,11 @@ for flag in none forced default; do
      -i "$out/.subtitles.srt" -map 0:v -map 1:a -map 2:s -t 2 "${x264[@]}" -c:a aac -c:s srt \
      -metadata:s:a:0 language=eng -metadata:s:s:0 language=eng -disposition:s:0 "$disposition" "$out/subtitles_$flag.mkv"
 done
+# French comes first deliberately: mpv's forced fallback may otherwise choose it over
+# English audio. Tuner must apply the user's subtitle language preferences after load.
+ff -i "$out/subtitles_forced.mkv" -map 0:v -map 0:a -map 0:s -map 0:s -c copy \
+   -metadata:s:s:0 language=fra -metadata:s:s:1 language=eng \
+   -disposition:s:0 forced -disposition:s:1 forced "$out/subtitles_forced_languages.mkv"
 rm "$out/.subtitles.srt"
 
 ff -f lavfi -i smptebars=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
