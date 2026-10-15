@@ -101,6 +101,7 @@ pub struct MovieDetailScreen {
     details_requested: Option<MovieId>,
     /// The focused button, then the Copies mini-cards (`buttons().len() + k`).
     focus: usize,
+    scroll_to_cursor: bool,
     copies: super::copies::Copies,
 }
 
@@ -424,6 +425,21 @@ impl Screen for MovieDetailScreen {
         }
         let n = self.focus_len(ctx);
         let buttons = self.buttons(ctx).len();
+        if matches!(
+            action,
+            Action::Left
+                | Action::Right
+                | Action::Up
+                | Action::Down
+                | Action::FocusPrev
+                | Action::FocusNext
+                | Action::Home
+                | Action::End
+                | Action::PageUp
+                | Action::PageDown
+        ) {
+            self.scroll_to_cursor = true;
+        }
         let handled = match action {
             Action::Left | Action::Up | Action::FocusPrev => {
                 self.focus = self.focus.saturating_sub(1);
@@ -602,7 +618,10 @@ impl Screen for MovieDetailScreen {
         let plays_from = self.copies.plays().and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
         let mut pressed = None;
         let mut copy_click = None;
+        let scroll = std::mem::take(&mut self.scroll_to_cursor);
         egui::ScrollArea::vertical().id_salt("movie-detail").auto_shrink([false, false]).show(ui, |ui| {
+            let top = ui.cursor().min;
+            let mut button_rect = None;
             let header = DetailHeader {
                 title: &title,
                 meta: &meta.join(" · "),
@@ -644,7 +663,11 @@ impl Screen for MovieDetailScreen {
                             bordered: true,
                             ..Default::default()
                         };
-                        if button(ui, ctx.theme, icon, &label, style).clicked() {
+                        let resp = button(ui, ctx.theme, icon, &label, style);
+                        if i == self.focus {
+                            button_rect = Some(resp.rect);
+                        }
+                        if resp.clicked() {
                             pressed = Some((i, *b));
                         }
                     }
@@ -658,7 +681,11 @@ impl Screen for MovieDetailScreen {
                     }
                 }
             });
-            copy_click = self.copies.show(ui, ctx);
+            if scroll && let Some(rect) = button_rect {
+                let header = egui::Rect::from_min_max(top, ui.cursor().min);
+                ui.scroll_to_rect(if header.height() <= ui.clip_rect().height() { rect.union(header) } else { rect }, None);
+            }
+            copy_click = self.copies.show(ui, ctx, scroll);
         });
         if let Some((i, b)) = pressed {
             self.focus = i;
@@ -838,6 +865,44 @@ pub(crate) mod tests {
 
     use crate::model::{ItemKey, SourceId};
     use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
+
+    #[test]
+    fn keyboard_scroll_reaches_wrapped_copies_and_returns_to_page_header() {
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let mut ids = Vec::new();
+            for i in 0..10 {
+                let s = testkit::source(c, &format!("Playlist {i}"))?;
+                ids.push(testkit::named_movies(c, s, &[("EN ★ Dune - 2021", "Dune")])?[0]);
+            }
+            Ok(ids[0])
+        });
+        let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(800.0, 500.0));
+        h.state_mut().enter(Route::MovieDetail(id));
+        until(&mut h, "copies", |h| has_label(h, "COPIES · 10"));
+        h.run_steps(30);
+        let top = h.get_by_label("Dune").rect().top();
+        h.state_mut().act(Action::End);
+        h.run_steps(30);
+        let last = h.get_by_label("Playlist 9 · EN").rect();
+        assert!(last.top() >= 8.0 && last.bottom() <= 492.0, "last copy: {last:?}");
+        h.event(egui::Event::PointerMoved(egui::pos2(400.0, 250.0)));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -10000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(30);
+        assert!((h.get_by_label("Playlist 9 · EN").rect().bottom() - last.bottom()).abs() < 1.0, "keyboard reaches touchpad bottom");
+        h.event(egui::Event::PointerGone);
+        h.state_mut().act(Action::Home);
+        h.run_steps(30);
+        assert!((h.get_by_label("Dune").rect().top() - top).abs() < 1.0, "Home returns to the top");
+        let play = h.get_by_label("Play · Playlist 0").rect();
+        assert!(play.top() >= 8.0 && play.bottom() <= 492.0, "Play is visible: {play:?}");
+    }
 
     /// Pretend the fullscreen player drew the video last frame (end-of-playback returns).
     pub(crate) fn fullscreen_placement(t: &mut crate::ui::testing::TestUi) {

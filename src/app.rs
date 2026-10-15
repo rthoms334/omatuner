@@ -2880,6 +2880,7 @@ impl eframe::App for TunerApp {
             self.devshot_commands(cmds);
         }
         let stack = self.key_stack();
+        crate::ui::screens::home::rail_bar_keyboard_input(ctx, &raw.events);
         let mut resolved: Vec<(Action, Vec<KeyContext>)> = Vec::new();
         let mut drop_text = self.drop_alt_text;
         raw.events.retain(|ev| {
