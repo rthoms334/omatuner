@@ -63,7 +63,7 @@ Omarchy theme, foreground-alpha state tints that work in light themes.
 | | Background EPG refresh, "updated N h ago" | MUST | ✅ | §9.5 |
 | Live | Groups, channel list with now/next + progress, preview | MUST | ✅ | Live screen §13.2 |
 | | EPG grid, programme details | MUST | ✅ | Guide §13.4 |
-| | Zapping within collection, last-channel recall, history | MUST | ✅ | `PlayerCommand::Zap/LastChannel`, `h` |
+| | Zapping within collection, last-channel recall, history | MUST | ✅ | `PlayerCommand::Zap/LastChannel`, `H` |
 | | Favourites, **multiple lists** (create/rename/delete/reorder) | MUST/SHOULD | ✅ | `fav_list`, `fav_item`, Ctrl+Shift+F, Settings ▸ Favourites |
 | | Hide categories **and channels**, rename, reorder | MUST/SHOULD | ✅ | `item_override`, `group_override` |
 | | Context menu | MUST | ✅ | `overlays::dialogs::ContextMenuOverlay` |
@@ -119,7 +119,7 @@ rate, background refresh while closed (`tuner --refresh` flag reserved for a sys
 | Wrong theme path `~/.config/omarchy/current` | `~/.local/state/omarchy/current/` (watched non-recursively). |
 | egui-phosphor vs Nerd glyphs | Nerd glyphs from the UI font (`widgets::glyphs`, code points verified with `fc-query`). |
 | Blit in PaintCallback vs registered texture | Registered texture (spike). Native egui viewports are forbidden (§3.1), so PaintCallback is never needed. |
-| Keymap collisions | Per-context tables (§15): `f` = fullscreen in player, favourite = Ctrl+F everywhere; `←` = last channel (live) / seek (VOD); `h` = history (live) / left (guide); digits = channel entry in the live player and the guide. |
+| Keymap collisions | Per-context tables (§15): `f` = fullscreen in player, favourite = Ctrl+F everywhere; `←`/`→` = skip in live and VOD; `H` = history (live), Backspace = last channel; `h` = left (guide); digits = channel entry in the live player and the guide. |
 | Adaptive frame rate claim | No VRR here → judder of 25/50 fps on 60 Hz is a known v1 limitation; measured in WP-07; `mpv_options` lets users try `video-sync=display-resample` (§11.8). |
 | Spike "verified" too narrow | WP-07/WP-13 acceptance adds hidden-workspace, fullscreen, 1-hour soak, audio, frame-pacing measurements (§25). |
 | Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 10 s without a rendered frame, resumed when the UI renders again) — §11.1. **Correction (hidden-workspace ANR):** with eframe's default vsync the UI thread did not merely idle there — it **blocked** in Mesa's `eglSwapBuffers` (swap interval 1 waits for the previous frame's callback), stopped answering `xdg_wm_base` pings, and after `misc:anr_missed_pings` Hyprland showed "application not responding" while mpv played on. Now vsync is off and frames are paced by winit frame callbacks (`pre_present_notify` in `App::ui`): hidden, the UI thread sits in its event loop and answers pings, with or without the window rule (§11.1). |
@@ -1504,6 +1504,45 @@ Off) takes precedence for the rest of that file. Off and Always keep mpv's selec
 New or missing settings default to Off; an explicit `sub_auto = "forced"` remains Forced only
 (no config migration).
 
+### 11.7.1 Local live rewind
+
+Only live channels use the timeshift policy (`player/timeshift.rs`); catch-up, VOD and
+casting retain their existing transport. Each picture has a private **0700** folder under
+`cache/live-rewind/`. Separate folders keep multi-view pictures independent; both obey the
+same free-space reserve, checked during playback. A load/channel change/reconnect starts a
+new cache. mpv unlinks its cache files immediately (including crash cleanup); Tuner empties
+the folder on each load and removes it at exit, cleaning crashed-process folders at startup.
+
+Per live load: `cache=yes`, `cache-on-disk=yes`, `demuxer-cache-dir=<private folder>`
+(the mpv 0.41 option is **demuxer-cache-dir**, not `cache-dir`),
+`demuxer-seekable-cache=yes`, `force-seekable=yes`, `demuxer-max-back-bytes=32MiB` (metadata, roughly 30 minutes at mpv's typical rate),
+`demuxer-max-bytes=64MiB`, `demuxer-donate-buffer=no`,
+`cache-secs=1810`, `demuxer-readahead-secs=1810`. The seek window is the newest contiguous
+`demuxer-cache-state/seekable-ranges` range, clipped to 30 minutes with a small end guard.
+Forced seeking only enables mpv's cache-seek path; Tuner offers seeking exactly when that
+range exists, and every live seek is clamped inside it. A rewind beyond the start flashes
+"That's as far back as Tuner has"; reaching the edge flashes "Live".
+
+**mpv limitation / bounded fallback:** [mpv 0.41's disk cache](https://github.com/mpv-player/mpv/blob/v0.41.0/DOCS/man/options.rst)
+is append-only. Its byte limits count packet metadata on disk, not the disk payload, and
+it has no API to reclaim old file blocks. Tuner therefore stops disk writes near **2 GiB**
+(32 MiB headroom) or below **3 GB free**, and continues on the same connection with up to
+**two minutes in memory** until the next load. Initial low disk or an unavailable cache
+folder uses that fallback immediately, logging once per controller. Memory limits are
+128 MiB forward and 128 MiB backward; high bitrates can shorten the available window.
+Already-written disk data remains until the stream closes. This is a bounded fallback,
+**not an indefinitely rolling 30-minute disk recorder**; doing that requires a different
+transport or upstream mpv support. Disk use is checked every 250 ms, so the cap is approximate.
+
+Pause keeps the demuxer reading. The read-ahead margin lets the controller advance an expired
+paused point to the oldest available point while staying paused; a byte-full memory cache
+also advances its reader so incoming data continues. Resume uses the paused point if retained,
+otherwise that oldest point. There is no second fetch/recording connection. Live loads disable
+FFmpeg's internal reconnect in favour of Tuner's existing stop-before-start reconnect path,
+so a reconnect also resets the cache. Live timeshift keeps video selected while hidden:
+`vid=no` would discard the video packets needed for rewind, so hidden live pictures continue
+decoding (VOD retains the existing suspension). Casting has no local rewind.
+
 ### 11.8 Frame pacing (known limitation)
 UI frames follow the compositor's frame callbacks (§11.1: vsync off, `pre_present_notify`), so
 mpv's update callback is served once per display refresh at most, aligned to the compositor's
@@ -1976,21 +2015,35 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
 │ 󰁍 ▣ 101  BBC One HD                                                              20:26  │ ← top OSD
 │                                                                                          │
-│                                        VIDEO                                             │
+│                              ⟲ 10       ▶ / ❚❚       10 ⟳                                │
 │                                                                    ┌ CHANNELS (c) ─────┐ │
 │                                                                    │ 100 BBC Parliament │ │
 │                                                                    │▸101 BBC One        │ │
 │ News at Eight                                     20:00 – 21:00    │ 102 BBC Two        │ │
 │ ▕██████████████████░░░░░░░░░░░░░░░▏                34 min left     └────────────────────┘ │
 │ Next  21:00 Drama                                    [HD] [5.1] [CC] [⟲]                  │
-│ 󰒮 󰐊 󰒭  󰗅 English (AC-3 5.1)  󰨖 Off  󰐑 Channels  󰃰 Guide  󰋚 History  󰋽 Info 󰊓 󰏌  󰕾 ━━━●─┊─ 80 % │
+│ 󰒮   󰒭  󰗅 English (AC-3 5.1)  󰨖 Off  󰐑 Channels  󰃰 Guide  󰋚 History  󰋽 Info 󰊓 󰏌  󰕾 ━━━●─┊─ 80 % │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
 ```
+The centre transport is **⟲ 10 · play/pause · 10 ⟳**, sized for the picture; the
+bottom row retains channel navigation, tracks, Up next, Next, Info, volume and window controls.
+Skip buttons appear only while the snapshot is seekable (including a live cache with a
+range). All three centre buttons share banner visibility and the controls focus walk;
+clicking acts without entering focus mode. Narrow full-player layouts use smaller centre
+buttons. The mini player keeps its existing compact UI; the pop-out keeps its transport
+strip and uses the full controls row in focus mode.
+
+A successful skip paints a non-interactive circle on its side of the picture for one second.
+Same-direction skips within one second add up; the target is a VOD clock or live offset.
+The circle expands/fades with egui animations enabled and stays static with animations off.
+Live badges show **Live** within three seconds of the cached edge, otherwise **−MM:SS**;
+**Back to live** appears among the controls when behind. `L` resumes at that edge.
+
 The OSD has two layers (UX review B1):
 * **Info banner** (passive): the top and bottom bars drawn above, shown on zap, on any key and
   on mouse motion; hides after `osd_timeout_ms` (3.5 s) and never while a side panel/menu is
-  open. It **does not change the key context**: ↑/↓ keep zapping, ←/→ keep recalling/seeking,
+  open. It **does not change the key context**: ↑/↓ keep zapping, ←/→ keep skipping,
   however often they are pressed.
 * **Controls focus mode**: entered only with Enter, `i` or Tab (`FocusOsdControls`) — a mouse
   click on a control just activates it, so the arrows keep zapping / seeking; pushes
@@ -2002,7 +2055,7 @@ The OSD has two layers (UX review B1):
 * **Which playlist**: with two or more playlists of the item's kind, the top bar shows
   `● TV` left of the clock (§13.0, §29).
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
-  700 pt the controls row collapses to previous · play/pause · next (live) · audio · subtitles
+  700 pt the controls row collapses to previous · next (live) · audio · subtitles
   · info, and the volume to its speaker (the level stays in the top bar).
 * **Mouse** (every control is an OSD button: hover fill, pointing hand, tooltip with its key):
   ← at the left of the top bar leaves the player like `p`; the controls row adds Channels
@@ -2026,7 +2079,7 @@ The OSD has two layers (UX review B1):
   Nothing playing: a "‹ Back to {where}" button, and a click anywhere goes back.
 
 Side panels: channel list `c` (current collection with now), mini guide `g` (now/next for the
-group), history `h`/→ — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
+group), history `H` — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
 panel cursor (no zap), Enter tunes, ←/Esc close (← also while the panel filters; Esc clears the
 filter first), letters filter. Mouse: a ✕ in the header, the
 wheel scrolls, hovering moves the cursor only with real pointer motion, one click tunes and
@@ -2058,7 +2111,7 @@ TV's name. The mini player shows the same card with a cast glyph, the compact la
 and quitting asks first. Multi-view shows "Leave multi-view to cast".
 
 **Video-only (popped-out window, §12.3).** Same screen, same keys (zap ↑/↓, volume, pause,
-mute, tracks, `c`/`g`/`h` panels) plus `PopOut` (Esc / `o` = back to the full window). The
+mute, tracks, `c`/`g`/`H` panels) plus `PopOut` (Esc / `o` = back to the full window). The
 passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
 now (live) or position / duration (VOD), Body/Caption type, no scale factor; the full OSD
 returns only in controls focus mode or with a side panel open. With the pointer in the window
@@ -2764,8 +2817,11 @@ no Ctrl+Shift+C (the terminal's copy).
 | Keys | Action |
 |---|---|
 | `↑` / `k` / `↓` / `j` / `PgUp` / `PgDn` | Previous / next channel (in this list) |
-| `Backspace` / `←` | Last channel |
-| `→` / `h` | Channel history |
+| `Backspace` | Last channel |
+| `←` / `→` | Skip back / forward (small step) |
+| `Shift+←` / `Shift+→` | Skip back / forward (big step) |
+| `H` | Channel history |
+| `L` | Back to live |
 | `c` | Channel list |
 | `g` | Mini guide (now / next) |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Type a channel number |

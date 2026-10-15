@@ -187,7 +187,7 @@ Settings ▸ Spoiler guard
 | **Ctrl+Shift+B** (`Global`, `Action::SpoilerMenu`) | Anywhere | The menu above: pause for 15 min / 1 h / session, blackout the focused programme, add a topic, settings. |
 | **Ctrl+W** (added to `GUIDE`, popover, search guide hits; `MarkWatched`) | Programme | Mark seen, which lifts its event or episode. It already means "mark watched" on VOD, so the meaning stays consistent. |
 | Menu key / Shift+F10 / Ctrl+Enter / right-click | Any guarded item | Adds "Show spoilers (Ctrl+B)", "Mark seen (Ctrl+W)", "Guard spoilers about…", "Stop guarding ‹label›", and on a programme "I'll watch this later…" |
-| Shield card | Player (live) | Enter = watch anyway (reveals and tunes; `FocusOsdControls` is taken by the screen while the card shows, the same pattern as "Next episode in 10 s"). ↑/↓/PgUp/PgDn zap on (the next channel is judged again). Backspace/← = last channel. Esc = normal ladder (hide banner → leave the player; nothing is playing). |
+| Shield card | Player (live) | Enter = watch anyway (reveals and tunes; `FocusOsdControls` is taken by the screen while the card shows, the same pattern as "Next episode in 10 s"). ↑/↓/PgUp/PgDn zap on (the next channel is judged again). Backspace = last channel. Esc = normal ladder (hide banner → leave the player; nothing is playing). |
 | Settings page | `Panel` | ↑/↓ rows, Enter/Space toggle, `x`/Delete = rule menu (delete or disable), Shift+←/→ (H/L) = steppers after pane-arrows, ← = back to the page list. |
 
 - **Esc ladder:** unchanged. Esc never reveals or hides.

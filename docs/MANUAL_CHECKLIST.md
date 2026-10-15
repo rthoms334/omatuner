@@ -150,7 +150,7 @@ in `~/.config/omarchy/shell.toml`; Tuner applies it live).
     Movies and Series grids; every Home rail (Continue watching, Recently watched,
     Favourites, Recently added movies / series, channel tiles); a movie and a series page;
     Search (`/`) results; Live ▸ Favourites, History, Reminders and All channels; the Live
-    preview; the player's channel (c), mini guide (g) and history (h) panels.
+    preview; the player's channel (c), mini guide (g) and history (H) panels.
   - **Expect:**
     - Each poster has a small chip in its top-left corner with its own playlist's short code
       in the playlist's colour ("NW" for Northwind; the lock and watched chips stay
@@ -1201,7 +1201,7 @@ layout. Use only the keyboard.
     text field (Settings, a rename), in onboarding and in Edit information. In a player side
     panel (`c`) type a letter, then press ←.
   - **Expect:** the guide moves between programmes (← goes into the past), detail pages walk
-    their buttons, the player zaps / seeks, text fields move the cursor, onboarding and Edit
+    their buttons, the player skips, text fields move the cursor, onboarding and Edit
     information change values. The filtered side panel closes with ← (no channel change).
 
 ## 20. Several playlists: copies everywhere (P3, real catalogue)

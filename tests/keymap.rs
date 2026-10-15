@@ -155,8 +155,14 @@ fn info_banner_never_changes_the_keys_only_controls_focus_does() {
     let live = [K::PlayerLive];
     assert_eq!(resolve(&live, &key(Key::ArrowUp)), Some(Action::ZapPrev));
     assert_eq!(resolve(&live, &key(Key::ArrowDown)), Some(Action::ZapNext));
-    assert_eq!(resolve(&live, &key(Key::ArrowLeft)), Some(Action::LastChannel));
-    assert_eq!(resolve(&live, &key(Key::ArrowRight)), Some(Action::ChannelHistory));
+    assert_eq!(resolve(&live, &key(Key::ArrowLeft)), Some(Action::SeekBack));
+    assert_eq!(resolve(&live, &key(Key::ArrowRight)), Some(Action::SeekForward));
+    assert_eq!(resolve(&live, &shift(Key::ArrowLeft)), Some(Action::SeekBackBig));
+    assert_eq!(resolve(&live, &shift(Key::ArrowRight)), Some(Action::SeekForwardBig));
+    assert_eq!(resolve(&live, &text("H")), Some(Action::ChannelHistory));
+    assert_eq!(resolve(&live, &text("h")), None);
+    assert_eq!(resolve(&live, &key(Key::Backspace)), Some(Action::LastChannel));
+    assert_eq!(resolve(&live, &text("L")), Some(Action::JumpToLive));
     let vod = [K::PlayerVod];
     assert_eq!(resolve(&vod, &key(Key::ArrowLeft)), Some(Action::SeekBack));
     assert_eq!(resolve(&vod, &shift(Key::ArrowRight)), Some(Action::SeekForwardBig));
