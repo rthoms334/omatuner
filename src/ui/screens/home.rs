@@ -1695,6 +1695,8 @@ pub(crate) mod testkit {
             },
             App { t, s, _one: one },
         );
+        crate::fonts::LoadedFonts::default().install(&h.ctx);
+        crate::theme::egui_style::apply(&h.ctx, &h.state().t.theme);
         h.run_steps(2);
         h
     }
@@ -1744,6 +1746,8 @@ pub(crate) mod testkit {
             },
             OvApp { t, o, last: String::new(), _one: one },
         );
+        crate::fonts::LoadedFonts::default().install(&h.ctx);
+        crate::theme::egui_style::apply(&h.ctx, &h.state().t.theme);
         h.run_steps(2);
         h
     }

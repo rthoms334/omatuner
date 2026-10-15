@@ -1022,10 +1022,11 @@ Daily `Maintenance`: programmes with `stop < now − max(epg_keep_past_days, max
 generation beside the old one, so the file briefly holds two guides; with `auto_vacuum=NONE`
 it never shrank back (a user's 690 MB file was 270 MB free pages). After every generation sweep
 and in `Maintenance`, `store::release_free_pages` runs `PRAGMA incremental_vacuum` in 8 MiB
-steps (one short write transaction each) until nothing is free. A database from before this is
-converted once by `Store::open` (one `VACUUM`, its scratch copy in a temp file rather than
-memory: 2.2 s for that 690 MB file, leaving 390 MB). A failed conversion is logged and tried
-again on the next start.
+steps (one short write transaction each) until nothing is free. New databases get the mode
+before their first table. 0.3.2 converted existing databases once, as `Store::open` opened them
+(one `VACUUM`: 14 s for that 690 MB file, leaving 389 MB). Later builds dropped the conversion
+(user decision, 2026-10-15), so a database made before 0.3.2 that never ran 0.3.2 keeps
+`auto_vacuum=NONE`: `incremental_vacuum` does nothing there and its file stays at its peak.
 
 ---
 
@@ -1980,7 +1981,8 @@ The OSD has two layers (UX review B1):
   it never vanishes under a drag of the volume or the seek bar, yet a pointer parked on a bar
   (a keyboard user's, pushed out of the way) doesn't hold it for good; with the banner gone
   the pointer hides over the video (not over a control that set its own cursor). A failed /
-  reconnecting stream shows Retry (and Last channel) buttons under the message; the
+  reconnecting stream shows Retry (and Last channel) buttons under the message; errors also
+  offer **Copy error**, which copies the heading and redacted details and toasts "Copied error". The
   next-episode card has "Play now · Enter" / "Cancel · Esc" buttons and plays on a click.
   Nothing playing: a "‹ Back to {where}" button, and a click anywhere goes back.
 
@@ -1991,7 +1993,10 @@ filter first), letters filter. Mouse: a ✕ in the header, the
 wheel scrolls, hovering moves the cursor only with real pointer motion, one click tunes and
 keeps the panel open for the next channel. Stream info `I` (codec,
 resolution, fps, pixel format, HDR badge from gamma pq/hlg, audio codec/layout/rate, bitrates,
-hwdec, dropped frames, cache seconds). Digits open numeric entry (`[NumericEntry, PlayerLive]`:
+hwdec, dropped frames, cache seconds), with **Copy stream info** to copy the displayed diagnostics
+and toast "Copied stream info". The panel's text lets the video's mouse handling through
+(including wheel volume and double-click fullscreen); the Copy button takes its own clicks.
+Digits open numeric entry (`[NumericEntry, PlayerLive]`:
 digits, Enter = go now, Backspace = delete digit, Esc = cancel; auto-commit after 1.5 s).
 States inside the video rect: Loading (logo + name + spinner), Buffering (%), Reconnecting
 (n/max + countdown), Error (glyph + copy + "r Retry · Backspace Last channel"), Radio (logo +
@@ -2106,6 +2111,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
 | AI agents (§39, after Parental) | offer to connect agents after updates · keep Claude Code's plugin up to date · agents play in (Pop-out / Tuner window, §30.13) · per agent: Connect / Update / Disconnect… / Copy | `agents.offer_connect`, `agents.keep_in_sync`, `agents.play_in` (+ `agents.checked_version`) | on · on · Pop-out |
 | About & logs | version, paths · Updates (§41.7): status, last check, Check now, Install now / Restart now, automatically install updates, install without asking for my password · debug logging, log viewer, export log | `updates.auto_install`, `updates.passwordless`, `general.debug_log` | on · off · off |
+| | Copy app details: version and settings / data / cache / log paths; toasts "Copied app details". Follows the update controls, so Check now stays the first focusable row when available | — | — |
 Per channel (Ctrl+I "Edit information", `OverlayRequest::EditItem`, WP-11): rename, catch-up
 offset (minutes), EPG assignment, lock, hide.
 
@@ -2159,9 +2165,13 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   right-aligned; opened by a right-click it hangs from the pointer (kept on the window).
 * Confirm (destructive = urgent button, Cancel focused), PIN (`[TextInput, Modal]`), Rename
   (`[TextInput, Modal]` — Space types a space), favourites-list picker (checklist + "New
-  list…"), Edit information (Ctrl+I).
+  list…"), Edit information (Ctrl+I). Backend failures in Rename and the favourites-list picker
+  offer **Copy error** (the redacted message, with a "Copied error" toast); PIN prompts,
+  validation messages and confirmation hints have no Copy action.
 * EPG mapping (§9.4; `[EpgMapping, List]`: Enter assigns, Delete clears) and Logs (type to
-  filter text; Ctrl+S view menu: minimum level, Export…) are full screens.
+  filter text; Ctrl+S view menu: minimum level, Export…) are full screens. Enter or a click
+  expands a log line; **Copy line** copies its time, level, target and full redacted message,
+  with a "Copied log line" toast.
 * **Rule: no screen reads raw keys** — every key a screen reacts to is in a keymap table, so
   the help overlay and the hint line are complete.
 * *Decided in phase 3:* Help and Jobs are toggles — requesting the one on top again (`?`/F1,
@@ -2287,6 +2297,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   Logs and EPG mapping → Settings, the player → Live TV.
 * *Decided in phase 3:* Ctrl+P (open the player) acts only while something is playing (any
   non-Idle player state); with nothing playing it does nothing rather than open an empty player.
+* **Label selection**: labels are not selectable app-wide, so a label inside a clickable row
+  leaves the click to that row. Standalone notes and errors with no click target beneath them
+  may opt into selection (Settings notes and onboarding failures). Use explicit Copy controls
+  for diagnostics and paths in interactive panels; each copy gives a "Copied …" toast.
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`) and never acts; **one click = exactly what Enter does in that
   context** on every selectable item (list rows of every kind, poster cards, Home tiles,

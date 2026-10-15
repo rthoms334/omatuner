@@ -18,7 +18,7 @@ use eframe::egui::{self, Align2, RichText};
 use super::{ConfirmSpec, ContextMenuSpec, ListPickerSpec, Overlay, OverlayOutcome, OverlayResult, RenameSpec, RenameTarget};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{FavListId, FavouriteList};
-use crate::msg::DataScope;
+use crate::msg::{DataScope, Toast};
 use crate::store::{Store, Ticket};
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
@@ -184,6 +184,27 @@ fn error_line(ui: &mut egui::Ui, theme: &Theme, error: Option<&str>) {
     if let Some(e) = error {
         ui.add_space(theme.space(SpaceToken::Sm));
         ui.add(egui::Label::new(RichText::new(e).size(theme.font(TypeToken::BodySmall)).color(theme.tokens.urgent)).wrap());
+    }
+}
+
+/// Form hints need no Copy action; a backend failure can be copied for diagnostics.
+enum FormMessage {
+    Hint(String),
+    Failure(String),
+}
+
+impl FormMessage {
+    fn ui(&self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        match self {
+            Self::Hint(text) => error_line(ui, ctx.theme, Some(text)),
+            Self::Failure(text) => {
+                error_line(ui, ctx.theme, Some(text));
+                if button(ui, ctx.theme, Some(glyphs::COPY), "Copy error", ButtonStyle::default()).clicked() {
+                    ui.ctx().copy_text(text.clone());
+                    ctx.toast(Toast::info("Copied error"));
+                }
+            }
+        }
     }
 }
 
@@ -660,7 +681,7 @@ pub struct RenameOverlay {
     pub spec: RenameSpec,
     text: String,
     pending: Option<Ticket<()>>,
-    error: Option<String>,
+    error: Option<FormMessage>,
     enter: Submit,
     /// Copies of a combined title with their own name: the name the user confirmed renaming
     /// them to (Enter again).
@@ -684,7 +705,7 @@ impl RenameOverlay {
                 RenameTarget::FavList(_) | RenameTarget::Source(_) | RenameTarget::Watchlist(_) | RenameTarget::DuplicateWatchlist(_)
             )
         {
-            self.error = Some("The name can't be empty".into());
+            self.error = Some(FormMessage::Hint("The name can't be empty".into()));
             return OverlayOutcome::Keep;
         }
         if name == self.spec.initial.trim() {
@@ -699,7 +720,7 @@ impl RenameOverlay {
                 if let Some((_, first)) = own.first() {
                     let n = own.len();
                     let which = if n == 1 { format!("A copy is named “{first}”") } else { format!("{n} copies have names of their own") };
-                    self.error = Some(format!("{which} — Enter again renames {} too", if n == 1 { "it" } else { "them" }));
+                    self.error = Some(FormMessage::Hint(format!("{which} — Enter again renames {} too", if n == 1 { "it" } else { "them" })));
                     self.overwrite = Some(name);
                     return OverlayOutcome::Keep;
                 }
@@ -732,7 +753,7 @@ impl Overlay for RenameOverlay {
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         match poll(&mut self.pending, egui_ctx) {
             Some(Ok(())) => return OverlayOutcome::Close,
-            Some(Err(e)) => self.error = Some(format!("Couldn't rename: {}", message(&e))),
+            Some(Err(e)) => self.error = Some(FormMessage::Failure(format!("Couldn't rename: {}", message(&e)))),
             None => {}
         }
         let theme = ctx.theme;
@@ -758,7 +779,9 @@ impl Overlay for RenameOverlay {
                     resp.request_focus();
                 }
             });
-            error_line(ui, theme, self.error.as_deref());
+            if let Some(error) = &self.error {
+                error.ui(ui, ctx);
+            }
             buttons(ui, theme, if saving { "Saving…" } else { "Save" }, ButtonStyle { primary: true, ..Default::default() }, None)
         })
         .inner;
@@ -794,7 +817,7 @@ pub struct ListPickerOverlay {
     toggles: Vec<PendingToggle>,
     /// Per list toggled here: its stored membership as far as the answered writes tell.
     stored: HashMap<FavListId, bool>,
-    error: Option<String>,
+    error: Option<FormMessage>,
     enter: Submit,
 }
 
@@ -865,7 +888,7 @@ impl ListPickerOverlay {
         }
         if let Some((list, e)) = failed {
             let name = ctx.favs.lists.iter().find(|l| l.id == list).map(|l| l.name.as_str()).unwrap_or("the list");
-            self.error = Some(format!("Couldn't update “{name}”: {}", message(&e)));
+            self.error = Some(FormMessage::Failure(format!("Couldn't update “{name}”: {}", message(&e))));
         }
         if !self.toggles.is_empty() {
             egui_ctx.request_repaint_after(Duration::from_millis(30));
@@ -877,7 +900,7 @@ impl ListPickerOverlay {
             return;
         }
         let Some(name) = self.naming.as_ref().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) else {
-            self.error = Some("The name can't be empty".into());
+            self.error = Some(FormMessage::Hint("The name can't be empty".into()));
             return;
         };
         self.new_name = name.clone();
@@ -951,7 +974,7 @@ impl Overlay for ListPickerOverlay {
     fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
         match poll(&mut self.creating, egui_ctx) {
             Some(Ok(id)) => self.created(ctx, id),
-            Some(Err(e)) => self.error = Some(format!("Couldn't create the list: {}", message(&e))),
+            Some(Err(e)) => self.error = Some(FormMessage::Failure(format!("Couldn't create the list: {}", message(&e)))),
             None => {}
         }
         self.poll_toggles(egui_ctx, ctx);
@@ -1013,7 +1036,9 @@ impl Overlay for ListPickerOverlay {
                     paint_menu_row(ui.painter(), rect, theme, glyphs::ADD, "New list…", None, true, self.cursor == new_row);
                 }
             }
-            error_line(ui, theme, self.error.as_deref());
+            if let Some(error) = &self.error {
+                error.ui(ui, ctx);
+            }
             ui.add_space(theme.space(SpaceToken::Md));
             let naming = self.naming.is_some();
             ui.horizontal(|ui| {
@@ -1091,7 +1116,7 @@ mod tests {
     #[test]
     fn renaming_every_copy_asks_before_overwriting_a_copys_own_name() {
         use crate::model::{ItemKey, ItemKind, ItemOverride, ItemRef, SourceId};
-        use crate::ui::screens::home::testkit::{overlay_harness, rig, seed, until_ov};
+        use crate::ui::screens::home::testkit::{has_label, overlay_harness, rig, seed, until_ov};
         let (mut t, one) = rig();
         let (a, b) = seed(&mut t, |c| {
             let a = crate::ui::screens::home::testkit::source(c, "Alpha")?;
@@ -1109,8 +1134,9 @@ mod tests {
         let mut h = overlay_harness(t, one, RenameOverlay::new(spec), egui::vec2(1000.0, 700.0));
         h.state_mut().o.text = "Dune: Part One".into();
         h.state_mut().act(Action::Activate);
-        h.run_steps(1);
-        assert_eq!(h.state().o.error.as_deref(), Some("A copy is named “Dune (Bravo)” — Enter again renames it too"), "asks first");
+        h.run_steps(2);
+        assert!(has_label(&h, "A copy is named “Dune (Bravo)” — Enter again renames it too"), "asks first");
+        assert!(!has_label(&h, "Copy error"), "a confirmation hint is not a backend failure");
         assert_ne!(h.state().last, "Close");
         h.state_mut().act(Action::Activate);
         h.run_steps(1);

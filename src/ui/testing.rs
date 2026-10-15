@@ -27,6 +27,9 @@ use crate::services::Services;
 use crate::store::library::{FavIndex, Library};
 use crate::theme::Theme;
 
+#[cfg(test)]
+pub(crate) mod clicks;
+
 pub struct TestUi {
     services: Option<Services>,
     pub events: crossbeam_channel::Receiver<AppEvent>,

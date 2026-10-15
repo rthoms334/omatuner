@@ -76,7 +76,7 @@ impl PlayerScreen {
 
     /// The stream info panel (`I`, the OSD's Info, the menu's Stream info): mpv's view of what
     /// plays, or while casting what the TV is fed ([`cast_lines`]). Drawn over the casting card.
-    pub(super) fn draw_info(&self, ui: &egui::Ui, ctx: &UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
+    pub(super) fn draw_info(&self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let s = scale_of(ui);
@@ -91,7 +91,9 @@ impl PlayerScreen {
         let lh = font.size * 1.4;
         // the TV's path needs the longer lines
         let w = (if snap.cast.is_some() { 560.0 } else { 420.0 } * s).min(rect.width() - 2.0 * pad);
-        let area = Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad));
+        let button_h = lh + pad;
+        let area =
+            Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad + button_h));
         p.rect_filled(area, t.rounding, t.osd_scrim);
         for (i, l) in lines.iter().enumerate() {
             osd_text(
@@ -103,6 +105,25 @@ impl PlayerScreen {
                 t.osd_text,
                 w - 2.0 * pad,
             );
+        }
+        let copy_rect =
+            Rect::from_min_max(egui::pos2(area.left() + pad, area.bottom() - pad - button_h), egui::pos2(area.right() - pad, area.bottom() - pad));
+        if super::osd::osd_button(
+            ui,
+            &p,
+            theme,
+            copy_rect,
+            ui.id().with("copy-stream-info"),
+            &format!("{}  Copy stream info", crate::ui::widgets::glyphs::COPY),
+            font,
+            "Copy stream info",
+            None,
+            false,
+        )
+        .clicked()
+        {
+            ui.ctx().copy_text(lines.join("\n"));
+            ctx.toast(Toast::info("Copied stream info"));
         }
     }
 }
@@ -282,6 +303,44 @@ mod tests {
     use crate::model::{CastPhase, ChannelId, DeviceId, Playable, ReceiverKind};
     use crate::redact::Secret;
     use crate::ui::screens::home::testkit::{harness, painted, rig};
+
+    #[test]
+    fn stream_info_copy_text_copies_the_displayed_diagnostics() {
+        use crate::ui::testing::clicks;
+        let (mut t, one) = rig();
+        t.snapshot = Arc::new(PlayerSnapshot {
+            state: crate::player::PlayerState::Playing,
+            stream_info: Some(StreamInfo { video_codec: Some("h264".into()), ..Default::default() }),
+            ..Default::default()
+        });
+        let mut h = harness(t, one, PlayerScreen { info: true, ..Default::default() }, egui::vec2(1600.0, 900.0));
+        clicks::click_text(&mut h, &format!("{}  Copy stream info", crate::ui::widgets::glyphs::COPY));
+        let copied = clicks::copied_text(&h).expect("clipboard command");
+        assert!(copied.starts_with("Video    h264 · "), "{copied}");
+        assert!(copied.contains("\nDecoder  software\n"), "{copied}");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied stream info"));
+        assert!(h.state().s.info);
+    }
+
+    #[test]
+    fn double_click_over_stream_info_toggles_fullscreen() {
+        use crate::ui::testing::clicks;
+        let (mut t, one) = rig();
+        t.snapshot = Arc::new(PlayerSnapshot {
+            state: crate::player::PlayerState::Playing,
+            stream_info: Some(StreamInfo { video_codec: Some("h264".into()), ..Default::default() }),
+            ..Default::default()
+        });
+        let mut h = harness(t, one, PlayerScreen { info: true, ..Default::default() }, egui::vec2(1600.0, 900.0));
+        let over_info = clicks::text_rect(&h, "Video    h264 · – · –").center();
+        clicks::click_at(&mut h, over_info);
+        clicks::click_at(&mut h, over_info);
+        assert!(
+            h.output().viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(true))),
+            "the video receives the double-click through Stream info"
+        );
+        assert!(h.state().s.info);
+    }
 
     /// Field report: "Info had no effect while casting". The panel shows over the casting card:
     /// the TV and what it is, "Starting on …" until the relay's first report, then what the TV

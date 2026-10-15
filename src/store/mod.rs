@@ -75,12 +75,11 @@ impl Store {
     pub fn open(path: &Path, bus: Option<EventBus>) -> Result<Self> {
         create_private_file(path)?;
         let mut conn = Connection::open(path)?;
-        // a new file gets incremental vacuum before its first table (an existing one is
-        // converted below); only an empty database takes this
+        // a new file gets incremental vacuum before its first table; an existing one keeps the
+        // mode it has (DESIGN §7.4)
         conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         configure(&conn, false)?;
         migrations::migrate(&mut conn)?;
-        use_incremental_vacuum(&conn);
         // which build last opened it: an older one quotes it when it refuses this schema (§21.7)
         if let Err(e) = migrations::record_app_version(&conn) {
             tracing::warn!("recording the app version in the database: {e}");
@@ -122,33 +121,6 @@ impl Store {
 
 /// Pages released per [`release_free_pages`] call: 8 MiB, one short write transaction.
 pub const FREE_PAGES_CHUNK: u32 = 2048;
-
-/// Converts a database made before incremental vacuum (DESIGN §7.4): guide refreshes write the
-/// new guide beside the old one, and with `auto_vacuum=NONE` the file never gave that space
-/// back (a 690 MB database was 270 MB free pages). One `VACUUM`, the first time a build with
-/// this opens it (about 2 s for 400 MB). Its scratch copy goes to a temp file, not memory
-/// (`temp_store=MEMORY` would hold the whole database in RAM). A failure (another process
-/// reading, a full disk) is logged and tried again on the next start; nothing depends on it.
-fn use_incremental_vacuum(conn: &Connection) {
-    let mode: i64 = match conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)) {
-        Ok(m) => m,
-        Err(e) => return tracing::warn!("reading the database's vacuum mode: {e}"),
-    };
-    if mode == 2 {
-        return;
-    }
-    let started = std::time::Instant::now();
-    let r = conn.execute_batch(
-        "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA temp_store=FILE; VACUUM; PRAGMA temp_store=MEMORY; \
-         PRAGMA wal_checkpoint(TRUNCATE);",
-    );
-    if let Err(e) = r {
-        let _ = conn.execute_batch("PRAGMA temp_store=MEMORY;");
-        return tracing::warn!("compacting the database (tried again next start): {e}");
-    }
-    let size = conn.query_row("SELECT page_count * page_size FROM pragma_page_count, pragma_page_size", [], |r| r.get::<_, i64>(0)).unwrap_or(0);
-    tracing::info!("database compacted to {} MiB in {:.1} s; it now gives free space back", size / (1024 * 1024), started.elapsed().as_secs_f64());
-}
 
 /// Give up to `pages` free pages back to the file system (incremental vacuum) and return how
 /// many are still free. Guide refreshes and prunes free hundreds of MB; callers loop in
@@ -402,32 +374,5 @@ mod tests {
         let (_, after, free) = w.blocking(|c| Ok(file_pages(c))).unwrap();
         assert_eq!(free, 0);
         assert!(after < before - 1500, "the file shrank: {before} → {after} pages");
-    }
-
-    #[test]
-    fn an_old_database_is_compacted_once_and_keeps_its_data() {
-        let dir = TempDir::new("tuner-vacuum-old").unwrap();
-        let path = dir.0.join("tuner.db");
-        let store = Store::open(&path, None).unwrap();
-        fill_and_free(store.writer());
-        assert!(store.close(Duration::from_secs(5)));
-        // as a database from before incremental vacuum: auto_vacuum NONE, free pages kept
-        {
-            let c = Connection::open(&path).unwrap();
-            c.execute_batch("PRAGMA auto_vacuum=NONE; VACUUM; INSERT INTO meta(key,value) VALUES ('kept','1');").unwrap();
-            c.execute_batch("CREATE TABLE filler(x BLOB);").unwrap();
-            for _ in 0..2000 {
-                c.execute("INSERT INTO filler VALUES (zeroblob(4000))", []).unwrap();
-            }
-            c.execute_batch("DROP TABLE filler;").unwrap();
-            let (mode, _, free) = file_pages(&c);
-            assert_eq!(mode, 0);
-            assert!(free > 1500);
-        }
-        let store = Store::open(&path, None).unwrap();
-        let (mode, _, free) = store.writer().blocking(|c| Ok(file_pages(c))).unwrap();
-        assert_eq!((mode, free), (2, 0), "converted, and the free pages went back");
-        let kept: i64 = store.reader().unwrap().query_row("SELECT count(*) FROM meta WHERE key = 'kept'", [], |r| r.get(0)).unwrap();
-        assert_eq!(kept, 1);
     }
 }
