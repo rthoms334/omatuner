@@ -59,7 +59,7 @@ fn view_of(route: &Route) -> Option<ViewArg> {
         Route::Live { .. } | Route::Player => ViewArg::Live,
         Route::Guide { .. } => ViewArg::Guide,
         Route::Movies { .. } | Route::MovieDetail(_) => ViewArg::Movies,
-        Route::Series { .. } | Route::SeriesDetail(_) => ViewArg::Series,
+        Route::Series { .. } | Route::SeriesDetail(_) | Route::SeriesDetailAt { .. } => ViewArg::Series,
         Route::Settings(_) | Route::Setting(_) | Route::EditPlaylist(_) | Route::Logs | Route::EpgMapping { .. } => ViewArg::Settings,
         Route::Onboarding(_) | Route::Queue | Route::Watchlists { .. } => return None,
     })

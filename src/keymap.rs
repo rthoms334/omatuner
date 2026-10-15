@@ -1002,6 +1002,8 @@ pub static SETTINGS: &[Binding] = &[
 /// Watchlist play order and entry actions (DESIGN §42 §2.4).
 pub static WATCHLISTS: &[Binding] = &[
     b(C::key(Key::ArrowRight), A::Right, "Open entries / move right"),
+    b(C::ctrl(Key::I), A::ShowDetails, "Episodes… / film details"),
+    b(C::ctrl(Key::W), A::MarkWatched, "Mark current episode / title watched; done entry unwatched"),
     b(C::ctrl_shift(Key::Enter), A::WatchlistOne, "Play just this one"),
     b(C::ch('s'), A::WatchlistSkip, "Skip in this list / unskip"),
     b(C::ch('o'), A::WatchlistOrder, "In order / Any order"),

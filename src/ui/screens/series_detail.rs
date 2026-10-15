@@ -159,6 +159,7 @@ pub struct SeriesDetailScreen {
     ep: usize,
     /// Place the cursor on the next episode when the data arrives (first load of a series).
     position_pending: bool,
+    episode_pending: Option<(u32, u32)>,
     scroll_target: Option<ScrollTarget>,
     copies: super::copies::Copies,
     /// Episodes of other copies being loaded before a combined ✓ (DESIGN §29.15, P3).
@@ -493,7 +494,11 @@ impl Screen for SeriesDetailScreen {
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
-        let Route::SeriesDetail(id) = route else { return };
+        let (id, episode) = match route {
+            Route::SeriesDetail(id) => (id, None),
+            Route::SeriesDetailAt { series, season, episode } => (series, Some((*season, *episode))),
+            _ => return,
+        };
         if self.id != Some(*id) {
             self.data = None;
             self.section = Section::Episodes;
@@ -503,6 +508,16 @@ impl Screen for SeriesDetailScreen {
             self.position_pending = true;
         }
         self.id = Some(*id);
+        self.episode_pending = episode;
+        if let Some((season, episode)) = episode {
+            self.section = Section::Episodes;
+            self.position_pending = true;
+            // Reopening a cached page must focus the requested row before another key
+            // can act, as well as when its refreshed data arrives.
+            if let Some(id) = self.data.as_ref().and_then(|d| d.episodes.iter().find(|e| (e.season, e.episode) == (season, episode))).map(|e| e.id) {
+                self.select_episode(id);
+            }
+        }
         self.missing = false;
         self.reload(ctx);
     }
@@ -755,11 +770,13 @@ impl Screen for SeriesDetailScreen {
                     self.details_requested = Some(d.series.id);
                     ctx.services.jobs.submit(JobKind::LoadSeriesDetails(d.series.id));
                 }
-                let next = if self.copies.combined() { d.next_across } else { d.next };
+                let target = self.episode_pending.and_then(|(s, n)| d.episodes.iter().find(|e| (e.season, e.episode) == (s, n)).map(|e| e.id));
+                let next = target.or(if self.copies.combined() { d.next_across } else { d.next });
                 let had_episodes = !d.episodes.is_empty();
                 self.data = Some(d);
-                if self.position_pending && had_episodes {
+                if self.position_pending && had_episodes && (self.episode_pending.is_none() || target.is_some() || !lazy) {
                     self.position_pending = false;
+                    self.episode_pending = None;
                     if let Some(n) = next {
                         self.select_episode(n);
                     }

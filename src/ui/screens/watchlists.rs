@@ -38,11 +38,15 @@ const QUEUE_NEXT: u8 = 215;
 const MOVE_UP: u8 = 216;
 const MOVE_DOWN: u8 = 217;
 const SHOW_WATCHED: u8 = 218;
+const ALL_WATCHED: u8 = 219;
+const DETAILS: u8 = 220;
 
 #[derive(Default)]
 pub struct WatchlistsScreen {
     snapshot: Arc<WatchlistsSnapshot>,
     selected: Option<WatchlistId>,
+    /// Pane navigation can select a different list without changing the opening route.
+    route_list: Option<WatchlistId>,
     cursor: usize,
     lists_focus: bool,
     drag: Option<WatchlistItemId>,
@@ -54,8 +58,11 @@ pub struct WatchlistsScreen {
     scroll: bool,
     opening: bool,
     fetch: crate::ui::copies::EpisodeFetch,
-    pending_mark: Option<(EntryState, bool)>,
+    pending_mark: Option<(EntryState, bool, bool)>,
     pending_focus: Option<(WatchlistItemId, usize)>,
+    return_to: Option<(Option<WatchlistId>, WatchlistId, WatchlistItemId)>,
+    /// Keep the returned entry visible even if it was completed on its details page.
+    revealed_entry: Option<WatchlistItemId>,
 }
 impl WatchlistsScreen {
     fn view(&self) -> Option<&ListView> {
@@ -63,7 +70,8 @@ impl WatchlistsScreen {
     }
     fn shown(&self) -> Vec<&EntryState> {
         let Some(v) = self.view() else { return vec![] };
-        let mut entries: Vec<_> = v.entries.iter().filter(|e| v.show_watched || e.status != EntryStatus::Done).collect();
+        let mut entries: Vec<_> =
+            v.entries.iter().filter(|e| v.show_watched || e.status != EntryStatus::Done || Some(e.entry.id) == self.revealed_entry).collect();
         if v.list.play_order == PlayOrder::Any {
             entries.sort_by_key(|e| e.done());
         }
@@ -74,12 +82,17 @@ impl WatchlistsScreen {
     }
     fn select(&mut self, id: WatchlistId) {
         self.pending_focus = None;
+        self.revealed_entry = None;
         self.selected = Some(id);
         self.cursor = self.view().and_then(|v| v.next).and_then(|id| self.shown().iter().position(|e| e.entry.id == id)).unwrap_or(0);
         self.scroll = true;
     }
     fn sync(&mut self, ctx: &UiCtx<'_>) {
+        let focused = self.shown().get(self.cursor).map(|e| e.entry.id);
         self.snapshot = shared::snapshot(ctx);
+        if let Some(index) = focused.and_then(|id| self.shown().iter().position(|e| e.entry.id == id)) {
+            self.cursor = index;
+        }
         if self.opening && self.selected.is_some_and(|id| self.snapshot.list(id).is_some()) {
             self.select(self.selected.unwrap());
             self.opening = false;
@@ -176,24 +189,40 @@ impl WatchlistsScreen {
             )
         } else if let Some(e) = self.entry() {
             self.menu_entry = Some(e.entry.id);
-            (
-                shared::label(ctx, &e),
-                vec![
-                    mi("Play from here", PLAY, e.playable.is_some()),
-                    mi("Play just this one", ONE, e.playable.is_some()),
-                    mi("Add to Up next", QUEUE, e.playable.is_some()),
-                    mi("Play next", QUEUE_NEXT, e.playable.is_some()),
-                    mi(if e.done() { "Mark unwatched" } else { "Mark watched" }, WATCHED, e.entry.item.is_some()),
-                    mi("Move earlier", MOVE_UP, e.entry.position > 0),
-                    mi("Move later", MOVE_DOWN, e.entry.position + 1 < v.entries.len()),
-                    mi(if e.entry.skipped { "Unskip" } else { "Skip in this list" }, SKIP, true),
-                    mi("Make next", NEXT, true),
-                    mi("Seasons…", SEASONS, e.entry.kind == ItemKind::Series),
-                    mi("Use another copy…", COPY, e.entry.item.is_some()),
-                    mi("Find in my playlists…", FIND, e.entry.item.is_none()),
-                    mi("Remove", REMOVE, true),
-                ],
-            )
+            let series = e.entry.kind == ItemKind::Series;
+            let current = series && e.status != EntryStatus::Done;
+            let watched = if e.status == EntryStatus::Done || (!series && e.done()) {
+                "Mark unwatched".into()
+            } else if series {
+                shared::episode_number(&e).map(|n| format!("Mark {n} watched")).unwrap_or_else(|| "Mark current episode watched".into())
+            } else {
+                "Mark watched".into()
+            };
+            let mut items = vec![
+                mi("Play from here", PLAY, e.playable.is_some()),
+                mi("Play just this one", ONE, e.playable.is_some()),
+                mi("Add to Up next", QUEUE, e.playable.is_some()),
+                mi("Play next", QUEUE_NEXT, e.playable.is_some()),
+                MenuItem { shortcut: Some("Ctrl+W".into()), ..mi(&watched, WATCHED, e.entry.item.is_some() && (!current || e.episode.is_some())) },
+            ];
+            if series {
+                items.push(mi("Mark all watched", ALL_WATCHED, e.entry.item.is_some()));
+            }
+            items.push(MenuItem {
+                shortcut: Some("Ctrl+I".into()),
+                ..mi(if e.entry.kind == ItemKind::Movie { "Details…" } else { "Episodes…" }, DETAILS, e.entry.item.is_some())
+            });
+            items.extend([
+                mi("Move earlier", MOVE_UP, e.entry.position > 0),
+                mi("Move later", MOVE_DOWN, e.entry.position + 1 < v.entries.len()),
+                mi(if e.entry.skipped { "Unskip" } else { "Skip in this list" }, SKIP, true),
+                mi("Make next", NEXT, true),
+                mi("Seasons…", SEASONS, e.entry.kind == ItemKind::Series),
+                mi("Use another copy…", COPY, e.entry.item.is_some()),
+                mi("Find in my playlists…", FIND, e.entry.item.is_none()),
+                mi("Remove", REMOVE, true),
+            ]);
+            (shared::label(ctx, &e), items)
         } else {
             return;
         };
@@ -277,9 +306,33 @@ impl WatchlistsScreen {
             _ => {}
         }
     }
-    fn mark(&mut self, ctx: &mut UiCtx<'_>) {
+    fn details(&mut self, ctx: &mut UiCtx<'_>) {
         let Some(e) = self.entry() else { return };
-        let on = e.status != EntryStatus::Done;
+        let Some(item) = e.playable.as_ref().or(e.entry.item.as_ref()) else { return };
+        let route = match item.kind {
+            ItemKind::Movie => crate::store::vod::resolve_movie(ctx.db, item).ok().flatten().map(Route::MovieDetail),
+            ItemKind::Episode => crate::store::vod::resolve_episode(ctx.db, item)
+                .ok()
+                .flatten()
+                .and_then(|id| crate::store::vod::episode(ctx.db, id).ok())
+                .map(|ep| Route::SeriesDetailAt { series: ep.series_id, season: ep.season, episode: ep.episode }),
+            ItemKind::Series => resolve_series(ctx.db, item).ok().flatten().map(|series| {
+                let (season, episode) = e.episode.unwrap_or((e.entry.season_from.unwrap_or(1), 1));
+                Route::SeriesDetailAt { series, season, episode }
+            }),
+            _ => None,
+        };
+        if let Some(route) = route {
+            self.return_to = Some((self.route_list, e.entry.list_id, e.entry.id));
+            ctx.push(route);
+        }
+    }
+    fn mark(&mut self, ctx: &mut UiCtx<'_>, all: bool) {
+        let Some(e) = self.entry() else { return };
+        let on = all || e.status != EntryStatus::Done;
+        if !all && on && e.entry.kind == ItemKind::Series && e.episode.is_none() {
+            return;
+        }
         if matches!(e.entry.kind, ItemKind::Series | ItemKind::Episode)
             && let Some(item) = &e.entry.item
         {
@@ -302,11 +355,18 @@ impl WatchlistsScreen {
             let unloaded = crate::store::copies::unloaded_series(ctx.db, &ids).unwrap_or_default();
             if !unloaded.is_empty() {
                 self.fetch.start(ctx, &unloaded);
-                self.pending_mark = Some((e, on));
+                self.pending_mark = Some((e, on, all));
                 return;
             }
         }
-        shared::mark_watched(ctx, e, on);
+        Self::finish_mark(ctx, e, on, all);
+    }
+    fn finish_mark(ctx: &UiCtx<'_>, e: EntryState, on: bool, all: bool) {
+        if e.entry.kind == ItemKind::Series && on && !all {
+            shared::mark_current_watched(ctx, e);
+        } else {
+            shared::mark_watched(ctx, e, on);
+        }
     }
     fn copies(&mut self, ctx: &mut UiCtx<'_>) {
         let Some(e) = self.entry() else { return };
@@ -634,7 +694,20 @@ impl Screen for WatchlistsScreen {
         vec![KeyContext::Watchlists, KeyContext::List]
     }
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
+        let Route::Watchlists { list: target } = route else { return };
+        self.route_list = *target;
         self.sync(ctx);
+        if let Some((route_list, list, entry)) = self.return_to.take()
+            && route_list == *target
+        {
+            self.selected = Some(list);
+            self.revealed_entry = Some(entry);
+            self.cursor = self.shown().iter().position(|e| e.entry.id == entry).unwrap_or(0);
+            self.lists_focus = false;
+            self.opening = false;
+            self.scroll = true;
+            return;
+        }
         if let Route::Watchlists { list: Some(id) } = route {
             self.selected = Some(*id);
         }
@@ -726,7 +799,8 @@ impl Screen for WatchlistsScreen {
                     );
                 }
             }
-            Action::MarkWatched if !self.lists_focus => self.mark(ctx),
+            Action::MarkWatched if !self.lists_focus => self.mark(ctx, false),
+            Action::ShowDetails if !self.lists_focus => self.details(ctx),
             _ => return false,
         }
         true
@@ -734,7 +808,9 @@ impl Screen for WatchlistsScreen {
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, r: OverlayResult) {
         match r {
             OverlayResult::Chosen(Action::Digit(COPY)) => self.copies(ctx),
-            OverlayResult::Chosen(Action::Digit(WATCHED)) => self.mark(ctx),
+            OverlayResult::Chosen(Action::Digit(WATCHED)) => self.mark(ctx, false),
+            OverlayResult::Chosen(Action::Digit(ALL_WATCHED)) => self.mark(ctx, true),
+            OverlayResult::Chosen(Action::Digit(DETAILS)) => self.details(ctx),
             OverlayResult::Chosen(Action::Digit(code @ (QUEUE | QUEUE_NEXT | MOVE_UP | MOVE_DOWN))) => {
                 self.on_action(
                     ctx,
@@ -776,10 +852,10 @@ impl Screen for WatchlistsScreen {
             if !failed.is_empty() {
                 ctx.toast(crate::msg::Toast::error("Some copies couldn't load their episodes"));
             }
-            if let Some((e, on)) = self.pending_mark.take()
+            if let Some((e, on, all)) = self.pending_mark.take()
                 && failed.is_empty()
             {
-                shared::mark_watched(ctx, e, on);
+                Self::finish_mark(ctx, e, on, all);
             }
         }
         section::page_header(ui, ctx, "Watchlists", |_| {});

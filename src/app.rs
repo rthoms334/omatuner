@@ -1386,7 +1386,7 @@ impl TunerApp {
         // pages and groups of explicit titles
         self.routes.retain(|r| match r {
             Route::MovieDetail(id) => !x.vod.contains(&crate::model::VodKind::Movie(*id)),
-            Route::SeriesDetail(id) => !x.vod.contains(&crate::model::VodKind::Series(*id)),
+            Route::SeriesDetail(id) | Route::SeriesDetailAt { series: id, .. } => !x.vod.contains(&crate::model::VodKind::Series(*id)),
             _ => true,
         });
         for r in &mut self.routes {
@@ -3779,6 +3779,170 @@ mod tests {
     /// A button by its label (the sidebar entries; screens may show the same words as text).
     fn button<'a>(texts: &'a [Node], text: &str) -> Option<&'a egui::accesskit::Rect> {
         texts.iter().find(|(t, _, role)| t == text && *role == egui::accesskit::Role::Button).map(|(_, r, _)| r)
+    }
+
+    /// A film before a season range ensures Back must restore the entry, not the list's
+    /// first unfinished title. Two copies exercise the global watched/Undo paths.
+    fn watchlist_episode_rig(season: u32) -> (Rig, crate::model::WatchlistId) {
+        use crate::store::watchlist as wl;
+        use crate::ui::screens::home::testkit;
+        let mut rig = Rig::with(test_config(), live(), 1.0, move |c| {
+            for name in ["TV", "TV 2"] {
+                let src = testkit::source(c, name)?;
+                testkit::series(c, src, 1, 3, 5)?;
+                c.execute("UPDATE series SET year=2020 WHERE source_id=?1", [src])?;
+                crate::store::titles::refresh_source(c, src)?;
+            }
+            testkit::movies(c, SourceId(1), 1)?;
+            let lib = crate::store::library::load(c)?;
+            let list = wl::create(c, "Episodes to watch", None, crate::watchlist::PlayOrder::Ordered, "app", 1)?;
+            let film = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000000".into()) };
+            let series = ItemRef { source: SourceId(1), kind: ItemKind::Series, key: ItemKey("m3u:series000000000".into()) };
+            let mut range = wl::new_entry(c, &series)?;
+            range.season_from = Some(season);
+            range.season_to = Some(season);
+            wl::add(c, &lib, list, &[wl::new_entry(c, &film)?, range], crate::watchlist::Insert::End, 1)?;
+            let finished = (1..=3).map(|n| (watchlist_episode_ref(1, season, n), format!("Episode {n}"))).collect::<Vec<_>>();
+            crate::store::user::mark_watched(c, &finished, true, 2)?;
+            crate::store::user::save_progress(
+                c,
+                &crate::model::WatchProgress {
+                    item: watchlist_episode_ref(1, season, 4),
+                    position_s: 90.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 3,
+                    finished: false,
+                    title: "Episode 4".into(),
+                    fingerprint: Default::default(),
+                },
+            )?;
+            Ok(())
+        });
+        rig.settle();
+        let list = wl::lists(&rig.app.db).unwrap().into_iter().find(|l| l.name == "Episodes to watch").unwrap().id;
+        rig.app.nav.push(NavRequest::Switch(Route::Watchlists { list: Some(list) }));
+        rig.frame_with(vec![]);
+        wait_watchlist_episode(&mut rig, list, (season, 4));
+        rig.press(Key::ArrowDown, NONE);
+        (rig, list)
+    }
+
+    fn watchlist_episode_ref(source: i64, season: u32, episode: u32) -> ItemRef {
+        ItemRef { source: SourceId(source), kind: ItemKind::Episode, key: ItemKey(format!("m3u:ep0-{season}-{episode}")) }
+    }
+
+    fn wait_watchlist_episode(rig: &mut Rig, list: crate::model::WatchlistId, episode: (u32, u32)) {
+        rig.until("watchlist current episode", |r| {
+            r.app.with_ctx(|ctx, _, _| crate::ui::watchlists::snapshot(ctx).list(list).is_some_and(|l| l.entries[1].episode == Some(episode)))
+        });
+        rig.frame_with(vec![]);
+    }
+
+    fn choose_watchlist_menu(rig: &mut Rig, label: &str) {
+        rig.press(Key::Enter, CTRL);
+        rig.frame_with(vec![]);
+        let nodes = texts(&rig.frame_with(vec![]));
+        let pos = centre(button(&nodes, label).unwrap_or_else(|| panic!("missing {label}: {nodes:?}")));
+        rig.click(pos, egui::PointerButton::Primary);
+        rig.frame_with(vec![]);
+    }
+
+    #[test]
+    fn watchlist_ctrl_w_marks_current_episode_only_and_undo_restores_its_progress() {
+        let (mut rig, list) = watchlist_episode_rig(1);
+        let before = crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 1, 4)).unwrap();
+        rig.press(Key::W, CTRL);
+        wait_watchlist_episode(&mut rig, list, (1, 5));
+        for source in [1, 2] {
+            assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 1, 4)).unwrap().unwrap().finished);
+            assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 1, 5)).unwrap().is_none());
+            assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 2, 1)).unwrap().is_none());
+        }
+        let toast = rig.log().toasts.iter().find(|t| t.text == "Marked S01E04 watched").cloned().expect("numbered toast");
+        let (label, undo) = toast.action.unwrap();
+        assert_eq!(label, "Undo");
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(undo, &[], &ctx);
+        wait_watchlist_episode(&mut rig, list, (1, 4));
+        assert_eq!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 1, 4)).unwrap(), before);
+        assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(2, 1, 4)).unwrap().is_none());
+        // The numbered menu action takes the same path, and the final episode completes
+        // the range without touching other seasons.
+        choose_watchlist_menu(&mut rig, "Mark S01E04 watched");
+        wait_watchlist_episode(&mut rig, list, (1, 5));
+        rig.press(Key::W, CTRL);
+        rig.until("range done", |r| {
+            crate::store::watchlist::view(&r.app.db, &r.app.lib, list, true, false).unwrap().unwrap().entries[1].status
+                == crate::watchlist::EntryStatus::Done
+        });
+        assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 2, 1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn watchlist_mark_all_watched_menu_marks_only_the_range_across_copies() {
+        let (mut rig, list) = watchlist_episode_rig(1);
+        choose_watchlist_menu(&mut rig, "Mark all watched");
+        rig.until("whole range watched", |r| {
+            crate::store::watchlist::view(&r.app.db, &r.app.lib, list, true, false).unwrap().unwrap().entries[1].status
+                == crate::watchlist::EntryStatus::Done
+        });
+        for source in [1, 2] {
+            for episode in 1..=5 {
+                assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 1, episode)).unwrap().unwrap().finished);
+                assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 2, episode)).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn watchlist_details_focus_current_season_and_episode_and_back_restores_entry() {
+        let (mut rig, list) = watchlist_episode_rig(2);
+        // Select a different list in the pane without changing the route that Back keeps.
+        let mine = crate::store::watchlist::default_list(&rig.app.db).unwrap();
+        let origin = Route::Watchlists { list: Some(mine) };
+        rig.app.nav.push(NavRequest::Switch(origin.clone()));
+        rig.frame_with(vec![]);
+        rig.press(Key::ArrowLeft, NONE);
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::ArrowRight, NONE);
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::I, CTRL);
+        assert!(matches!(rig.route(), Route::SeriesDetailAt { season: 2, episode: 4, .. }));
+        // The page's focused row owns Ctrl+W. Earlier seasons remain unwatched, so this
+        // also proves the route overrides the series' ordinary next episode.
+        rig.until("focused S2E4", |r| find(&texts(&r.frame_with(vec![])), "S2E4").is_some());
+        rig.press(Key::W, CTRL);
+        rig.until("focused episode watched", |r| {
+            crate::store::user::progress(&r.app.db, &watchlist_episode_ref(1, 2, 4)).unwrap().is_some_and(|p| p.finished)
+        });
+        assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 1, 1)).unwrap().is_none());
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &origin);
+        wait_watchlist_episode(&mut rig, list, (2, 5));
+        choose_watchlist_menu(&mut rig, "Episodes…");
+        assert!(matches!(rig.route(), Route::SeriesDetailAt { season: 2, episode: 5, .. }));
+        rig.until("focused S2E5", |r| find(&texts(&r.frame_with(vec![])), "S2E5").is_some());
+        rig.press(Key::W, CTRL);
+        rig.until("last episode watched", |r| {
+            crate::store::user::progress(&r.app.db, &watchlist_episode_ref(1, 2, 5)).unwrap().is_some_and(|p| p.finished)
+        });
+        rig.press(Key::ArrowLeft, ALT);
+        assert_eq!(rig.route(), &origin);
+        rig.until("done row returned", |r| {
+            r.app.with_ctx(|ctx, _, _| {
+                crate::ui::watchlists::snapshot(ctx).list(list).is_some_and(|l| l.entries[1].status == crate::watchlist::EntryStatus::Done)
+            })
+        });
+        rig.press(Key::W, CTRL); // The returned done entry unmarks its range, not the film.
+        wait_watchlist_episode(&mut rig, list, (2, 1));
+        for source in [1, 2] {
+            for episode in 1..=5 {
+                assert!(!crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 2, episode)).unwrap().is_some_and(|p| p.finished));
+            }
+        }
+        rig.press(Key::ArrowUp, NONE);
+        rig.press(Key::I, CTRL);
+        assert_eq!(rig.route(), &Route::MovieDetail(crate::model::MovieId(1)), "films use the same Details key");
     }
 
     // ---- key consumption -----------------------------------------------------------------

@@ -134,6 +134,12 @@ pub enum Route {
     },
     MovieDetail(MovieId),
     SeriesDetail(SeriesId),
+    /// Series details with an explicit episode cursor (including a watchlist's range).
+    SeriesDetailAt {
+        series: SeriesId,
+        season: u32,
+        episode: u32,
+    },
     /// Fullscreen player for whatever is playing.
     Player,
     Settings(SettingsPage),
@@ -162,7 +168,7 @@ impl Route {
             Route::Movies { .. } => ScreenId::Movies,
             Route::Series { .. } => ScreenId::Series,
             Route::MovieDetail(_) => ScreenId::MovieDetail,
-            Route::SeriesDetail(_) => ScreenId::SeriesDetail,
+            Route::SeriesDetail(_) | Route::SeriesDetailAt { .. } => ScreenId::SeriesDetail,
             Route::Player => ScreenId::Player,
             Route::Settings(_) | Route::Setting(_) | Route::EditPlaylist(_) => ScreenId::Settings,
             Route::Onboarding(_) => ScreenId::Onboarding,

@@ -2508,6 +2508,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | Keys | Action |
 |---|---|
 | `→` | Open entries / move right |
+| `Ctrl+I` | Episodes… / film details |
+| `Ctrl+W` | Mark current episode / title watched; done entry unwatched |
 | `Ctrl+Shift+Enter` | Play just this one |
 | `s` | Skip in this list / unskip |
 | `o` | In order / Any order |
@@ -2913,7 +2915,22 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Enter` | Confirm |
 | `Esc` | Leave the field |
 
-#### Settings (`Panel`)
+#### Panel (`Panel`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `k` / `↓` / `j` | Move |
+| `←` / `h` | Back to the page list |
+| `→` / `l` / `Shift+→` / `L` | Increase / next option |
+| `Shift+←` / `H` | Decrease / previous option |
+| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
+| `Tab` / `Shift+Tab` | Next / previous section |
+| `Enter` / `Space` | Toggle / open |
+| `x` / `Delete` | Delete / more actions |
+| `Esc` | Back |
+| `?` | Keyboard help |
+
+#### Settings (`Settings`)
 
 | Keys | Action |
 |---|---|
@@ -6932,6 +6949,17 @@ In the lists pane, Enter, → and a click select the list and open its entries; 
 its menu, header and Home tile. A ticked list toggles off a single title or the exact series
 range with Undo. Batch additions skip duplicates and report “N already there”. Save Up next
 keeps pending film/series/episode rows and reports live or unavailable rows left out.
+
+In the entries pane, Ctrl+W on a series or season range marks only its current episode:
+the S/E shown by the row and the episode Play would start. The toast “Marked S01E04 watched”
+offers Undo; the entry advances, becoming Done after its last unwatched episode. The menu
+names this action “Mark S01E04 watched” (Ctrl+W) and offers “Mark all watched” for the whole
+range (no key). A done series' “Mark unwatched” still clears the range; film and episode
+toggles are unchanged. S/E numbers always show; episode titles obey the spoiler guard.
+“Episodes…” / Ctrl+I opens series details with that episode's season selected and its row
+focused, including for a range. Ctrl+I reuses List's Details key and opens film details too.
+Esc / Alt+← returns to the same watchlist and entry with refreshed progress; a newly done
+entry remains visible for that return even when other watched entries are folded.
 
 ### 42.2 Playing through Up next
 `QueueCommand::PlayList` sets `QueueMachine.context` and adds one entry. When the queue's

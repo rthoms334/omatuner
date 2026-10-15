@@ -121,12 +121,19 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 | | `Ctrl+Shift+Enter` | Play just this one (no list after it) |
 | | `Alt+↑↓`, drag the handle | Reorder |
 | | `Delete` | Remove, with Undo |
-| | `Ctrl+W` | Mark the title watched / unwatched (global, as today) |
+| | `Ctrl+W` | Series/range: mark only the current episode (the row's S/E, also the episode Play starts); a done series unmarks its range. Film and episode entries toggle watched as before. All edits are global, with Undo. |
+| | `Ctrl+I` | Episodes…: open series details on the current episode, selecting its season and focusing its row. Films open their details page. Esc / Alt+← returns to the same list and entry, refreshed from episode edits. |
 | | `s` | Skip in this list / unskip |
-| | `Ctrl+Enter` / `Shift+F10` | Menu: Play from here · Play just this one · Skip · Make next · Seasons… · Use another copy… · Find in my playlists… (placeholders) · Remove |
+| | `Ctrl+Enter` / `Shift+F10` | Menu: Play from here · Play just this one · Mark S01E04 watched (Ctrl+W) · Mark all watched (series/range, no key) · Episodes… (Ctrl+I; Details… for films) · Skip · Make next · Seasons… · Use another copy… · Find in my playlists… (placeholders) · Remove |
 | Lists pane | `F2` / `Delete` / `Alt+↑↓` | Rename / delete (Confirm) / reorder. The menu adds "Play", "Start again…" and "Duplicate" |
 
 The mouse gets a menu item or a button for every key, the same as Up next.
+Ctrl+I reuses List's existing Details binding; it has no competing Watchlists action.
+The current-episode edit toasts “Marked S01E04 watched” with Undo and advances the row to
+the following episode, or Done after the range's last unwatched episode. S/E numbers always
+show under the spoiler guard; episode titles remain guarded. “Mark all watched” retains the
+whole-range edit. Returning from details keeps the entry visible and focused even if it is
+now done and other watched entries are folded.
 
 ---
 
