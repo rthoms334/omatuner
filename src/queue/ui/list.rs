@@ -12,7 +12,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Align2, Color32, FontId, Rect};
 
 use crate::keymap::Action;
-use crate::model::{ItemKind, QueueId, Timestamp};
+use crate::model::{ItemKind, QueueId, Timestamp, WatchlistId, WatchlistItemId};
 use crate::queue::{QueueCommand, QueueRow, QueueSnapshot, RowState};
 use crate::theme::{SpaceToken, Theme, TypeToken, with_alpha};
 use crate::ui::UiCtx;
@@ -22,6 +22,9 @@ use crate::ui::widgets::list::{ListOutcome, ListState, virtual_list};
 
 /// A pointer this close (pt) to the list's top or bottom edge scrolls it during a drag.
 const EDGE: f32 = 24.0;
+const PREVIEW_PLAY: u8 = 220;
+const PREVIEW_SKIP: u8 = 221;
+const PREVIEW_OPEN: u8 = 222;
 
 /// One line of the list.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +33,9 @@ pub enum Line {
     Header(String),
     /// A row: index into the snapshot's rows.
     Row(usize),
+    /// A future watchlist entry, indexed into `watchlist.then`.
+    Preview(usize),
+    StopList,
     /// The sleep timer's marker; rows after it are "late".
     Sleep(String),
 }
@@ -50,7 +56,7 @@ pub enum SleepMark {
 pub enum Mode {
     /// The Up next screen; `compact` (under 700 pt): no ETA column, "Played" on one line.
     Screen { compact: bool },
-    /// The player's `u` panel: what is still to play, no sections, OSD colours, no drag.
+    /// The player's `u` panel: what is still to play, OSD colours, no drag.
     Panel,
 }
 
@@ -66,6 +72,12 @@ pub enum Out {
         fullscreen: bool,
     },
     Menu(QueueId),
+    PlayList {
+        list: WatchlistId,
+        entry: WatchlistItemId,
+    },
+    PreviewMenu(WatchlistItemId),
+    OpenList(WatchlistId),
     /// ← / Backspace with nothing to the left.
     Parent,
     Send(Vec<QueueCommand>),
@@ -88,6 +100,7 @@ pub struct QueueList {
     late_from: Option<usize>,
     /// The list's rect and the pointer's place last frame (drag auto-scroll).
     rect: Option<Rect>,
+    preview_menu: Option<(WatchlistId, WatchlistItemId)>,
 }
 
 impl QueueList {
@@ -99,6 +112,8 @@ impl QueueList {
             return;
         }
         let keep = self.cursor_id();
+        let preview = self.cursor_preview();
+        let stop = matches!(self.lines.get(self.list.cursor), Some(Line::StopList));
         self.snap = snap.clone();
         self.built = Some((snap, q, mode, sleep));
         self.rebuild(mode, sleep);
@@ -106,7 +121,16 @@ impl QueueList {
         if self.drag.is_some_and(|d| self.snap.row(d).is_none()) {
             self.drag = None;
         }
-        let at = keep.and_then(|id| self.line_of(id)).or_else(|| self.first_row_from(0, true)).unwrap_or(0);
+        let at = keep
+            .and_then(|id| self.line_of(id))
+            .or_else(|| {
+                preview.and_then(|id| {
+                    self.lines.iter().position(|l| matches!(l, Line::Preview(i) if self.snap.watchlist.as_ref().is_some_and(|w| w.then[*i].id == id)))
+                })
+            })
+            .or_else(|| stop.then(|| self.lines.iter().position(|l| *l == Line::StopList)).flatten())
+            .or_else(|| self.first_row_from(0, true))
+            .unwrap_or(0);
         self.list.cursor = at.min(self.lines.len().saturating_sub(1));
         self.list.set_len(self.lines.len());
     }
@@ -120,6 +144,7 @@ impl QueueList {
             let mut hits = self.list.filter.apply(hay.iter().map(String::as_str));
             hits.sort_unstable(); // list order, not best first: it is a play order
             lines.extend(hits.into_iter().map(|i| Line::Row(i as usize)).filter(|l| mode != Mode::Panel || self.to_play(l)));
+            self.append_previews(&mut lines);
             self.lines = lines;
             return;
         }
@@ -178,7 +203,25 @@ impl QueueList {
                 self.late_from = Some(lines.len());
             }
         }
+        self.append_previews(&mut lines);
         self.lines = lines;
+    }
+
+    fn append_previews(&mut self, lines: &mut Vec<Line>) {
+        let Some(w) = &self.snap.watchlist else { return };
+        let mut hits = self.list.filter.apply(w.then.iter().take(3).map(|e| e.title.as_str()));
+        hits.sort_unstable();
+        if self.list.filter.is_active() && hits.is_empty() {
+            return;
+        }
+        let heading = if w.any_order { "Another from" } else { "Then from" };
+        lines.push(Line::Header(format!("{heading} {} · {} of {}", w.name, w.position, w.total)));
+        lines.extend(hits.into_iter().map(|i| Line::Preview(i as usize)));
+        let more = w.total.saturating_sub(w.position + w.then.len().min(3));
+        if more > 0 && !self.list.filter.is_active() {
+            lines.push(Line::Header(format!("and {more} more")));
+        }
+        lines.push(Line::StopList);
     }
 
     /// A still-to-play row (the panel lists only those).
@@ -207,7 +250,7 @@ impl QueueList {
 
     /// The first row line at or after `from` (`down`) / at or before it.
     fn first_row_from(&self, from: usize, down: bool) -> Option<usize> {
-        let is_row = |i: &usize| matches!(self.lines.get(*i), Some(Line::Row(_)));
+        let is_row = |i: &usize| matches!(self.lines.get(*i), Some(Line::Row(_) | Line::Preview(_) | Line::StopList));
         if down { (from..self.lines.len()).find(is_row) } else { (0..=from.min(self.lines.len().saturating_sub(1))).rev().find(is_row) }
     }
 
@@ -218,6 +261,64 @@ impl QueueList {
 
     pub fn cursor_id(&self) -> Option<QueueId> {
         self.cursor_row().map(|r| r.entry.id)
+    }
+
+    fn cursor_preview(&self) -> Option<WatchlistItemId> {
+        let Line::Preview(i) = self.lines.get(self.list.cursor)? else { return None };
+        self.snap.watchlist.as_ref()?.then.get(*i).map(|e| e.id)
+    }
+
+    fn activate(&self, fullscreen: bool) -> Out {
+        if let Some(id) = self.cursor_id() {
+            Out::Play { id, fullscreen }
+        } else if let Some(entry) = self.cursor_preview() {
+            Out::PlayList { list: self.snap.watchlist.as_ref().unwrap().id, entry }
+        } else if matches!(self.lines.get(self.list.cursor), Some(Line::StopList)) {
+            Out::Send(vec![QueueCommand::StopList])
+        } else {
+            Out::Handled
+        }
+    }
+
+    fn menu(&self) -> Out {
+        self.cursor_preview().map(Out::PreviewMenu).or_else(|| self.cursor_id().map(Out::Menu)).unwrap_or(Out::Handled)
+    }
+
+    pub fn open_preview_menu(&mut self, ctx: &mut UiCtx<'_>, entry: WatchlistItemId) {
+        use crate::ui::overlays::{ContextMenuSpec, MenuItem};
+        let Some(w) = &self.snap.watchlist else { return };
+        let Some(e) = w.then.iter().find(|e| e.id == entry) else { return };
+        self.preview_menu = Some((w.id, entry));
+        let items = [
+            (PREVIEW_PLAY, "Play from here", glyphs::PLAY),
+            (PREVIEW_SKIP, "Skip in this list", glyphs::NEXT),
+            (PREVIEW_OPEN, "Open the list", glyphs::FAV_LIST),
+        ]
+        .into_iter()
+        .map(|(code, label, icon)| MenuItem { icon, label: label.into(), action: Action::Digit(code), enabled: true, shortcut: None })
+        .collect();
+        ctx.open(crate::ui::OverlayRequest::ContextMenu(ContextMenuSpec { title: e.title.clone(), items }));
+    }
+
+    /// Menu targets keep their identity across snapshot refreshes, but never outlive concealment.
+    pub fn preview_choice(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> Option<Out> {
+        let Action::Digit(code @ PREVIEW_PLAY..=PREVIEW_OPEN) = action else { return None };
+        let (list, entry) = self.preview_menu.take()?;
+        let snap = super::snapshot(ctx);
+        if !snap.watchlist.as_ref().is_some_and(|w| w.id == list && w.then.iter().any(|e| e.id == entry)) {
+            return Some(Out::Handled);
+        }
+        Some(match code {
+            PREVIEW_PLAY => Out::PlayList { list, entry },
+            PREVIEW_SKIP => {
+                crate::ui::watchlists::write(ctx, "Skipped in this list", move |c| {
+                    crate::store::watchlist::skip(c, list, &[entry], true)?;
+                    Ok(None)
+                });
+                Out::Handled
+            }
+            _ => Out::OpenList(list),
+        })
     }
 
     /// Put the cursor on a row (the current one when the panel opens).
@@ -243,7 +344,7 @@ impl QueueList {
 
     /// The cursor left a section line: step on in the same direction (or back).
     fn skip_lines(&mut self, down: bool) {
-        if matches!(self.lines.get(self.list.cursor), Some(Line::Row(_)) | None) {
+        if matches!(self.lines.get(self.list.cursor), Some(Line::Row(_) | Line::Preview(_) | Line::StopList) | None) {
             return;
         }
         let at = self.first_row_from(self.list.cursor, down).or_else(|| self.first_row_from(self.list.cursor, !down));
@@ -269,14 +370,16 @@ impl QueueList {
                 return Out::Handled;
             }
             ListOutcome::Activated(_) | ListOutcome::ActivatedAlt(_) => {
-                return match self.cursor_id() {
-                    Some(id) => Out::Play { id, fullscreen: action == Action::ActivateAlt },
-                    None => Out::Handled,
-                };
+                return self.activate(action == Action::ActivateAlt);
             }
-            ListOutcome::ContextMenu(_) => return self.cursor_id().map_or(Out::Handled, Out::Menu),
+            ListOutcome::ContextMenu(_) => return self.menu(),
             ListOutcome::Parent => return Out::Parent,
             ListOutcome::None => {}
+        }
+        if self.cursor_id().is_none()
+            && matches!(action, Action::ToggleMark | Action::Remove | Action::MoveUp | Action::MoveDown | Action::QueuePlayNext)
+        {
+            return Out::Handled;
         }
         match action {
             Action::ToggleMark => {
@@ -399,10 +502,7 @@ impl QueueList {
         let icon = FontId::proportional(theme.font(TypeToken::Icon));
         let pad = theme.space(SpaceToken::RowPaddingX).min(row_h / 2.0);
         let mut first = true;
-        let then_h = snap.watchlist.as_ref().map_or(0.0, |w| (w.then.len().min(3) as f32 + 2.2) * row_h).min(rect.height() * 0.45);
-        let rows_rect = Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() - then_h));
-        let mut rows_ui = ui.new_child(egui::UiBuilder::new().max_rect(rows_rect));
-        let outcome = virtual_list(&mut rows_ui, theme, ("queue-list", mode == Mode::Panel), &mut self.list, row_h, |ui, rc| {
+        let outcome = virtual_list(ui, theme, ("queue-list", mode == Mode::Panel), &mut self.list, row_h, |ui, rc| {
             if std::mem::take(&mut first) && scroll != 0.0 {
                 ui.scroll_with_delta(egui::vec2(0.0, scroll));
                 ui.ctx().request_repaint();
@@ -428,6 +528,23 @@ impl QueueList {
                     }
                     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text.clone()));
                     resp
+                }
+                Line::Preview(_) | Line::StopList => {
+                    let cursor = rc.state.is_cursor();
+                    if cursor {
+                        p.rect_filled(r, theme.tokens.rounding, look.cursor_bg);
+                    }
+                    let label = if let Line::Preview(i) = &lines[rc.index] {
+                        let e = &snap.watchlist.as_ref().unwrap().then[*i];
+                        let episode = e.season.zip(e.episode).map(|(s, n)| format!(" · S{s}E{n}")).unwrap_or_default();
+                        format!("{}{}{episode}", if e.locked { "󰌾 " } else { "" }, e.title)
+                    } else {
+                        "Stop the list".into()
+                    };
+                    let color = if matches!(lines[rc.index], Line::StopList) { look.accent } else { look.dim };
+                    osd_text(&p, egui::pos2(r.left() + pad, r.center().y), Align2::LEFT_CENTER, &label, font.clone(), color, r.width() - 2.0 * pad);
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()));
+                    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                 }
                 Line::Row(i) => {
                     let row = &snap.rows[*i];
@@ -566,12 +683,14 @@ impl QueueList {
         self.lines = lines;
         let mut out = match outcome {
             // a click on a section or sleep line: the cursor steps on to a row, as keys would
-            ListOutcome::Activated(_) | ListOutcome::ContextMenu(_) if self.cursor_id().is_none() => {
+            ListOutcome::Activated(_) | ListOutcome::ContextMenu(_)
+                if matches!(self.lines.get(self.list.cursor), Some(Line::Header(_) | Line::Sleep(_))) =>
+            {
                 self.skip_lines(true);
                 Out::Handled
             }
-            ListOutcome::Activated(_) => self.cursor_id().map_or(Out::Handled, |id| Out::Play { id, fullscreen: false }),
-            ListOutcome::ContextMenu(_) => self.cursor_id().map_or(Out::Handled, Out::Menu),
+            ListOutcome::Activated(_) => self.activate(false),
+            ListOutcome::ContextMenu(_) => self.menu(),
             ListOutcome::Moved => {
                 self.skip_lines(true);
                 Out::Handled
@@ -604,20 +723,6 @@ impl QueueList {
             ui.ctx().request_repaint();
         } else if self.drag.is_some() && ui.input(|i| !i.pointer.any_down()) {
             self.drag = None;
-        }
-        if let Some(w) = &snap.watchlist {
-            let then_rect = Rect::from_min_max(egui::pos2(rect.left(), rows_rect.bottom()), rect.max);
-            ui.scope_builder(egui::UiBuilder::new().max_rect(then_rect), |ui| {
-                ui.separator();
-                ui.label(egui::RichText::new(format!("Then from {}", w.name)).color(look.accent));
-                for e in w.then.iter().take(3) {
-                    let episode = e.season.zip(e.episode).map(|(s, n)| format!(" · S{s}E{n}")).unwrap_or_default();
-                    ui.label(egui::RichText::new(format!("{}{}{episode}", if e.locked { "󰌾 " } else { "" }, e.title)).color(look.dim));
-                }
-                if ui.button("Stop after the queue").clicked() {
-                    out = Out::Send(vec![QueueCommand::StopList]);
-                }
-            });
         }
         out
     }
@@ -766,5 +871,44 @@ mod tests {
         assert!(l.marks.is_empty());
         l.handle(Action::FilterInput('4'));
         assert_eq!(l.handle(Action::MoveUp), Out::Toast("Clear the filter to reorder"));
+    }
+
+    #[test]
+    fn previews_keep_focus_across_refreshes_filter_and_never_edit_queue_marks() {
+        let mut s = (*snap(&[(1, RowState::Pending)])).clone();
+        s.watchlist = Some(crate::queue::ListContext {
+            id: WatchlistId(1),
+            name: "Saga".into(),
+            any_order: false,
+            position: 1,
+            total: 4,
+            playing_through: true,
+            then: (2..=4)
+                .map(|id| crate::queue::ListPreview {
+                    id: WatchlistItemId(id),
+                    kind: ItemKind::Movie,
+                    title: format!("Preview {id}"),
+                    series: None,
+                    season: None,
+                    episode: None,
+                    locked: false,
+                })
+                .collect(),
+        });
+        let mut l = QueueList::default();
+        l.sync(Arc::new(s.clone()), Mode::Panel, None);
+        l.marks.push(QueueId(1));
+        l.handle(Action::Down);
+        l.handle(Action::Down);
+        assert_eq!(l.cursor_preview(), Some(WatchlistItemId(3)));
+        s.watchlist.as_mut().unwrap().then.remove(0);
+        l.sync(Arc::new(s), Mode::Panel, None);
+        assert_eq!(l.cursor_preview(), Some(WatchlistItemId(3)));
+        assert_eq!(l.handle(Action::Remove), Out::Handled);
+        assert_eq!(l.handle(Action::Activate), Out::PlayList { list: WatchlistId(1), entry: WatchlistItemId(3) });
+        l.handle(Action::FilterInput('4'));
+        assert_eq!(l.cursor_preview(), Some(WatchlistItemId(4)));
+        l.handle(Action::End);
+        assert_eq!(l.handle(Action::Activate), Out::Send(vec![QueueCommand::StopList]));
     }
 }

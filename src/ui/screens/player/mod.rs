@@ -839,6 +839,11 @@ impl Screen for PlayerScreen {
     }
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
+        if let OverlayResult::Chosen(action) = &result
+            && self.queue_panel_choice(ctx, *action)
+        {
+            return;
+        }
         match result {
             // the app handles the pop-out key itself; from the menu it comes here
             OverlayResult::Chosen(Action::TogglePopOut) => ctx.navigate(NavRequest::TogglePopOut),
