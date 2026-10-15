@@ -103,7 +103,7 @@ fn settings_sets_a_pin_then_lock_now_and_change_need_it() {
     assert!(has(&h, "SET A PIN (4–8 DIGITS)"));
     // the first field: New PIN (Enter edits, Tab to the repeat field)
     press(&mut h, Action::Activate);
-    assert_eq!(h.state().s.key_contexts(), vec![KeyContext::TextInput, KeyContext::Panel]);
+    assert_eq!(h.state().s.key_contexts(), vec![KeyContext::TextInput, KeyContext::Settings]);
     type_text(&mut h, "12a34");
     press(&mut h, Action::FocusNext);
     type_text(&mut h, "4321");
