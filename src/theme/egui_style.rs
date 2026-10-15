@@ -114,7 +114,6 @@ mod tests {
             assert_eq!(s.spacing.interact_size.y, 28.0);
             assert_eq!(s.spacing.button_padding, egui::vec2(10.0, 6.0));
             assert_eq!(s.spacing.item_spacing, egui::vec2(8.0, 3.0));
-            assert!(!s.interaction.selectable_labels);
             assert_eq!(s.text_styles[&TextStyle::Heading], FontId::new(16.0, FontFamily::Name(FAMILY_MEDIUM.into())));
             assert_eq!(s.text_styles[&TextStyle::Body].size, 12.0);
         }

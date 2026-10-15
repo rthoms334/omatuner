@@ -724,6 +724,7 @@ fn confirm_context_menu_and_rename_dialogs() {
     assert_eq!(h.state_mut().act(Action::Activate), "Keep");
     h.run();
     assert!(h.query_by_label("The name can't be empty").is_some());
+    assert!(h.query_by_label("Copy error").is_none(), "validation is not a backend failure");
     assert_eq!(h.state_mut().act(Action::Back), "Close");
 }
 
@@ -750,6 +751,7 @@ fn pin_prompt_and_list_picker() {
     assert_eq!(h.state_mut().act(Action::Activate), "Keep", "too short");
     h.run();
     assert!(h.query_by_label("Enter 4–8 digits").is_some());
+    assert!(h.query_by_label("Copy error").is_none());
     // the last digits and Enter in the same frame: Enter is acted on after the field took them
     h.event(egui::Event::Text("34".into()));
     assert_eq!(h.state_mut().act(Action::Activate), "Keep");
@@ -767,6 +769,7 @@ fn pin_prompt_and_list_picker() {
         assert_eq!(h.state_mut().act(Action::Activate), "Keep", "attempt {attempt}");
         h.run();
         assert!(h.state().last.is_empty(), "attempt {attempt}: {}", h.state().last);
+        assert!(h.query_by_label("Copy error").is_none());
     }
     assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Modal]);
     assert!(h.query_by_label_contains("try again in").is_some());
@@ -800,6 +803,8 @@ fn pin_prompt_and_list_picker() {
     h.run();
     assert!(h.state().t.favs.lists_of(&item).is_empty(), "failed writes are undone");
     assert!(h.query_by_label_contains("Couldn't update “").is_some());
+    assert!(h.query_by_label("Copy error").is_some());
+    h.run_steps(2); // the error and Copy button change the centred card's height
     h.get_by_label("Favourites").click();
     h.run();
     assert!(h.state().t.favs.lists_of(&item).is_empty());
@@ -814,11 +819,13 @@ fn pin_prompt_and_list_picker() {
     assert_eq!(h.state_mut().act(Action::Activate), "Keep", "empty name");
     h.run();
     assert!(h.query_by_label("The name can't be empty").is_some());
+    assert!(h.query_by_label("Copy error").is_none(), "validation replaces the backend failure");
     // a name typed in the same frame as Enter is used (the create then fails: no writer)
     h.event(egui::Event::Text("Sport 2".into()));
     assert_eq!(h.state_mut().act(Action::Activate), "Keep");
     h.run();
     assert!(h.query_by_label_contains("Couldn't create the list").is_some());
+    assert!(h.query_by_label("Copy error").is_some());
     assert_eq!(h.state_mut().act(Action::Back), "Keep");
     assert_eq!(h.state().ov.key_contexts(), vec![KeyContext::Modal]);
     assert_eq!(h.state_mut().act(Action::Back), "Close");

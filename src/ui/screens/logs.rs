@@ -15,6 +15,7 @@ use tracing::Level;
 
 use crate::keymap::{Action, KeyContext};
 use crate::logging::LogLine;
+use crate::msg::Toast;
 use crate::platform::PickPurpose;
 use crate::theme::{SpaceToken, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
@@ -314,6 +315,7 @@ impl Screen for LogsScreen {
                     let heading = format!("{} {} {}", super::home::kit::date(line.at), level_label(line.level), line.target);
                     if button(ui, theme, Some(glyphs::COPY), "Copy line", ButtonStyle::default()).clicked() {
                         ui.ctx().copy_text(format!("{heading}\n{}", line.message));
+                        ctx.toast(Toast::info("Copied log line"));
                     }
                     ui.label(RichText::new(heading).size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
                     ui.add(egui::Label::new(RichText::new(&line.message).monospace().size(theme.font(TypeToken::Body)).color(t.fg)).wrap());
@@ -347,6 +349,7 @@ mod tests {
         clicks::click_text(&mut h, "Copy line");
         let copied = clicks::copied_text(&h).expect("clipboard command");
         assert!(copied.contains("ERROR tuner::test\nCouldn't refresh: HTTP 404"), "{copied}");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied log line"));
         assert!(h.state().s.expanded.is_some());
     }
 

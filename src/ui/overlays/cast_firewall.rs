@@ -34,6 +34,7 @@ use super::{Overlay, OverlayOutcome};
 use crate::cast::firewall::{self, AllowOutcome, Detection, FirewallState, Rule, UnknownWhy, Verb};
 use crate::cast::{CastErrorKind, CastHandle, FirewallJob};
 use crate::keymap::{Action, KeyContext};
+use crate::msg::Toast;
 use crate::player::{PlayerCommand, PlayerErrorKind};
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
@@ -371,6 +372,7 @@ impl FirewallPanel {
     pub(super) fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>, s: &Subject) -> Option<Btn> {
         if let Some(text) = self.copy.take() {
             ui.ctx().copy_text(text);
+            ctx.toast(Toast::info("Copied the command"));
         }
         let theme = ctx.theme;
         let t = &theme.tokens;
@@ -567,6 +569,7 @@ mod tests {
             Some("sudo ufw allow in on wlan0 from 192.168.1.0/24 to any port 47800 proto tcp comment 'omatuner cast'")
         );
         assert!(fake.take_calls().is_empty(), "copying does not run the command");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied the command"));
     }
 
     /// The button shows for ufw with pkexec when ufw blocks, or right after a cast failed with

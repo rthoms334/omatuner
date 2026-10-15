@@ -1440,8 +1440,8 @@ impl SettingsScreen {
             SettingsPage::About => {
                 v.push(Row::Section("Tuner".into()));
                 v.extend(Self::about_details(ctx).into_iter().map(|s| Row::Note(s, false)));
-                v.push(Row::Act { act: Act::CopyAbout, icon: glyphs::COPY, label: "Copy app details".into(), danger: false });
                 updates::rows(self, ctx, &mut v);
+                v.push(Row::Act { act: Act::CopyAbout, icon: glyphs::COPY, label: "Copy app details".into(), danger: false });
                 v.push(Row::Section("Logs".into()));
                 v.push(Row::Toggle(&IFACE_T[11]));
                 v.push(Row::Act { act: Act::OpenLogs, icon: glyphs::INFO, label: "Open the log viewer".into(), danger: false });
@@ -1872,7 +1872,10 @@ impl SettingsScreen {
 
     fn act(&mut self, ctx: &mut UiCtx<'_>, act: Act) {
         match act {
-            Act::CopyAbout => self.copy = Some(Self::about_details(ctx).join("\n")),
+            Act::CopyAbout => {
+                self.copy = Some(Self::about_details(ctx).join("\n"));
+                ctx.toast(Toast::info("Copied app details"));
+            }
             Act::Feature(f, n) => self.feature_act(ctx, f, n),
             Act::DistinctColours => {
                 let theme = ctx.theme;
@@ -3214,7 +3217,8 @@ impl SettingsScreen {
                             } else {
                                 t.text_secondary
                             }))
-                            .wrap(),
+                            .wrap()
+                            .selectable(true),
                         );
                         continue;
                     }
@@ -3581,6 +3585,7 @@ mod tests {
         for label in ["\nData: ", "\nCache: ", "\nLog: "] {
             assert!(copied.contains(label), "{copied}");
         }
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied app details"));
     }
 
     /// Focus the content row labelled `label` (by moving with ↓ from the top).

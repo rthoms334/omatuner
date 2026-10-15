@@ -76,7 +76,7 @@ impl PlayerScreen {
 
     /// The stream info panel (`I`, the OSD's Info, the menu's Stream info): mpv's view of what
     /// plays, or while casting what the TV is fed ([`cast_lines`]). Drawn over the casting card.
-    pub(super) fn draw_info(&self, ui: &egui::Ui, ctx: &UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
+    pub(super) fn draw_info(&self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let s = scale_of(ui);
@@ -94,8 +94,6 @@ impl PlayerScreen {
         let button_h = lh + pad;
         let area =
             Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad + button_h));
-        // Keep clicks on the panel from reaching the video behind it.
-        ui.interact(area, ui.id().with("stream-info"), egui::Sense::click());
         p.rect_filled(area, t.rounding, t.osd_scrim);
         for (i, l) in lines.iter().enumerate() {
             osd_text(
@@ -125,6 +123,7 @@ impl PlayerScreen {
         .clicked()
         {
             ui.ctx().copy_text(lines.join("\n"));
+            ctx.toast(Toast::info("Copied stream info"));
         }
     }
 }
@@ -315,13 +314,31 @@ mod tests {
             ..Default::default()
         });
         let mut h = harness(t, one, PlayerScreen { info: true, ..Default::default() }, egui::vec2(1600.0, 900.0));
-        let expected = {
-            let t = &mut h.state_mut().t;
-            let snap = t.snapshot.clone();
-            t.with_ctx(|ctx| local_lines(ctx, &snap, snap.stream_info.as_ref().unwrap()).join("\n"))
-        };
         clicks::click_text(&mut h, &format!("{}  Copy stream info", crate::ui::widgets::glyphs::COPY));
-        assert_eq!(clicks::copied_text(&h), Some(expected.as_str()));
+        let copied = clicks::copied_text(&h).expect("clipboard command");
+        assert!(copied.starts_with("Video    h264 · "), "{copied}");
+        assert!(copied.contains("\nDecoder  software\n"), "{copied}");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied stream info"));
+        assert!(h.state().s.info);
+    }
+
+    #[test]
+    fn double_click_over_stream_info_toggles_fullscreen() {
+        use crate::ui::testing::clicks;
+        let (mut t, one) = rig();
+        t.snapshot = Arc::new(PlayerSnapshot {
+            state: crate::player::PlayerState::Playing,
+            stream_info: Some(StreamInfo { video_codec: Some("h264".into()), ..Default::default() }),
+            ..Default::default()
+        });
+        let mut h = harness(t, one, PlayerScreen { info: true, ..Default::default() }, egui::vec2(1600.0, 900.0));
+        let over_info = clicks::text_rect(&h, "Video    h264 · – · –").center();
+        clicks::click_at(&mut h, over_info);
+        clicks::click_at(&mut h, over_info);
+        assert!(
+            h.output().viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(true))),
+            "the video receives the double-click through Stream info"
+        );
         assert!(h.state().s.info);
     }
 

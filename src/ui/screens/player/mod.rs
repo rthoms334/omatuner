@@ -713,6 +713,7 @@ impl Screen for PlayerScreen {
                         if let PlayerState::Error(e) = &snap.state {
                             let (head, detail) = crate::ui::video_host::error_copy(e.kind, &e.message);
                             ui.ctx().copy_text(if detail.is_empty() { head } else { format!("{head}\n{detail}") });
+                            ctx.toast(Toast::info("Copied error"));
                         }
                     }
                     None => self.cast_state_action(ctx, b.action, &snap),
@@ -1305,6 +1306,7 @@ mod tests {
         let copied = clicks::copied_text(&h).expect("clipboard command");
         assert_eq!(copied, format!("Network error\n{}", crate::redact::redact(message)));
         assert!(!copied.contains("alice") && !copied.contains("secret"));
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied error"));
         assert!(h.state_mut().nav().is_empty());
     }
 
