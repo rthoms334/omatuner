@@ -185,7 +185,7 @@ fn info_banner_never_changes_the_keys_only_controls_focus_does() {
 
 #[test]
 fn letters_filter_lists_and_grids_but_drive_guide_player_and_panels() {
-    for ctx in [K::List, K::ListFiltering, K::PosterGrid, K::PosterGridFiltering, K::Search] {
+    for ctx in [K::List, K::ListFiltering, K::PosterGrid, K::PosterGridFiltering, K::Search, K::Settings] {
         for c in ['a', 'j', 'k', 'Z', 'é', '1', 'ß'] {
             assert_eq!(resolve(&[ctx], &text(&c.to_string())), Some(Action::FilterInput(c)), "{ctx:?} {c}");
         }
@@ -199,7 +199,7 @@ fn letters_filter_lists_and_grids_but_drive_guide_player_and_panels() {
         }
     }
     assert_eq!(resolve(&[K::Guide], &text("k")), Some(Action::Up));
-    assert_eq!(resolve(&[K::Panel], &text("l")), Some(Action::Right));
+    assert_eq!(resolve(&[K::Settings], &text("l")), Some(Action::FilterInput('l')));
     assert_eq!(resolve(&[K::PlayerLive], &text("k")), Some(Action::ZapPrev));
     // IME commits of several characters and control characters are not filter input
     assert_eq!(resolve(&[K::List], &text("ab")), None);
@@ -463,4 +463,26 @@ fn hint_line_comes_from_the_tables() {
     assert_eq!(hint_line(&[K::PlayerOsd, K::List]), hint_line(&[K::List]));
     assert!(hint_line(&[K::Modal]).starts_with("Enter confirm"));
     assert_eq!(hint_line(&[]), "");
+}
+
+#[test]
+fn epg_mapping_adjust_keeps_panel_shortcuts() {
+    let stack = [K::EpgMapping, K::Panel];
+    assert_eq!(resolve(&stack, &key(Key::Space)), Some(Action::Activate));
+    for (ch, action) in [
+        ('j', Action::Down),
+        ('k', Action::Up),
+        ('h', Action::Left),
+        ('l', Action::Right),
+        ('H', Action::Decrease),
+        ('L', Action::Increase),
+        ('J', Action::MoveDown),
+        ('K', Action::MoveUp),
+        ('x', Action::ContextMenu),
+        ('?', Action::ToggleHelp),
+    ] {
+        assert_eq!(resolve(&stack, &text(&ch.to_string())), Some(action));
+        assert_eq!(resolve(&[K::Settings], &text(&ch.to_string())), Some(Action::FilterInput(ch)));
+    }
+    assert_eq!(resolve(&stack, &text("z")), None, "Adjust does not filter");
 }

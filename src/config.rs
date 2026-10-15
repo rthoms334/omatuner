@@ -10,6 +10,8 @@
 //!
 //! Ownership: struct shape frozen by the skeleton; the Settings screen (WP-12) renders it.
 
+pub mod audit;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

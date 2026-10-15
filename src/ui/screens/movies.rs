@@ -1859,7 +1859,7 @@ mod tests {
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::PlaylistPicker(ScopeKind::Movies))]);
 
         // a saved playlist without movies: All
-        h.state_mut().t.config_edits.push(Box::new(move |c| c.interface.playlist_scope.movies = Some(free)));
+        h.state_mut().t.config_edits.push(crate::config::audit::edit("key", move |c| c.interface.playlist_scope.movies = Some(free)));
         h.state_mut().apply_config();
         h.run_steps(2);
         assert_eq!(h.state().s.browser.shown.len(), 2, "Favourites of every playlist");
@@ -1942,11 +1942,11 @@ mod tests {
         h.state_mut().result(OverlayResult::Chosen(bravo));
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Player)]);
         // "Show each copy": every copy is a card
-        h.state_mut().t.config_edits.push(Box::new(|c| c.interface.same_title = crate::config::SameTitle::ShowEach));
+        h.state_mut().t.config_edits.push(crate::config::audit::edit("key", |c| c.interface.same_title = crate::config::SameTitle::ShowEach));
         h.state_mut().apply_config();
         h.run_steps(1);
         assert_eq!(shown_names(&h).len(), 5);
-        h.state_mut().t.config_edits.push(Box::new(|c| c.interface.same_title = crate::config::SameTitle::Combine));
+        h.state_mut().t.config_edits.push(crate::config::audit::edit("key", |c| c.interface.same_title = crate::config::SameTitle::Combine));
         h.state_mut().apply_config();
         // one playlist: Alpha's three movies, nothing stacked; its Dunes are also in Bravo
         h.state_mut().act(Action::NextPlaylist);
@@ -2239,7 +2239,7 @@ mod tests {
         let saved = |h: &mut egui_kittest::Harness<'static, testkit::OvApp<PlaylistPickerOverlay>>| {
             let mut c = (*h.state().t.config).clone();
             for e in h.state_mut().t.config_edits.drain(..) {
-                e(&mut c);
+                (e.apply)(&mut c);
             }
             c.interface.playlist_scope
         };

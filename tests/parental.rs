@@ -42,7 +42,7 @@ impl<S: Screen> App<S> {
     fn apply_config(&mut self) {
         let mut c = (*self.t.config).clone();
         for e in self.t.config_edits.drain(..) {
-            e(&mut c);
+            (e.apply)(&mut c);
         }
         self.t.config = Arc::new(c);
     }

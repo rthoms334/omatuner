@@ -1924,7 +1924,7 @@ to its detail page.
 ```
             ┌──────────────────────────────────────────────────────────────────┐
             │ 󰍉 bbc▏                                                            │
-            │ All · Live · Movies · Series · Guide                    Tab cycles│
+            │ All · Live · Movies · Series · Guide · Settings         Tab cycles│
             │ LIVE ──────────────────────────────────────────────────────────── │
             │ ▣ BBC One HD        [󰐹 My IPTV]   News at Eight · 20:00     ▕██░▏ │
             │ ▣ BBC Two           [󰒍 Free]      Gardeners' World               │
@@ -1938,6 +1938,12 @@ Launcher card (width 720, grows downward once typing starts), header is the quer
 highlighting (accent), source badges. Enter plays channels FULLSCREEN (no preview here; zap
 collection = the channel's primary group) and opens VOD/series details; Shift+Enter plays
 VOD directly. Locked items are excluded while the session is locked (`SearchItem.locked`).
+A **Settings** section shows up to five matching settings, labelled `Start screen · Interface`.
+Enter or a click opens Settings on that row and scrolls it into view. Channels, movies and
+series come first unless the query exactly matches a setting title. Tab also offers a Settings
+section with all matching settings. The settings index is built once per opening, after its
+stored lists load off the UI thread; typing only matches the cached documents. A change in
+parental visibility or the library invalidates it, so concealed rows cannot survive relocking.
 No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 
 ### 13.8 Player & OSD
@@ -2087,15 +2093,40 @@ raw mpv options set it; backups keep this computer's saved outputs.
 │        │   About & logs       │                                                             │
 └────────┴──────────────────────┴─────────────────────────────────────────────────────────────┘
 ```
-Panel idiom (h/j/k/l allowed, Enter toggles; ← / h steps back to the page list from every row
-(§15.1 spatial panes; the source editor and the attach view stay open), → / l / Shift+→ / L
-increase or pick the next option, Shift+← / H decrease or pick the previous one; → / Enter / Tab
+**Search settings** sits above the page list. Typing starts a filter from either pane;
+letters, including h/j/k/l and their capitals, type instead of navigating. Backspace deletes
+a character, Ctrl+Backspace a word, Ctrl+U / Esc clears and restores the original page, row
+and pane. While filtering the context is `[ListFiltering, Settings]`; a setting's own focused
+text editor still owns typing through `TextInput`. The mouse can focus the visible search
+field. No results: `No settings match “xyz”`.
+
+Results contain the real controls from **every visible page**, grouped under page headers.
+Toggles and value arrows work in place; Enter or a row click jumps to the setting on its page
+so its neighbours are visible. Action clicks run the action and text clicks open the editor
+on that page. Clearing a filter keeps any changes already made. An unsaved playlist editor
+still prevents leaving its page.
+
+Each searchable row carries a page, stable target, title, description (its existing section,
+notes and detail) and short aliases, derived from the same row builders as the pages. A new
+row is searchable automatically. Page feature flags, per-playlist conditions and parental
+concealment run before indexing; explicit category names are absent while hidden. Matching
+uses the shared `textmatch::fold` case/accent folding and requires every query word to prefix
+a word. Exact titles rank first, then title words, descriptions, and aliases. Page groups are
+ordered by their best match. Aliases include open on / launch / startup / home; lip sync /
+audio offset / out of sync; hwdec / gpu; captions / cc; menu; pin / lock / kids; spoilers;
+airplay / tv / apple tv; claude / mcp / codex; export / restore; upgrade / version; look / size.
+There are also short aliases for providers, guides, saved lists, notifications, automatic
+rules, hidden categories, missing items, buffering, seeking, languages, pop-out and diagnostics.
+
+Panel idiom (Enter toggles; ← steps back to the page list from every row
+(§15.1 spatial panes; the source editor and the attach view stay open), → / Shift+→
+increase or pick the next option, Shift+← decreases or picks the previous one; → / Enter / Tab
 in the page list return to the page; focused text fields push `TextInput`, which owns
 ←/→/Delete/Space). A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in
 the page list show "Unsaved playlist changes: Enter on Save, or Esc to discard" and return the
 highlight to the editor instead of dropping them (Esc there then discards).
 Reorderable rows (playlists, **EPG source priority**,
-favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every edit goes through
+favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓. Every edit goes through
 `ctx.edit_config` / the store and applies live (`PlayerCommand::ApplyConfig`). Settings list:
 
 | Page | Setting | Key / storage | Default |
@@ -2145,7 +2176,7 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Parental | enable · set/change PIN · relock after · lock groups/channels (from lists via Ctrl+L) · Explicit content: "Show explicit content" without a PIN (offers a PIN first), the categories treated as explicit (only while shown; Enter = Not explicit / Mark as explicit) | `parental.*`, overrides | off; explicit hidden |
 | Backup | export (include passwords? history?) · import (merge/replace, restore settings?) | §19 | — |
 | Hidden items | unhide groups/channels/VOD | overrides | — |
-| Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
+| Orphans | Enter = attach to…, Delete → menu with Forget | §8.3 | — |
 | AI agents (§39, after Parental) | offer to connect agents after updates · keep Claude Code's plugin up to date · agents play in (Pop-out / Tuner window, §30.13) · per agent: Connect / Update / Disconnect… / Copy | `agents.offer_connect`, `agents.keep_in_sync`, `agents.play_in` (+ `agents.checked_version`) | on · on · Pop-out |
 | About & logs | version, paths · Updates (§41.7): status, last check, Check now, Install now / Restart now, automatically install updates, install without asking for my password · debug logging, log viewer, export log | `updates.auto_install`, `updates.passwordless`, `general.debug_log` | on · off · off |
 | | Copy app details: version and settings / data / cache / log paths; toasts "Copied app details". Follows the update controls, so Check now stays the first focusable row when available | — | — |
@@ -2241,6 +2272,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | No VOD in any source | sidebar, Alt+4/5 | Movies/Series entries hidden; Alt+4/5 toast "Your playlists have no movies or series" |
 | Empty favourites list | Live groups pane, Home | "Press Ctrl+F on any channel to add it here" |
 | Empty history | History group | 󰋚 "Nothing watched yet" |
+| No settings match | Settings | `No settings match “xyz”` (the active query); Esc clears and restores the original page, row and pane |
 | No search results | search overlay | "No matches — Ctrl+K searches everything, Tab switches sections" |
 | Source disabled | lists, settings row | its groups hidden; settings row "Disabled" + Enable action |
 | Source needs credentials (restored) | settings row, Live empty state | "Needs credentials" → opens the onboarding Details step |
@@ -2257,12 +2289,18 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   movies and series from the `Library` (one column "name · group · source"); rebuilt when the
   snapshot changes (injection < 100 ms for 170k items; kept by the app across overlay opens);
   `reparse(append=true)` when the query extends; `tick(10 ms)` per frame; top 200; sections All
-  (interleaved by score, grouped by kind), Live, Movies, Series, Guide. Locked items excluded
+  (interleaved by score, grouped by kind), Live, Movies, Series, Guide, Settings. Locked items excluded
   until unlocked (`SearchItem.locked`); hidden items never indexed. Search results that are
   channels play fullscreen and zap through their primary group (§13.0).
 * **EPG** (`search::EpgSearch`): debounced 150 ms; FTS query (§6.3) on a runtime task with its
   own reader; stale results dropped by sequence number; results show airing/upcoming first,
   then past with ⟲ when catch-up is possible.
+* **Settings** (`search::SettingDocument`): the visible Settings row builders supply both
+  the in-page filter and Ctrl+K. Folded title, description and alias fields are matched by
+  word prefix with that ranking (§13.9); the overlay caches the small index per opening and
+  rebuilds it when the session lock changes. Ctrl+K indexes settings only, excluding user-data
+  rows such as reminders, hidden items and orphans. The in-page filter retains those rows
+  subject to the same item and group locks as content search.
 * **List filter** (`search::ListFilter`, implemented in the skeleton): per pane,
   `nucleo_matcher` scoring, ties keep list order; < 5 ms for 20k rows; leading spaces ignored;
   Ctrl+Backspace deletes a word. Channel haystacks are `"<number> <name>"`; an all-digit query
@@ -2290,10 +2328,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Rules** (`keymap::resolve`): first matching binding wins, innermost context first;
   printable symbols match `Event::Text` (layout-independent, shift applied), named keys and
   Ctrl/Alt chords match `Event::Key`.
-  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search, Help):
+  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search, Panel, Help):
     an unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
-    and grids, so no j/k there**; vim keys exist only in the guide, the player and settings
-    panels.
+    and grids, so no j/k there**; Settings also types to filter. Vim keys remain in the guide
+    and player.
   * **TextInput owns the keyboard**: after its own table only Ctrl/Alt chords and F-keys may
     reach `Global`; Space, ←/→, Delete, Backspace… return `None` and go to the text widget;
     contexts below it are never consulted (typing a space in Rename can't confirm the dialog).
@@ -2312,8 +2350,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     candidates → channels; menus and pickers close; a player side panel closes.
   * Grids: ←/→ move between posters; ← on the first column is `Parent` → the categories
     (drawer at Medium) — also while filtering (the filter is kept) and on an empty grid.
-  * Settings: ← / h is the page list from every content row; values change with → / l and
-    Shift+←/→ / H / L (Interface is almost all value rows, so "← changes a value where there
+  * Settings: ← is the page list from every content row; values change with → and
+    Shift+←/→ (Interface is almost all value rows, so "← changes a value where there
     is one" would almost never reach the page list). The page list has nothing on its left.
   * ←/→ keep their own meaning where there is no pane to the left or they move within the
     pane: the guide (← is the previous programme, into the past for catch-up; the channel
@@ -2872,16 +2910,20 @@ no Ctrl+Shift+C (the terminal's copy).
 
 | Keys | Action |
 |---|---|
-| `↑` / `k` / `↓` / `j` | Move |
-| `←` / `h` | Back to the page list |
-| `→` / `l` / `Shift+→` / `L` | Increase / next option |
-| `Shift+←` / `H` | Decrease / previous option |
-| `Alt+↑` / `K` / `Alt+↓` / `J` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
+| `↑` / `↓` | Move |
+| `←` | Back to the page list |
+| `→` / `Shift+→` | Increase / next option |
+| `Shift+←` | Decrease / previous option |
+| `Alt+↑` / `Alt+↓` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
 | `Tab` / `Shift+Tab` | Next / previous section |
-| `Enter` / `Space` | Toggle / open |
-| `x` / `Delete` | Delete / more actions |
+| `Enter` | Toggle / open |
+| `Space` | Toggle / open (types a space while filtering) |
+| `Delete` | Delete / more actions |
 | `Esc` | Back |
-| `?` | Keyboard help |
+| `Backspace` | Delete filter character |
+| `Ctrl+Backspace` | Delete filter word |
+| `Ctrl+U` | Clear filter |
+| `a–z, 0–9 …` | Type to filter |
 
 #### Keyboard help (`Help`)
 
@@ -3019,6 +3061,20 @@ the current settings; the onboarding restore always applies them). Machine-speci
 ---
 
 ## 20. Security & redaction
+
+* **Settings change log**: every applied config edit emits INFO in the existing log, e.g.
+  `settings: start screen Home → Live TV (key →)`. The queued edit carries its input: key,
+  click, agent or restore (automatic housekeeping uses system / exit). Text fields and
+  dynamic maps say `changed`; log labels come from the fixed schema, never playlist names,
+  URLs, credentials, device names or programme titles. Enum-like strings are allowlisted.
+  Per-output corrections say `audio delay for the current output`, with the old/new ms,
+  once after 500 ms without a change to that output (also flushed on exit). Other config
+  settings batch independently the same way, keeping the first old and last new values,
+  never one line per key repeat.
+  Restoring a backup logs each changed preference with `restore`. Agent multi-view layout
+  edits use `agent`; asynchronous update-switch edits retain the initiating key/click.
+  Playlist editor saves and guide enable/offset changes also log without identifying the
+  playlist or guide. No-op config edits emit nothing.
 
 * **At rest**: DB 0600 inside a 0700 data dir (created before SQLite opens it; WAL/SHM inherit
   the mode); `~/.cache/tuner/{playlists,epg}` are 0700 and downloads are created 0600 (Xtream
@@ -6034,9 +6090,9 @@ an agent's switches win, then rule priority, then the earlier start; the loser n
   toasted as "Arsenal: 4 in the next 14 days · next Sat 12:30 on Sky Sports Main Event · 2 left
   out (repeat)": the rule's name, times and channels only), **Move up / down**, **Delete…**
   ("Delete it and cancel its N reminders" / "keep the reminders as my own").
-* Reorder: Alt+↑/↓ (K/J), the drag grip (shown with two rules or more) or the menu's Move; the
-  order is saved at once and the guide checked again. The Panel hint's "reorder" covers them.
-* Upcoming rows: Enter, a click or `x` opens the programme's popover (Watch, Cancel reminder =
+* Reorder: Alt+↑/↓, the drag grip (shown with two rules or more) or the menu's Move; the
+  order is saved at once and the guide checked again. The Settings hint's "reorder" covers them.
+* Upcoming rows: Enter, a click or Delete opens the programme's popover (Watch, Cancel reminder =
   skip this one, Follow…).
 
 ## 34. Spoiler guard
