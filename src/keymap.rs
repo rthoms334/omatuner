@@ -72,7 +72,7 @@ pub enum KeyContext {
     Modal,
     /// A focused text field (settings, onboarding forms, rename, PIN).
     TextInput,
-    /// Settings panes (panel idiom: h/j/k/l allowed because there is no filter).
+    /// Settings panes: arrows change values; letters start a filter.
     Panel,
     /// The video-only player of a popped-out window, stacked right above `PlayerLive` /
     /// `PlayerVod` (Esc pops back in instead of leaving the player).
@@ -164,9 +164,9 @@ pub enum Action {
     /// ← / Backspace in a list (Backspace only on an empty filter), ← on a grid's first
     /// column, ← in Settings: step to the pane on the left (DESIGN §15.1 "Spatial panes").
     Parent,
-    /// Settings value rows (Shift+← / H): previous option, smaller number, switch off.
+    /// Settings value rows (Shift+←): previous option, smaller number, switch off.
     Decrease,
-    /// Settings value rows (→ / l / Shift+→ / L): next option, larger number, switch on.
+    /// Settings value rows (→ / Shift+→): next option, larger number, switch on.
     Increase,
     FocusNext,
     FocusPrev,
@@ -944,32 +944,25 @@ pub static TEXT_INPUT: &[Binding] = &[
 
 pub static PANEL: &[Binding] = &[
     b(C::key(Key::ArrowUp), A::Up, "Move"),
-    b(C::ch('k'), A::Up, "Move"),
     b(C::key(Key::ArrowDown), A::Down, "Move"),
-    b(C::ch('j'), A::Down, "Move"),
     // ← always steps to the page list (spatial panes, DESIGN §15.1); values change with →
-    // and Shift+←/→ (H/L) — on Interface almost every row has a value, so "← changes the
+    // and Shift+←/→ — on Interface almost every row has a value, so "← changes the
     // value where there is one" would almost never reach the page list
     b(C::key(Key::ArrowLeft), A::Left, "Back to the page list"),
-    b(C::ch('h'), A::Left, "Back to the page list"),
     b(C::key(Key::ArrowRight), A::Right, "Increase / next option"),
-    b(C::ch('l'), A::Right, "Increase / next option"),
     b(C::shift(Key::ArrowRight), A::Increase, "Increase / next option"),
-    b(C::ch('L'), A::Increase, "Increase / next option"),
     b(C::shift(Key::ArrowLeft), A::Decrease, "Decrease / previous option"),
-    b(C::ch('H'), A::Decrease, "Decrease / previous option"),
     b(C::alt(Key::ArrowUp), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
-    b(C::ch('K'), A::MoveUp, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
     b(C::alt(Key::ArrowDown), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
-    b(C::ch('J'), A::MoveDown, "Move up / down (reorder: guide priority, playlists, lists, Following rules)"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous section"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous section"),
     b(C::key(Key::Enter), A::Activate, "Toggle / open"),
-    b(C::key(Key::Space), A::Activate, "Toggle / open"),
-    b(C::ch('x'), A::ContextMenu, "Delete / more actions"),
+    b(C::ch(' '), A::FilterInput(' '), "Toggle / open (types a space while filtering)"),
     b(C::key(Key::Delete), A::ContextMenu, "Delete / more actions"),
     b(C::key(Key::Escape), A::Back, "Back"),
-    b(C::ch('?'), A::ToggleHelp, "Keyboard help"),
+    b(C::key(Key::Backspace), A::FilterBackspace, "Delete filter character"),
+    b(C::ctrl(Key::Backspace), A::FilterDeleteWord, "Delete filter word"),
+    b(C::ctrl(Key::U), A::FilterClear, "Clear filter"),
 ];
 
 /// Watchlist play order and entry actions (DESIGN §42 §2.4).
@@ -1030,7 +1023,8 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
 pub fn is_filtering(ctx: KeyContext) -> bool {
     matches!(
         ctx,
-        KeyContext::List
+        KeyContext::Panel
+            | KeyContext::List
             | KeyContext::ListFiltering
             | KeyContext::PosterGrid
             | KeyContext::PosterGridFiltering
@@ -1194,6 +1188,7 @@ const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
 
 /// Hints of a filtering list inside a dialog or menu (Esc clears the filter there).
 const MODAL_FILTERING_HINTS: &[(Action, &str)] = &[(A::Activate, "confirm"), (A::FilterClear, "clear")];
+const SETTINGS_FILTERING_HINTS: &[(Action, &str)] = &[(A::Activate, "show setting"), (A::FilterClear, "clear")];
 
 /// The hints of a context stack: (action, key, verb) for the innermost context that has
 /// hints. A list inside a dialog or menu (`[List, Modal]`) gets the dialog's verbs: the
@@ -1204,6 +1199,7 @@ pub fn hints(stack: &[KeyContext]) -> Vec<(Action, KeyChord, &'static str)> {
         let items = match ctx {
             KeyContext::List if modal => continue,
             KeyContext::ListFiltering if modal => MODAL_FILTERING_HINTS,
+            KeyContext::ListFiltering if stack.contains(&KeyContext::Panel) => SETTINGS_FILTERING_HINTS,
             _ => match HINTS.iter().find(|(c, _)| c == ctx) {
                 Some((_, items)) => *items,
                 None => continue,
@@ -1342,18 +1338,18 @@ mod tests {
         assert!(help_rows(K::PosterGrid).iter().any(|(_, h)| *h == "Type to filter"));
     }
 
-    /// Spatial panes: ← steps left in Settings (values change with → and Shift+←/→ / H/L) and
+    /// Spatial panes: ← steps left in Settings (values change with → and Shift+←/→) and
     /// in a filtered list (Backspace still edits the filter); a text field keeps its arrows.
     #[test]
     fn left_steps_to_the_pane_on_the_left() {
         let shift = |k| key_ev(k, false, false, true, false);
         assert_eq!(resolve(&[K::Panel], &key(Key::ArrowLeft, false)), Some(Action::Left));
-        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("h".into())), Some(Action::Left));
+        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("h".into())), Some(Action::FilterInput('h')));
         assert_eq!(resolve(&[K::Panel], &key(Key::ArrowRight, false)), Some(Action::Right));
         assert_eq!(resolve(&[K::Panel], &shift(Key::ArrowLeft)), Some(Action::Decrease));
-        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("H".into())), Some(Action::Decrease));
+        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("H".into())), Some(Action::FilterInput('H')));
         assert_eq!(resolve(&[K::Panel], &shift(Key::ArrowRight)), Some(Action::Increase));
-        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("L".into())), Some(Action::Increase));
+        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("L".into())), Some(Action::FilterInput('L')));
         // a text field owns its arrows, shifted (selection) too, and its letters
         assert_eq!(resolve(&[K::TextInput, K::Panel], &key(Key::ArrowLeft, false)), None);
         assert_eq!(resolve(&[K::TextInput, K::Panel], &shift(Key::ArrowLeft)), None);
@@ -1366,16 +1362,16 @@ mod tests {
         assert_eq!(resolve(&[K::List], &key(Key::ArrowLeft, false)), Some(Action::Parent));
         // help: one row per meaning
         let rows = help_rows(K::Panel);
-        assert!(rows.iter().any(|(k, h)| *h == "Back to the page list" && k == "← / h"), "{rows:?}");
-        assert!(rows.iter().any(|(k, h)| *h == "Increase / next option" && k == "→ / l / Shift+→ / L"), "{rows:?}");
-        assert!(rows.iter().any(|(k, h)| *h == "Decrease / previous option" && k == "Shift+← / H"), "{rows:?}");
+        assert!(rows.iter().any(|(k, h)| *h == "Back to the page list" && k == "←"), "{rows:?}");
+        assert!(rows.iter().any(|(k, h)| *h == "Increase / next option" && k == "→ / Shift+→"), "{rows:?}");
+        assert!(rows.iter().any(|(k, h)| *h == "Decrease / previous option" && k == "Shift+←"), "{rows:?}");
         assert!(hint_line(&[K::Panel]).contains("→ change") && !hint_line(&[K::Panel]).contains("Shift+"), "{}", hint_line(&[K::Panel]));
     }
 
     #[test]
     fn panel_reorders_and_mapping_clears() {
         assert_eq!(resolve(&[K::Panel], &key_ev(Key::ArrowUp, false, true, false, false)), Some(Action::MoveUp));
-        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("J".into())), Some(Action::MoveDown));
+        assert_eq!(resolve(&[K::Panel], &egui::Event::Text("J".into())), Some(Action::FilterInput('J')));
         assert_eq!(resolve(&[K::EpgMapping, K::List], &key(Key::Delete, false)), Some(Action::ClearEpg));
         assert_eq!(resolve(&[K::List], &key(Key::Delete, false)), Some(Action::Remove));
         assert_eq!(resolve(&[K::NumericEntry, K::PlayerLive], &key(Key::Backspace, false)), Some(Action::FilterBackspace));

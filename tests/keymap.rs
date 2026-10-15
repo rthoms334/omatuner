@@ -199,7 +199,7 @@ fn letters_filter_lists_and_grids_but_drive_guide_player_and_panels() {
         }
     }
     assert_eq!(resolve(&[K::Guide], &text("k")), Some(Action::Up));
-    assert_eq!(resolve(&[K::Panel], &text("l")), Some(Action::Right));
+    assert_eq!(resolve(&[K::Panel], &text("l")), Some(Action::FilterInput('l')));
     assert_eq!(resolve(&[K::PlayerLive], &text("k")), Some(Action::ZapPrev));
     // IME commits of several characters and control characters are not filter input
     assert_eq!(resolve(&[K::List], &text("ab")), None);

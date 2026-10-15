@@ -137,6 +137,7 @@ pub enum Route {
     /// Fullscreen player for whatever is playing.
     Player,
     Settings(SettingsPage),
+    Setting(screens::settings::SettingTarget),
     /// Settings ▸ Playlists with one playlist's editor open (a scope tab's "Edit playlist…").
     EditPlaylist(SourceId),
     /// Sidebar and status bar are hidden while this route is current.
@@ -163,7 +164,7 @@ impl Route {
             Route::MovieDetail(_) => ScreenId::MovieDetail,
             Route::SeriesDetail(_) => ScreenId::SeriesDetail,
             Route::Player => ScreenId::Player,
-            Route::Settings(_) | Route::EditPlaylist(_) => ScreenId::Settings,
+            Route::Settings(_) | Route::Setting(_) | Route::EditPlaylist(_) => ScreenId::Settings,
             Route::Onboarding(_) => ScreenId::Onboarding,
             Route::EpgMapping { .. } => ScreenId::EpgMapping,
             Route::Logs => ScreenId::Logs,
@@ -330,13 +331,14 @@ impl BackTarget {
 }
 
 /// A queued Settings change (applied by the app after the frame).
-pub type ConfigEdit = Box<dyn FnOnce(&mut Config)>;
+pub type ConfigEdit = crate::config::audit::Edit;
 
 /// Per-viewer UI session state that isn't config (parental unlock etc.).
 pub use parental::ParentalSession;
 
 /// Everything a screen needs for one frame.
 pub struct UiCtx<'a> {
+    pub config_input: &'static str,
     pub theme: &'a Theme,
     pub services: &'a Services,
     /// Current catalogue snapshot (swapped atomically after imports). Do NOT read
@@ -438,6 +440,7 @@ impl<'a> UiCtx<'a> {
             mv_out: Default::default(),
             toasts: p.toasts,
             config_edits: p.config_edits,
+            config_input: "click",
             cast: Default::default(),
         }
     }
@@ -470,7 +473,7 @@ impl<'a> UiCtx<'a> {
     /// Queue a config change; the app applies it, saves `config.toml`, sends
     /// `PlayerCommand::ApplyConfig` and re-applies dependent state (theme scale) after the frame.
     pub fn edit_config(&mut self, f: impl FnOnce(&mut Config) + 'static) {
-        self.config_edits.push(Box::new(f));
+        self.config_edits.push(crate::config::audit::edit(self.config_input, f));
     }
     /// Adjust a remembered output, or reset it (`None`). Shared by player keys, tracks and
     /// Settings; edits reach every local picture through ApplyConfig at once, with a debounced save.
@@ -547,7 +550,7 @@ impl<'a> UiCtx<'a> {
     /// Ask multi-view for something (focus, sound, layout, a picture's channel…); the app
     /// applies it after the frame.
     pub fn mv_request(&self, r: multiview::MvRequest) {
-        self.mv_out.borrow_mut().push(r);
+        self.mv_out.borrow_mut().push(multiview::MvRequest::FromInput(Box::new(r), self.config_input));
     }
     /// The requests made this frame (the app turns them into `NavRequest::MultiView`).
     pub fn take_mv_requests(&mut self) -> Vec<multiview::MvRequest> {

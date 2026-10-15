@@ -66,6 +66,7 @@ pub struct Integrations {
 pub struct Services {
     pub paths: AppPaths,
     pub config: SharedConfig,
+    pub(crate) config_audit: Arc<crate::config::audit::Pending>,
     pub bus: EventBus,
     pub rt: tokio::runtime::Runtime,
     pub store: Store,
@@ -149,6 +150,7 @@ impl Services {
         let updater =
             crate::update::Updater::for_services(&paths, http.clone(), bus.clone(), rt.handle().clone(), config.clone(), agent.clone(), jobs.clone());
         Ok(Self {
+            config_audit: Arc::default(),
             paths,
             config,
             bus,
@@ -244,8 +246,17 @@ impl Services {
         // a restart into an update from a hidden window exits the way a signal does
         let (registry, writer, socket, cast) = (self.tiles.registry(), self.store.writer().clone(), self.socket.clone(), self.cast_stop.clone());
         let (config, config_file) = (self.config.clone(), self.paths.config_file());
+        let config_audit = self.config_audit.clone();
         let cleanup = move || -> futures_util::future::BoxFuture<'static, ()> {
-            Box::pin(direct_exit_cleanup(registry.all(), writer.clone(), socket.clone(), cast.clone(), config.clone(), config_file.clone()))
+            Box::pin(direct_exit_cleanup(
+                registry.all(),
+                writer.clone(),
+                socket.clone(),
+                cast.clone(),
+                config.clone(),
+                config_file.clone(),
+                config_audit.clone(),
+            ))
         };
         self.updater.start(crate::update::service::RestartHooks { closing: self.closing.clone(), cleanup: Arc::new(cleanup) });
     }
@@ -468,6 +479,7 @@ impl Services {
             self.cast_stop.clone(),
             self.config.clone(),
             self.paths.config_file(),
+            self.config_audit.clone(),
         )
     }
 
@@ -511,10 +523,13 @@ async fn direct_exit_cleanup(
     cast: Arc<Mutex<Option<crate::cast::service::CastStopper>>>,
     config: SharedConfig,
     config_file: std::path::PathBuf,
+    config_audit: Arc<crate::config::audit::Pending>,
 ) {
     // A signal or update restart can bypass the UI's pending lip-sync save and on_exit.
     if let Err(e) = crate::config::current(&config).save(&config_file) {
         tracing::warn!("saving settings at exit: {e}");
+    } else {
+        config_audit.flush();
     }
     let stopper = cast.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(stopper) = stopper {

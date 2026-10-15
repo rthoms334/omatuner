@@ -395,7 +395,9 @@ impl TunerApp {
         use crate::agent::connect::{AgentId, Offer, PassOutcome, Status};
         match self.services().agent_connect.take_pass_outcome() {
             Some(PassOutcome::Offer(o)) => self.agent_offer = Some(o),
-            Some(PassOutcome::Settled) => self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned()))),
+            Some(PassOutcome::Settled) => {
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())))
+            }
             Some(PassOutcome::Retry) | None => {}
         }
         if self.agent_offer.is_none() {
@@ -419,7 +421,7 @@ impl TunerApp {
             if self.services().config().agents.offer_connect && !agents.is_empty() {
                 self.nav.push(NavRequest::Open(OverlayRequest::AgentConnect(Offer { agents, connected })));
             } else {
-                self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())));
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())));
             }
         }
     }
@@ -453,7 +455,7 @@ impl TunerApp {
         {
             self.services().tiles.a().handle().send(PlayerCommand::SetPlayOn(Some(id)));
         } else if c.play_on.is_some() {
-            self.config_edits.push(Box::new(|c| c.cast.play_on = None));
+            self.config_edits.push(crate::config::audit::edit("system", |c| c.cast.play_on = None));
         }
     }
 
@@ -482,7 +484,7 @@ impl TunerApp {
         match cast.take_pass_outcome() {
             Some(crate::cast::PassOutcome { offer: Some(o) }) => self.cast.offer = Some(o),
             Some(crate::cast::PassOutcome { offer: None }) => {
-                self.config_edits.push(Box::new(|c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
             }
             None => {}
         }
@@ -499,7 +501,7 @@ impl TunerApp {
             if cfg.cast.enabled && cfg.cast.offer_setup && !paired {
                 self.nav.push(NavRequest::Open(OverlayRequest::CastOffer(offer)));
             } else {
-                self.config_edits.push(Box::new(|c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
             }
         }
     }
@@ -859,7 +861,7 @@ impl TunerApp {
         | AppEvent::Tile(crate::player::tiles::TileEvent::Player(_, crate::player::PlayerEvent::AudioOutputChanged { output, .. })) = &ev
         {
             let output = output.clone();
-            self.config_edits.push(Box::new(move |cfg| {
+            self.config_edits.push(crate::config::audit::edit("system", move |cfg| {
                 cfg.player.lip_sync.entry(output.name).or_default().label = output.label;
             }));
         }
@@ -1088,7 +1090,7 @@ impl TunerApp {
             // Settings screen, which the user may have left while the restore ran
             Ok(JobOutcome::Restored(r)) => {
                 if let Some(cfg) = r.settings.clone() {
-                    self.config_edits.push(Box::new(move |c: &mut Config| *c = *cfg));
+                    self.config_edits.push(crate::config::audit::edit("restore", move |c: &mut Config| *c = *cfg));
                 }
             }
             Ok(_) => {}
@@ -2415,13 +2417,21 @@ impl TunerApp {
                 continue;
             }
             let handled = if let Some(top) = self.overlays.len().checked_sub(1) {
-                let outcome = self.as_overlay(top, |app| app.with_ctx(|ctx, _, ovs| ovs[top].overlay.on_action(ctx, action)));
+                let outcome = self.as_overlay(top, |app| {
+                    app.with_ctx(|ctx, _, ovs| {
+                        ctx.config_input = crate::config::audit::key_input(action);
+                        ovs[top].overlay.on_action(ctx, action)
+                    })
+                });
                 let ignored = matches!(outcome, OverlayOutcome::Ignored);
                 self.apply_overlay_outcome(outcome);
                 !ignored
             } else {
                 let idx = self.screen_index(self.view_screen());
-                self.with_ctx(|ctx, screens, _| screens[idx].on_action(ctx, action))
+                self.with_ctx(|ctx, screens, _| {
+                    ctx.config_input = crate::config::audit::key_input(action);
+                    screens[idx].on_action(ctx, action)
+                })
             };
             if !handled {
                 self.global_action(action, &stack, egui_ctx);
@@ -2562,10 +2572,14 @@ impl TunerApp {
     fn save_pending_config(&mut self) {
         if self.config_save_at.take().is_some()
             && let Some(services) = &self.services
-            && let Err(e) = services.config().save(&services.paths.config_file())
         {
-            tracing::warn!("saving settings: {e}");
-            self.toast(Toast::error(format!("Couldn't save settings: {e}")));
+            match services.config().save(&services.paths.config_file()) {
+                Ok(()) => services.config_audit.flush(),
+                Err(e) => {
+                    tracing::warn!("saving settings: {e}");
+                    self.toast(Toast::error(format!("Couldn't save settings: {e}")));
+                }
+            }
         }
     }
 
@@ -2580,7 +2594,9 @@ impl TunerApp {
         let old = services.config();
         let mut cfg: Config = (*old).clone();
         for e in edits {
-            e(&mut cfg);
+            let before = cfg.clone();
+            (e.apply)(&mut cfg);
+            services.config_audit.record(&before, &cfg, e.input);
         }
         if cfg == *old {
             return;
@@ -2592,7 +2608,11 @@ impl TunerApp {
             Ok(())
         } else {
             self.config_save_at = None;
-            cfg.save(&services.paths.config_file())
+            let result = cfg.save(&services.paths.config_file());
+            if result.is_ok() {
+                services.config_audit.flush();
+            }
+            result
         };
         let cfg = Arc::new(cfg);
         *services.config.write().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
@@ -2669,7 +2689,7 @@ impl TunerApp {
                     Place::Forget => None,
                     Place::Keep => self.services().config().player.popout_last,
                 };
-                self.config_edits.push(Box::new(move |c: &mut Config| c.player.popout_last = last));
+                self.config_edits.push(crate::config::audit::edit("system", move |c: &mut Config| c.player.popout_last = last));
                 if std::mem::take(&mut self.fullscreen_after_pop_in) {
                     self.set_window_fullscreen(true, egui_ctx);
                 }
@@ -2719,7 +2739,7 @@ impl TunerApp {
             self.toast(Toast::info(text));
         }
         if !reset.is_empty() {
-            self.config_edits.push(Box::new(move |c: &mut Config| {
+            self.config_edits.push(crate::config::audit::edit("system", move |c: &mut Config| {
                 for k in reset {
                     *k.slot(&mut c.interface.playlist_scope) = None;
                 }
@@ -2788,8 +2808,10 @@ impl TunerApp {
         if last.is_none() || last == cfg.interface.last_screen {
             return;
         }
+        let before = cfg.clone();
         let mut cfg = (*cfg).clone();
         cfg.interface.last_screen = last;
+        services.config_audit.record(&before, &cfg, "exit");
         if let Err(e) = cfg.save(&services.paths.config_file()) {
             tracing::warn!("remembering the last screen: {e}");
         }
@@ -4446,7 +4468,7 @@ mod tests {
         // picked again, then removed
         rig.writer().blocking(|c| Ok(c.execute("UPDATE source SET enabled = 1 WHERE id = 2", [])?)).unwrap();
         deliver_library(&mut rig);
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.interface.playlist_scope.live = Some(SourceId(2))));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.interface.playlist_scope.live = Some(SourceId(2))));
         rig.frame_with(vec![]);
         rig.frame_with(vec![]);
         assert_eq!(rig.app.window_title, "Tuner — Live TV · Bravo");
@@ -4932,14 +4954,14 @@ mod tests {
         assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("This channel is hidden by parental control (Settings ▸ Parental)"));
         assert!(no_late_night(&rig.log()));
 
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.parental.show_explicit = true));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.parental.show_explicit = true));
         rig.frame_with(vec![]);
         rig.until("explicit content shown", |r| r.app.lib.live.by_ref(&explicit_ref()).is_some());
         let xxx = rig.app.lib.live.groups.iter().find(|g| g.name == "XXX").map(|g| g.id).unwrap();
         let cfg = rig.app.services().config();
         assert_eq!(rig.app.zap_list(xxx, &cfg).map(|z| z.channels.len()), Some(1));
 
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.parental.show_explicit = false));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.parental.show_explicit = false));
         rig.frame_with(vec![]);
         assert_eq!(rig.app.lib.live.by_ref(&explicit_ref()), None, "hidden in the same frame");
         assert!(rig.app.zap_list(xxx, &cfg).is_none());
@@ -5747,7 +5769,7 @@ mod tests {
     fn network_settings_reach_the_shared_http_client_live() {
         let mut rig = Rig::new();
         let images_and_jobs = rig.app.services().jobs.context().http.clone();
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.player.user_agent = "Live/1".into()));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.player.user_agent = "Live/1".into()));
         rig.frame_with(vec![]);
         assert_eq!(rig.app.services().http.default_user_agent(), "Live/1");
         assert_eq!(images_and_jobs.default_user_agent(), "Live/1", "every clone follows");
@@ -5770,7 +5792,7 @@ mod tests {
     fn config_edits_are_saved_and_applied() {
         let mut rig = Rig::new();
         let file = rig.app.services().paths.config_file();
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.player.cache_secs = 33));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.player.cache_secs = 33));
         rig.frame_with(vec![]);
         assert_eq!(rig.app.services().config().player.cache_secs, 33);
         assert_eq!(Config::load(&file).unwrap().player.cache_secs, 33);
@@ -5785,14 +5807,84 @@ mod tests {
             .collect();
         assert_eq!(applied, [33]);
         // an edit that changes nothing sends nothing
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.player.cache_secs = 33));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.player.cache_secs = 33));
         rig.frame_with(vec![]);
         assert_eq!(rig.log().commands.iter().filter(|c| matches!(c, PlayerCommand::ApplyConfig(_))).count(), 1);
         // UI scale re-derives the theme
         let rem = rig.app.theme.rem();
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.interface.ui_scale = 1.5));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.interface.ui_scale = 1.5));
         rig.frame_with(vec![]);
         assert!((rig.app.theme.rem() - rem * 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn settings_search_ctrl_k_opens_and_focuses_a_real_setting() {
+        let mut rig = Rig::new();
+        rig.settle();
+        rig.press(Key::K, CTRL);
+        assert_eq!(rig.app.overlays.len(), 1);
+        for c in "start screen".chars() {
+            rig.frame_with(vec![Event::Text(c.to_string())]);
+        }
+        rig.until("the settings hit", |r| {
+            let out = r.frame_with(vec![]);
+            find(&texts(&out), "Start screen · Interface").is_some()
+        });
+        rig.press(Key::Enter, NONE);
+        assert!(matches!(rig.route(), Route::Setting(target) if target.page == crate::ui::SettingsPage::Interface));
+        assert!(rig.app.overlays.is_empty());
+        let log = crate::config::audit::capture(|| {
+            rig.press(Key::ArrowRight, NONE);
+        });
+        assert_eq!(rig.app.services().config().general.start_screen, crate::config::StartScreen::Live);
+        assert_eq!(log.lines().filter(|line| line.contains("settings:")).count(), 1, "{log}");
+        assert!(log.contains("start screen Home → Live TV (key →)"), "{log}");
+        rig.frame_with("open on".chars().map(|c| Event::Text(c.to_string())).collect());
+        assert_eq!(rig.app.key_stack().first(), Some(&KeyContext::ListFiltering), "a batch of text, including space, keeps filtering");
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.app.key_stack().first(), Some(&KeyContext::Panel));
+    }
+
+    #[test]
+    fn settings_audit_logs_real_edits_once_with_redacted_input() {
+        use crate::player::audio_output::AudioOutput;
+        let mut rig = Rig::new();
+        let log = crate::config::audit::capture(|| {
+            rig.app.with_ctx(|ctx, _, _| {
+                ctx.config_input = "key →";
+                ctx.edit_config(|c| c.general.start_screen = crate::config::StartScreen::Live);
+            });
+            rig.app.apply_config_edits(&rig.ctx);
+            rig.app.apply_config_edits(&rig.ctx);
+        });
+        assert_eq!(log.lines().filter(|line| line.contains("settings:")).count(), 1, "{log}");
+        assert!(log.contains("INFO") && log.contains("settings: start screen Home → Live TV (key →)"), "{log}");
+        let output = AudioOutput { name: "private-output".into(), label: "Private living room".into() };
+        let presses = crate::config::audit::capture(|| {
+            for _ in 0..4 {
+                rig.app.with_ctx(|ctx, _, _| {
+                    ctx.config_input = "key ]";
+                    ctx.edit_lip_sync(output.clone(), Some(1));
+                });
+                rig.app.apply_config_edits(&rig.ctx);
+            }
+        });
+        assert!(!presses.contains("settings:"), "{presses}");
+        let saved = crate::config::audit::capture(|| {
+            rig.app.config_save_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+            rig.app.apply_config_edits(&rig.ctx);
+            rig.app.apply_config_edits(&rig.ctx);
+        });
+        assert_eq!(saved.lines().filter(|line| line.contains("settings:")).count(), 1, "{saved}");
+        assert!(saved.contains("audio delay for the current output +0 ms → +200 ms (key ])"), "{saved}");
+        assert!(!saved.contains("private-output") && !saved.contains("Private living room"), "{saved}");
+        let agent = crate::config::audit::capture(|| {
+            rig.event(AppEvent::Agent(crate::agent::AgentCommand::MultiView(crate::agent::AgentMultiView::Swap(
+                crate::agent::MultiViewSwap::Layout(crate::config::MultiViewLayout::Pip),
+            ))));
+            rig.app.apply_config_edits(&rig.ctx);
+        });
+        assert!(agent.contains("settings:") && agent.contains("(agent)"), "{agent}");
     }
 
     #[test]
@@ -5854,20 +5946,20 @@ mod tests {
         // notification reminders on and off
         let notifies = |rig: &Rig| rig.app.services().integrations.reminders.as_ref().map(|r| r.notifies());
         assert_eq!(notifies(&rig), Some(false));
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.reminders.enabled = true));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.reminders.enabled = true));
         rig.frame_with(vec![]);
         assert_eq!(notifies(&rig), Some(true));
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.reminders.enabled = false));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.reminders.enabled = false));
         rig.frame_with(vec![]);
         assert_eq!(notifies(&rig), Some(false));
         // follow the Omarchy theme (fake home: nothing there → fallback palette, loaded on a
         // worker), then stop following
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.integration.follow_omarchy_theme = true));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.integration.follow_omarchy_theme = true));
         rig.frame_with(vec![]);
         assert!(rig.app.services().integrations.theme_watch.is_some());
         let before = Arc::as_ptr(&rig.app.theme);
         rig.until("the reloaded theme", |r| Arc::as_ptr(&r.app.theme) != before);
-        rig.app.config_edits.push(Box::new(|c: &mut Config| {
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| {
             c.integration.follow_omarchy_theme = false;
             c.interface.ui_scale = 1.25;
         }));
@@ -6651,7 +6743,7 @@ mod tests {
         // an offer that waited while the switch was turned off isn't shown; the version is
         // recorded instead
         rig.press(Key::Escape, NONE);
-        rig.app.config_edits.push(Box::new(|c: &mut Config| {
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| {
             c.agents.offer_connect = false;
             c.agents.checked_version = None;
         }));
@@ -6976,7 +7068,7 @@ mod tests {
         assert!(rig.app.overlays.is_empty());
         assert_eq!(rig.app.services().config().cast.checked_version.as_deref(), Some(TUNER_VERSION), "Not now answers this version");
 
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.cast.checked_version = None));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.cast.checked_version = None));
         let mut paired =
             crate::cast::Device::new(living_room(), "Living Room", crate::model::cast::ReceiverKind::AppleTv, crate::cast::Protocol::AirPlay);
         paired.pairing = crate::cast::Pairing::Paired(crate::cast::PairVariant::Hkp3);

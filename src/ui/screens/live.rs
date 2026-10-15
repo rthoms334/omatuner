@@ -2527,7 +2527,7 @@ mod tests {
         open(&mut h, Entry::All);
 
         let pick = |h: &mut egui_kittest::Harness<'static, testkit::App<LiveScreen>>, id| {
-            h.state_mut().t.config_edits.push(Box::new(move |c| c.interface.playlist_scope.live = Some(id)));
+            h.state_mut().t.config_edits.push(crate::config::audit::edit("key", move |c| c.interface.playlist_scope.live = Some(id)));
             h.state_mut().apply_config();
             h.run_steps(2);
         };
@@ -2581,7 +2581,7 @@ mod tests {
         h.run_steps(2);
         assert_eq!(h.state().s.open, Some(Entry::FavList(list)), "returning keeps the group");
 
-        h.state_mut().t.config_edits.push(Box::new(|c| c.interface.live_opens_on = LiveOpensOn::Favourites));
+        h.state_mut().t.config_edits.push(crate::config::audit::edit("key", |c| c.interface.live_opens_on = LiveOpensOn::Favourites));
         h.state_mut().apply_config();
         assert_eq!(first_open(&mut h), Some(Entry::FavList(list)));
         assert_eq!(h.state().s.cursor_channel(), Some(chs[2]));

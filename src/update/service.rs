@@ -172,7 +172,7 @@ struct State {
     status: UpdateStatus,
     ui: Option<UiNow>,
     /// The passwordless switch changed: the app saves it into the config.
-    config_change: Option<bool>,
+    config_change: Option<(bool, &'static str)>,
     /// When the next check is due (unix seconds).
     next: Option<Timestamp>,
     quiet: QuietTimer,
@@ -290,6 +290,10 @@ impl Updater {
 
     /// The passwordless switch's new state to save, once (the app's frame).
     pub fn take_config_change(&self) -> Option<bool> {
+        self.take_config_edit().map(|(on, _)| on)
+    }
+
+    pub fn take_config_edit(&self) -> Option<(bool, &'static str)> {
         self.state().config_change.take()
     }
 
@@ -329,6 +333,10 @@ impl Updater {
     /// The passwordless switch: the helper writes (or removes) the polkit rule, asking for the
     /// password; the config follows only once it did ([`Updater::take_config_change`]).
     pub fn set_passwordless(&self, on: bool) {
+        self.set_passwordless_from(on, "system");
+    }
+
+    pub fn set_passwordless_from(&self, on: bool, input: &'static str) {
         {
             let mut st = self.state();
             if !matches!(st.status.mode, Some(Mode::Managed { .. })) || matches!(st.status.switch, Some(SwitchOp::Working(_))) {
@@ -348,7 +356,7 @@ impl Updater {
                     o => Some(SwitchOp::Failed(o.text())),
                 };
                 if matches!(outcome, Outcome::Done(_)) {
-                    st.config_change = Some(on);
+                    st.config_change = Some((on, input));
                 }
                 match &st.status.phase {
                     Phase::Ready { release, path, .. } if on && matches!(outcome, Outcome::Done(_)) => {

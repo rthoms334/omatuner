@@ -17,7 +17,7 @@
 //! VS Code, Zed and any other MCP agent: add the command tuner mcp in its MCP settings.
 //!  Copy "tuner mcp" ·  Copy the VS Code command ·  Copy the README link
 //! ```
-//! Enter (or a click, `x`, the gear) on an agent opens its menu: Connect / Repair, Update,
+//! Enter (or a click, Delete, the gear) on an agent opens its menu: Connect / Repair, Update,
 //! Disconnect… (a destructive confirm), and the Copy actions (the setup command, Cursor's JSON
 //! and its file, how to remove it by hand, the README link). A busy row has no menu. Every
 //! change runs in the background (`AgentConnect::run`) and toasts its result; the rows are the

@@ -39,6 +39,40 @@ use nucleo::pattern::{CaseMatching, Normalization};
 use crate::model::{ChannelId, GroupId, MovieId, ProgrammeHit, SeriesId, SourceId, Timestamp, VodKind};
 use crate::store::library::Library;
 
+/// A small settings document, built from a visible page row. Fold once, match on each key.
+#[derive(Clone, Debug)]
+pub struct SettingDocument {
+    title: String,
+    description: String,
+    words: String,
+}
+
+impl SettingDocument {
+    pub fn new(title: &str, description: &str, words: &[&str]) -> Self {
+        use crate::textmatch::fold::folded;
+        Self { title: folded(title), description: folded(description), words: folded(&words.join(" ")) }
+    }
+
+    /// Every query word is a prefix. Lower scores rank first; title, description, aliases.
+    pub fn score(&self, query: &str) -> Option<u32> {
+        let query = crate::textmatch::fold::folded(query);
+        if query.is_empty() {
+            return None;
+        }
+        if query == self.title {
+            return Some(0);
+        }
+        let mut score = 1;
+        for token in query.split_whitespace() {
+            let rank = [&self.title, &self.description, &self.words]
+                .iter()
+                .position(|field| field.split_whitespace().any(|word| word.starts_with(token)))?;
+            score += [0, 10, 100][rank];
+        }
+        Some(score)
+    }
+}
+
 /// Libraries up to this size are injected on the calling thread.
 const SYNC_INJECT_MAX: usize = 4096;
 /// Matcher threads (nucleo's rayon pool); matching 170k short strings needs few.
@@ -83,10 +117,12 @@ pub enum SearchSection {
     Movies,
     Series,
     Guide,
+    Settings,
 }
 
 impl SearchSection {
-    pub const ALL: [SearchSection; 5] = [SearchSection::All, SearchSection::Live, SearchSection::Movies, SearchSection::Series, SearchSection::Guide];
+    pub const ALL: [SearchSection; 6] =
+        [SearchSection::All, SearchSection::Live, SearchSection::Movies, SearchSection::Series, SearchSection::Guide, SearchSection::Settings];
 
     fn accepts(self, t: SearchTarget) -> bool {
         matches!(
@@ -961,5 +997,21 @@ mod tests {
             delete_last_word(&mut q);
             assert_eq!(q, want, "{raw:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::SettingDocument;
+    #[test]
+    fn settings_word_prefixes_fold_accents_and_rank_fields() {
+        let title = SettingDocument::new("Thème size", "", &[]);
+        let description = SettingDocument::new("Appearance", "Theme size", &[]);
+        let alias = SettingDocument::new("Look", "", &["theme size"]);
+        assert_eq!(title.score("THÉME SIZE"), Some(0));
+        assert!(title.score("the si") < description.score("the si"));
+        assert!(description.score("the si") < alias.score("the si"));
+        assert_eq!(title.score("heme"), None);
+        assert_eq!(title.score("theme absent"), None);
     }
 }

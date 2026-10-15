@@ -488,7 +488,7 @@ mod tests {
     fn answered(h: &mut H) -> Config {
         let mut c = Config::default();
         for e in h.state_mut().t.config_edits.drain(..) {
-            e(&mut c);
+            (e.apply)(&mut c);
         }
         c
     }

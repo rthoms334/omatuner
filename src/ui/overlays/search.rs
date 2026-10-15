@@ -76,6 +76,7 @@ enum Row {
     Hit(SearchHit),
     Guide(ProgrammeHit),
     Watchlist(crate::model::WatchlistId, String),
+    Setting(crate::ui::screens::settings::SettingTarget),
 }
 
 impl Row {
@@ -85,6 +86,10 @@ impl Row {
 }
 
 pub struct SearchOverlay {
+    settings_loader: Option<crate::ui::screens::settings::SettingsScreen>,
+    settings_rows: Vec<crate::ui::screens::settings::IndexedRow>,
+    settings_visibility: Option<(u64, bool, bool)>,
+
     query: String,
     section: SearchSection,
     /// Index into the selectable rows.
@@ -110,6 +115,9 @@ pub struct SearchOverlay {
 impl SearchOverlay {
     pub fn new(initial: String) -> Self {
         Self {
+            settings_loader: None,
+            settings_rows: Vec::new(),
+            settings_visibility: None,
             query: initial,
             section: SearchSection::All,
             cursor: 0,
@@ -166,6 +174,16 @@ impl SearchOverlay {
     fn activate(&mut self, ctx: &mut UiCtx<'_>, row: Row, alt: bool) -> OverlayOutcome {
         match row {
             Row::Header(_) => OverlayOutcome::Keep,
+            Row::Setting(target) => {
+                let visibility = (ctx.lib.generation, ctx.parental.hides_explicit(&ctx.config.parental), ctx.config.parental.pin_hash.is_some());
+                if self.settings_visibility != Some(visibility) {
+                    self.ensure_settings(ctx);
+                    self.build_rows(ctx);
+                    return OverlayOutcome::Keep;
+                }
+                ctx.push(Route::Setting(target));
+                OverlayOutcome::Close
+            }
             Row::Watchlist(id, _) => {
                 ctx.push(Route::Watchlists { list: Some(id) });
                 OverlayOutcome::Close
@@ -354,7 +372,7 @@ impl SearchOverlay {
             shortcut: Some(shortcut.into()),
         };
         let (title, items) = match row {
-            Row::Header(_) | Row::Watchlist(_, _) => return,
+            Row::Header(_) | Row::Watchlist(_, _) | Row::Setting(_) => return,
             Row::Guide(g) => {
                 let (play, play_label) = match guide_channel(ctx, g) {
                     Some((_, p)) if p.contains(ctx.now) => (glyphs::PLAY, "Watch"),
@@ -420,6 +438,25 @@ impl SearchOverlay {
     }
 
     /// Build or refresh the shared index (lazily, also after a lock change).
+    fn ensure_settings(&mut self, ctx: &mut UiCtx<'_>) {
+        let visibility = (ctx.lib.generation, ctx.parental.hides_explicit(&ctx.config.parental), ctx.config.parental.pin_hash.is_some());
+        if self.settings_visibility != Some(visibility) {
+            let mut settings = crate::ui::screens::settings::SettingsScreen::default();
+            settings.load_search_pages(ctx);
+            self.settings_rows.clear();
+            self.settings_loader = Some(settings);
+            self.settings_visibility = Some(visibility);
+            self.rows_key = None;
+        }
+        if let Some(settings) = &mut self.settings_loader
+            && settings.poll_search_pages(ctx)
+        {
+            self.settings_rows = settings.indexed_rows(ctx);
+            self.settings_loader = None;
+            self.rows_key = None;
+        }
+    }
+
     fn ensure_index(&mut self, egui_ctx: &egui::Context, ctx: &mut UiCtx<'_>) {
         let unlocked = kit::unlocked(ctx);
         if ctx.search_index.is_some() && BUILT_UNLOCKED.get() == Some(unlocked) {
@@ -481,6 +518,20 @@ impl SearchOverlay {
             self.rows = rows;
             return;
         }
+        let mut settings: Vec<_> = if matches!(self.section, SearchSection::All | SearchSection::Settings) {
+            self.settings_rows.iter().filter_map(|row| row.document.score(&self.query).map(|score| (score, row.target.clone()))).collect()
+        } else {
+            Vec::new()
+        };
+        settings.sort_by_key(|(score, _)| *score);
+        if self.section == SearchSection::All {
+            settings.truncate(5);
+        }
+        let exact = settings.first().is_some_and(|(score, _)| *score == 0);
+        if exact {
+            rows.push(Row::Header("Settings"));
+            rows.extend(settings.iter().filter(|(score, _)| *score == 0).map(|(_, target)| Row::Setting(target.clone())));
+        }
         // one row per stack: its best-matching copy (DESIGN §29.14)
         let mut seen = std::collections::HashSet::new();
         let hits = ctx
@@ -515,6 +566,11 @@ impl SearchOverlay {
                 self.chips.insert(rows.len(), st::playlists_of(stacks, stacks.members(s), st::all(ctx.lib, movies)));
             }
             rows.push(Row::Hit(h));
+        }
+        let remaining: Vec<_> = settings.into_iter().filter(|(score, _)| *score != 0).collect();
+        if !remaining.is_empty() {
+            rows.push(Row::Header("Settings"));
+            rows.extend(remaining.into_iter().map(|(_, target)| Row::Setting(target)));
         }
         if matches!(self.section, SearchSection::All | SearchSection::Guide) {
             let guide = self.guide_hits(ctx);
@@ -558,7 +614,7 @@ pub(crate) fn hit_matches(query: &str, title: &str, sub_title: Option<&str>) -> 
 fn row_target(ctx: &UiCtx<'_>, row: &Row) -> Option<crate::ui::item_menu::Target> {
     use crate::ui::item_menu::Target;
     Some(match row {
-        Row::Header(_) | Row::Watchlist(_, _) => return None,
+        Row::Header(_) | Row::Watchlist(_, _) | Row::Setting(_) => return None,
         Row::Guide(g) => {
             let (channel, p) = guide_channel(ctx, g)?;
             Target::Programme { programme: p.id, channel }
@@ -651,6 +707,7 @@ impl Overlay for SearchOverlay {
             self.rows_key = None;
         }
 
+        self.ensure_settings(ctx);
         self.ensure_index(egui_ctx, ctx);
         let mut matched = false;
         if let Some(idx) = ctx.search_index.as_mut() {
@@ -694,6 +751,7 @@ impl Overlay for SearchOverlay {
                         SearchSection::Movies => "Movies",
                         SearchSection::Series => "Series",
                         SearchSection::Guide => "Guide",
+                        SearchSection::Settings => "Settings",
                     };
                     if button(ui, theme, None, label, ButtonStyle { selected: s == self.section, ..Default::default() }).clicked() {
                         section_clicked = Some(s);
@@ -772,6 +830,17 @@ impl Overlay for SearchOverlay {
                                 rect.left_center() + egui::vec2(16.0, 0.0),
                                 Align2::LEFT_CENTER,
                                 format!("{}  {name}", glyphs::FAV_LIST),
+                                egui::FontId::proportional(theme.font(TypeToken::Body)),
+                                theme.tokens.fg,
+                            );
+                        }
+                        Row::Setting(target) => {
+                            let label = format!("{} · {}", target.title, target.page_name());
+                            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+                            ui.painter().text(
+                                rect.left_center() + egui::vec2(16.0, 0.0),
+                                Align2::LEFT_CENTER,
+                                label,
                                 egui::FontId::proportional(theme.font(TypeToken::Body)),
                                 theme.tokens.fg,
                             );
@@ -963,6 +1032,72 @@ mod tests {
     use crate::ui::screens::home::testkit::{self, has_label, overlay_harness, rig, seed, until_ov};
 
     #[test]
+    fn settings_hits_rank_open_the_setting_and_respect_visibility() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            let channels = testkit::channels(c, src, 1)?;
+            c.execute("UPDATE channel SET name = 'Start screen channel', clean_name = 'Start screen channel' WHERE id = ?1", [channels[0].0])?;
+            Ok(())
+        });
+        let mut h = overlay_harness(t, one, SearchOverlay::new("start".into()), egui::vec2(1400.0, 900.0));
+        until_ov(&mut h, "settings and channels", |h| has_label(h, "Start screen · Interface") && has_label(h, "Start screen channel"));
+        assert!(matches!(h.state().o.current(), Some(Row::Hit(_))), "content before partial settings matches");
+        for c in " screen".chars() {
+            h.state_mut().act(Action::FilterInput(c));
+        }
+        h.run_steps(2);
+        assert!(matches!(h.state().o.current(), Some(Row::Setting(_))), "exact title first");
+        assert_eq!(h.state_mut().act(Action::Activate), "Close");
+        let nav = h.state_mut().nav();
+        let [crate::ui::NavRequest::Push(Route::Setting(target))] = nav.as_slice() else { panic!("{nav:?}") };
+        assert_eq!(target.page, crate::ui::SettingsPage::Interface);
+        assert_eq!(target.title, "Start screen");
+        h.state_mut().act(Action::FilterClear);
+        for c in "open on".chars() {
+            h.state_mut().act(Action::FilterInput(c));
+        }
+        h.run_steps(2);
+        assert!(has_label(&h, "Start screen · Interface"));
+        h.state_mut().act(Action::FilterClear);
+        for c in "same title".chars() {
+            h.state_mut().act(Action::FilterInput(c));
+        }
+        h.run_steps(2);
+        assert!(!h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(_))));
+    }
+
+    #[test]
+    fn settings_search_drops_concealed_hits_when_visibility_changes() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            c.execute(
+                "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_order, item_count, seen_gen, explicit)
+                VALUES (?1, 'channel', 'channel:secret', 'Concealed category', 'Concealed category', 0, 0, 1, 1)",
+                [src],
+            )?;
+            Ok(())
+        });
+        let shown = crate::store::library::load(&t.services().store.reader().unwrap()).unwrap();
+        t.set_library(shown);
+        let mut cfg = (*t.config).clone();
+        cfg.parental.show_explicit = true;
+        t.config = Arc::new(cfg);
+        let mut h = overlay_harness(t, one, SearchOverlay::new("concealed".into()), egui::vec2(1400.0, 900.0));
+        until_ov(&mut h, "the visible category setting", |h| has_label(h, "Concealed category · Parental"));
+        let mut cfg = (*h.state().t.config).clone();
+        cfg.parental.show_explicit = false;
+        h.state_mut().t.config = Arc::new(cfg);
+        let hidden = h.state().t.lib.hiding_explicit();
+        h.state_mut().t.set_library(hidden);
+        h.run_steps(2);
+        assert!(!h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(_))));
+        until_ov(&mut h, "the rebuilt settings index", |h| h.state().o.settings_loader.is_none());
+        assert!(!h.state().o.rows.iter().any(|r| matches!(r, Row::Setting(_))));
+    }
+
+    #[test]
     fn keyboard_scroll_returns_to_the_first_section_header() {
         use egui_kittest::kittest::Queryable;
         let (mut t, one) = rig();
@@ -972,7 +1107,7 @@ mod tests {
             Ok(())
         });
         let mut h = overlay_harness(t, one, SearchOverlay::new("Channel".into()), egui::vec2(800.0, 500.0));
-        until_ov(&mut h, "channel hits", |h| has_label(h, "LIVE"));
+        until_ov(&mut h, "channel and settings hits", |h| has_label(h, "LIVE") && h.state().o.settings_loader.is_none());
         h.run_steps(30);
         let top = h.get_by_label("LIVE").rect().top();
         let n = h.state().o.selectable().len();
@@ -1236,7 +1371,7 @@ mod tests {
         assert_eq!(o.section, SearchSection::Live);
         let _ = o.cycle_section(false);
         let _ = o.cycle_section(false);
-        assert_eq!(o.section, SearchSection::Guide, "wraps backwards");
+        assert_eq!(o.section, SearchSection::Settings, "wraps backwards");
         let _ = o.edit(|q| q.push_str("bbc"));
         assert_eq!(o.query, "bbc");
     }
