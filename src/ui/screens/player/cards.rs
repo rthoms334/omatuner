@@ -694,6 +694,12 @@ mod tests {
         countdown(&mut h);
         assert!(card_shown(&h), "{:?}", painted(&h));
         assert!(has_label(&h, "Play now") && has_label(&h, "List") && has_label(&h, "Cancel"));
+        assert!(h.state_mut().act(Action::PlayerSettings));
+        assert!(h.state_mut().act(Action::Activate));
+        assert!(h.state_mut().act(Action::Back), "close the tracks sub-page");
+        assert!(h.state().s.settings.is_some() && card_shown(&h));
+        assert!(h.state_mut().act(Action::Back), "close the cog");
+        assert!(h.state().s.settings.is_none() && card_shown(&h));
         assert!(h.state_mut().act(Action::LeaveOsdControls));
         until(&mut h, "the card cancelled", |h| !card_shown(h));
         assert!(h.state().s.key_contexts().contains(&KeyContext::PlayerOsd), "the controls keep the focus");
@@ -736,11 +742,10 @@ mod tests {
         s.osd_focus.then(|| s.visible.get(s.control).copied()).flatten()
     }
 
-    /// The OSD row has `Up next` (the panel) and, once Up next has a next item, `Next`, for
-    /// the mouse and the controls focus alike: the button appearing doesn't move the focus,
-    /// Enter on `Next` plays the next item and a click on `Up next` opens the panel.
+    /// Next appearing keeps focus on its control; Enter plays it. Up next's panel opens
+    /// from the cog with the same action as its former row button.
     #[test]
-    fn the_osd_has_up_next_and_next_buttons() {
+    fn the_osd_has_next_and_the_cog_opens_up_next() {
         use crate::ui::item_menu::Target;
         use crate::ui::screens::home::testkit::{movies, seed, source, until};
         use egui_kittest::kittest::Queryable;
@@ -752,9 +757,9 @@ mod tests {
         let (mut h, rec) = player_on(t, one, false, egui::vec2(1600.0, 900.0));
         assert!(h.state_mut().act(Action::FocusOsdControls));
         h.run_steps(2);
-        assert!(has_label(&h, "Up next") && !has_label(&h, "Next in Up next"), "Up next is empty: no Next");
-        // the focus on Info, then Up next gets two films: Next comes in before Info
-        while focused(&h) != Some(Control::Info) {
+        assert!(!has_label(&h, "Up next") && !has_label(&h, "Next in Up next"), "Up next is empty: no Next");
+        // Audio & subtitles keeps focus when Next appears immediately before it
+        while focused(&h) != Some(Control::AudioSubtitles) {
             assert!(h.state_mut().act(Action::Right));
             h.run_steps(1);
         }
@@ -763,7 +768,7 @@ mod tests {
         }
         until(&mut h, "the Next button", |h| has_label(h, "Next in Up next"));
         h.run_steps(1);
-        assert_eq!(focused(&h), Some(Control::Info), "the focus stays on Info");
+        assert_eq!(focused(&h), Some(Control::AudioSubtitles), "the focus stays on Audio & subtitles");
         assert!(h.state_mut().act(Action::Left));
         h.run_steps(1);
         assert_eq!(focused(&h), Some(Control::QueueNext));
@@ -772,6 +777,8 @@ mod tests {
             rec.0.lock().unwrap().iter().any(|c| matches!(c, PlayerCommand::PlayCopy(c) if c.req.media == MediaRef::Movie(ms[0])))
         });
         assert!(h.state().s.panel.is_none());
+        h.get_by_label("Player settings").click();
+        h.run_steps(3);
         h.get_by_label("Up next").click();
         h.run_steps(2);
         assert_eq!(h.state().s.panel.as_ref().map(|p| p.kind), Some(PanelKind::Queue), "the button opens the panel");

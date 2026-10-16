@@ -62,6 +62,8 @@ pub enum KeyContext {
     /// Controls focus mode (entered with Enter / `i` / Tab): arrows move
     /// between OSD controls; unbound keys fall through to PlayerLive/Vod.
     PlayerOsd,
+    /// The player cog pop-up and its sub-pages (DESIGN §13.8).
+    PlayerSettings,
     /// Typing a channel number (player, guide): digits, Enter, Backspace, Esc.
     NumericEntry,
     /// EPG mapping screen extras (assign / clear), stacked above a list context.
@@ -95,7 +97,7 @@ pub enum KeyContext {
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 22] = [
+    pub const ALL: [KeyContext; 23] = [
         KeyContext::Global,
         KeyContext::Watchlists,
         KeyContext::List,
@@ -108,6 +110,7 @@ impl KeyContext {
         KeyContext::PlayerLive,
         KeyContext::PlayerVod,
         KeyContext::PlayerOsd,
+        KeyContext::PlayerSettings,
         KeyContext::MultiView,
         KeyContext::PopOut,
         KeyContext::NumericEntry,
@@ -133,6 +136,7 @@ impl KeyContext {
             KeyContext::PlayerLive => "Player — live TV",
             KeyContext::PlayerVod => "Player — movies, episodes, catch-up",
             KeyContext::PlayerOsd => "Player — on-screen controls",
+            KeyContext::PlayerSettings => "Player — settings menu",
             KeyContext::PopOut => "Pop-out player",
             KeyContext::NumericEntry => "Channel number entry",
             KeyContext::EpgMapping => "Guide fixes",
@@ -281,6 +285,7 @@ pub enum Action {
     FocusOsdControls,
     /// Esc in controls focus mode: leave it (the info banner stays until its timeout).
     LeaveOsdControls,
+    PlayerSettings,
     StreamInfo,
     AudioMenu,
     SubtitleMenu,
@@ -733,6 +738,7 @@ pub static PLAYER_COMMON: &[Binding] = &[
     b(C::key(Key::Enter), A::FocusOsdControls, "On-screen controls"),
     b(C::ch('i'), A::FocusOsdControls, "On-screen controls"),
     b(C::key(Key::Tab), A::FocusOsdControls, "On-screen controls"),
+    b(C::ch('O'), A::PlayerSettings, "Player settings…"),
     b(C::ch('I'), A::StreamInfo, "Stream info (codec, resolution, bitrate)"),
     b(C::ch('a'), A::CycleAudio, "Next audio track"),
     b(C::ch('A'), A::AudioMenu, "Audio tracks…"),
@@ -818,6 +824,20 @@ pub static PLAYER_OSD: &[Binding] = &[
     b(C::key(Key::Tab), A::FocusNext, "Next / previous control"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous control"),
     b(C::key(Key::Escape), A::LeaveOsdControls, "Leave the controls"),
+];
+
+/// The cog keeps navigation inside the pop-up; other player shortcuts still work.
+pub static PLAYER_SETTINGS: &[Binding] = &[
+    b(C::key(Key::ArrowUp), A::Up, "Previous / next menu row"),
+    b(C::key(Key::ArrowDown), A::Down, "Previous / next menu row"),
+    b(C::key(Key::Tab), A::FocusNext, "Next / previous menu row"),
+    b(C::shift(Key::Tab), A::FocusPrev, "Next / previous menu row"),
+    b(C::key(Key::Enter), A::Activate, "Open / choose / reset value"),
+    b(C::key(Key::Space), A::Activate, "Open / choose / reset value"),
+    b(C::key(Key::ArrowRight), A::Right, "Open / choose / increase value"),
+    b(C::key(Key::ArrowLeft), A::Back, "Back a page, then close"),
+    b(C::key(Key::Backspace), A::Back, "Back a page, then close"),
+    b(C::key(Key::Escape), A::Back, "Back a page, then close"),
 ];
 
 /// The popped-out (video-only) player, above `PlayerLive` / `PlayerVod`: every player key
@@ -1045,6 +1065,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
         KeyContext::PlayerLive => vec![PLAYER_LIVE, PLAYER_COMMON],
         KeyContext::PlayerVod => vec![PLAYER_VOD, PLAYER_COMMON],
         KeyContext::PlayerOsd => vec![PLAYER_OSD],
+        KeyContext::PlayerSettings => vec![PLAYER_SETTINGS],
         KeyContext::PopOut => vec![POP_OUT],
         KeyContext::NumericEntry => vec![NUMERIC_ENTRY],
         KeyContext::EpgMapping => vec![EPG_MAPPING],
