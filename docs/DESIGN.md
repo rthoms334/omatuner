@@ -1633,8 +1633,8 @@ never the screens below. Only user keys pop the window back in: `p` (keep playin
 window can't); a finished movie returning to its page stays popped out ("Nothing playing")
 with the page waiting underneath. Key stack: the player's contexts with `PopOut` right above
 `PlayerLive`/`PlayerVod` — Esc pops back in once a side panel, number entry or controls focus
-has had it. The compact OSD strip (title · volume, what's on or the position, "o · Esc back"
-when at least 360 px wide) shows for the usual OSD time after popping out.
+has had it. The compact OSD strip (title · return, what's on or the position, and the
+essential controls with their cog) shows for the usual OSD time after popping out.
 
 ---
 
@@ -2031,24 +2031,45 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
 │ 󰁍 ▣ 101  BBC One HD                                                              20:26  │ ← top OSD
 │                                                                                          │
-│                              ⟲ 10       ▶ / ❚❚       10 ⟳                                │
+│                                                                                          │
 │                                                                    ┌ CHANNELS (c) ─────┐ │
 │                                                                    │ 100 BBC Parliament │ │
 │                                                                    │▸101 BBC One        │ │
 │ News at Eight                                     20:00 – 21:00    │ 102 BBC Two        │ │
 │ ▕██████████████████░░░░░░░░░░░░░░░▏                34 min left     └────────────────────┘ │
 │ Next  21:00 Drama                                    [HD] [5.1] [CC] [⟲]                  │
-│ 󰒮   󰒭  󰗅 English (AC-3 5.1)  󰨖 Off  󰐑 Channels  󰃰 Guide  󰋚 History  󰋽 Info 󰊓 󰏌  󰕾 ━━━●─┊─ 80 % │
+│ ⟲  ▶ / ❚❚  ⟳  Live  󰒮  󰒭  󰕾 ━━━●─┊─ 80 %              Next  󰗅  Cast  󰊓  ⚙             │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
 ```
-The centre transport is **⟲ 10 · play/pause · 10 ⟳**, sized for the picture; the
-bottom row retains channel navigation, tracks, Up next, Next, Info, volume and window controls.
-Skip buttons appear only while the snapshot is seekable (including a live cache with a
-range). All three centre buttons share banner visibility and the controls focus walk;
-clicking acts without entering focus mode. Narrow full-player layouts use smaller centre
-buttons. The mini player keeps its existing compact UI; the pop-out keeps its transport
-strip and uses the full controls row in focus mode.
+The bottom row keeps the essentials, in order:
+
+* Left: skip back · play/pause · skip forward (skips only while seekable, including a live
+  cache range) · Back to live (only behind the live edge) · previous/next channel (live) ·
+  speaker and volume slider.
+* Right: Next in Up next (only with a next item, outside multi-view) · Audio & subtitles
+  (one glyph, no track names, tooltip) · Cast (while casting is on or a cast is running,
+  outside multi-view) · Fullscreen · **⚙ Player settings**.
+
+The cog opens a **pop-up rising from the cog**, with these rows and their shortcuts:
+Audio & subtitles › (`A` / `S`), Delay › (`[` / `]`, `z` / `x`), Channels (`c`), Guide (`g`),
+History (`H`), Up next (`u`), Info (`I`), Pop out (`Ctrl+Shift+O`). Channels, Guide and History
+are live-only; Up next requires the feature; Pop out is absent in the popped-out window and
+while casting. Tracks and Delay are absent while casting. Each moved control keeps its former
+action. `H` and `I` retain their existing uppercase bindings (`i` still enters OSD focus).
+
+The row's Audio & subtitles button opens the same pop-up directly on its track page: audio
+tracks and subtitle tracks (including Off), with current selections ticked. Picking a track
+applies it and closes, like the existing pickers. Delay is another page in the same pop-up:
+local output lip sync (50 ms steps, reset) and subtitle delay (100 ms steps, click to reset;
+§13.8.1). The earlier/later buttons and existing delay keys adjust without closing it.
+`A` and `S` still open their existing pickers, including subtitle size controls.
+
+`O` (Shift+O) opens the cog; lowercase `o` keeps its existing pop-out binding. The OSD focus
+walk includes Audio & subtitles and the cog; Enter or Space on the cog opens it. In the
+pop-up, ↑/↓ (or Tab/Shift+Tab) move, Enter/→ open or choose, ←/Backspace/Esc go back a page,
+then close. Enter resets a focused delay value; → increases it. A click outside closes the
+pop-up without activating the covered control. The OSD stays visible while it is open.
 
 A successful skip paints a non-interactive circle on its side of the picture for one second.
 Same-direction skips within one second add up; the target is a VOD clock or live offset.
@@ -2065,17 +2086,19 @@ The OSD has two layers (UX review B1):
   click on a control just activates it, so the arrows keep zapping / seeking; pushes
   `PlayerOsd` (arrows move between controls / scrub, Enter activates); Esc
   (`LeaveOsdControls`) or Back (Alt+←, the mouse back button) leaves focus mode and the banner
-  times out normally. Unbound keys fall through (Space still pauses).
-* **Esc ladder in the player**: leave controls focus → hide the banner → leave window
-  fullscreen → leave the player (mini-player keeps playing). Esc never *shows* the banner.
+  times out normally. Unbound keys fall through (Space pauses, except on the cog).
+* **Esc ladder in the player**: clear filter / number entry → close overlay / side panel or
+  settings sub-page → close settings pop-up → cancel Up next countdown → leave controls focus
+  → hide the banner → leave window fullscreen → leave the player (mini-player keeps playing).
 * **Which playlist**: with two or more playlists of the item's kind, the top bar shows
   `● TV` left of the clock (§13.0, §29).
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
-  700 pt the controls row collapses to previous · next (live) · audio · subtitles
-  · info, and the volume to its speaker (the level stays in the top bar).
+  700 pt × rem the row retains transport, live zapping, the speaker (no slider), Next in Up
+  next, Audio & subtitles and the cog. Cast and Fullscreen move into the cog menu. Labels
+  collapse to glyphs before spacing shrinks; the cog stays at the right edge.
 * **Mouse** (every control is an OSD button: hover fill, pointing hand, tooltip with its key):
-  ← at the left of the top bar leaves the player like `p`; the controls row adds Channels
-  (live) and Pop out (not in the popped-out window); the row ends with the volume — the
+  ← at the left of the top bar leaves the player like `p`; the cog offers Channels
+  (live) and Pop out (not in the popped-out window); volume follows transport — the
   speaker (glyph by level; click = mute, tooltip "Mute (m)"), a slider 0–130 % with a mark
   at 100 % (click sets, drag scrubs, wheel ±5; moving it while muted unmutes; 112 pt × s wide,
   80 pt × s from 1200 pt down) and the level ("80 %", "Muted"), its room reserved before the
@@ -2083,8 +2106,8 @@ The OSD has two layers (UX review B1):
   handling runs after the controls, which consume the scroll). Right-click on the video opens
   the player menu (Channels…, Now / next…, History…, Last channel, favourite, aspect, zoom,
   audio…, subtitles…, stream info, jump to live, pop out / back to the full window, keep
-  playing in the mini player, stop and close) — the way to every side panel in a narrow
-  window; a click on the video closes a side panel or leaves focus mode. The banner stays
+  playing in the mini player, stop and close). The cog also reaches every side panel in a
+  narrow window; a click on the video closes a side panel or leaves focus mode. The banner stays
   while the pointer is *in use* on a bar (a button held, or moved within the last 10 s), so
   it never vanishes under a drag of the volume or the seek bar, yet a pointer parked on a bar
   (a keyboard user's, pushed out of the way) doesn't hold it for good; with the banner gone
@@ -2128,14 +2151,11 @@ and quitting asks first. Multi-view shows "Leave multi-view to cast".
 
 **Video-only (popped-out window, §12.3).** Same screen, same keys (zap ↑/↓, volume, pause,
 mute, tracks, `c`/`g`/`H` panels) plus `PopOut` (Esc / `o` = back to the full window). The
-passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
-now (live) or position / duration (VOD), Body/Caption type, no scale factor; the full OSD
-returns only in controls focus mode or with a side panel open. With the pointer in the window
-(or paused) the strip's right side holds buttons instead of the volume and the key hint:
-previous / play / next (live) or skip back / play / skip forward (VOD), the speaker (+ a
-64 pt × rem volume slider from 560 pt × rem of strip; changing it flashes the level, since the
-strip then has no readout), back to the full window, stop and close; below 420 pt × rem
-previous / next drop out so the title and position keep room. Double-click pops back in
+passive banner is a compact bottom strip: title and return button, programme on now (live)
+or position / duration (VOD), then the same essentials row and cog as the full window.
+Pop out is omitted from its menu. Below 700 pt × rem it keeps the speaker without a slider,
+with Cast and Fullscreen in the cog. The full OSD returns in controls focus mode or with a
+side panel open. Double-click pops back in
 (instead of window fullscreen); a drag on the video moves the window (only the video-only
 video senses drags: a drag-sensing video would count as hovered under every button drawn on
 it). Nothing playing: "Nothing playing · o · Esc" on black, with a "Back to the full window"
@@ -2162,7 +2182,8 @@ every local load and checks again every 15 s while playing or paused. Changing o
 applies that output's offset (zero when unseen) and flashes “Delay for ‹label›: ‹offset›”.
 Every discovered output is remembered, including at zero; the first identification is silent.
 
-Audio tracks (`A`) has a Delay stepper (←/→, earlier/later buttons) and Reset delay; stream info
+The cog’s Delay page has the local output stepper and Reset delay, plus subtitle delay.
+Audio tracks (`A`) also keeps its Delay stepper (←/→, earlier/later buttons) and Reset delay; stream info
 (`I`) shows “Audio delay: ‹offset›” and the output. Settings ▸ Player ▸ Audio delay lists the
 remembered outputs with the current output marked, the usual value-row stepper and a Reset row. Its keys use
 the Settings model: → / l increases, Shift+← / H decreases, Enter on Reset resets; ← / h
@@ -2454,7 +2475,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     are Tab filters). The app sidebar is never reached with ← (Alt+digits switch screens).
   * `Global` contains only Ctrl/Alt/F-key chords so it never steals typing.
   * **No screen reads raw keys**: every key is in a table, so help and hints are complete.
-* **Esc ladder**: clear filter → close overlay/side panel → leave OSD controls focus → hide the
+* **Esc ladder**: clear filter → close overlay/side panel or cog sub-page → close cog pop-up →
+  cancel Up next countdown → leave OSD controls focus → hide the
   info banner → leave window fullscreen → leave the player (mini player keeps playing) → back
   in the route stack. Esc never shows the banner. Alt+← = Back. The mouse back button IS Esc:
   the app resolves a synthetic Esc against the same context stack, so it walks this whole
@@ -2845,6 +2867,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
 | `Enter` / `i` / `Tab` | On-screen controls |
+| `O` | Player settings… |
 | `I` | Stream info (codec, resolution, bitrate) |
 | `a` | Next audio track |
 | `A` | Audio tracks… |
@@ -2884,6 +2907,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
 | `Enter` / `i` / `Tab` | On-screen controls |
+| `O` | Player settings… |
 | `I` | Stream info (codec, resolution, bitrate) |
 | `a` | Next audio track |
 | `A` | Audio tracks… |
@@ -2919,6 +2943,16 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Enter` | Activate control |
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
+
+#### Player — settings menu (`PlayerSettings`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Previous / next menu row |
+| `Tab` / `Shift+Tab` | Next / previous menu row |
+| `Enter` / `Space` | Open / choose / reset value |
+| `→` | Open / choose / increase value |
+| `←` / `Backspace` / `Esc` | Back a page, then close |
 
 #### Player — multi-view (`MultiView`)
 
@@ -6099,9 +6133,10 @@ the panel, `n` / `N` step. Home shows an "Up next" rail while items wait and not
   When the queue runs out after an episode, the next one is offered with no countdown.
 * A queued film ending in the fullscreen player keeps the player (the next item follows on the
   card); only films started elsewhere return to their page.
-* The player's OSD row has `Up next` (the panel, `u`) and, while Up next has a next item and
-  multi-view is off, `Next` (`n`), before Info; narrow keeps `Next` only. Both are in the
-  controls focus walk, and a button that comes or goes keeps the focus on its control.
+* The player's cog has `Up next` (the panel, `u`). While Up next has a next item and multi-view
+  is off, the OSD row has `Next` (`n`) before Audio & subtitles, in wide and narrow layouts.
+  The controls focus walk includes Next and the cog; Next appearing or disappearing keeps
+  focus on its control, or falls back to Play / pause if that control vanished.
 * Enter (a click, "Play now") on a film or episode row with progress past
   `resume_min_s` opens the usual Resume prompt (the latest progress of any copy, as the
   resolver resumes it); its answer goes to the engine as `PlayAtFrom { id, resume }`, which

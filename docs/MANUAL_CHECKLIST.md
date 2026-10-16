@@ -1053,14 +1053,14 @@ side buttons, at
   - **Do:** at Wide play a channel; move the mouse to show the controls. Click the speaker; click
     the slider's middle; drag it; scroll over it one notch at a time; scroll over the speaker;
     mute, then click the knob. Repeat at Tiled (790 pt) and in a window under 700 pt.
-  - **Expect:** Wide: speaker · slider (mark at 100 %) · "80 %" at the right end of the controls;
+  - **Expect:** Wide: speaker · slider (mark at 100 %) · "80 %" after transport on the left of the controls;
     the speaker glyph follows the level; click mutes ("Muted", greyed fill) and its tooltip says
     Mute / Unmute (m); click sets, drag scrubs smoothly (no jump back), one notch = ±5 exactly
     (also over the speaker — never ±10); clicking while muted unmutes. Tiled: a shorter slider,
     controls drop to glyphs before the volume shrinks. Under 700 pt: the speaker alone (wheel over
     it steps), the level in the top bar, previous / next still in the row.
 - [ ] **Player by mouse:**
-  - **Do:** click Play / pause, then press ↑. Click the top-left ←. Open Channels from the row,
+  - **Do:** click Play / pause, then press ↑. Click the top-left ←. Open Channels from the cog,
     click two channels, click its ✕; open it again and click the video beside it. Rest the
     pointer on the bottom bar without moving it for 15 s. Stop the stream's network (or use a
     dead channel) and use Retry / Last channel. Let an episode end and click Play now / Cancel.
@@ -1075,11 +1075,12 @@ side buttons, at
   - **Do:** pop the player out (Small 480 × 270 and Medium 640 × 360). Hover it; click each strip
     button; drag the video; double-click it. Stop playback while popped out and use the card's
     button. In the full window, click the mini player's pop-out button.
-  - **Expect:** with the pointer over it the strip shows previous / play / next (skips for VOD),
-    the speaker, a slider at Medium only, back to the full window and stop; at Small the title and
-    position keep readable room (previous / next drop out below 420 pt). A slider change flashes
-    the level. The drag moves the window; a click on a strip button acts without moving the window. The
-    mini player's button pops the player out.
+  - **Expect:** the strip has title / return, programme / position and the same essential row
+    with a cog. Small and Medium keep the speaker without a slider; Cast and Fullscreen are
+    in the cog, and Pop out is absent. Play, skips when seekable and live zapping remain.
+    The drag moves the window; a click on a strip button acts without moving the window.
+    The return button and `o` / Esc put it back; `q` still stops. The mini player's button
+    pops the player out.
 
 ## 18. Several playlists: stacks in All (real catalogue)
 
@@ -1417,10 +1418,23 @@ with Claude Code, and *Second agent* with another one.
   "Next episode is locked", nothing plays.
 - [ ] **Restart:** quit during an item, start Tuner. **Expect:** nothing plays; Home shows
   "Resume Up next".
-- [ ] **OSD buttons:** play a film with two items in Up next and show the OSD. **Expect:**
-  `Up next` and `Next` before Info (tooltips "u" / "n"); a click on `Up next` opens the panel,
-  `Next` plays the next item; with the controls focus (↓) the arrows reach both and Enter acts.
-  With Up next empty there is no `Next`.
+- [ ] **OSD essentials and cog:** play live TV, a seekable film and a live rewind, then add
+  two items to Up next. **Expect:** transport · Back to live when behind · live channel zapping
+  · volume on the left; Next only with a next item · one Audio & subtitles glyph · Cast when
+  enabled · Fullscreen · cog on the right. No track names, Channels, Guide, History, Info,
+  Up next panel or Pop out on the row. Next plays the next item. Repeat below 700 pt: speaker
+  only; Cast and Fullscreen in the cog. Repeat popped out and in multi-view (no Cast / Next).
+- [ ] **Cog mouse and keyboard:** click the cog, or press `O`. **Expect:** a pop-up above the
+  cog, never a side panel; applicable rows show their existing keys (`H` history, `I` info,
+  lowercase `o` still pops out). Open Audio & subtitles and Delay, use their back buttons,
+  pick audio / subtitles / Off, adjust and reset both delays. Track selections are ticked;
+  the row's Audio & subtitles glyph goes straight to that same page. A long list scrolls.
+  Arrow through OSD focus to the cog; Enter and Space open it. ↑/↓ move, Enter/→ choose,
+  ←/Backspace go back. Esc closes the sub-page, then pop-up, then countdown if present,
+  then OSD focus. Wait past the banner timeout: the open pop-up keeps it visible. Clicking
+  outside closes it without activating the covered row. Cast, Fullscreen, Pop out, Channels,
+  Guide, History, Info and Up next keep their former actions. Test light and dark themes.
+
 - [ ] **Resume prompt:** watch 5 minutes of a queued film, stop, `Alt+6`, Enter on it.
   **Expect:** "Resume from 5:00" / "Start over"; Start over plays it from 0 as Up next's item
   (the list stays; Shift+Enter opens the player); a row set to "Play from the start" doesn't
