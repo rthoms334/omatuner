@@ -72,6 +72,9 @@ pub struct DownloadRequest {
     pub headers: HttpHeaders,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// Media files retain their part on pause; range replies must match every validator.
+    /// `Some((0, ..))` opts a new file into this mode (DESIGN §43 §3, §8.1).
+    pub resume_from: Option<(u64, ResumeValidators)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +116,198 @@ pub struct ApiResponse {
 
 /// Progress callback: (bytes so far, total if known).
 pub type ProgressFn<'a> = &'a (dyn Fn(u64, Option<u64>) + Send + Sync);
+
+/// Validators captured before the first byte is written, so a pause or crash can resume.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeValidators {
+    #[serde(default)]
+    pub streamed: bool,
+    pub accepts_ranges: bool,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub length: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MediaOptions {
+    pub limits: Option<crate::downloads::limits::Limits>,
+    pub max_mbps: f64,
+    pub reserve_bytes: u64,
+    pub max_bytes: Option<u64>,
+    /// Raw live transport: append on reconnect and end by wall clock, including suspend.
+    pub until: Option<crate::model::Timestamp>,
+    /// A chunked MPEG transport catch-up is bounded even if its URL has no extension.
+    pub stream_for_s: Option<u64>,
+}
+
+impl HttpClient {
+    /// One media GET, with a socket-close acknowledgement before returning the account to
+    /// playback. Cache imports retain their original conditional-GET semantics above.
+    pub async fn download_media(
+        &self,
+        req: &DownloadRequest,
+        opts: &MediaOptions,
+        progress: ProgressFn<'_>,
+        validators: &(dyn Fn(ResumeValidators) + Send + Sync),
+        cancel: &CancellationToken,
+    ) -> Result<DownloadOutcome> {
+        use crate::cast::relay::upstream::{Net, request_headers};
+        let stop = CancellationToken::new();
+        let cfg = self.shared.read().unwrap_or_else(|e| e.into_inner()).opts.clone();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(cfg.connect_timeout_s))
+            .read_timeout(std::time::Duration::from_secs(cfg.read_timeout_s))
+            .pool_max_idle_per_host(0)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .build()?;
+        let net = Net::start(stop.clone()).await.map_err(Error::other)?;
+        let result = async {
+            let part = part_path(&req.dest);
+            let actual = tokio::fs::metadata(&part).await.map_or(0, |m| m.len());
+            let (requested, previous) = req.resume_from.clone().unwrap_or_default();
+            let mut offset = if requested == actual && previous.accepts_ranges { actual } else { 0 };
+            if opts.until.is_some() {
+                offset = actual;
+            }
+            let url = req.url.expose();
+            let make = |offset: u64| {
+                let mut rb = client.get(url).headers(request_headers(&req.headers, &cfg.default_user_agent));
+                if offset > 0 && opts.until.is_none() {
+                    rb = rb.header(header::RANGE, format!("bytes={offset}-"));
+                    if let Some(v) =
+                        previous.etag.as_ref().filter(|v| !v.starts_with("W/")).or(previous.last_modified.as_ref()).and_then(|v| header_value(v))
+                    {
+                        rb = rb.header(header::IF_RANGE, v);
+                    }
+                }
+                rb
+            };
+            let send = |rb| async {
+                tokio::select! {
+                    () = cancel.cancelled() => Err(Error::Cancelled),
+                    r = net.send(rb) => r.map_err(|_| Error::other("The download connection failed")),
+                }
+            };
+            let mut resp = send(make(offset)).await?;
+            if offset > 0 && opts.until.is_none() {
+                let range = header_string(&resp, header::CONTENT_RANGE);
+                let range = range.as_deref().and_then(|v| v.strip_prefix("bytes ")).and_then(|v| v.split_once('/'));
+                let start = range.and_then(|(r, _)| r.split_once('-')).and_then(|(n, _)| n.parse::<u64>().ok());
+                let length = range.and_then(|(_, n)| n.parse::<u64>().ok());
+                let matches = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                    && start == Some(offset)
+                    && previous.length == length
+                    && previous.etag == header_string(&resp, header::ETAG)
+                    && previous.last_modified == header_string(&resp, header::LAST_MODIFIED)
+                    && (previous.etag.is_some() || previous.last_modified.is_some());
+                if !matches {
+                    offset = 0;
+                    if resp.status() != reqwest::StatusCode::OK {
+                        drop(resp);
+                        net.closed().await;
+                        resp = send(make(0)).await?;
+                    }
+                }
+            }
+            check_status(&resp, url)?;
+            let until=opts.until.or_else(||opts.stream_for_s.filter(|_|resp.content_length().is_none() && (header_string(&resp,header::CONTENT_TYPE).is_some_and(|t|t.to_ascii_lowercase().contains("mp2t")) || url::Url::parse(url).is_ok_and(|u|u.path().ends_with(".ts")))).map(|s|crate::model::now().saturating_add(s.min(i64::MAX as u64) as i64)));
+            let etag = header_string(&resp, header::ETAG);
+            let last_modified = header_string(&resp, header::LAST_MODIFIED);
+            let total = until.is_none().then(|| resp.content_length().map(|n| n + offset)).flatten();
+            validators(ResumeValidators {
+                streamed:until.is_some(),
+                accepts_ranges: (offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT) || header_string(&resp, header::ACCEPT_RANGES).is_some_and(|s| s.eq_ignore_ascii_case("bytes")),
+                etag: etag.clone(),
+                last_modified: last_modified.clone(),
+                length: total,
+            });
+            let mut file = if offset == 0 {
+                create_part(&part).await?
+            } else {
+                tokio::fs::OpenOptions::new().append(true).open(&part).await.map_err(|e| Error::io(&part, e))?
+            };
+            if let Some(limits) = &opts.limits { limits.reset(offset); }
+            let mut done = offset;
+            let started = tokio::time::Instant::now();
+            let mut report = started;
+            progress(done, total);
+            loop {
+                if until.is_some_and(|until| crate::model::now() >= until) {
+                    break;
+                }
+                let chunk = tokio::select! {
+                    () = cancel.cancelled() => { file.flush().await.map_err(|e| Error::io(&part,e))?; progress(done,total); return Err(Error::Cancelled); }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if until.is_some() => continue,
+                    chunk = resp.chunk() => chunk?,
+                };
+                let Some(chunk) = chunk else { break };
+                if done == 0 && (chunk.starts_with(b"#EXTM3U") || header_string(&resp,header::CONTENT_TYPE).is_some_and(|t|t.contains("mpegurl") || t.contains("m3u8"))) {
+                    return Err(Error::other("hls"));
+                }
+                if opts.max_bytes.is_some_and(|max| done.saturating_add(chunk.len() as u64) > max)
+                    || (opts.reserve_bytes > 0
+                        && free_bytes(part.parent().unwrap_or(Path::new("."))).is_none_or(|free| free <= opts.reserve_bytes + chunk.len() as u64))
+                {
+                    file.flush().await.map_err(|e| Error::io(&part, e))?;
+                    progress(done, total);
+                    return Err(Error::other("space"));
+                }
+                let permit = if let Some(limits) = &opts.limits {
+                    let Some(permit) = limits.reserve(chunk.len() as u64) else {
+                        file.flush().await.map_err(|e| Error::io(&part,e))?;
+                        progress(done,total);
+                        return Err(Error::other("space"));
+                    };
+                    Some(permit)
+                } else { None };
+                file.write_all(&chunk).await.map_err(|e| Error::io(&part, e))?;
+                if let Some(permit) = permit { permit.commit(); }
+                done += chunk.len() as u64;
+                if until.is_some() {
+                    // Recordings share the space cap, never the downloads' rate budget.
+                } else if let Some(limits) = &opts.limits {
+                    tokio::select! {
+                        () = cancel.cancelled() => { file.flush().await.map_err(|e| Error::io(&part,e))?; progress(done,total); return Err(Error::Cancelled); }
+                        () = limits.throttle(chunk.len() as u64) => {}
+                    }
+                } else if opts.max_mbps.is_finite() && opts.max_mbps > 0.0 {
+                    let seconds = (done - offset) as f64 / (opts.max_mbps * 1_000_000.0);
+                    tokio::select! {
+                        () = cancel.cancelled() => { file.flush().await.map_err(|e| Error::io(&part,e))?; progress(done,total); return Err(Error::Cancelled); }
+                        _ = tokio::time::sleep_until(started + std::time::Duration::from_secs_f64(seconds)) => {}
+                    }
+                }
+                if report.elapsed() >= std::time::Duration::from_millis(250) {
+                    progress(done, total);
+                    report = tokio::time::Instant::now();
+                }
+            }
+            file.flush().await.map_err(|e| Error::io(&part, e))?;
+            file.sync_all().await.map_err(|e| Error::io(&part, e))?;
+            progress(done, total);
+            if until.is_some_and(|until| crate::model::now() < until) {
+                return Err(Error::other("recording connection ended"));
+            }
+            if total.is_some_and(|n| n != done) {
+                return Err(Error::other("The download ended early"));
+            }
+            tokio::fs::rename(&part, &req.dest).await.map_err(|e| Error::io(&req.dest, e))?;
+            Ok(DownloadOutcome::Downloaded { path: req.dest.clone(), bytes: done, etag, last_modified, compression: Compression::None })
+        }
+        .await;
+        drop(client);
+        net.closed().await;
+        stop.cancel();
+        result
+    }
+}
+
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    rustix::fs::statvfs(path).ok().map(|s| s.f_bavail.saturating_mul(s.f_frsize))
+}
 
 impl HttpClient {
     pub fn new(opts: &HttpOptions) -> Result<Self> {
@@ -172,6 +367,9 @@ impl HttpClient {
     /// The destination directory is created 0700 when missing; the `.part` file is created
     /// 0600 before the first byte and removed again on any failure or cancellation.
     pub async fn download(&self, req: &DownloadRequest, progress: ProgressFn<'_>, cancel: &CancellationToken) -> Result<DownloadOutcome> {
+        if req.resume_from.is_some() {
+            return self.download_media(req, &MediaOptions::default(), progress, &|_| {}, cancel).await;
+        }
         let url = req.url.expose().as_str();
         let mut rb = self.request(url, &req.headers);
         if let Some(etag) = req.etag.as_deref().and_then(header_value) {
@@ -588,7 +786,7 @@ mod tests {
     }
 
     fn req(url: String, dest: PathBuf) -> DownloadRequest {
-        DownloadRequest { url: Secret::new(url), dest, headers: none(), etag: None, last_modified: None }
+        DownloadRequest { url: Secret::new(url), dest, headers: none(), etag: None, last_modified: None, resume_from: None }
     }
 
     #[tokio::test]
@@ -891,5 +1089,108 @@ mod tests {
         assert_eq!(part_path(Path::new("/c/epg/3.xml")), Path::new("/c/epg/3.xml.part"));
         assert_eq!(host_of("http://u:p@h.tv:8080/x?password=y").as_deref(), Some("h.tv:8080"));
         assert_eq!(host_of("nonsense"), None);
+    }
+    // These transport tests need localhost sockets; keep them enabled for CI and an
+    // outside-sandbox run when the editing sandbox denies bind (DESIGN §43 §8.1, §8.8).
+    #[tokio::test]
+    async fn media_range_resume_changed_validators_and_no_ranges() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls = seen.clone();
+        let app = Router::new().route(
+            "/{mode}",
+            get(move |axum::extract::Path(mode): axum::extract::Path<String>, h: HeaderMap| {
+                let calls = calls.clone();
+                async move {
+                    let range = hdr(&h, "range");
+                    calls.lock().unwrap().push(range.clone());
+                    let body = plain_body();
+                    let offset = range.strip_prefix("bytes=").and_then(|s| s.strip_suffix('-')).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                    let etag = if mode == "changed" { "v2" } else { "v1" };
+                    if offset > 0 && mode != "none" {
+                        (
+                            StatusCode::PARTIAL_CONTENT,
+                            [("etag", etag.to_owned()), ("content-range", format!("bytes {}-{}/{}", offset, body.len() - 1, body.len()))],
+                            body[offset..].to_vec(),
+                        )
+                            .into_response()
+                    } else {
+                        ([("etag", etag.to_owned()), ("accept-ranges", if mode == "none" { "none".into() } else { "bytes".into() })], body)
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("outside-sandbox run: localhost sockets required");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        for (mode, ranges) in [("same", true), ("changed", true), ("none", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("17.mp4");
+            let part = part_path(&dest);
+            std::fs::write(&part, &plain_body()[..12345]).unwrap();
+            let mut req = req(format!("http://{address}/{mode}"), dest.clone());
+            req.resume_from = Some((
+                12345,
+                ResumeValidators { streamed: false, accepts_ranges: ranges, etag: Some("v1".into()), last_modified: None, length: Some(BIG as u64) },
+            ));
+            seen.lock().unwrap().clear();
+            let saved = Mutex::new(ResumeValidators::default());
+            client()
+                .download_media(&req, &MediaOptions::default(), &|_, _| {}, &|v| *saved.lock().unwrap() = v, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), plain_body());
+            if mode == "same" {
+                let validators = saved.into_inner().unwrap();
+                assert!(validators.accepts_ranges, "206 confirms ranges without Accept-Ranges");
+                std::fs::write(&part, &plain_body()[..23456]).unwrap();
+                req.resume_from = Some((23456, validators));
+                client().download_media(&req, &MediaOptions::default(), &|_, _| {}, &|_| {}, &CancellationToken::new()).await.unwrap();
+                assert_eq!(std::fs::read(&dest).unwrap(), plain_body());
+            }
+            assert!(!part.exists());
+            let actual = seen.lock().unwrap().clone();
+            match mode {
+                "same" => assert_eq!(actual, ["bytes=12345-", "bytes=23456-"]),
+                "changed" => assert_eq!(actual, ["bytes=12345-", ""]),
+                _ => assert_eq!(actual, [""]),
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn media_pause_keeps_private_part_and_rate_cap_holds() {
+        let base = server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = req(format!("{base}/slow"), dir.path().join("18.ts"));
+        req.resume_from = Some((0, ResumeValidators::default()));
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            stop.cancel();
+        });
+        assert!(matches!(client().download(&req, &|_, _| {}, &cancel).await, Err(Error::Cancelled)));
+        let part = part_path(&req.dest);
+        assert!(std::fs::metadata(&part).unwrap().len() > 0);
+        assert_eq!(std::fs::metadata(&part).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!req.dest.exists());
+        let req = DownloadRequest {
+            url: Secret::new(format!("{base}/big")),
+            dest: dir.path().join("19.mp4"),
+            resume_from: Some((0, ResumeValidators::default())),
+            ..req
+        };
+        let start = Instant::now();
+        let result = client()
+            .download_media(&req, &MediaOptions { max_mbps: 0.5, ..Default::default() }, &|_, _| {}, &|_| {}, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(result,DownloadOutcome::Downloaded{bytes,..} if bytes==BIG as u64));
+        assert!(start.elapsed().as_secs_f64() >= BIG as f64 / 500_000.0 * 0.97);
+        assert!(start.elapsed() < Duration::from_secs(15));
     }
 }

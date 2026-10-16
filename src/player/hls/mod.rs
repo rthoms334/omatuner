@@ -1,6 +1,7 @@
 //! One provider reader per picture, unchanged HLS bytes, bounded disk, loopback playback.
 //! The controller holds the usual connection lease until `Drop` joins the reader and closes
 //! its provider sockets. mpv never knows the provider URL. No probe or remux is involved.
+pub mod finish;
 mod playlist;
 mod store;
 
@@ -54,9 +55,13 @@ pub struct Snapshot {
     pub origin: f64,
     pub next_view: Option<f64>,
     pub failed: bool,
+    pub failure: Option<PlayerErrorKind>,
+    pub duration: f64,
+    pub partial: bool,
+    pub ended: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Event {
     Failed(PlayerErrorKind, Option<String>),
     Published,
@@ -75,6 +80,8 @@ struct View {
     read: [Option<u64>; 2],
 }
 
+type Readers = std::collections::HashMap<u64, (Arc<Mutex<View>>, crossbeam_channel::Sender<Event>)>;
+
 struct Shared {
     store: Mutex<Store>,
     changed: Notify,
@@ -82,12 +89,32 @@ struct Shared {
     // A selected variant's separate default audio rendition, if any.
     audio: Mutex<bool>,
     view: Mutex<View>,
+    readers: Mutex<Readers>,
+    next_reader: std::sync::atomic::AtomicU64,
     errors: crossbeam_channel::Sender<Event>,
     failed: Mutex<bool>,
+    failure: Mutex<Option<PlayerErrorKind>>,
     retry: Notify,
+    recording: Mutex<Option<RecordingLimits>>,
+    partial: Mutex<bool>,
+    /// Archive recordings start at the first segment; live starts at the newest.
+    archive: bool,
+}
+
+#[derive(Clone)]
+pub struct RecordingLimits {
+    pub limits: Option<crate::downloads::limits::Limits>,
+    pub reserve_bytes: u64,
+    pub max_bytes: u64,
 }
 
 impl Shared {
+    fn emit(&self, event: Event) {
+        let _ = self.errors.try_send(event.clone());
+        for (_, sender) in self.readers.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            let _ = sender.send(event.clone());
+        }
+    }
     fn store(&self) -> MutexGuard<'_, Store> {
         self.store.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -99,9 +126,70 @@ pub struct Buffer {
     stop: CancellationToken,
     thread: Option<JoinHandle<()>>,
     pub errors: crossbeam_channel::Receiver<Event>,
+    budget_group: Mutex<Option<u64>>,
+}
+
+impl std::fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Buffer").finish_non_exhaustive()
+    }
+}
+
+/// A picture's local view is independent of every other picture sharing this recorder
+/// (DESIGN §43 §2.4). Its lifetime also keeps the single provider reader alive.
+pub struct Reader {
+    buffer: Arc<Buffer>,
+    id: u64,
+    view: Arc<Mutex<View>>,
+    url: String,
+    pub errors: crossbeam_channel::Receiver<Event>,
+}
+impl Reader {
+    pub fn snapshot(&self) -> Snapshot {
+        self.buffer.snapshot_for(&self.view)
+    }
+    pub fn view(&self, target: Option<f64>) -> (String, f64) {
+        self.buffer.view_for(&self.view, &self.url, target)
+    }
+}
+impl std::ops::Deref for Reader {
+    type Target = Buffer;
+    fn deref(&self) -> &Buffer {
+        &self.buffer
+    }
+}
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.buffer.shared.readers.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
 }
 
 impl Buffer {
+    pub fn reader(self: &Arc<Self>) -> Reader {
+        let id = self.shared.next_reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let view = Arc::new(Mutex::new(View::default()));
+        let (sender, errors) = crossbeam_channel::unbounded();
+        self.shared.readers.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (view.clone(), sender));
+        let base = self.url().rsplit_once('/').expect("local playlist").0;
+        Reader { buffer: self.clone(), id, view, url: format!("{base}/r{id}/0.m3u8"), errors }
+    }
+
+    pub(crate) fn budget_group(&self) -> Option<u64> {
+        *self.budget_group.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn set_budget_group(&self, group: u64) {
+        *self.budget_group.lock().unwrap_or_else(|e| e.into_inner()) = Some(group);
+    }
+
+    /// Freeze the kept recording, while its current picture continues on a rolling store.
+    pub fn finish_recording(&self, cache: &Path) -> io::Result<()> {
+        let dir = super::timeshift::make_dir(cache, TileId::A)?;
+        self.shared.store().resume_rolling(dir)?;
+        *self.shared.recording.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.shared.partial.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        Ok(())
+    }
+
     /// Starts the local listener immediately. Its first playlist request waits for the first
     /// provider window; neither the controller nor mpv opens any other provider connection.
     pub fn start(p: &Playable, cache: &Path, tile: TileId, user_agent: &str, window: f64) -> io::Result<Self> {
@@ -112,16 +200,35 @@ impl Buffer {
                 Store::memory(window)
             }
         };
-        let (errors_tx, errors_rx) = crossbeam_channel::unbounded();
+        Self::start_store(p, store, user_agent, None, false)
+    }
+
+    /// A recording uses the very same serialized provider reader (DESIGN §43 §3).
+    pub fn start_keep(p: &Playable, dir: &Path, user_agent: &str, limits: RecordingLimits, archive: bool) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let mut store = if dir.join("index.json").is_file() { Store::resume(dir.to_owned(), WINDOW)? } else { Store::new(dir.to_owned(), WINDOW) };
+        store.keep = true;
+        Self::start_store(p, store, user_agent, Some(limits), archive)
+    }
+
+    fn start_store(p: &Playable, store: Store, user_agent: &str, limits: Option<RecordingLimits>, archive: bool) -> io::Result<Self> {
+        let (errors_tx, errors_rx) = crossbeam_channel::bounded(64);
         let shared = Arc::new(Shared {
             store: Mutex::new(store),
             changed: Notify::new(),
             token: Token::mint(),
             audio: Mutex::new(false),
             view: Mutex::new(View::default()),
+            readers: Mutex::new(Default::default()),
+            next_reader: std::sync::atomic::AtomicU64::new(1),
             errors: errors_tx,
             failed: Mutex::new(false),
+            failure: Mutex::new(None),
             retry: Notify::new(),
+            recording: Mutex::new(limits),
+            partial: Mutex::new(false),
+            archive,
         });
         let stop = CancellationToken::new();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -184,7 +291,7 @@ impl Buffer {
             });
         })?;
         match rx.recv().map_err(io::Error::other)? {
-            Ok(url) => Ok(Self { shared, url: Secret::new(url), stop, thread: Some(thread), errors: errors_rx }),
+            Ok(url) => Ok(Self { shared, url: Secret::new(url), stop, thread: Some(thread), errors: errors_rx, budget_group: Mutex::new(None) }),
             Err(e) => {
                 stop.cancel();
                 let _ = thread.join();
@@ -211,12 +318,16 @@ impl Buffer {
     /// seeking independent of FFmpeg's stale playlist after a long pause or a discontinuity.
     /// The recorder and the provider lease keep running unchanged.
     pub fn view(&self, target: Option<f64>) -> (String, f64) {
+        self.view_for(&self.shared.view, self.url(), target)
+    }
+
+    fn view_for(&self, state: &Mutex<View>, url: &str, target: Option<f64>) -> (String, f64) {
         let s = self.shared.store();
         let targeted = target.is_some();
         let target = s.range().map(|range| target.unwrap_or(range.end).clamp(range.start, (s.tracks[0].edge - 0.5).max(range.end)));
         let from =
             target.and_then(|p| s.tracks[0].segments.iter().find(|seg| seg.end > p).or_else(|| s.tracks[0].segments.back()).map(|seg| seg.start));
-        let mut v = self.shared.view.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v = state.lock().unwrap_or_else(|e| e.into_inner());
         v.id += 1;
         v.from = from;
         v.targeted = targeted;
@@ -227,19 +338,65 @@ impl Buffer {
         v.read = [None; 2];
         let offset = target.zip(from).map_or(0.0, |(p, from)| (p - from).max(0.0));
         tracing::debug!(view = v.id, ?target, ?from, offset, "live rewind: opening local view");
-        let url = format!("{}?view={}", self.url(), v.id);
+        let url = format!("{}?view={}", url, v.id);
         drop(v);
         drop(s);
         // Release a pending reload from the replaced reader even if the provider stalls.
         self.shared.changed.notify_waiters();
         (url, offset)
     }
+    pub fn relay_url(&self) -> String {
+        let base = self.url().rsplit_once('/').map_or(self.url(), |(base, _)| base);
+        format!("{base}/relay0.m3u8")
+    }
+    pub fn is_recording(&self) -> bool {
+        self.shared.recording.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     pub fn directory(&self) -> PathBuf {
         self.shared.store().dir.clone()
     }
+
+    /// Move the retained live history into this job without reopening its provider socket.
+    pub fn adopt(&self, dir: &Path, from: f64, limits: RecordingLimits) -> io::Result<()> {
+        // Keep the source stable while copying outside the store lock. New segments may
+        // arrive meanwhile; retry the snapshot until every one is present before switching.
+        {
+            let mut store = self.shared.store();
+            if store.keep || store.memory {
+                return Err(io::Error::other("recording store unavailable"));
+            }
+            store.keep = true;
+        }
+        loop {
+            let mut next = self.shared.store().clone();
+            let (counter, epoch, old) = (next.next, next.epoch, next.dir.clone());
+            if let Err(error) = next.adopt(dir.to_owned(), from) {
+                self.shared.store().keep = false;
+                return Err(error);
+            }
+            let mut current = self.shared.store();
+            if current.next != counter || current.epoch != epoch {
+                continue;
+            }
+            *current = next;
+            drop(current);
+            let _ = std::fs::remove_dir_all(old);
+            break;
+        }
+        if let Some(limits) = &limits.limits {
+            limits.reset(self.shared.store().blobs.values().map(|b| b.size).sum());
+        }
+        *self.shared.recording.lock().unwrap_or_else(|e| e.into_inner()) = Some(limits);
+        Ok(())
+    }
     pub fn snapshot(&self) -> Snapshot {
+        self.snapshot_for(&self.shared.view)
+    }
+
+    fn snapshot_for(&self, state: &Mutex<View>) -> Snapshot {
         let s = self.shared.store();
-        let mut view = self.shared.view.lock().unwrap_or_else(|e| e.into_inner());
+        let mut view = state.lock().unwrap_or_else(|e| e.into_inner());
         let origin = view.origin.or(view.from).unwrap_or(0.0);
         view.next = view.next.or_else(|| s.boundary(origin));
         Snapshot {
@@ -251,11 +408,16 @@ impl Buffer {
             origin,
             next_view: view.next,
             failed: *self.shared.failed.lock().unwrap_or_else(|e| e.into_inner()),
+            failure: *self.shared.failure.lock().unwrap_or_else(|e| e.into_inner()),
+            duration: s.tracks.first().map_or(0.0, |t| t.edge - t.segments.front().map_or(t.edge, |s| s.start)),
+            partial: *self.shared.partial.lock().unwrap_or_else(|e| e.into_inner()),
+            ended: s.tracks.iter().all(|t| t.ended),
         }
     }
 
     /// The state machine owns retry timing, including first-play refusals and give-up.
     pub fn retry(&self) {
+        *self.shared.failed.lock().unwrap_or_else(|e| e.into_inner()) = false;
         self.shared.retry.notify_one();
     }
 
@@ -442,9 +604,36 @@ fn check_disk(state: &Shared) {
 
 fn check_space(state: &Shared, free: Option<u64>) {
     let mut s = state.store();
+    if let Some(limits) = state.recording.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if free.is_none_or(|n| n < limits.reserve_bytes) || s.blobs.values().map(|b| b.size).sum::<u64>() >= limits.max_bytes {
+            *state.partial.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        }
+        return;
+    }
     if !s.memory && free.is_none_or(|n| n < RESERVE) {
         tracing::info!("live rewind: less than 3 GB free; using up to two minutes in memory until the next channel");
         s.memory_fallback();
+    }
+}
+
+async fn recording_write(state: &Shared, bytes: usize) -> Result<Option<crate::downloads::limits::Permit>, PlayerErrorKind> {
+    let limits = state.recording.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(limits) = limits else { return Ok(None) };
+    let dir = state.store().dir.clone();
+    if free_bytes(&dir).is_none_or(|n| n.saturating_sub(limits.reserve_bytes) < bytes as u64) {
+        *state.partial.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        return Err(PlayerErrorKind::Mpv);
+    }
+    if let Some(limits) = limits.limits {
+        limits.throttle(bytes as u64).await;
+        let permit = limits.reserve(bytes as u64);
+        if permit.is_none() {
+            *state.partial.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            return Err(PlayerErrorKind::Mpv);
+        }
+        Ok(permit)
+    } else {
+        Ok(None)
     }
 }
 
@@ -457,10 +646,23 @@ async fn blob(state: &Shared, client: &mut Client, r: &Resource, ext: &'static s
         return Err(PlayerErrorKind::Unsupported);
     }
     check_disk(state);
+    if *state.partial.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Err(PlayerErrorKind::Mpv);
+    }
+    let permit = recording_write(state, bytes.len()).await?;
     let mut s = state.store();
     match s.insert(r.clone(), bytes.clone(), ext) {
-        Ok(id) => Ok(id),
+        Ok(id) => {
+            if let Some(permit) = permit {
+                permit.commit();
+            }
+            Ok(id)
+        }
         Err(_) => {
+            if s.keep {
+                *state.partial.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                return Err(PlayerErrorKind::Mpv);
+            }
             tracing::info!("live rewind: disk unavailable; using up to two minutes in memory until the next channel");
             s.memory_fallback();
             s.insert(r.clone(), bytes, ext).map_err(|_| PlayerErrorKind::Mpv)
@@ -476,7 +678,7 @@ async fn refresh(state: &Shared, client: &mut Client, source: &mut Source, track
     let media = playlist::parse(&text, &base).map_err(|_| PlayerErrorKind::Unsupported)?;
     // A finished playlist (`#EXT-X-ENDLIST`, the "loop" channels some providers serve) has no
     // live edge to follow: mpv plays it from the start, as before live rewind.
-    if source.last.is_none() && media.ended {
+    if source.last.is_none() && media.ended && !state.archive {
         client.not_playlist = true;
         return Err(PlayerErrorKind::Unsupported);
     }
@@ -489,7 +691,7 @@ async fn refresh(state: &Shared, client: &mut Client, source: &mut Source, track
     let initial = source.last.is_none();
     // Start on the newest complete provider segment. No multi-segment ready wait:
     // first-frame latency includes only the playlist, required key/map, and this segment.
-    let skip = if initial { media.segments.len().saturating_sub(1) } else { 0 };
+    let skip = if initial && !state.archive { media.segments.len().saturating_sub(1) } else { 0 };
     for seg in media.segments.iter().skip(skip) {
         if source.last.is_some_and(|last| seg.seq <= last) {
             continue;
@@ -519,10 +721,23 @@ async fn refresh(state: &Shared, client: &mut Client, source: &mut Source, track
         // Segments must be fetched again if a provider reuses a URI at a new sequence.
         let (_, bytes) = client.get(&seg.resource, MAX_SEGMENT, false).await?;
         check_disk(state);
+        if *state.partial.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(PlayerErrorKind::Mpv);
+        }
+        let permit = recording_write(state, bytes.len()).await?;
         let mut s = state.store();
         let id = match s.insert(seg.resource.clone(), bytes.clone(), ext) {
-            Ok(id) => id,
+            Ok(id) => {
+                if let Some(permit) = permit {
+                    permit.commit();
+                }
+                id
+            }
             Err(_) => {
+                if s.keep {
+                    *state.partial.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    return Err(PlayerErrorKind::Mpv);
+                }
                 tracing::info!("live rewind: disk unavailable; using up to two minutes in memory until the next channel");
                 s.memory_fallback();
                 s.insert(seg.resource.clone(), bytes, ext).map_err(|_| PlayerErrorKind::Mpv)?
@@ -541,11 +756,12 @@ async fn refresh(state: &Shared, client: &mut Client, source: &mut Source, track
         t.segments.push_back(store::Segment { id, seq, start: t.edge, end: t.edge + seg.duration, disc, key, map });
         t.edge += seg.duration;
         t.target = media.target;
-        t.ended = media.ended;
+        t.ended = false;
         source.last = Some(seg.seq);
         source.discontinuity = Some(seg.discontinuity);
         source.gap = false;
         s.pending.clear();
+        s.save().map_err(|_| PlayerErrorKind::Mpv)?;
     }
     {
         let mut store = state.store();
@@ -621,18 +837,20 @@ async fn record(state: &Shared, client: &mut Client, root: Secret<String>) {
         match result {
             Ok(delay) => {
                 *state.failed.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                *state.failure.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 if failed_edge.take().is_some() || state.store().tracks[0].edge > before {
-                    let _ = state.errors.send(Event::Published);
+                    state.emit(Event::Published);
                 }
                 tokio::time::sleep(delay).await;
             }
             Err(kind) => {
+                *state.failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(kind);
                 *state.failed.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 failed_edge.get_or_insert(state.store().tracks[0].edge);
                 if client.not_playlist {
-                    let _ = state.errors.send(Event::NotPlaylist);
+                    state.emit(Event::NotPlaylist);
                 } else {
-                    let _ = state.errors.send(Event::Failed(kind, client.provider_text.take()));
+                    state.emit(Event::Failed(kind, client.provider_text.take()));
                 }
                 state.changed.notify_waiters();
                 // No independent polling after give-up; the controller's normal backoff
@@ -654,6 +872,40 @@ async fn serve(State(state): State<Arc<Shared>>, req: Request) -> Response {
     if !state.token.matches(token) {
         return response(StatusCode::NOT_FOUND, Body::empty());
     }
+    if let Some(track) = name.strip_prefix("relay").and_then(|n| n.strip_suffix(".m3u8")).and_then(|n| n.parse::<usize>().ok()) {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            let changed = state.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let playlist = {
+                let store = state.store();
+                if store.closed || Instant::now() >= deadline {
+                    return response(StatusCode::NOT_FOUND, Body::empty());
+                }
+                if track == 0 && *state.audio.lock().unwrap_or_else(|e| e.into_inner()) {
+                    Some("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,URI=\"relay1.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO=\"a\"\nrelay2.m3u8\n".to_owned())
+                } else {
+                    store.relay_playlist(if track == 2 { 0 } else { track })
+                }
+            };
+            if let Some(p) = playlist {
+                let mut r = response(StatusCode::OK, Body::from(p));
+                r.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/vnd.apple.mpegurl"));
+                return r;
+            }
+            let _ = tokio::time::timeout(PLAYLIST_WAIT, changed).await;
+        }
+    }
+    let (reader, name) = if let Some((reader, rest)) = name.split_once('/') {
+        let id = reader.strip_prefix('r').and_then(|r| r.parse::<u64>().ok());
+        let view = id.and_then(|id| state.readers.lock().unwrap_or_else(|e| e.into_inner()).get(&id).map(|r| r.0.clone()));
+        let Some(view) = view else { return response(StatusCode::NOT_FOUND, Body::empty()) };
+        (Some(view), rest)
+    } else {
+        (None, name)
+    };
+    let reader = reader.as_deref().unwrap_or(&state.view);
     let started = Instant::now();
     let requested_view = req.uri().query().and_then(|q| q.strip_prefix("view=")).and_then(|v| v.parse::<u64>().ok());
     if let Some(track) = name.strip_suffix(".m3u8").and_then(|s| s.parse::<usize>().ok()) {
@@ -670,7 +922,7 @@ async fn serve(State(state): State<Arc<Shared>>, req: Request) -> Response {
                     tracing::debug!(view = ?requested_view, track, "live rewind: local playlist unavailable");
                     return response(StatusCode::NOT_FOUND, Body::empty());
                 }
-                let mut view = state.view.lock().unwrap_or_else(|e| e.into_inner());
+                let mut view = reader.lock().unwrap_or_else(|e| e.into_inner());
                 if requested_view.is_some_and(|id| id != view.id) {
                     tracing::debug!(view = ?requested_view, current_view = view.id, elapsed_ms = started.elapsed().as_millis(), "live rewind: local reader replaced");
                     return response(StatusCode::NOT_FOUND, Body::empty());
@@ -737,7 +989,7 @@ async fn serve(State(state): State<Arc<Shared>>, req: Request) -> Response {
     let Some((id, ext)) = name.split_once('.').and_then(|(id, ext)| Some((id.parse::<u64>().ok()?, ext))) else {
         return response(StatusCode::NOT_FOUND, Body::empty());
     };
-    let current_view = state.view.lock().unwrap_or_else(|e| e.into_inner()).id;
+    let current_view = reader.lock().unwrap_or_else(|e| e.into_inner()).id;
     tracing::debug!(view = current_view, resource = id, "live rewind: local resource requested");
     let bytes = {
         let s = state.store();
@@ -749,7 +1001,7 @@ async fn serve(State(state): State<Arc<Shared>>, req: Request) -> Response {
             return response(StatusCode::NOT_FOUND, Body::empty());
         }
         {
-            let mut view = state.view.lock().unwrap_or_else(|e| e.into_inner());
+            let mut view = reader.lock().unwrap_or_else(|e| e.into_inner());
             if view.id == current_view {
                 for (index, track) in s.tracks.iter().enumerate() {
                     if let Some(segment) = track.segments.iter().find(|seg| seg.id == id) {

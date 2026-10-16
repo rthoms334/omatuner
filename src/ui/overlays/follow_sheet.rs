@@ -48,6 +48,7 @@ use crate::ui::widgets::{glyphs, section};
 /// What the sheet opens on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FollowSheetSpec {
+    pub record: bool,
     /// The programme it was opened on (`None`: a blank rule, Settings ▸ Following ▸ New).
     pub programme: Option<(crate::model::ProgrammeId, crate::model::ChannelId)>,
     /// An existing rule to edit.
@@ -115,6 +116,7 @@ impl F {
 /// What the Pick view's When row offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum When {
+    Record,
     Remind,
     Switch,
     List,
@@ -123,11 +125,16 @@ enum When {
 }
 
 fn whens(kind: FollowKind) -> &'static [When] {
-    if kind == FollowKind::News { &[When::FlashHeadlines, When::FlashWhole, When::Remind] } else { &[When::Remind, When::Switch, When::List] }
+    if kind == FollowKind::News {
+        &[When::FlashHeadlines, When::FlashWhole, When::Remind, When::Record]
+    } else {
+        &[When::Remind, When::Switch, When::List, When::Record]
+    }
 }
 
 fn when_of(r: &FollowRule) -> When {
     match r.mode {
+        FollowMode::Record => When::Record,
         FollowMode::Notify => When::Remind,
         FollowMode::Switch => When::Switch,
         FollowMode::List => When::List,
@@ -146,6 +153,7 @@ fn apply_when(r: &mut FollowRule, w: When, headlines_min: u16) {
                 r.lead_s = 120;
             }
         }
+        When::Record => r.mode = FollowMode::Record,
         When::Switch => r.mode = FollowMode::Switch,
         When::List => r.mode = FollowMode::List,
         When::FlashHeadlines => {
@@ -166,6 +174,7 @@ fn apply_when(r: &mut FollowRule, w: When, headlines_min: u16) {
 /// "Remind me 2 min before", "Switch over at the start", "Pop up · first 5 min"…
 fn when_text(r: &FollowRule, w: When) -> String {
     match w {
+        When::Record => "Record each new episode".into(),
         When::Remind if r.lead_s > 0 => format!("Remind me {} min before", (r.lead_s + 59) / 60),
         When::Remind => "Remind me at the start".into(),
         When::Switch => "Switch over at the start".into(),
@@ -305,6 +314,9 @@ impl FollowSheet {
         if let Some(w) = when.filter(|w| whens(s.kind).contains(w)) {
             apply_when(&mut r, w, cfg.news_flash.headlines_min);
         }
+        if self.spec.record && when.is_none() {
+            r.mode = FollowMode::Record;
+        }
         self.draft = Some(r);
     }
 
@@ -346,7 +358,7 @@ impl FollowSheet {
                         }
                         v.extend([F::Volume, F::Offset]);
                     }
-                    FollowMode::List => {}
+                    FollowMode::List | FollowMode::Record => {}
                 }
                 v.extend([F::Spoiler, F::Limit]);
                 if r.id.0 != 0 {
@@ -1457,7 +1469,7 @@ pub(crate) mod tests {
     fn enter_follows_the_focused_suggestion() {
         let (mut t, one) = rig();
         let (pid, ch, _) = fixture(&mut t);
-        let sheet = FollowSheet::new(FollowSheetSpec { programme: Some((pid, ch)), rule: None });
+        let sheet = FollowSheet::new(FollowSheetSpec { record: false, programme: Some((pid, ch)), rule: None });
         let mut h = overlay_harness(t, one, sheet, egui::vec2(1600.0, 1000.0));
         until_ov(&mut h, "the preview", |h| count_line(h).starts_with("1 in the guide"));
         assert!(has_label(&h, "Arsenal: every match") && has_label(&h, "Chelsea: every match"));
@@ -1490,12 +1502,12 @@ pub(crate) mod tests {
                 crate::store::follow::save_rule(c, &r, 100, 0)
             });
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-            let sheet = FollowSheet::new(FollowSheetSpec { programme: Some((pid, ch)), rule: None });
+            let sheet = FollowSheet::new(FollowSheetSpec { record: false, programme: Some((pid, ch)), rule: None });
             let mut h = overlay_harness(t, one, sheet, size);
             until_ov(&mut h, "the suggestions", |h| has_label(h, "Follow"));
             h.run_steps(3); // the card settles where its size puts it
             assert!(screen.contains_rect(h.get_by_role_and_label(egui::accesskit::Role::Button, "Follow").rect()), "{size:?}: Follow");
-            h.state_mut().o = FollowSheet::new(FollowSheetSpec { programme: None, rule: Some(id) });
+            h.state_mut().o = FollowSheet::new(FollowSheetSpec { record: false, programme: None, rule: Some(id) });
             until_ov(&mut h, "the editor", |h| has_label(h, "Save"));
             h.run_steps(3);
             assert!(screen.contains_rect(h.get_by_label("Save").rect()), "{size:?}: Save at {:?}", h.get_by_label("Save").rect());
@@ -1514,7 +1526,7 @@ pub(crate) mod tests {
             let r = FollowRule::draft("Arsenal", FollowKind::Team, vec!["Arsenal".into()], &crate::config::FollowConfig::default(), 0);
             crate::store::follow::save_rule(c, &r, 100, 0)
         });
-        let spec = FollowSheetSpec { programme: None, rule: Some(id) };
+        let spec = FollowSheetSpec { record: false, programme: None, rule: Some(id) };
         let mut h = overlay_harness(t, one, FollowSheet::new(spec.clone()), egui::vec2(900.0, 800.0));
         until_ov(&mut h, "the editor", |h| h.state().o.view == View::Edit);
         assert_eq!(h.state_mut().act(Action::Back), "Close", "unchanged: Esc closes");

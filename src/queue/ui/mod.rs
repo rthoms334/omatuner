@@ -367,7 +367,7 @@ pub fn on_action(ctx: &mut UiCtx<'_>, action: Action, target: &Target) -> bool {
 }
 
 /// What to add for an item (a few indexed reads, once per key press).
-fn add_target(ctx: &UiCtx<'_>, target: &Target) -> Result<AddTarget, &'static str> {
+pub(crate) fn add_target(ctx: &UiCtx<'_>, target: &Target) -> Result<AddTarget, &'static str> {
     const GONE: &str = "That is no longer in your playlists";
     let plain = |item: ItemRef| AddTarget { item, programme: None, from_start: false, any_copy: true };
     match *target {

@@ -436,6 +436,13 @@ pub(crate) fn poster_tile_ex(
         p.rect_stroke(poster, t.rounding, stroke, egui::StrokeKind::Inside);
     }
 
+    if let Some(label) = crate::ui::downloads::cached_badge(ui.ctx(), &crate::store::copies::vod_ref(item)) {
+        let font = egui::FontId::proportional(theme.font(TypeToken::BodySmall));
+        let galley = p.layout_no_wrap(label, font, t.fg);
+        let at = poster.left_top() + egui::vec2(5.0, 5.0);
+        p.rect_filled(egui::Rect::from_min_size(at - egui::vec2(3.0, 2.0), galley.size() + egui::vec2(6.0, 4.0)), t.rounding, t.osd_scrim);
+        p.galley(at, galley, t.fg);
+    }
     // title (≤ 2 lines, now-playing marker first), then the meta line
     let mut y = full.bottom() + theme.space(SpaceToken::Md);
     let mut left = rect.left();

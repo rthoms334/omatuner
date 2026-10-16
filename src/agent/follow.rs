@@ -93,6 +93,7 @@ fn kind_name(k: FollowKind) -> &'static str {
 
 fn mode_name(m: FollowMode) -> &'static str {
     match m {
+        FollowMode::Record => "record",
         FollowMode::Notify => "notify",
         FollowMode::Switch => "switch",
         FollowMode::List => "list",
@@ -123,6 +124,7 @@ fn match_out(q: &Q, u: &Upcoming, rule: &FollowRule, safe: bool, preview: bool) 
     let safe = safe || concealed;
     let state = match (u.state, preview) {
         (MatchState::Scheduled, true) => match u.mode {
+            FollowMode::Record => "would_record",
             FollowMode::Switch => "would_switch",
             FollowMode::Flash => "would_flash",
             FollowMode::List => "listed",
@@ -214,6 +216,7 @@ pub fn rule_from_input(q: &Q, i: &FollowRuleInput) -> Out<FollowRule> {
     }
     if let Some(m) = i.mode.as_deref() {
         r.mode = match m {
+            "record" => FollowMode::Record,
             "notify" => FollowMode::Notify,
             "switch" => FollowMode::Switch,
             "list" => FollowMode::List,
@@ -328,8 +331,13 @@ fn list(q: &Q) -> Out<Value> {
     Ok(json!({ "rules": out }))
 }
 
-pub(super) async fn handle(h: &Arc<Inner>, p: Follow, who: &crate::model::AgentName) -> Out<Value> {
+pub(super) async fn handle(h: &Arc<Inner>, mut p: Follow, who: &crate::model::AgentName) -> Out<Value> {
+    if p.action == FollowAction::Record {
+        p.rule.as_mut().ok_or_else(|| Fail::bad("record needs a rule"))?.mode = Some("record".into());
+        p.action = FollowAction::Add;
+    }
     match p.action {
+        FollowAction::Record => unreachable!(),
         FollowAction::Preview => {
             let out = h.run(true, move |q| preview(q, &p)).await?;
             to_value(&out)

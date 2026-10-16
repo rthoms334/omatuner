@@ -275,6 +275,7 @@ async fn fetch_playlist(
     progress.set(JobPhase::Connecting);
     let dest = ctx.paths.playlist_cache().join(format!("{}-{}.m3u", src.id.0, progress.id.0));
     let req = DownloadRequest {
+        resume_from: None,
         url: url.clone(),
         dest,
         headers: source_headers(src, cfg),

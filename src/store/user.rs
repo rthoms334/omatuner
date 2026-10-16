@@ -820,6 +820,9 @@ pub struct Orphan {
 /// The user-data tables carrying `fp` + `orphaned_since`: (holder name, table, kind column
 /// expression, key column, extra condition).
 const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
+    ("download", "download", "kind", "item_key", " AND kind IN ('movie','episode') AND item_key IS NOT NULL"),
+    ("download", "download", "'channel'", "item_key", " AND kind IN ('live','catchup') AND item_key IS NOT NULL"),
+    ("download rule", "download_rule", "'series'", "series_key", ""),
     ("favourite", "fav_item", "kind", "item_key", ""),
     // Watchlists survive re-keys; placeholders have no ItemRef (DESIGN §42 §4).
     ("watchlist", "watchlist_item", "kind", "item_key", " AND source_id IS NOT NULL"),
@@ -842,7 +845,7 @@ pub fn orphans(conn: &Connection) -> Result<Vec<Orphan>> {
     let sql = HOLDERS
         .iter()
         .map(|(name, table, kind, key, extra)| {
-            format!("SELECT source_id, {kind}, {key}, fp, orphaned_since, '{name}' FROM {table} WHERE orphaned_since IS NOT NULL{extra}")
+            format!("SELECT COALESCE(source_id,0), {kind}, {key}, fp, orphaned_since, '{name}' FROM {table} WHERE orphaned_since IS NOT NULL{extra}")
         })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
@@ -903,7 +906,7 @@ pub(crate) fn holders_for(kind: ItemKind) -> impl Iterator<Item = (&'static str,
     HOLDERS.iter().filter_map(move |(_, table, kcol, key, extra)| {
         if *kcol == "kind" {
             Some((*table, *key, format!(" AND kind = '{}'{extra}", kind.as_str())))
-        } else if kind == ItemKind::Channel {
+        } else if *kcol == format!("'{}'", kind.as_str()) {
             Some((*table, *key, extra.to_string()))
         } else {
             None
@@ -915,8 +918,8 @@ pub(crate) fn holders_for(kind: ItemKind) -> impl Iterator<Item = (&'static str,
 pub fn forget_orphan(conn: &mut Connection, item: &ItemRef) -> Result<()> {
     let tx = conn.transaction()?;
     for (table, key, extra) in holders_for(item.kind) {
-        if table == "watchlist_item" {
-            tx.execute(&format!("UPDATE {table} SET source_id=NULL,item_key=NULL,orphaned_since=NULL WHERE source_id=?1 AND {key}=?2 AND orphaned_since IS NOT NULL{extra}"), params![item.source, item.key.as_str()])?;
+        if table == "watchlist_item" || table == "download" {
+            tx.execute(&format!("UPDATE {table} SET source_id=NULL,item_key=NULL,orphaned_since=NULL WHERE COALESCE(source_id,0)=?1 AND {key}=?2 AND orphaned_since IS NOT NULL{extra}"), params![item.source, item.key.as_str()])?;
             continue;
         }
         tx.execute(
@@ -955,8 +958,9 @@ pub(crate) fn mark_attached(conn: &Connection, item: &ItemRef, fp: &Fingerprint)
             params![item.source, item.key.as_str()],
         )? > 0;
         if fp.is_some() {
+            let fp_expr = if table.starts_with("download") { "json_remove(json_patch(fp,?3),'$.url_key')" } else { "?3" };
             conn.execute(
-                &format!("UPDATE {table} SET fp = ?3 WHERE source_id = ?1 AND {key} = ?2 AND fp IS NOT ?3{extra}"),
+                &format!("UPDATE {table} SET fp = {fp_expr} WHERE source_id = ?1 AND {key} = ?2 AND fp IS NOT ?3{extra}"),
                 params![item.source, item.key.as_str(), fp],
             )?;
         }
@@ -1000,10 +1004,11 @@ pub(crate) fn move_user_data(conn: &Connection, from: &ItemRef, to: &ItemRef) ->
         }
     }
     for (table, key, extra) in holders_for(from.kind) {
+        let fp_expr = if table.starts_with("download") { "json_remove(json_patch(fp,COALESCE(?5,'{}')),'$.url_key')" } else { "COALESCE(?5,fp)" };
         conn.execute(
             &format!(
-                "UPDATE OR IGNORE {table} SET source_id = ?3, {key} = ?4, fp = COALESCE(?5, fp), orphaned_since = NULL
-                 WHERE source_id = ?1 AND {key} = ?2{extra}"
+                "UPDATE OR IGNORE {table} SET source_id = ?3, {key} = ?4, fp = {fp_expr}, orphaned_since = NULL
+                 WHERE COALESCE(source_id,0) = ?1 AND {key} = ?2{extra}"
             ),
             params![from.source, from.key.as_str(), to.source, to.key.as_str(), fp],
         )?;

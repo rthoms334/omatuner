@@ -136,6 +136,7 @@ async fn probe_m3u(
             let digest = blake3::hash(url.as_bytes()).to_hex();
             let dest = ctx.paths.playlist_cache().join(format!("probe-{}-{}.m3u", digest.get(..16).unwrap_or("x"), progress.id.0));
             let req = DownloadRequest {
+                resume_from: None,
                 url: url.to_owned().into(),
                 dest: dest.clone(),
                 headers: HttpHeaders { user_agent: Some(ua), ..Default::default() },

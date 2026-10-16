@@ -59,6 +59,10 @@ impl AppPaths {
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }
+    /// Private media, numbered by download id (DESIGN §43 §4).
+    pub fn downloads(&self) -> PathBuf {
+        self.data_dir.join("downloads")
+    }
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("tuner.db")
     }

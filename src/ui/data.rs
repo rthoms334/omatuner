@@ -309,6 +309,7 @@ mod tests {
         };
         let mut snap = PlayerSnapshot { state: PlayerState::Zapping { until: Instant::now() }, video_size: Some((1920, 1080)), ..Default::default() };
         snap.playable = Some(Arc::new(crate::model::Playable {
+            from_download: false,
             media: MediaRef::Channel(ChannelId(4)),
             kind: crate::model::PlayableKind::Live,
             item: Some(crate::model::ItemRef { source: SourceId(1), kind: crate::model::ItemKind::Channel, key: ItemKey("a".into()) }),

@@ -113,6 +113,7 @@ pub enum Call {
     // ---- the batch (DESIGN §31–§35, the skill plan): action-shaped feature tools…
     Queue(Queue),
     Watchlist(Watchlist),
+    Downloads(Downloads),
     Follow(Follow),
     SpoilerGuard(SpoilerGuard),
     GuideFix(GuideFix),
@@ -150,6 +151,7 @@ impl Call {
             Call::Control(_) => "control",
             Call::Queue(_) => "queue",
             Call::Watchlist(_) => "watchlist",
+            Call::Downloads(_) => "downloads",
             Call::Follow(_) => "follow",
             Call::SpoilerGuard(_) => "spoiler_guard",
             Call::GuideFix(_) => "guide_fix",
@@ -176,6 +178,7 @@ impl Call {
             Call::FavouritesEdit(_) | Call::Lock(_) => true,
             Call::Queue(p) => p.action.mutates(),
             Call::Watchlist(p) => p.action.mutates(),
+            Call::Downloads(p) => p.action.mutates(),
             Call::Follow(p) => p.action.mutates(),
             Call::SpoilerGuard(p) => p.action.mutates(),
             Call::GuideFix(p) => p.action.mutates(),
@@ -438,6 +441,9 @@ pub struct Empty {}
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Play {
+    /// Only after the user agrees to pause a download or stop a recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_downloads: Option<bool>,
     /// Channel, movie, series, episode or programme ref.
     #[serde(rename = "ref")]
     pub item: String,
@@ -1345,10 +1351,22 @@ mod tests {
     fn tool_arguments_are_the_params() {
         let call = Call::from_tool("play", serde_json::json!({"ref": "channel:2:xt:live:1", "from_start": true})).unwrap();
         // an older client: no open_in
-        assert_eq!(call, Call::Play(Play { item: "channel:2:xt:live:1".into(), from_start: Some(true), open_in: None, device: None }));
+        assert_eq!(
+            call,
+            Call::Play(Play { pause_downloads: None, item: "channel:2:xt:live:1".into(), from_start: Some(true), open_in: None, device: None })
+        );
         assert!(call.is_action() && call.name() == "play");
         let tv = Call::from_tool("play", serde_json::json!({"ref": "movie:2:xt:vod:1", "open_in": "full_window"})).unwrap();
-        assert_eq!(tv, Call::Play(Play { item: "movie:2:xt:vod:1".into(), from_start: None, open_in: Some("full_window".into()), device: None }));
+        assert_eq!(
+            tv,
+            Call::Play(Play {
+                pause_downloads: None,
+                item: "movie:2:xt:vod:1".into(),
+                from_start: None,
+                open_in: Some("full_window".into()),
+                device: None
+            })
+        );
         let cast =
             Call::from_tool("play", serde_json::json!({"ref": "movie:2:xt:vod:1", "device": "device:00112233445566778899aabbccddeeff"})).unwrap();
         assert_eq!(cast.name(), "play");

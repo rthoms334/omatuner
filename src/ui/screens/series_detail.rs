@@ -51,6 +51,7 @@ enum ScrollTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Btn {
+    Download,
     Play,
     /// "Play from ▾": the series' copies (DESIGN §29.14).
     PlayFrom,
@@ -296,9 +297,9 @@ impl SeriesDetailScreen {
 
     fn buttons(&self) -> Vec<Btn> {
         let mut buttons = if self.copies.is_stacked() {
-            vec![Btn::Play, Btn::PlayFrom, Btn::Favourite, Btn::SeasonWatched]
+            vec![Btn::Play, Btn::PlayFrom, Btn::Download, Btn::Favourite, Btn::SeasonWatched]
         } else {
-            vec![Btn::Play, Btn::Favourite, Btn::SeasonWatched]
+            vec![Btn::Play, Btn::Download, Btn::Favourite, Btn::SeasonWatched]
         };
         if self.in_continue_watching() {
             buttons.push(Btn::RemoveContinue);
@@ -319,6 +320,9 @@ impl SeriesDetailScreen {
         if self.copies.combined() {
             crate::ui::copies::forget_series(ctx, self.copies.plan());
         } else if let Some(id) = self.id {
+            if let Ok(series) = crate::store::vod::series(ctx.db, id) {
+                crate::ui::downloads::offer_cleanup(ctx, &[ItemRef { source: series.source_id, kind: ItemKind::Series, key: series.key }]);
+            }
             crate::ui::copies::write_with_undo(ctx, DataScope::Progress, "Removed from Continue watching".into(), move |c| {
                 crate::store::copies::forget_series(c, &[id])
             });
@@ -361,6 +365,9 @@ impl SeriesDetailScreen {
     }
 
     fn mark(&mut self, ctx: &mut UiCtx<'_>, eps: Vec<Episode>, on: bool) {
+        if !on {
+            crate::ui::downloads::offer_cleanup(ctx, &eps.iter().map(episode_ref).collect::<Vec<_>>());
+        }
         if eps.is_empty() {
             return;
         }
@@ -428,6 +435,11 @@ impl SeriesDetailScreen {
 
     fn press(&mut self, ctx: &mut UiCtx<'_>, b: Btn) {
         match b {
+            Btn::Download => {
+                if let Some(id) = self.id {
+                    ctx.open(OverlayRequest::Download(crate::ui::item_menu::Target::Series(id)));
+                }
+            }
             Btn::Play => {
                 if let Some(c) = self.other_copy() {
                     self.play_copy(ctx, c);
@@ -914,6 +926,7 @@ impl Screen for SeriesDetailScreen {
                                 };
                                 (glyphs::PLAY, label, true, false)
                             }
+                            Btn::Download => ("⤓", "Download ▾".into(), false, false),
                             Btn::PlayFrom => (glyphs::PLAYLIST, "Play from ▾".into(), false, false),
                             Btn::Favourite => (
                                 if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF },
@@ -1017,6 +1030,27 @@ impl Screen for SeriesDetailScreen {
                         ui.label(line);
                     }
                 });
+            }
+            if let Some(id) = self.id
+                && let Some(summary) = ctx.lib.vod.index_of(VodKind::Series(id)).and_then(|i| ctx.lib.vod.series.get(i as usize))
+            {
+                let item = crate::store::copies::vod_ref(summary);
+                let snap = crate::ui::downloads::snapshot(ctx);
+                let jobs: Vec<_> = snap
+                    .jobs
+                    .iter()
+                    .filter(|j| {
+                        j.source_id == Some(item.source) && j.fp.get("download_series_key").and_then(|v| v.as_str()) == Some(item.key.as_str())
+                    })
+                    .collect();
+                if !jobs.is_empty() {
+                    ui.label(format!(
+                        "{} of {} downloaded · {:.1} GB",
+                        jobs.iter().filter(|j| j.state == crate::downloads::State::Done).count(),
+                        data.episodes.len(),
+                        jobs.iter().map(|j| j.bytes_done).sum::<u64>() as f64 / 1e9
+                    ));
+                }
             }
             // season tabs
             let seasons_rect = ui
@@ -1441,9 +1475,9 @@ mod tests {
         h.state_mut().act(Action::Remove);
         h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
         assert!(named_ep(&h, source, 1).is_some());
-        // Tab to buttons, then right past Play, My list and Mark season watched.
+        // Tab to buttons, then right past Play, Download, My list and Mark season watched.
         h.state_mut().act(Action::FocusNext);
-        for _ in 0..3 {
+        for _ in 0..4 {
             h.state_mut().act(Action::Right);
         }
         h.state_mut().act(Action::Activate);

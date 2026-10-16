@@ -69,3 +69,15 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` (this plugin's shared rules) and
 - **"Go back to the last channel"**: `control` `previous_channel`.
 
 Never zap through channels in a loop to look for something; search the guide instead.
+
+## Save or record
+
+“Record this” means resolve the current guide programme from `status` / `whats_on`, confirm
+its time and account, then `downloads record`. With no guide use the current channel ref and
+an agreed number of minutes. “Save last night's …” uses a catch-up programme ref returned by
+the guide and `downloads add` or `record`, after consent. Report the job id and cancellation
+command, without a file path. A finished download plays with ordinary `play`.
+
+If Play returns `busy`, ask whether to pause the download or stop the recording, use an
+available copy, or cancel. Never send `pause_downloads: true` without that consent. The app
+resumes a paused download when playback frees its account. Follow RULES.md §14.

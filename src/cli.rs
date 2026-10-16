@@ -56,6 +56,10 @@ pub struct Cli {
     #[arg(long, value_name = "ID")]
     pub reminder: Option<i64>,
 
+    /// Record a saved job without opening a window.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["refresh", "rearm", "reminder", "play", "view", "inputs"])]
+    pub record: Option<i64>,
+
     /// Verbose logging (also `RUST_LOG`).
     #[arg(long, global = true)]
     pub debug: bool,

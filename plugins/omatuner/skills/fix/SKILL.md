@@ -82,3 +82,16 @@ and `sources` for guide coverage.
 guide coverage and failures in 24 hours; per guide its age and when it ends. Rank the problems,
 most urgent first. A regular check can be set up with Claude Code's /loop or /schedule if the
 user wants (opt-in).
+
+## Downloads and recordings
+
+Read `downloads list` and `status` once. Explain the job's reason before proposing a change:
+waiting for space needs deletion or a Settings cap/reserve change; waiting for an account
+means playback or another job holds it; waiting for the window resumes at its start. A
+non-resumable server restarts a paused file. Three failed jobs pause that account's queue;
+use Retry only after checking the cause, without repeated probing.
+
+A Partial recording retains what was captured. Finishing remuxes HLS into a seekable file;
+a failed finish keeps the source folder and can retry on restart or with `downloads retry`.
+Missing media is not included in backups. Ask before deleting files or interrupting another
+job, and never print private paths, credentials or stream addresses. See RULES.md §14.

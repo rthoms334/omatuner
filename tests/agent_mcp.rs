@@ -198,6 +198,7 @@ fn tools_list_has_every_tool() {
             "cancel_switch",
             "control",
             // the feature tools (each listed while its feature is on)
+            "downloads",
             "queue",
             "watchlist",
             "follow",

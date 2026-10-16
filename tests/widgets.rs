@@ -426,9 +426,10 @@ fn sidebar_rail_and_compact_glyph_strip() {
             let (mut search, mut play_on_clicked) = (false, false);
             let play_on = Some(tuner::ui::widgets::sidebar::PlayOn { tv: None, key: "Alt+T" });
             let clicked = if s.strip {
-                ui.horizontal(|ui| sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, None, play_on, &mut search, &mut play_on_clicked)).inner
+                ui.horizontal(|ui| sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, None, None, play_on, &mut search, &mut play_on_clicked))
+                    .inner
             } else {
-                sidebar(ui, &s.theme, ScreenId::Live, false, false, None, None, &mut search, &mut play_on_clicked)
+                sidebar(ui, &s.theme, ScreenId::Live, false, false, None, None, None, &mut search, &mut play_on_clicked)
             };
             s.clicked = s.clicked.or(clicked);
             s.search |= search;

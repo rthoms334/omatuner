@@ -144,6 +144,7 @@ fn create(
     Controller {
         live_cache: super::timeshift::LiveCache::new(deps.cache_dir.as_deref(), tile),
         hls: None,
+        recording: None,
         hls_media: None,
         hls_origin: 0.0,
         hls_epoch: 0,
@@ -249,7 +250,8 @@ struct LocalView {
 
 struct Controller {
     live_cache: super::timeshift::LiveCache,
-    hls: Option<super::hls::Buffer>,
+    hls: Option<super::hls::Reader>,
+    recording: Option<Arc<crate::downloads::reader::Reader>>,
     hls_media: Option<MediaRef>,
     hls_origin: f64,
     hls_epoch: u64,
@@ -656,6 +658,7 @@ impl Controller {
     /// The lease waits for the upstream's `UpstreamClosed`, unless that upstream never opened
     /// (or already closed).
     fn stop_remote(&mut self) {
+        self.close_hls();
         self.pending = None;
         self.waiting = None;
         let replaced_next = matches!(self.machine.state(), PlayerState::Reconnecting { .. });
@@ -719,6 +722,9 @@ impl Controller {
     }
 
     fn close_hls(&mut self) {
+        if self.recording.take().is_some() {
+            self.release_lease();
+        }
         if let Some(hls) = self.hls.take() {
             // Buffer::drop joins its fetcher after the actual provider socket closes.
             drop(hls);
@@ -804,24 +810,52 @@ impl Controller {
                 return;
             }
         }
-        if self.hls.is_none() {
+        if self.hls.is_none() && self.recording.is_none() {
             self.release_lease();
         }
-        if let Some(src) = p.source_id.filter(|_| self.hls.is_none()) {
+        if self.hls.is_none()
+            && p.kind.is_live()
+            && let Some((buffer, lease)) = self.budget.share_live(&p.media, self.tile)
+        {
+            self.hls = Some(buffer.reader());
+            self.hls_media = Some(p.media.clone());
+            self.lease = Some(lease);
+            self.lease_media = Some(p.media.clone());
+        }
+        if self.hls.is_none()
+            && self.recording.is_none()
+            && p.kind.is_live()
+            && let Some((reader, lease)) = self.budget.share_raw(&p.media, self.tile)
+        {
+            self.recording = Some(reader);
+            self.lease = Some(lease);
+            self.lease_media = Some(p.media.clone());
+        }
+        if let Some(src) = p.source_id.filter(|_| self.hls.is_none() && self.recording.is_none()) {
             match self.budget.acquire(self.tile, src) {
                 Ok(l) => {
                     self.lease = Some(l);
                     self.lease_media = Some(p.media.clone());
                     self.lease_played = false;
                 }
-                Err(e) if e.closing && Instant::now() < deadline => {
-                    tracing::debug!("{}: source {} is still closing in picture {:?}; waiting", self.log, src.0, e.holder);
+                Err(e) if e.closing() && Instant::now() < deadline => {
+                    tracing::debug!("{}: source {} is still closing in picture {:?}; waiting", self.log, src.0, e.holder());
                     // the lease went above: the old stream must not run on unaccounted (casting
                     // excludes multi-view, so the relay never gets here)
                     if !self.casting() {
                         let _ = self.mpv.command("stop", &[]);
                     }
                     self.waiting = Some(PendingLoad { playable: p, deadline });
+                    return;
+                }
+                Err(super::budget::BudgetExceeded::Download { id }) => {
+                    self.feed(Input::Stop, Instant::now());
+                    self.deps.bus.send(AppEvent::DownloadBusy(crate::ui::downloads::Busy {
+                        id,
+                        source: src,
+                        tile: self.tile,
+                        command: Box::new(PlayerCommand::Play(self.zap_request(p.media.clone(), true))),
+                    }));
                     return;
                 }
                 Err(e) => {
@@ -835,6 +869,13 @@ impl Controller {
             crate::redact::register_secret(v);
         }
         if self.casting() {
+            let p = if let Some(hls) = &self.hls {
+                Arc::new(Playable { url: crate::redact::Secret::new(hls.relay_url()), headers: Default::default(), ..(*p).clone() })
+            } else if let Some(reader) = &self.recording {
+                Arc::new(Playable { url: crate::redact::Secret::new(reader.url().to_owned()), headers: Default::default(), ..(*p).clone() })
+            } else {
+                p
+            };
             return self.load_remote(p);
         }
         if p.kind.is_live() && self.snap.video_suspended {
@@ -857,11 +898,15 @@ impl Controller {
         self.subtitle_selected_manually = false;
         self.snap.last_error = None;
         let mut args = super::mpv::loadfile_args(&p);
+        if let Some(reader) = &self.recording {
+            let local = Playable { url: crate::redact::Secret::new(reader.url().to_owned()), headers: Default::default(), ..(*p).clone() };
+            args = super::mpv::loadfile_args(&local);
+        }
         self.cache_ready = false;
         self.snap.live_buffer = None;
         self.snap.seekable = false;
         self.pending_seek = None;
-        if super::hls::eligible(&p) && self.hls_fallback.as_ref() != Some(&p.media) {
+        if (self.hls.is_some() || super::hls::eligible(&p)) && self.hls_fallback.as_ref() != Some(&p.media) {
             if self.hls.is_none() {
                 let root = self
                     .deps
@@ -871,7 +916,11 @@ impl Controller {
                     .unwrap_or_else(std::env::temp_dir);
                 match super::hls::Buffer::start(&p, &root, self.tile, &self.applied.player.user_agent, self.hls_window) {
                     Ok(buffer) => {
-                        self.hls = Some(buffer);
+                        let buffer = Arc::new(buffer);
+                        if let Some(source) = p.source_id {
+                            self.budget.register_live(p.media.clone(), self.tile, source, &buffer);
+                        }
+                        self.hls = Some(buffer.reader());
                         self.hls_media = Some(p.media.clone());
                     }
                     Err(_) => {
@@ -1024,9 +1073,28 @@ impl Controller {
         (!lines.is_empty()).then(|| crate::redact::redact(&lines.join(" ")).into_owned())
     }
 
+    /// Ask before mutating the current output. Cancel keeps its picture, and the answer
+    /// replays the complete request (resume, copy fallback and destination included, §43 §2.4).
+    fn ask_download(&mut self, req: &PlayRequest, command: PlayerCommand) -> bool {
+        let Ok(p) = self.deps.resolver.resolve(&req.media, req.resume) else { return false };
+        let Some(source) = p.source_id else { return false };
+        if self.budget.has_reader(&p.media) {
+            return false;
+        }
+        if self.budget.admits(self.tile, source) {
+            return false;
+        }
+        let Some(id) = self.budget.download_holder(source) else { return false };
+        self.deps.bus.send(AppEvent::DownloadBusy(crate::ui::downloads::Busy { id, source, tile: self.tile, command: Box::new(command) }));
+        true
+    }
+
     /// Resolve and play; a copy with a fallback that can't be resolved goes straight to the
     /// fallback (once). The machine is armed only for the target that actually plays.
     fn play_copy(&mut self, c: CopyPlay) -> bool {
+        if self.ask_download(&c.req, PlayerCommand::PlayCopy(c.clone())) {
+            return false;
+        }
         let CopyPlay { req, fallback, elsewhere, start_at } = c;
         if let Some(z) = req.zap.clone() {
             self.snap.zap = Some(z);
@@ -1294,6 +1362,9 @@ impl Controller {
     /// (DESIGN §40 §3.9): [`Controller::play_on_tv`]'s TV, else here. Not Play here's own play
     /// (`stop_casting`), which is this computer's by definition.
     fn play_where_on(&mut self, c: CopyPlay) -> bool {
+        if self.ask_download(&c.req, PlayerCommand::PlayCopy(c.clone())) {
+            return false;
+        }
         match self.play_on_tv(&c.req) {
             Some(device) => self.cast_to(device, Some(c)),
             None => self.play_copy(c),
@@ -1337,6 +1408,11 @@ impl Controller {
     /// or what played, at its position. Another TV's session (or a lost one) ends first: one
     /// relay at a time.
     fn cast_to(&mut self, device: DeviceId, play: Option<CopyPlay>) -> bool {
+        if let Some(c) = &play
+            && self.ask_download(&c.req, PlayerCommand::CastTo { device, play: Some(c.req.clone()) })
+        {
+            return false;
+        }
         // picture B's claim, not a stream it is still closing: the relay's lease waits for that
         if self.tile != TileId::A || self.budget.others_claim(self.tile) {
             tracing::info!("{}: not casting: multi-view is on", self.log);
@@ -1972,6 +2048,9 @@ impl Controller {
         {
             return true;
         }
+        if reason == EndReason::Eof && self.machine.owns_entry(entry_id) && self.recording.as_ref().is_some_and(|r| !r.active()) {
+            self.close_hls();
+        }
         let line = format!("END_FILE entry {entry_id}: {reason:?} ({error}) in {}", state_label(self.machine.state()));
         if self.machine.owns_entry(entry_id) && matches!(reason, EndReason::Eof | EndReason::Error | EndReason::Unknown) {
             tracing::info!("{line}");
@@ -2237,6 +2316,9 @@ impl Controller {
     /// and ad-hoc URLs have none, so neither gets a resume point).
     fn save_progress(&mut self, pos: Option<f64>) {
         let Some(p) = self.snap.playable.clone() else { return };
+        if let (MediaRef::Download(id), Some(pos)) = (&p.media, pos) {
+            self.deps.store.save_download_progress(*id, pos, self.snap.duration, self.watched(Some(pos)));
+        }
         if !matches!(p.kind, PlayableKind::Movie | PlayableKind::Episode { .. }) {
             return;
         }
@@ -2685,6 +2767,7 @@ mod tests {
     fn hidden_live_suspends_but_pause_and_rewind_restore_video() {
         let (mut c, _) = audio_controller(&Config::default(), Arc::new(|_| None));
         let p = Arc::new(Playable {
+            from_download: false,
             media: MediaRef::Channel(ChannelId(1)),
             kind: PlayableKind::Live,
             source_id: None,

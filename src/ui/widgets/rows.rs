@@ -646,6 +646,19 @@ pub fn episode_row(
         );
         right = r.left() - theme.space(SpaceToken::Md);
     }
+    let item = crate::model::ItemRef { source: e.source_id, kind: crate::model::ItemKind::Episode, key: e.key.clone() };
+    if let Some(label) = crate::ui::downloads::cached_badge(ui.ctx(), &item) {
+        let r = paint::text(
+            painter,
+            egui::pos2(right, y),
+            Align2::RIGHT_CENTER,
+            label,
+            paint::font(theme, TypeToken::BodySmall),
+            t.accent,
+            f32::INFINITY,
+        );
+        right = r.left() - gap;
+    }
     let title = match e.duration_s {
         Some(d) if d > 0 => format!("{name} · {} min", (d + 30) / 60),
         _ => name.into_owned(),

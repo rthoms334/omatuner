@@ -195,3 +195,113 @@ fn a_news_flash_follows_the_bulletin_on_weekdays() {
     (cfg.follow.news_flash.quiet_from_min, cfg.follow.news_flash.quiet_to_min) = (Some(0), Some(24 * 60));
     assert_eq!(at(&cfg, None), Some(FlashSkip::QuietHours));
 }
+
+/// DESIGN §43 §8.7: the same evaluator/ledger produces recording jobs, never reminders.
+#[test]
+fn recording_rule_schedules_new_matches_once_and_cancels_with_rule() {
+    let s = Store::open_temp("follow-recording", None).unwrap();
+    seed(&s);
+    let mut rule = FollowRule::draft("Arsenal", FollowKind::Team, vec!["Arsenal".into()], &Default::default(), NOW);
+    rule.mode = FollowMode::Record;
+    let id = w(&s, move |c| store_follow::save_rule(c, &rule, 100, NOW));
+    guide(&s, 1, SAT);
+    evaluate(&s, FollowReason::Rules, NOW).unwrap();
+    let schedule = |c: &mut Connection| {
+        let lib = library::load(c)?;
+        tuner::downloads::maintenance::following(c, &lib, &Default::default(), NOW)
+    };
+    w(&s, schedule);
+    w(&s, schedule);
+    let rows = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap();
+    assert_eq!(rows.len(), 1, "one new event; explicit channel and repeat excluded");
+    assert_eq!(rows[0].state, tuner::downloads::State::Scheduled);
+    assert_eq!(rows[0].prog_start, Some(SAT));
+    assert!(reminders(&s).is_empty(), "record is a Following action, not a reminder");
+    guide(&s, 2, SAT + 600);
+    evaluate(&s, FollowReason::Guide, NOW + 120).unwrap();
+    w(&s, schedule);
+    let rows = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].prog_start, Some(SAT + 600));
+    w(&s, move |c| {
+        c.execute("DELETE FROM follow_rule WHERE id=?1", [id])?;
+        Ok(())
+    });
+    w(&s, schedule);
+    assert_eq!(tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap()[0].state, tuner::downloads::State::Cancelled);
+}
+
+#[test]
+fn series_recording_skips_a_downloaded_episode_and_repeated_airings() {
+    let s = Store::open_temp("follow-downloaded", None).unwrap();
+    seed(&s);
+    w(&s, |c| {
+        let (epg, ch): (i64, i64) =
+            c.query_row("SELECT epg_source_id,id FROM epg_channel WHERE xmltv_id='ch0.tv'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        for (offset, episode) in [(0, 4), (3600, 5), (86400, 5)] {
+            c.execute("INSERT INTO programme(epg_source_id,epg_channel_id,gen,start,stop,title,season,episode,flags) VALUES (?1,?2,1,?3,?4,'Taskmaster',20,?5,2)",params![epg,ch,SAT+offset,SAT+offset+1800,episode])?;
+        }
+        c.execute(
+            "INSERT INTO download(position,kind,title,state,added_at,fp) VALUES (0,'episode','Taskmaster','done',?1,?2)",
+            params![NOW - 3600, r#"{"download_season":20,"download_episode":4}"#],
+        )?;
+        let mut rule = FollowRule::draft("Taskmaster", FollowKind::Show, vec!["Taskmaster".into()], &Default::default(), NOW);
+        rule.mode = FollowMode::Record;
+        store_follow::save_rule(c, &rule, 100, NOW)?;
+        Ok(())
+    });
+    evaluate(&s, FollowReason::Rules, NOW).unwrap();
+    w(&s, |c| {
+        let lib = library::load(c)?;
+        tuner::downloads::maintenance::following(c, &lib, &Default::default(), NOW)?;
+        tuner::downloads::maintenance::following(c, &lib, &Default::default(), NOW + 60)?;
+        Ok(())
+    });
+    let rows = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap();
+    assert_eq!(rows.len(), 2, "one downloaded episode plus one new recording; no repeat");
+    assert_eq!(rows[1].fp["download_event"], "taskmaster#s20e05");
+}
+
+#[test]
+fn recording_identity_keeps_fixture_dates_and_failed_matches_can_be_scheduled_again() {
+    let s = Store::open_temp("follow-dates", None).unwrap();
+    seed(&s);
+    let mut rule = FollowRule::draft("Arsenal", FollowKind::Team, vec!["Arsenal".into()], &Default::default(), NOW);
+    rule.mode = FollowMode::Record;
+    w(&s, move |c| store_follow::save_rule(c, &rule, 100, NOW));
+    guide(&s, 1, SAT);
+    evaluate(&s, FollowReason::Rules, NOW).unwrap();
+    let schedule = |c: &mut Connection| {
+        let lib = library::load(c)?;
+        tuner::downloads::maintenance::following(c, &lib, &Default::default(), NOW)
+    };
+    w(&s, schedule);
+    let first = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap()[0].clone();
+    assert!(first.fp["download_event"].as_str().unwrap().contains('@'));
+    let first_id = first.id;
+    w(&s, move |c| {
+        c.execute("UPDATE download SET state='done',fp=json_set(fp,'$.download_follow_rule',999) WHERE id=?1", [first_id])?;
+        Ok(())
+    });
+    guide(&s, 2, SAT + 3600);
+    evaluate(&s, FollowReason::Guide, NOW + 60).unwrap();
+    w(&s, schedule);
+    assert_eq!(
+        tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap().len(),
+        2,
+        "another rule's completed recording does not consume this rule's identity"
+    );
+    guide(&s, 3, SAT + 86400);
+    evaluate(&s, FollowReason::Guide, NOW + 120).unwrap();
+    w(&s, schedule);
+    let rows = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap();
+    assert_eq!(rows.len(), 3, "the next day's fixture is new");
+    assert_ne!(rows[0].fp["download_event"], rows[2].fp["download_event"]);
+    for state in [tuner::downloads::State::Missed, tuner::downloads::State::Failed, tuner::downloads::State::Cancelled] {
+        let rows = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap();
+        let id = rows.last().unwrap().id;
+        w(&s, move |c| tuner::store::downloads::set_state(c, id, state, None));
+        w(&s, schedule);
+        assert_eq!(tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap().len(), rows.len() + 1);
+    }
+}

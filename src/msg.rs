@@ -86,6 +86,7 @@ impl Toast {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // rare messages; boxing buys nothing
 pub enum AppEvent {
+    DownloadBusy(crate::ui::downloads::Busy),
     Job(JobEvent),
     Player(PlayerEvent),
     Theme(ThemeEvent),

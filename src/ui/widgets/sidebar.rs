@@ -34,6 +34,7 @@ pub const ITEMS: &[SidebarItem] = &[
     // only while Up next has items to go, with their count (DESIGN §32)
     SidebarItem { id: ScreenId::Queue, glyph: glyphs::UP_NEXT, label: "Up next" },
     SidebarItem { id: ScreenId::Watchlists, glyph: glyphs::FAV_LIST, label: "Watchlists" },
+    SidebarItem { id: ScreenId::Downloads, glyph: "⤓", label: "Downloads" },
     SidebarItem { id: ScreenId::Settings, glyph: glyphs::SETTINGS, label: "Settings" },
 ];
 
@@ -159,6 +160,7 @@ pub fn sidebar(
     expanded: bool,
     has_vod: bool,
     up_next: Option<usize>,
+    downloads: Option<usize>,
     play_on: Option<PlayOn<'_>>,
     search_clicked: &mut bool,
     play_on_clicked: &mut bool,
@@ -187,7 +189,9 @@ pub fn sidebar(
         };
         let size = if strip { egui::vec2(side, side) } else { egui::vec2(ui.available_width(), side) };
         let selected = matches!(e, Entry::Screen(it) if is_current(it.id, current));
-        let count = up_next.filter(|_| matches!(e, Entry::Screen(it) if it.id == ScreenId::Queue));
+        let count = up_next
+            .filter(|_| matches!(e, Entry::Screen(it) if it.id == ScreenId::Queue))
+            .or(downloads.filter(|_| matches!(e, Entry::Screen(it) if it.id == ScreenId::Downloads)));
         if entry(ui, theme, &row, size, expanded && !strip, selected, count) {
             match e {
                 Entry::Screen(it) => clicked = Some(it.id),
@@ -214,15 +218,18 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(labels(false, true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Watchlists", "Settings"]);
-        assert_eq!(labels(false, false, None), ["Search", "Home", "Live TV", "Guide", "Watchlists", "Settings"]);
-        assert_eq!(labels(false, true, Some(2)), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Settings"]);
-        assert_eq!(labels(false, false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Watchlists", "Settings"]);
+        assert_eq!(labels(false, true, None), ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Watchlists", "Downloads", "Settings"]);
+        assert_eq!(labels(false, false, None), ["Search", "Home", "Live TV", "Guide", "Watchlists", "Downloads", "Settings"]);
+        assert_eq!(
+            labels(false, true, Some(2)),
+            ["Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Downloads", "Settings"]
+        );
+        assert_eq!(labels(false, false, Some(2)), ["Search", "Home", "Live TV", "Guide", "Up next", "Watchlists", "Downloads", "Settings"]);
         // Play on heads the list when shown, and is no screen
-        assert_eq!(labels(true, false, None), ["Play on", "Search", "Home", "Live TV", "Guide", "Watchlists", "Settings"]);
+        assert_eq!(labels(true, false, None), ["Play on", "Search", "Home", "Live TV", "Guide", "Watchlists", "Downloads", "Settings"]);
         assert_eq!(
             labels(true, true, Some(2)),
-            ["Play on", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Settings"]
+            ["Play on", "Search", "Home", "Live TV", "Guide", "Movies", "Series", "Up next", "Watchlists", "Downloads", "Settings"]
         );
         assert!(is_current(ScreenId::Movies, ScreenId::MovieDetail));
         assert!(!is_current(ScreenId::Live, ScreenId::Guide));

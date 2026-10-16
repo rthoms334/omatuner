@@ -268,6 +268,7 @@ mod tests {
 
     fn playable(headers: HttpHeaders, start_at: Option<f64>) -> Playable {
         Playable {
+            from_download: false,
             media: MediaRef::Url("u".into()),
             kind: PlayableKind::Live,
             item: None,

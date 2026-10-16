@@ -381,6 +381,9 @@ fn favourite_write(ctx: &crate::ui::UiCtx<'_>, list: FavListId, refs: Vec<ItemRe
 /// ✓ on a combined movie: mark the copy that would play watched, or (`on` false) forget every
 /// copy's progress (a card's Remove in Continue watching).
 pub fn mark_watched(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan, title: &str, on: bool) {
+    if !on {
+        crate::ui::downloads::offer_cleanup(ctx, &plan.refs());
+    }
     let text = if on { "Marked as watched" } else { "Removed from Continue watching" };
     watched_write(ctx, plan, None, title, on, text.to_owned());
 }
@@ -401,6 +404,7 @@ fn watched_write(ctx: &crate::ui::UiCtx<'_>, plan: &CopyPlan, plays: Option<u32>
 
 /// "Forget" a combined series: every episode progress of every copy.
 pub fn forget_series(ctx: &mut crate::ui::UiCtx<'_>, plan: &CopyPlan) {
+    crate::ui::downloads::offer_cleanup(ctx, &plan.refs());
     let ids: Vec<SeriesId> = plan
         .copies
         .iter()

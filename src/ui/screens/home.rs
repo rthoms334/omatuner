@@ -277,6 +277,9 @@ pub(crate) mod kit {
 
     /// Ctrl+W (`on`) / "remove from Continue watching" (`!on`, which forgets the progress).
     pub(crate) fn mark_watched(ctx: &mut UiCtx<'_>, item: &ItemRef, title: &str, on: bool) {
+        if !on {
+            crate::ui::downloads::offer_cleanup(ctx, std::slice::from_ref(item));
+        }
         let (now, items) = (ctx.now, vec![(item.clone(), title.to_owned())]);
         let _ = ctx.services.store.writer().submit_notify(DataScope::Progress, move |c| crate::store::user::mark_watched(c, &items, on, now));
         ctx.toast(Toast::info(if on { "Marked as watched" } else { "Removed from Continue watching" }));
@@ -891,6 +894,7 @@ impl HomeScreen {
             }
             (Action::Remove, _) => match rail {
                 Some((RailKind::Favourites, Some(list))) => {
+                    crate::ui::downloads::offer_cleanup(ctx, std::slice::from_ref(&item));
                     kit::set_in_list(ctx, list, &item, false);
                     let list_name = ctx.favs.lists.iter().find(|l| l.id == list).map(|l| l.name.clone()).unwrap_or_default();
                     ctx.toast(crate::msg::Toast::info(format!("Removed from {list_name}")));

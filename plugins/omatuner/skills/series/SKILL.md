@@ -54,3 +54,13 @@ From `continue_watching` and `history`, group shows into active (watched this we
   answers keep later episodes hidden.
 
 Without the `queue` tool, play one episode and say Tuner offers the next one at the end.
+
+## Downloads
+
+For “download the rest of season 1”, resolve the series or episode with `search` / `details`,
+then `downloads list` for space and existing jobs. Use `downloads series` with `scope: season`
+and `season`, or `downloads add` with the returned remaining episode refs. Confirm more than
+three items as RULES.md §14 requires. `scope: next_n` with `n` chooses unwatched episodes;
+`scope: keep` maintains 1–10 unwatched downloads and always needs consent. Report returned
+counts and size; explain any refused refs. Finished copies play locally through ordinary Play.
+`downloads pause` keeps partial files, `resume` continues them and `cancel` removes the job.

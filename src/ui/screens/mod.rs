@@ -1,6 +1,7 @@
 //! Screens (one file = one owner). Wireframes and behaviour: DESIGN §13.
 
 pub(crate) mod copies;
+pub mod downloads;
 pub mod epg_mapping;
 pub(crate) mod group_marks;
 pub mod guide;
@@ -36,5 +37,6 @@ pub fn all() -> Vec<Box<dyn Screen>> {
         Box::new(logs::LogsScreen::default()),
         Box::new(queue::QueueScreen::default()),
         Box::new(watchlists::WatchlistsScreen::default()),
+        Box::new(downloads::DownloadsScreen::default()),
     ]
 }

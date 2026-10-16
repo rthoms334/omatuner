@@ -52,6 +52,8 @@ pub struct Config {
     pub agents: AgentsConfig,
     /// Casting to TVs (DESIGN §40).
     pub cast: CastConfig,
+    /// Private downloads and recordings (DESIGN §43 §4).
+    pub downloads: DownloadsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -985,5 +987,35 @@ mod tests {
         std::fs::write(&path, "nonsense").unwrap();
         assert_eq!(load().expect_err("malformed").moved_to.unwrap(), dir.path().join("config.toml.bad.1"));
         assert_eq!(std::fs::read_to_string(dir.path().join("config.toml.bad")).unwrap(), broken);
+    }
+}
+
+/// Space and scheduling preferences (DESIGN §43 §3–§4). Zero disables optional limits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DownloadsConfig {
+    pub paused: bool,
+    pub cap_gb: u64,
+    pub reserve_gb: u64,
+    pub delete_after_watched_days: u32,
+    pub pad_before_s: u32,
+    pub pad_after_s: u32,
+    pub dir: String,
+    pub max_mbps: f64,
+    pub window: String,
+}
+impl Default for DownloadsConfig {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            cap_gb: 200,
+            reserve_gb: 10,
+            delete_after_watched_days: 0,
+            pad_before_s: 60,
+            pad_after_s: 300,
+            dir: String::new(),
+            max_mbps: 0.0,
+            window: String::new(),
+        }
     }
 }

@@ -49,6 +49,7 @@ impl Target {
 /// Add the features' entries for `target` to a menu (`keys`: the context the shortcuts are
 /// shown for).
 pub fn extend(items: &mut Vec<MenuItem>, target: &Target, ctx: &UiCtx<'_>, keys: KeyContext) {
+    items.extend(crate::ui::downloads::menu_items(target, ctx, keys));
     items.extend(crate::queue::ui::menu_items(target, ctx, keys));
     items.extend(crate::follow::ui::menu_items(target, ctx, keys));
     items.extend(crate::spoiler::ui::menu_items(target, ctx, keys));
@@ -66,7 +67,8 @@ pub fn popover_buttons(target: &Target, ctx: &UiCtx<'_>) -> Vec<MenuItem> {
 
 /// A feature's key or menu choice on `target`; true when a feature took it.
 pub fn dispatch(ctx: &mut UiCtx<'_>, action: Action, target: &Target) -> bool {
-    crate::queue::ui::on_action(ctx, action, target)
+    crate::ui::downloads::on_action(ctx, action, target)
+        || crate::queue::ui::on_action(ctx, action, target)
         || crate::follow::ui::on_action(ctx, action, target)
         || crate::spoiler::ui::on_action(ctx, action, target)
         || crate::ui::multiview::on_action(ctx, action, target)

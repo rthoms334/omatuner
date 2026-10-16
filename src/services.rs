@@ -176,6 +176,9 @@ impl Services {
     /// Start optional integrations; each failure is logged, never fatal. Also feeds the
     /// player's connection budget from stored account info.
     pub fn start_integrations(&mut self) {
+        if self.integrations.ipc.is_some() {
+            return;
+        }
         let cfg = self.config();
         if cfg.integration.follow_omarchy_theme {
             self.start_theme_watch(&cfg);
@@ -237,6 +240,22 @@ impl Services {
             }),
             Err(e) => tracing::warn!("connection limits: {e}"),
         }
+        if crate::downloads::ENABLED {
+            let downloads = crate::downloads::service::spawn(
+                self.rt.handle(),
+                crate::downloads::service::Deps {
+                    store: self.store.clone(),
+                    config: self.config.clone(),
+                    shared: self.agent.clone(),
+                    budget: self.tiles.budget().clone(),
+                    http: self.http.clone(),
+                    bus: self.bus.clone(),
+                    tiles: self.tiles.registry(),
+                    paths: self.paths.clone(),
+                },
+            );
+            self.agent.set_downloads(Some(downloads));
+        }
         // the batch features' background parts (each a no-op until its track turns it on)
         if crate::spoiler::ENABLED {
             crate::spoiler::tracker::start(self.rt.handle(), self.agent.clone(), self.store.clone());
@@ -247,9 +266,11 @@ impl Services {
         let (registry, writer, socket, cast) = (self.tiles.registry(), self.store.writer().clone(), self.socket.clone(), self.cast_stop.clone());
         let (config, config_file) = (self.config.clone(), self.paths.config_file());
         let config_audit = self.config_audit.clone();
+        let shared = self.agent.clone();
         let cleanup = move || -> futures_util::future::BoxFuture<'static, ()> {
             Box::pin(direct_exit_cleanup(
                 registry.all(),
+                shared.clone(),
                 writer.clone(),
                 socket.clone(),
                 cast.clone(),
@@ -474,6 +495,7 @@ impl Services {
     pub(crate) fn exit_cleanup(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         direct_exit_cleanup(
             self.tiles.handles(),
+            self.agent.clone(),
             self.store.writer().clone(),
             self.socket.clone(),
             self.cast_stop.clone(),
@@ -501,6 +523,9 @@ impl Services {
         }
         self.integrations = Integrations::default();
         self.jobs.shutdown();
+        if let Some(downloads) = self.agent.downloads() {
+            self.rt.block_on(downloads.request(crate::downloads::DownloadCommand::Shutdown));
+        }
         self.tiles.shutdown(); // final progress saves are submitted to the writer here
         // cancelled jobs finish their wind-down (an aborted guide import discards its partial
         // data and restores the channel matches) before the runtime drops their tasks
@@ -518,6 +543,7 @@ impl Services {
 /// from a hidden window).
 async fn direct_exit_cleanup(
     players: Vec<crate::player::PlayerHandle>,
+    shared: Arc<crate::shared::AppShared>,
     writer: Writer,
     socket: Arc<Mutex<Option<crate::ipc::SocketGuard>>>,
     cast: Arc<Mutex<Option<crate::cast::service::CastStopper>>>,
@@ -534,6 +560,9 @@ async fn direct_exit_cleanup(
     let stopper = cast.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(stopper) = stopper {
         stopper.stop_fast().await;
+    }
+    if let Some(downloads) = shared.downloads() {
+        downloads.request(crate::downloads::DownloadCommand::Shutdown).await;
     }
     for player in &players {
         player.send(PlayerCommand::Shutdown);
@@ -587,6 +616,9 @@ fn connection_limits(conn: &rusqlite::Connection) -> Result<Vec<PlayerCommand>> 
 struct WriterPlayerStore(Writer);
 
 impl PlayerStore for WriterPlayerStore {
+    fn save_download_progress(&mut self, id: crate::model::DownloadId, position: f64, duration: Option<f64>, finished: bool) {
+        let _ = self.0.submit_notify(DataScope::Progress, move |c| crate::store::downloads::save_progress(c, id, position, duration, finished));
+    }
     fn save_progress(&mut self, p: WatchProgress) {
         let _ = self.0.submit_notify(DataScope::Progress, move |c| crate::store::user::save_progress(c, &p));
     }
@@ -658,9 +690,22 @@ impl DbResolver {
 impl MediaResolver for DbResolver {
     fn resolve(&mut self, media: &MediaRef, resume: bool) -> std::result::Result<Playable, PlayerError> {
         let cfg = crate::config::current(&self.config);
+        let shared = self.shared.clone();
         let conn = self.conn()?;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::sources::resolve::resolve(conn, &cfg, media, resume, crate::model::now())
+            if let Some(shared) = &shared {
+                crate::sources::resolve::resolve_with_view(
+                    conn,
+                    &cfg,
+                    media,
+                    resume,
+                    crate::model::now(),
+                    &shared.library(),
+                    shared.parental(&cfg.parental),
+                )
+            } else {
+                crate::sources::resolve::resolve(conn, &cfg, media, resume, crate::model::now())
+            }
         }));
         let r = match r {
             Ok(r) => r.map_err(|e| {

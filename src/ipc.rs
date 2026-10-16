@@ -50,6 +50,9 @@ pub struct IpcRequest {
     /// `--reminder <id>`: a reminder timer fired (B6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<i64>,
+    /// A recording timer wakes the scheduler without raising a window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -245,7 +248,7 @@ fn v1_reply(line: &str, bus: &EventBus) -> std::io::Result<String> {
             tracing::info!("IPC request: view={:?} play={} inputs={}", req.view, req.play.is_some(), req.inputs.len());
             // a reminder's timer and a pop-out play never take focus (the app raises the
             // window itself for "Open in: Full window")
-            let raise = req.reminder.is_none() && !req.popout;
+            let raise = req.reminder.is_none() && req.record.is_none() && !req.popout;
             bus.send(AppEvent::Ipc(req));
             if raise {
                 crate::platform::hypr::focus_self();

@@ -2059,3 +2059,42 @@ helper's outcome.
   ranges, skip, move, restart and stop. **Expect:** fuzzy names return ambiguity when needed,
   status names the playing list, playback opens in the expected window/pop-out, and the
   plugin asks for the confirmations in RULES.md. Film favourites edits point to watchlist.
+
+## Downloads and recordings (DESIGN §43)
+
+- [ ] Queue a season with enough space, then one that exceeds the cap/reserve. The latter adds
+      nothing. Pause, resume, reorder and change copy; check badges, progress, ETA and Undo.
+- [ ] Download a film; disconnect networking and play/seek it, including through another title
+      copy, Up next and a watchlist. Verify the account has no provider connection.
+- [ ] With one connection per account, start a download then Play on that account. Check the
+      Ask prompt: Pause it and play, a free alternate, Cancel, Enter / 2 / Esc, and automatic
+      resume after playback stops. Repeat while casting and in picture B.
+- [ ] Record the channel being watched. Rewind into retained history, close/reopen the picture,
+      then stop recording. Check Finishing progress and seek/cast across a discontinuity.
+- [ ] Schedule a real overnight programme, close Tuner completely and leave the machine awake.
+      Confirm its `tuner-record-<id>` timer starts headless, padding is included, sleep is
+      inhibited, the completed file plays, and the headless process exits after recordings.
+- [ ] Suspend during a recording and across a scheduled start. On resume verify the wall-clock
+      stop, gap/partial indication, and catch-up fallback or Missed. Check an expired archive.
+- [ ] Leave a recording clash unanswered for 60 seconds, both with the window visible and
+      hidden. Playback continues; catch-up or “Missed (you were watching)” follows.
+- [ ] Move a programme in a refreshed guide; check its timer follows. Remove it; its old time
+      remains with “Not in the guide any more”. Test a Following record rule and repeat dedupe.
+- [ ] Enable Keep 3, watch/delete an episode and verify exactly the next unwatched one queues.
+      Test watched retention off and on, Delete watched confirmation and the ten-second Undo.
+- [ ] Check the optional speed cap across two accounts and the overnight window. Recordings
+      ignore the window. Hit the reserve while recording; the retained result is Partial.
+- [ ] Lock and conceal items: app downloading is allowed, playback asks for the PIN, MCP
+      refuses locked refs, and concealed jobs disappear from every count and title surface.
+- [ ] Delete a playlist with downloads, play its orphaned media, restore a metadata backup and
+      check missing files are labelled. Move the downloads folder and verify private modes.
+
+### Downloads review regressions
+- [ ] A due recording pauses an account's download without asking; a watched picture still gets Record / other account / Skip. Skip cancels; no answer uses catch-up or Missed.
+- [ ] Pause downloads survives restart; recordings and Finishing continue. A closing download window pauses only downloads and reopening resumes them.
+- [ ] Set a tiny speed cap: raw TS and HLS recordings remain continuous while downloads share the cap.
+- [ ] Kept topped up appears in Downloads and Settings; Delete and Undo remove/restore the rule. Agent list returns rules; `scope=keep,n=0` removes one.
+- [ ] Forget a downloaded movie or episode, including another copy: Confirm offers file deletion and Undo restores it. Ctrl+D recognises the saved copy.
+- [ ] Kill an HLS recording before its stop, restart, and verify it continues in the kept folder. Stop or Delete then Undo a raw TS recording: it stays Partial with its original bytes.
+- [ ] Move a large downloads folder across filesystems while a recording becomes due: it starts on time, the move waits for active recordings, and all saved files play after the switch.
+- [ ] Agent download list and busy play replies show plain titles but omit future episode titles protected by a series spoiler rule.

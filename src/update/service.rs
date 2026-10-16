@@ -660,6 +660,7 @@ impl Updater {
         let sig = sig.map_err(|e| (format!("downloading its signature: {e}"), false))?;
         let sig = String::from_utf8(sig.to_vec()).map_err(|_| ("its signature isn't text".to_owned(), true))?;
         let req = DownloadRequest {
+            resume_from: None,
             url: crate::redact::Secret::new(p.file.url.clone()),
             dest: dest.clone(),
             headers: github::asset_headers(),

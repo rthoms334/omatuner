@@ -125,6 +125,7 @@ fn fake_playing(media: MediaRef, kind: PlayableKind, zap: Option<ZapList>, origi
     Arc::new(PlayerSnapshot {
         state: PlayerState::Playing,
         playable: Some(Arc::new(Playable {
+            from_download: false,
             media,
             kind,
             item: None,

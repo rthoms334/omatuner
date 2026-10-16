@@ -542,6 +542,8 @@ pub trait MediaResolver: Send {
 pub trait PlayerStore: Send {
     /// VOD/catch-up progress (fingerprint left empty — the store computes it).
     fn save_progress(&mut self, p: WatchProgress);
+    /// Private recordings and orphans have their own resume point (DESIGN §43 §3).
+    fn save_download_progress(&mut self, _id: crate::model::DownloadId, _position: f64, _duration: Option<f64>, _finished: bool) {}
     fn push_history(&mut self, e: HistoryEntry);
     /// `Some(kind)` = record a failure, `None` = clear (successful play).
     fn record_failure(&mut self, item: ItemRef, kind: Option<PlayerErrorKind>);
@@ -760,6 +762,7 @@ mod tests {
     impl MediaResolver for Lavfi {
         fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
             Ok(Playable {
+                from_download: false,
                 media: media.clone(),
                 kind: if matches!(media, MediaRef::Movie(_)) { PlayableKind::Movie } else { PlayableKind::Live },
                 item: None,
@@ -997,6 +1000,7 @@ mod tests {
             let MediaRef::Channel(ch) = media else { return Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "channels only".into() }) };
             let source = Self::source(*ch);
             Ok(Playable {
+                from_download: false,
                 media: media.clone(),
                 kind: PlayableKind::Live,
                 item: Some(ItemRef { source, kind: ItemKind::Channel, key: ItemKey(format!("ch{}", ch.0)) }),
@@ -1267,6 +1271,7 @@ mod tests {
                 _ => return Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "no such copy".into() }),
             };
             Ok(Playable {
+                from_download: false,
                 media: media.clone(),
                 kind: PlayableKind::Movie,
                 item: Some(ItemRef { source: SourceId(id), kind: ItemKind::Movie, key: ItemKey(format!("m{id}")) }),
@@ -1394,6 +1399,7 @@ mod tests {
         impl MediaResolver for File {
             fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
                 Ok(Playable {
+                    from_download: false,
                     media: media.clone(),
                     kind: PlayableKind::Movie,
                     item: None,
