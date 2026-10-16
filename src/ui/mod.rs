@@ -189,6 +189,7 @@ impl Route {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayRequest {
     Download(item_menu::Target),
+    DeleteDownloads(Vec<crate::model::DownloadId>),
     DownloadBusy(downloads::Busy),
     DownloadRecording {
         channel: ChannelId,

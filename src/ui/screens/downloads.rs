@@ -16,6 +16,7 @@ pub struct DownloadsScreen {
     selected: Option<DownloadId>,
     delete: Vec<DownloadId>,
     drag: Option<DownloadId>,
+    rule: Option<i64>,
 }
 
 fn section(job: &Job) -> u8 {
@@ -80,10 +81,13 @@ impl Screen for DownloadsScreen {
             Action::Up => {
                 self.cursor = self.cursor.saturating_sub(1);
                 self.selected = rows.get(self.cursor).map(|j| j.id);
+                self.rule = self.cursor.checked_sub(rows.len()).and_then(|i| shared::snapshot(ctx).rules.get(i).map(|r| r.id));
             }
             Action::Down => {
-                self.cursor = (self.cursor + 1).min(rows.len().saturating_sub(1));
+                let rules = shared::snapshot(ctx);
+                self.cursor = (self.cursor + 1).min((rows.len() + rules.rules.len()).saturating_sub(1));
                 self.selected = rows.get(self.cursor).map(|j| j.id);
+                self.rule = self.cursor.checked_sub(rows.len()).and_then(|i| rules.rules.get(i)).map(|r| r.id);
             }
             Action::Activate => {
                 if let Some(j) = current {
@@ -105,7 +109,9 @@ impl Screen for DownloadsScreen {
                 }
             }
             Action::Remove => {
-                if let Some(j) = current {
+                if let Some(id) = self.rule.take() {
+                    shared::deleted_rule(ctx, id);
+                } else if let Some(j) = current {
                     self.confirm(ctx, vec![j.id]);
                 }
             }
@@ -168,7 +174,7 @@ impl Screen for DownloadsScreen {
                 snap.cap_bytes as f64 / 1e9,
                 snap.free_bytes as f64 / 1e9
             ));
-            if ui.button(if snap.paused { "Resume all" } else { "Pause all" }).clicked() {
+            if ui.button(if snap.paused { "Resume downloads" } else { "Pause downloads" }).clicked() {
                 shared::send(ctx, DownloadCommand::PauseAll(!snap.paused));
             }
         });
@@ -208,11 +214,13 @@ impl Screen for DownloadsScreen {
                     let r = ui.selectable_label(self.selected == Some(job.id) || self.selected.is_none() && self.cursor == i, name);
                     if r.clicked() {
                         self.cursor = i;
+                        self.rule = None;
                         self.selected = Some(job.id);
                         play = Some(job.id);
                     }
                     if r.secondary_clicked() {
                         self.cursor = i;
+                        self.rule = None;
                         self.selected = Some(job.id);
                         menu = Some(job.id);
                     }
@@ -281,7 +289,7 @@ impl Screen for DownloadsScreen {
                         remove = Some(job.id);
                     }
                 });
-                if job.reason.as_deref() == Some("clash") {
+                if shared::clash_live(job, ctx.now) {
                     ui.horizontal(|ui| {
                         for (label, record, alternate) in
                             [("Record (stops playback)", true, false), ("Use the other account", true, true), ("Skip this recording", false, false)]
@@ -292,6 +300,22 @@ impl Screen for DownloadsScreen {
                             if ui.button(label).clicked() {
                                 shared::send(ctx, DownloadCommand::Clash { id: job.id, record, alternate });
                             }
+                        }
+                    });
+                }
+            }
+            if !snap.rules.is_empty() {
+                ui.separator();
+                ui.heading("Kept topped up");
+                for (i, rule) in snap.rules.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.rule == Some(rule.id), format!("{} · keep {} unwatched", rule.title, rule.keep)).clicked() {
+                            self.cursor = rows.len() + i;
+                            self.selected = None;
+                            self.rule = Some(rule.id);
+                        }
+                        if ui.button("Delete").clicked() {
+                            shared::deleted_rule(ctx, rule.id);
                         }
                     });
                 }

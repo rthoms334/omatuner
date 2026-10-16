@@ -320,6 +320,9 @@ impl SeriesDetailScreen {
         if self.copies.combined() {
             crate::ui::copies::forget_series(ctx, self.copies.plan());
         } else if let Some(id) = self.id {
+            if let Ok(series) = crate::store::vod::series(ctx.db, id) {
+                crate::ui::downloads::offer_cleanup(ctx, &[ItemRef { source: series.source_id, kind: ItemKind::Series, key: series.key }]);
+            }
             crate::ui::copies::write_with_undo(ctx, DataScope::Progress, "Removed from Continue watching".into(), move |c| {
                 crate::store::copies::forget_series(c, &[id])
             });
@@ -362,6 +365,9 @@ impl SeriesDetailScreen {
     }
 
     fn mark(&mut self, ctx: &mut UiCtx<'_>, eps: Vec<Episode>, on: bool) {
+        if !on {
+            crate::ui::downloads::offer_cleanup(ctx, &eps.iter().map(episode_ref).collect::<Vec<_>>());
+        }
         if eps.is_empty() {
             return;
         }

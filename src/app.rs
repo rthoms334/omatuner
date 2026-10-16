@@ -2228,6 +2228,11 @@ impl TunerApp {
             // the batch features' global keys (each a no-op while its feature is off)
             Action::GoDownloads => self.nav.push(NavRequest::Switch(Route::Downloads)),
             Action::PlayDownload(id) => self.with_ctx(|ctx, _, _| crate::ui::downloads::play(ctx, id)),
+            Action::UndoDownloadRule(id) => {
+                if let Some(h) = self.services().agent.downloads() {
+                    h.send(crate::downloads::DownloadCommand::UndoRule(id));
+                }
+            }
             Action::UndoDownload(id) => {
                 if let Some(h) = self.services().agent.downloads() {
                     h.send(crate::downloads::DownloadCommand::Undo(vec![id]));

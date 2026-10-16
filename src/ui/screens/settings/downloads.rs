@@ -80,12 +80,27 @@ pub(super) fn rows(_s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     v.push(Row::Act {
         act: Act::Feature(Feature::Downloads, 1),
         icon: "⤓",
-        label: if snap.paused { "Resume all" } else { "Pause all" }.into(),
+        label: if snap.paused { "Resume downloads" } else { "Pause downloads" }.into(),
         danger: false,
     });
+    v.push(Row::Section("Kept topped up".into()));
+    for (i, rule) in snap.rules.iter().enumerate().take(u16::MAX as usize - 2) {
+        v.push(Row::Act {
+            act: Act::Feature(Feature::Downloads, i as u16 + 2),
+            icon: "×",
+            label: format!("Delete · {} · keep {} unwatched", rule.title, rule.keep),
+            danger: true,
+        });
+    }
 }
 pub(super) fn act(_s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, n: u16) {
     let Some(handle) = ctx.services.agent.downloads() else { return };
+    if n >= 2 {
+        if let Some(rule) = handle.snapshot().rules.get(n as usize - 2) {
+            crate::ui::downloads::deleted_rule(ctx, rule.id);
+        }
+        return;
+    }
     if n == 1 {
         handle.send(DownloadCommand::PauseAll(!handle.snapshot().paused));
         return;

@@ -296,7 +296,11 @@ fn ask_prompt_offers_a_free_copy_and_cancel_keeps_the_download_lease() {
     assert!(h.query_all_by_label("Play from TV 2 · 2").next().is_some());
     let app = h.state_mut();
     let ask = &mut app.ask;
-    assert!(matches!(app.t.with_ctx(|ctx| ask.on_action(ctx, tuner::keymap::Action::Back)), OverlayOutcome::Close));
+    assert!(matches!(app.t.with_ctx(|ctx| ask.on_action(ctx, tuner::keymap::Action::Up)), OverlayOutcome::Keep));
+    assert!(
+        matches!(app.t.with_ctx(|ctx| ask.on_action(ctx, tuner::keymap::Action::Activate)), OverlayOutcome::Close),
+        "Up from the first choice selects Cancel"
+    );
     assert_eq!(budget.download_holder(source), Some(id));
     assert_eq!(budget.claim_of(TileId::A), None, "cancel must not reserve the account or send Play");
     budget.release(id, lease, None);
@@ -339,4 +343,130 @@ fn backup_restore_is_metadata_only_idempotent_and_preserves_future_schedules() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn crash_reconcile_resumes_future_hls_and_marks_expired_capture_partial() {
+    let (store, _, _, _, channel) = fixture();
+    let c = store.reader().unwrap();
+    let ch = tuner::store::live::channel(&c, channel).unwrap();
+    let item = ItemRef { source: ch.source_id, kind: ItemKind::Channel, key: ch.key };
+    let root = db::root(&c, &Config::default().downloads).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    for future in [true, false] {
+        let mut j = job(&c, item.clone());
+        let now = tuner::model::now();
+        j.state = State::Running;
+        j.prog_start = Some(if future { now - 60 } else { now - 7200 });
+        j.prog_stop = Some(if future { now + 3600 } else { now - 3600 });
+        j.pad_after_s = 0;
+        let id = store.writer().blocking(move |c| db::add(c, &j)).unwrap();
+        let dir = root.join(id.to_string());
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("index.json"), b"{}").unwrap();
+        let path = root.clone();
+        store.writer().blocking(move |c| db::reconcile(c, &path)).unwrap();
+        let recovered = db::job(&c, id).unwrap().unwrap();
+        assert_eq!(recovered.state, if future { State::Waiting } else { State::Finishing });
+        assert_eq!(recovered.fp["download_partial"], true);
+        assert_eq!(recovered.path(&root), Some(dir));
+    }
+}
+
+#[test]
+fn picker_recognises_other_copy_and_forgetting_offers_confirmed_file_deletion() {
+    use egui_kittest::{Harness, kittest::Queryable};
+    use tuner::downloads::DownloadCommand;
+    use tuner::ui::overlays::{
+        Overlay, OverlayOutcome,
+        downloads::{DeleteFiles, Picker},
+    };
+    use tuner::ui::{NavRequest, OverlayRequest, item_menu, testing::TestUi};
+    let mut cfg = Config::default();
+    cfg.downloads.paused = true;
+    cfg.downloads.reserve_gb = 0;
+    let mut t = TestUi::with_config(cfg).unwrap();
+    let (id, copy, movie) = t
+        .services()
+        .store
+        .writer()
+        .blocking(|c| {
+            let a = support::seed::seed_source(c, "TV")?;
+            let b = support::seed::seed_source(c, "TV 2")?;
+            let m = support::seed::seed_movies(c, a, 1)?[0];
+            let n = support::seed::seed_movies(c, b, 1)?[0];
+            c.execute("UPDATE movie SET tmdb_id='123'", [])?;
+            let m = tuner::store::vod::movie(c, m)?;
+            let nrow = tuner::store::vod::movie(c, n)?;
+            let mut j = job(c, ItemRef { source: a, kind: ItemKind::Movie, key: m.key });
+            j.state = State::Done;
+            let id = db::add(c, &j)?;
+            j.id = id;
+            j.store_name = Some(format!("{id}.mp4"));
+            db::put(c, &j)?;
+            Ok((id, ItemRef { source: b, kind: ItemKind::Movie, key: nrow.key }, n))
+        })
+        .unwrap();
+    let root = db::root(&t.db, &t.config.downloads).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!("{id}.mp4"));
+    std::fs::write(&path, b"kept file").unwrap();
+    t.set_library(library::load(&t.db).unwrap());
+    drop(t.services().agent.publish_library(&t.lib));
+    let s = t.services();
+    let handle = tuner::downloads::service::spawn(
+        s.rt.handle(),
+        tuner::downloads::service::Deps {
+            store: s.store.clone(),
+            config: s.config.clone(),
+            shared: s.agent.clone(),
+            budget: s.tiles.budget().clone(),
+            http: s.http.clone(),
+            bus: s.bus.clone(),
+            tiles: s.tiles.registry(),
+            paths: s.paths.clone(),
+        },
+    );
+    s.agent.set_downloads(Some(handle.clone()));
+    let mut snap = handle.subscribe();
+    s.rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), snap.wait_for(|s| s.jobs.iter().any(|j| j.id == id))).await.unwrap().unwrap();
+    });
+    struct App {
+        t: TestUi,
+        picker: Picker,
+    }
+    let mut h = Harness::builder().with_size(eframe::egui::vec2(1000.0, 800.0)).build_ui_state(
+        |ui, app: &mut App| {
+            app.t.with_ctx(|ctx| {
+                app.picker.ui(ui.ctx(), ctx);
+            });
+        },
+        App { t, picker: Picker::new(item_menu::Target::Movie(movie)) },
+    );
+    h.run_steps(3);
+    assert!(h.query_all_by_label("Play download").next().is_some());
+    assert!(h.query_all_by_label("Delete download…").next().is_some());
+    let app = h.state_mut();
+    app.t.with_ctx(|ctx| tuner::ui::downloads::offer_cleanup(ctx, &[copy]));
+    let ids =
+        app.t.nav.iter().find_map(|n| if let NavRequest::Open(OverlayRequest::DeleteDownloads(ids)) = n { Some(ids.clone()) } else { None }).unwrap();
+    assert_eq!(ids, vec![id]);
+    assert!(path.exists());
+    let mut confirm = DeleteFiles::new(ids);
+    assert!(matches!(app.t.with_ctx(|ctx| confirm.on_action(ctx, tuner::keymap::Action::Back)), OverlayOutcome::Close));
+    assert_eq!(db::job(&app.t.db, id).unwrap().unwrap().state, State::Done);
+    let mut confirm = DeleteFiles::new(vec![id]);
+    app.t.with_ctx(|ctx| {
+        confirm.on_action(ctx, tuner::keymap::Action::Up);
+        confirm.on_action(ctx, tuner::keymap::Action::Activate);
+    });
+    let s = app.t.services();
+    s.rt.block_on(async {
+        // Requests preserve FIFO order with the confirmation's Delete command.
+        handle.request(DownloadCommand::Undo(vec![id])).await;
+        assert_eq!(db::job(&s.store.reader().unwrap(), id).unwrap().unwrap().state, State::Done);
+        handle.request(DownloadCommand::Shutdown).await;
+    });
+    assert_eq!(std::fs::read(path).unwrap(), b"kept file");
 }

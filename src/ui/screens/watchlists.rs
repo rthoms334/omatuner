@@ -163,6 +163,11 @@ impl WatchlistsScreen {
             return;
         }
         if let Some(e) = self.entry() {
+            if e.done()
+                && let Some(item) = &e.entry.item
+            {
+                crate::ui::downloads::offer_cleanup(ctx, std::slice::from_ref(item));
+            }
             shared::write(ctx, "Removed from watchlist", move |c| store::remove(c, e.entry.list_id, &[e.entry.id]).map(Some));
         }
     }
@@ -271,6 +276,11 @@ impl WatchlistsScreen {
             })),
             REMOVE => {
                 if let Some(e) = self.entry() {
+                    if e.done()
+                        && let Some(item) = &e.entry.item
+                    {
+                        crate::ui::downloads::offer_cleanup(ctx, std::slice::from_ref(item));
+                    }
                     shared::write(ctx, "Removed from watchlist", move |c| store::remove(c, id, &[e.entry.id]).map(Some));
                 }
             }

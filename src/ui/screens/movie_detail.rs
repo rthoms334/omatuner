@@ -367,6 +367,7 @@ impl MovieDetailScreen {
         if self.copies.combined() {
             crate::ui::copies::mark_watched(ctx, self.copies.plan(), &title, false);
         } else if let Some(item) = self.item(ctx) {
+            crate::ui::downloads::offer_cleanup(ctx, std::slice::from_ref(&item));
             let now = ctx.now;
             crate::ui::copies::write_with_undo(ctx, DataScope::Progress, "Removed from Continue watching".into(), move |c| {
                 crate::store::copies::watched_items(c, &[(item, title)], false, now)

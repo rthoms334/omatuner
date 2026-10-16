@@ -26,6 +26,7 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<DownloadsSnapshot> {
         j.item().is_none_or(|item| !ctx.lib.conceals(&item))
             && (!hide || (!j.explicit() && j.item().is_none_or(|item| !ctx.lib.explicit.contains(&item))))
     });
+    shown.rules.retain(|r| !ctx.lib.conceals(&r.item) && (!hide || !ctx.lib.explicit.contains(&r.item)));
     let guard = crate::ui::widgets::spoiler::Spoilers::of(ctx);
     for job in &mut shown.jobs {
         if job.kind == crate::downloads::Kind::Episode {
@@ -104,6 +105,31 @@ pub fn play(ctx: &mut UiCtx<'_>, id: DownloadId) {
     ctx.push(Route::Player);
 }
 
+/// Forgetting a title offers to remove its saved file after a separate Confirm (§43 §3).
+pub fn offer_cleanup(ctx: &mut UiCtx<'_>, items: &[crate::model::ItemRef]) {
+    let mut items = items.to_vec();
+    for series in items.clone().into_iter().filter(|i| i.kind == ItemKind::Series) {
+        if let Ok(targets) = crate::downloads::planning::series_targets(ctx.db, &series, crate::downloads::SeriesScope::All) {
+            items.extend(targets.into_iter().map(|t| t.item));
+        }
+    }
+    let ids: Vec<_> = snapshot(ctx).jobs.iter().filter(|j| j.state.playable() && items.iter().any(|item| j.matches(item))).map(|j| j.id).collect();
+    if !ids.is_empty() {
+        ctx.open(OverlayRequest::DeleteDownloads(ids));
+    }
+}
+
+pub fn deleted_rule(ctx: &mut UiCtx<'_>, id: i64) {
+    send(ctx, DownloadCommand::DeleteRule(id));
+    ctx.toast(Toast { action: Some(("Undo".into(), Action::UndoDownloadRule(id))), ttl_ms: 10_000, ..Toast::info("Keep rule removed") });
+}
+
+pub fn clash_live(job: &Job, now: i64) -> bool {
+    matches!(job.state, State::Scheduled | State::Waiting)
+        && job.reason.as_deref() == Some("clash")
+        && job.fp.get("download_clash_at").and_then(|v| v.as_i64()).is_some_and(|at| now < at + 60)
+}
+
 pub fn deleted(ctx: &mut UiCtx<'_>, id: DownloadId) {
     send(ctx, DownloadCommand::Delete(vec![id]));
     ctx.toast(Toast { action: Some(("Undo".into(), Action::UndoDownload(id))), ttl_ms: 10_000, ..Toast::info("Download deleted") });
@@ -164,35 +190,6 @@ pub fn state_text(job: &Job) -> String {
         State::Finishing => unreachable!(),
     };
     if job.state == State::Running { job.progress().map_or_else(|| name.into(), |p| format!("{name} {:.0} %", p * 100.0)) } else { name.into() }
-}
-
-/// One badge lookup for cards/episode rows; a series aggregates the same visible jobs.
-pub fn badge(ctx: &UiCtx<'_>, item: &crate::model::ItemRef) -> Option<String> {
-    let snap = snapshot(ctx);
-    let rows: Vec<_> = snap
-        .jobs
-        .iter()
-        .filter(|j| {
-            j.item().as_ref() == Some(item)
-                || (item.kind == ItemKind::Series
-                    && j.source_id == Some(item.source)
-                    && j.fp.get("download_series_key").and_then(serde_json::Value::as_str) == Some(item.key.as_str()))
-        })
-        .collect();
-    if rows.is_empty() {
-        return None;
-    }
-    if item.kind == ItemKind::Series {
-        return Some(format!("⤓ {}/{}", rows.iter().filter(|j| j.state == State::Done).count(), rows.len()));
-    }
-    let j = rows[0];
-    Some(if j.state == State::Done {
-        "⤓".into()
-    } else if j.kind.recording() && j.state.active() {
-        "●".into()
-    } else {
-        j.progress().map_or_else(|| "⤓".into(), |p| format!("⤓ {:.0} %", p * 100.0))
-    })
 }
 
 /// Frame-local lookup for leaf widgets that do not hold a UiCtx. Built once from the watch
@@ -279,13 +276,7 @@ pub fn status_chip(shared: &crate::shared::AppShared, cfg: &crate::config::Paren
 }
 pub fn due_toasts(egui: &eframe::egui::Context, ctx: &UiCtx<'_>) {
     let snap = snapshot(ctx);
-    let jobs: Vec<_> = snap
-        .jobs
-        .iter()
-        .filter(|j| {
-            j.reason.as_deref() == Some("clash") && j.fp.get("download_clash_at").and_then(|v| v.as_i64()).is_some_and(|at| ctx.now < at + 60)
-        })
-        .collect();
+    let jobs: Vec<_> = snap.jobs.iter().filter(|j| clash_live(j, ctx.now)).collect();
     if jobs.is_empty() {
         return;
     }
@@ -297,9 +288,7 @@ pub fn due_toasts(egui: &eframe::egui::Context, ctx: &UiCtx<'_>) {
                 for job in jobs {
                     let left = job.fp["download_clash_at"].as_i64().unwrap_or(ctx.now) + 60 - ctx.now;
                     let name = job.source_id.and_then(|s| ctx.lib.source(s)).map_or("this account", |s| s.name.as_str());
-                    let other = job.source_id.and_then(|s| ctx.services.tiles.budget().download_holder(s));
-                    let use_ = if other.is_some_and(|id| id != job.id) { "which is saving another item" } else { "which you're watching" };
-                    ui.label(format!("{} recording starts on {name}, {use_} · {left} s", job.title));
+                    ui.label(format!("{} recording starts on {name}, which you're watching · {left} s", job.title));
                     ui.horizontal(|ui| {
                         for (label, record, alternate) in
                             [("Record (stops this)", true, false), ("Record from another account", true, true), ("Skip", false, false)]

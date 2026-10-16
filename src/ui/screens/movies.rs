@@ -912,6 +912,9 @@ impl VodBrowser {
             match action {
                 // Delete in Favourites takes every copy out, like Ctrl+F on a favourite stack
                 Action::ToggleFavourite | Action::Remove if action == Action::ToggleFavourite || self.open == Cat::Favourites => {
+                    if action == Action::Remove {
+                        crate::ui::downloads::offer_cleanup(ctx, &plan.refs());
+                    }
                     crate::ui::copies::toggle_favourite(ctx, &plan)
                 }
                 Action::MarkWatched if self.movies => crate::ui::copies::mark_watched(ctx, &plan, &v.name, true),
@@ -943,7 +946,10 @@ impl VodBrowser {
                 VodKind::Series(_) => ctx.toast(crate::msg::Toast::info("Open the series to mark its episodes watched")),
             },
             Action::Remove => match self.open {
-                Cat::Favourites => kit::toggle_favourite(ctx, &item),
+                Cat::Favourites => {
+                    crate::ui::downloads::offer_cleanup(ctx, std::slice::from_ref(&item));
+                    kit::toggle_favourite(ctx, &item);
+                }
                 Cat::Continue => self.forget_progress(ctx, &v),
                 _ => kit::not_here(ctx),
             },
@@ -957,6 +963,7 @@ impl VodBrowser {
         match v.kind {
             VodKind::Movie(_) => kit::mark_watched(ctx, &super::home::vod_ref(v), &v.name, false),
             VodKind::Series(id) => {
+                crate::ui::downloads::offer_cleanup(ctx, &[super::home::vod_ref(v)]);
                 let now = ctx.now;
                 let _ = ctx.services.store.writer().submit_notify(DataScope::Progress, move |c| {
                     let items: Vec<(crate::model::ItemRef, String)> = crate::store::vod::episodes(c, id, None)?

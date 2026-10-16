@@ -63,9 +63,7 @@ impl Picker {
             return;
         };
         let snap = shared::snapshot(ctx);
-        if let Some(job) =
-            snap.jobs.iter().find(|j| j.item().as_ref() == Some(&target.item) && j.prog_start == target.programme.as_ref().map(|p| p.start))
-        {
+        if let Some(job) = snap.jobs.iter().find(|j| j.matches(&target.item) && j.prog_start == target.programme.as_ref().map(|p| p.start)) {
             if job.state.playable() {
                 self.choices.push(("Play download".into(), Choice::Play(job.id), 0));
                 self.choices.push(("Delete download…".into(), Choice::Delete(job.id), 0));
@@ -474,7 +472,8 @@ impl Overlay for Ask {
         match action {
             Action::Up | Action::Down | Action::FocusNext | Action::FocusPrev => {
                 self.init(ctx);
-                self.cursor = (self.cursor + 1) % (2 + usize::from(self.alternate.is_some()));
+                let count = 2 + usize::from(self.alternate.is_some());
+                self.cursor = (self.cursor + if matches!(action, Action::Up | Action::FocusPrev) { count - 1 } else { 1 }) % count;
                 OverlayOutcome::Keep
             }
             Action::Activate => self.choose(ctx),
@@ -524,5 +523,50 @@ impl Overlay for Ask {
         } else {
             OverlayOutcome::Keep
         }
+    }
+}
+
+/// A forget action has already removed progress; removing its file is a separate choice.
+pub struct DeleteFiles {
+    ids: Vec<DownloadId>,
+    confirm: super::dialogs::ConfirmOverlay,
+}
+impl DeleteFiles {
+    pub fn new(ids: Vec<DownloadId>) -> Self {
+        Self {
+            ids,
+            confirm: super::dialogs::ConfirmOverlay::new(super::ConfirmSpec {
+                title: "Delete the download too?".into(),
+                body: "Remove the saved file from this computer. Undo is available for 10 seconds.".into(),
+                confirm_label: "Delete download".into(),
+                destructive: true,
+                token: 0,
+            }),
+        }
+    }
+    fn finish(&self, ctx: &mut UiCtx<'_>, outcome: OverlayOutcome) -> OverlayOutcome {
+        match outcome {
+            OverlayOutcome::CloseWith(super::OverlayResult::Confirmed(_)) => {
+                for id in &self.ids {
+                    shared::deleted(ctx, *id);
+                }
+                OverlayOutcome::Close
+            }
+            OverlayOutcome::CloseWith(super::OverlayResult::Cancelled(_)) => OverlayOutcome::Close,
+            other => other,
+        }
+    }
+}
+impl Overlay for DeleteFiles {
+    fn key_contexts(&self) -> Vec<KeyContext> {
+        self.confirm.key_contexts()
+    }
+    fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> OverlayOutcome {
+        let outcome = self.confirm.on_action(ctx, action);
+        self.finish(ctx, outcome)
+    }
+    fn ui(&mut self, egui: &egui::Context, ctx: &mut UiCtx<'_>) -> OverlayOutcome {
+        let outcome = self.confirm.ui(egui, ctx);
+        self.finish(ctx, outcome)
     }
 }

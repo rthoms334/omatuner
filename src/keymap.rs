@@ -317,6 +317,7 @@ pub enum Action {
     Download,
     PlayDownload(crate::model::DownloadId),
     UndoDownload(crate::model::DownloadId),
+    UndoDownloadRule(i64),
     WatchlistOne,
     WatchlistSkip,
     WatchlistOrder,
