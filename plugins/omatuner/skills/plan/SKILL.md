@@ -67,3 +67,16 @@ confirm, `cancel` each. Rule reminders name their rule; removing one stops that 
 `sleep_timer` `set` with exactly one of `at`, `after_min`, `end_of_programme`, `after_items`,
 `end_of_queue`, and `then: "stop"` or `"pause"`. It runs in Tuner (it outlives this chat) and
 warns with a toast and Cancel first. Read back the stop time from the answer.
+
+## Recording plans
+
+Include `downloads list` alongside reminders when planning a viewing day: scheduled jobs,
+account use and free space matter. Resolve programmes with the guide, obtain consent, then
+`downloads record` with the exact programme ref. A bare channel needs `minutes`. State the
+start, stop and any clash. An unanswered clash keeps watching; Tuner saves from catch-up
+when available or marks the recording Missed. Recordings work with Tuner closed while the
+computer is awake; don't promise that a timer wakes a suspended machine.
+
+For recurring programmes, preview a Following rule, show its matches, then use `follow` with
+`action: record` after consent. It records new episodes and skips repeats. The rule can be
+removed with `follow remove`; individual jobs can be cancelled with `downloads cancel`.
