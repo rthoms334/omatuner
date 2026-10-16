@@ -1359,6 +1359,28 @@ mod tests {
     }
 
     #[test]
+    fn disappearing_back_to_live_focus_falls_back_to_play_pause() {
+        let mut h = player(WIDE);
+        let mut snap = (*shown(&h)).clone();
+        snap.seekable = true;
+        snap.live_buffer = Some(crate::player::LiveBufferRange { start: 0.0, end: 100.0 });
+        snap.position = Some(60.0);
+        h.state_mut().t.snapshot = Arc::new(snap.clone());
+        h.run_steps(3);
+        h.state_mut().act(Action::FocusOsdControls);
+        h.run_steps(2);
+        let index = h.state().s.visible.iter().position(|c| *c == Control::BackToLive).unwrap();
+        h.state_mut().s.control = index;
+        snap.position = Some(100.0);
+        h.state_mut().t.snapshot = Arc::new(snap);
+        h.run_steps(3);
+        assert_eq!(h.state().s.visible[h.state().s.control], Control::PlayPause);
+        let paused = real(&h).paused;
+        h.state_mut().act(Action::Activate);
+        until(&mut h, "fallback activates pause", |h| real(h).paused != paused);
+    }
+
+    #[test]
     fn skip_ripple_accumulates_and_live_boundary_flashes() {
         use crate::ui::screens::home::testkit::painted;
         let mut h = player(WIDE);

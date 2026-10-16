@@ -123,6 +123,11 @@ pub enum Input {
     /// The controller found the provider's text where the stream should be (the playlist
     /// "expanded" into lines of prose, see `controller`); already redacted.
     ProviderMessage(String),
+    /// Current HLS recorder failed, including attempts with no local decoder entry.
+    RecorderFailed {
+        kind: PlayerErrorKind,
+        text: Option<String>,
+    },
     /// Sent by the controller after the `Loaded` of every load: when a DIFFERENT stream of the
     /// target's source (whose limit is 1 or unknown) closed recently, the instant it closed. Only
     /// the first after a Play counts (arms the connection-limit race window, see module docs).
@@ -393,6 +398,12 @@ impl PlayerMachine {
             Input::GiveUp(err) => {
                 fx.push(Effect::Emit(PlayerEvent::Failed(err.clone())));
                 self.set_state(PlayerState::Error(err), &mut fx);
+            }
+            Input::RecorderFailed { kind, text } => {
+                if matches!(self.state, PlayerState::Loading { .. } | PlayerState::Playing | PlayerState::Paused | PlayerState::Buffering { .. }) {
+                    self.provider_message = text;
+                    self.fail(kind, now, &mut fx);
+                }
             }
             Input::Failed { entry, kind } => {
                 if self.owns_entry(entry) {
@@ -1027,6 +1038,26 @@ mod tests {
         start_playing(&mut m, vod(), 1, t);
         m.handle(Input::EndFile { reason: EndReason::Error, error: -13, entry: 1 }, t);
         assert!(matches!(m.state(), PlayerState::Reconnecting { max: 3, .. }), "{:?}", m.state());
+    }
+
+    #[test]
+    fn recorder_refusal_without_a_decoder_entry_uses_direct_play_policy() {
+        let mut m = machine();
+        let now = Instant::now();
+        m.handle(Input::Play { target: live(), immediate: true }, now);
+        m.handle(Input::RecorderFailed { kind: PlayerErrorKind::HttpForbidden, text: None }, now);
+        let PlayerState::Reconnecting { at, reason: PlayerErrorKind::HttpForbidden, .. } = m.state().clone() else {
+            panic!("{:?}", m.state());
+        };
+        assert!(at - now <= secs(3));
+        m.handle(Input::Tick, at);
+        let fx = m.handle(Input::RecorderFailed { kind: PlayerErrorKind::HttpForbidden, text: None }, at);
+        assert_eq!(recorded(&fx), Some(PlayerErrorKind::HttpForbidden));
+        let PlayerState::Error(error) = m.state() else {
+            panic!("{:?}", m.state());
+        };
+        assert_eq!(error.message, describe(PlayerErrorKind::HttpForbidden));
+        assert!(fx.contains(&Effect::StopMpv));
     }
 
     #[test]

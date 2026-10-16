@@ -74,9 +74,10 @@ impl Store {
     pub fn range(&self) -> Option<LiveBufferRange> {
         let t = self.tracks.first()?;
         let start = t.segments.front()?.start;
-        // Leave enough video for an exact seek (audio may extend beyond the last picture).
-        let end = (t.edge - 0.5).max(start);
-        (end > start).then_some(LiveBufferRange { start, end })
+        // The live point is the newest complete segment's start: a seek has a full
+        // segment to play while the next one is published. Badges use this same point.
+        let end = t.segments.back()?.start;
+        Some(LiveBufferRange { start, end })
     }
 
     /// Prune BEFORE allocating the arriving segment. A segment crossing the cutoff stays:
@@ -237,7 +238,7 @@ mod tests {
             add(&mut s, 2.0);
             assert!(fs::read_dir(root.path()).unwrap().count() <= 10);
         }
-        assert_eq!(s.range(), Some(LiveBufferRange { start: 60.0, end: 79.5 }));
+        assert_eq!(s.range(), Some(LiveBufferRange { start: 60.0, end: 78.0 }));
         let p = s.playlist(0, None).unwrap();
         assert!(p.contains("#EXT-X-MEDIA-SEQUENCE:30\n"));
         assert!(!p.contains("secret") && !p.contains("https:"));

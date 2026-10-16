@@ -147,6 +147,10 @@ fn create(
         hls_media: None,
         hls_origin: 0.0,
         hls_epoch: 0,
+        hls_resume: None,
+        hls_paused: false,
+        hls_waiting: false,
+        hls_fallback: None,
         hls_window,
         cache_ready: false,
         pending_seek: None,
@@ -247,6 +251,10 @@ struct Controller {
     hls_media: Option<MediaRef>,
     hls_origin: f64,
     hls_epoch: u64,
+    hls_resume: Option<f64>,
+    hls_paused: bool,
+    hls_waiting: bool,
+    hls_fallback: Option<MediaRef>,
     hls_window: f64,
     cache_ready: bool,
     pending_seek: Option<(f64, Instant)>,
@@ -579,6 +587,11 @@ impl Controller {
                         self.snap.seekable = false;
                         self.snap.playable = Some(p.clone());
                     }
+                    // A consumer woken by StateChanged must see that state and its
+                    // controls in the snapshot, including the first reconnect frame.
+                    if matches!(ev, PlayerEvent::StateChanged(_)) {
+                        self.publish(true);
+                    }
                     self.emit(ev);
                 }
                 Effect::SaveProgress { .. } => self.save_progress(pos.or(self.machine.last_position())),
@@ -612,6 +625,11 @@ impl Controller {
     fn stop_local(&mut self) {
         if !matches!(self.machine.state(), PlayerState::Reconnecting { .. }) {
             self.close_hls();
+        } else if self.hls.is_some()
+            && let Some(range) = self.snap.live_buffer
+        {
+            self.hls_paused = self.snap.paused;
+            self.hls_resume = self.snap.position.filter(|p| self.snap.paused || range.behind(*p));
         }
         self.live_cache.clear();
         self.cache_ready = false;
@@ -644,8 +662,33 @@ impl Controller {
         }
     }
 
-    /// Preserve the existing provider-error and budget policy before the first frame.
-    fn hls_error(&mut self, kind: PlayerErrorKind) -> bool {
+    /// The recorder reports every failed attempt; the same state machine as direct play
+    /// owns backoff, refusal classification, failure records and the final stop.
+    fn hls_error(&mut self, event: super::hls::Event) -> bool {
+        let (kind, text) = match event {
+            super::hls::Event::Published => {
+                if self.hls_waiting
+                    && matches!(self.machine.state(), PlayerState::Loading { .. })
+                    && let Some(p) = self.machine.target().cloned()
+                {
+                    self.hls_waiting = false;
+                    self.load_now(p);
+                    return true;
+                }
+                return false;
+            }
+            super::hls::Event::NotPlaylist => {
+                if let Some(p) = self.machine.target().cloned() {
+                    self.hls_fallback = Some(p.media.clone());
+                    self.close_hls();
+                    self.machine.replace_local_reader(None);
+                    self.load(p);
+                    return true;
+                }
+                return false;
+            }
+            super::hls::Event::Failed(kind, text) => (kind, text),
+        };
         let code = match kind {
             PlayerErrorKind::HttpForbidden => Some(403),
             PlayerErrorKind::HttpNotFound => Some(404),
@@ -656,18 +699,8 @@ impl Controller {
             self.log_http(code, Instant::now());
             self.observe_refusal(code);
         }
-        // Before first playback, the normal controller policy owns failures/copy fallback.
-        // Once playing, the recorder retries independently while recorded playback continues.
-        if !self.lease_played
-            && matches!(self.machine.state(), PlayerState::Loading { .. })
-            && let Some(entry) = self.lease_entry
-        {
-            if let Some(code) = code {
-                self.feed(Input::HttpStatus(code), Instant::now());
-            }
-            return self.feed(Input::Failed { entry, kind }, Instant::now());
-        }
-        false
+        self.hls_waiting = false;
+        self.feed(Input::RecorderFailed { kind, text }, Instant::now())
     }
 
     fn close_hls(&mut self) {
@@ -678,6 +711,9 @@ impl Controller {
         }
         self.hls_media = None;
         self.hls_origin = 0.0;
+        self.hls_resume = None;
+        self.hls_paused = false;
+        self.hls_waiting = false;
     }
 
     /// Stop-before-start (see [`must_stop_first`]): `stop`, wait for the old entry's END_FILE
@@ -685,6 +721,18 @@ impl Controller {
     /// opens the next (§8.5), so only the local stream a cast just stopped is waited for: the
     /// TV's upstream never runs alongside it.
     fn load(&mut self, p: Arc<Playable>) {
+        if self.hls_fallback.as_ref().is_some_and(|m| *m != p.media) {
+            self.hls_fallback = None;
+        }
+        if !self.casting()
+            && let Some(hls) = &self.hls
+            && self.hls_media.as_ref() == Some(&p.media)
+            && hls.snapshot().failed
+        {
+            self.hls_waiting = true;
+            hls.retry();
+            return;
+        }
         if self.casting() || self.hls_media.as_ref() != Some(&p.media) {
             self.close_hls();
         }
@@ -732,6 +780,15 @@ impl Controller {
     /// Load `p` now. Refused by the budget only because another picture's stream is still
     /// closing (its claim moved on): wait for it until `deadline`, then the refusal stands.
     fn load_now_by(&mut self, p: Arc<Playable>, deadline: Instant) {
+        if let Some(hls) = &self.hls {
+            let status = hls.snapshot();
+            if status.failed
+                || (self.lease_played && self.hls_resume.is_none() && status.range.zip(self.snap.position).is_some_and(|(r, pos)| pos > r.end + 0.5))
+            {
+                self.hls_waiting = true;
+                return;
+            }
+        }
         if self.hls.is_none() {
             self.release_lease();
         }
@@ -770,7 +827,7 @@ impl Controller {
             self.snap.video_suspended = false;
         }
         self.apply_lip_sync();
-        if self.snap.paused {
+        if self.snap.paused && !self.hls_paused {
             // a new play always plays (mpv's `pause` survives loadfile)
             let _ = self.mpv.set_property("pause", false);
         }
@@ -787,7 +844,7 @@ impl Controller {
         self.snap.live_buffer = None;
         self.snap.seekable = false;
         self.pending_seek = None;
-        if super::hls::eligible(&p) {
+        if super::hls::eligible(&p) && self.hls_fallback.as_ref() != Some(&p.media) {
             if self.hls.is_none() {
                 let root = self
                     .deps
@@ -812,10 +869,15 @@ impl Controller {
             }
             if let Some(hls) = &self.hls {
                 let status = hls.snapshot();
-                self.hls_origin = status.range.map_or(0.0, |r| r.start);
+                self.hls_origin = status.range.map_or(0.0, |r| r.end);
                 self.hls_epoch = status.epoch;
-                args[0] = hls.view(None).0;
-                args[3] = hls.options().to_owned();
+                let (url, offset) = hls.view(self.hls_resume.take().or_else(|| hls.live_target()));
+                args[0] = url;
+                args[3] = format!("{},start={offset:.6}", self.hls_options());
+                if self.hls_paused {
+                    let _ = self.mpv.set_property("pause", true);
+                }
+                self.hls_paused = false;
                 self.live_cache.clear();
             }
         } else {
@@ -2179,9 +2241,11 @@ impl Controller {
             if let Some(hls) = &self.hls {
                 let status = hls.snapshot();
                 if status.memory {
-                    super::timeshift::CacheState::read(&self.mpv)
-                        .range(120.0)
-                        .map(|r| LiveBufferRange { start: r.start + self.hls_origin, end: r.end + self.hls_origin })
+                    super::timeshift::CacheState::read(&self.mpv).range(120.0).map(|r| {
+                        let start = r.start + self.hls_origin;
+                        let end = r.end + self.hls_origin;
+                        LiveBufferRange { start, end: status.range.map_or(end, |live| live.end.min(end)).max(start) }
+                    })
                 } else {
                     status.range
                 }
@@ -2235,7 +2299,7 @@ impl Controller {
             self.pending_seek = Some((next, Instant::now()));
             return;
         }
-        let expired = pos < range.start;
+        let expired = self.snap.paused && pos < range.start;
         let full = self.hls.as_ref().is_none_or(|h| h.snapshot().memory) && self.snap.paused && state.idle && !state.eof && range.end - pos > 10.0;
         if (expired || full) && self.pending_seek.is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(1)) {
             let target = if expired { range.start } else { (pos + 2.0).min(range.end) };
@@ -2245,15 +2309,21 @@ impl Controller {
         }
     }
 
+    fn hls_options(&self) -> String {
+        let hls = self.hls.as_ref().expect("local HLS reader");
+        super::mpv::hls_options(&self.applied, self.tile, hls.snapshot().memory, hls.options())
+    }
+
     fn open_hls_view(&mut self, target: f64) -> bool {
         let Some(hls) = &self.hls else { return false };
         let (url, offset) = hls.view(Some(target));
-        let opts = format!("{},demuxer-lavf-o=live_start_index=0,start={offset:.6}", hls.options());
+        let opts = format!("{},start={offset:.6}", self.hls_options());
         let mut args = [url, "replace".into(), "-1".into(), opts];
         if self.light_decode {
             super::mpv::add_light_decode(&mut args);
         }
         if let Ok(entry) = super::mpv::loadfile(&self.mpv, &args) {
+            tracing::debug!("live rewind: replacing local reader at {target:.3}");
             self.machine.replace_local_reader(entry);
             self.lease_entry = entry;
             self.cache_ready = false;
@@ -2284,10 +2354,13 @@ impl Controller {
             })
             .map_or(current, |(t, _)| t);
         let requested = if mode == "relative" { from + seconds } else { seconds };
-        let target = self
-            .snap
-            .live_buffer
-            .map_or_else(|| self.snap.duration.map_or(requested.max(0.0), |d| requested.clamp(0.0, d.max(0.0))), |r| requested.clamp(r.start, r.end));
+        let target = self.snap.live_buffer.map_or_else(
+            || self.snap.duration.map_or(requested.max(0.0), |d| requested.clamp(0.0, d.max(0.0))),
+            |r| {
+                let end = self.hls.as_ref().and_then(|h| h.live_target()).unwrap_or(r.end).clamp(r.start, r.end);
+                requested.clamp(r.start, end)
+            },
+        );
         // Clamp against the recorder or packet cache. Pending targets make rapid repeated
         // commands add up before mpv echoes the new position.
         let failed = !refused && !self.local_seek(target);
@@ -2354,6 +2427,11 @@ impl Controller {
             return;
         }
         self.snap.state = self.machine.state().clone();
+        // PlaybackRestart changes Loading to Playing. Read the range after that
+        // transition so the first Playing snapshot already has its live controls.
+        if !self.casting() {
+            self.read_seekable();
+        }
         self.snap.last_position = self.machine.last_position();
         if let PlayerState::Error(e) = &self.snap.state {
             self.snap.last_error = Some(e.clone());

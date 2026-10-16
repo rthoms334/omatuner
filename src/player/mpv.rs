@@ -99,6 +99,24 @@ pub(super) fn runtime_settings(cfg: &Config, tile: TileId) -> Vec<(&'static str,
     ]
 }
 
+/// Reuse the normal per-picture cache settings for localhost HLS. The disk recording
+/// supplies rewind history, so only its default packet back buffer needs to be smaller.
+pub(super) fn hls_options(cfg: &Config, tile: TileId, memory: bool, base: &str) -> String {
+    let mut options = base.to_owned();
+    let mut cache: BTreeMap<_, _> = runtime_settings(cfg, tile)
+        .into_iter()
+        .filter(|(key, _)| matches!(*key, "cache-secs" | "demuxer-readahead-secs" | "demuxer-max-bytes"))
+        .collect();
+    cache.insert("demuxer-max-back-bytes", if memory && tile == TileId::A { "32MiB" } else { SECOND_PICTURE_BACK }.into());
+    for (key, value) in cache {
+        let value = cfg.player.mpv_options.get(key).unwrap_or(&value);
+        options.push_str(&format!(",{key}={}", quote(value)));
+    }
+    let lavf = cfg.player.mpv_options.get("demuxer-lavf-o").map(String::as_str).unwrap_or(DEMUXER_LAVF_O);
+    options.push_str(&format!(",demuxer-lavf-o={}", quote(&format!("{lavf},live_start_index=0"))));
+    options
+}
+
 /// Apply what changed from `previous` (the config currently applied) to a running instance:
 /// the [`runtime_settings`] whose value differs and changed user `mpv_options`. Unchanged
 /// settings are not re-set: `sid` is a live track switch during playback, and `sub-scale` may
@@ -263,6 +281,28 @@ mod tests {
             start_at,
             duration_hint: None,
         }
+    }
+
+    #[test]
+    fn hls_cache_options_follow_tile_config_and_user_overrides() {
+        let mut cfg = Config::default();
+        cfg.player.instant_load = false;
+        cfg.player.cache_secs = 7;
+        cfg.player.demuxer_max_mib = 192;
+        let a = hls_options(&cfg, TileId::A, false, "cache-on-disk=no");
+        let b = hls_options(&cfg, TileId::B, false, "cache-on-disk=no");
+        assert!(a.contains("cache-secs=%1%7") && a.contains("demuxer-max-bytes=%6%192MiB"));
+        assert!(b.contains("demuxer-max-bytes=%5%64MiB") && b.contains("demuxer-max-back-bytes=%4%8MiB"));
+        cfg.player.instant_load = true;
+        assert!(hls_options(&cfg, TileId::A, false, "").contains("cache-secs=%1%1"));
+        cfg.player.mpv_options.insert("cache-secs".into(), "4".into());
+        cfg.player.mpv_options.insert("demuxer-max-bytes".into(), "20MiB".into());
+        cfg.player.mpv_options.insert("demuxer-max-back-bytes".into(), "2MiB".into());
+        cfg.player.mpv_options.insert("demuxer-lavf-o".into(), "http_persistent=1".into());
+        let custom = hls_options(&cfg, TileId::B, false, "");
+        assert!(custom.contains("cache-secs=%1%4") && custom.contains("demuxer-max-bytes=%5%20MiB"));
+        assert!(custom.contains("demuxer-max-back-bytes=%4%2MiB"));
+        assert!(custom.contains("http_persistent=1,live_start_index=0"));
     }
 
     #[test]

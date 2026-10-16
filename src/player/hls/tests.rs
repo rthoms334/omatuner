@@ -158,6 +158,8 @@ fn low_disk_is_a_one_way_switch_and_unlinks_recording() {
         audio: Mutex::new(false),
         view: Mutex::new(View::default()),
         errors: crossbeam_channel::unbounded().0,
+        failed: Mutex::new(false),
+        retry: Notify::new(),
     };
     {
         let mut s = state.store();
@@ -259,14 +261,6 @@ fn local_view_real_mpv() {
     }
 }
 
-#[test]
-fn unavailable_directory_keeps_the_single_fetcher_in_memory() {
-    let mut store = Store::memory(20.0);
-    let id = store.insert(Resource { uri: "https://fixture/segment".into(), range: None }, Bytes::from_static(b"packets"), "ts").unwrap();
-    assert!(store.memory && store.dir.as_os_str().is_empty());
-    assert_eq!(store.blobs[&id].data.as_deref(), Some(b"packets".as_slice()));
-}
-
 #[tokio::test]
 async fn recorded_view_reload_does_not_wait_for_publication() {
     let state = Arc::new(Shared {
@@ -274,8 +268,10 @@ async fn recorded_view_reload_does_not_wait_for_publication() {
         changed: Notify::new(),
         token: Token::mint(),
         audio: Mutex::new(false),
-        view: Mutex::new(View { from: Some(0.0), ..View::default() }),
+        view: Mutex::new(View { from: Some(0.0), targeted: true, ..View::default() }),
         errors: crossbeam_channel::unbounded().0,
+        failed: Mutex::new(false),
+        retry: Notify::new(),
     });
     {
         let mut s = state.store();
@@ -314,6 +310,8 @@ async fn live_reload_waits_for_publication_and_releases_replaced_reader() {
         audio: Mutex::new(false),
         view: Mutex::new(View::default()),
         errors: crossbeam_channel::unbounded().0,
+        failed: Mutex::new(false),
+        retry: Notify::new(),
     });
     {
         let mut s = state.store();
@@ -346,4 +344,164 @@ async fn live_reload_waits_for_publication_and_releases_replaced_reader() {
     };
     buffer.view(Some(0.5));
     assert_eq!(tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+fn test_buffer(store: Store) -> Buffer {
+    Buffer {
+        shared: Arc::new(Shared {
+            store: Mutex::new(store),
+            changed: Notify::new(),
+            token: Token::mint(),
+            audio: Mutex::new(false),
+            view: Mutex::new(View::default()),
+            errors: crossbeam_channel::unbounded().0,
+            failed: Mutex::new(false),
+            retry: Notify::new(),
+        }),
+        url: Secret::new("http://127.0.0.1/unused/0.m3u8".into()),
+        stop: CancellationToken::new(),
+        thread: None,
+        errors: crossbeam_channel::unbounded().1,
+    }
+}
+
+fn append_segment(s: &mut Store, duration: f64, disc: u64) {
+    s.prepare(0, duration);
+    let id = s.insert(Resource { uri: format!("https://fixture/{}", s.next), range: None }, Bytes::from_static(b"packets"), "ts").unwrap();
+    let t = &mut s.tracks[0];
+    t.segments.push_back(store::Segment { id, seq: t.next_seq, start: t.edge, end: t.edge + duration, disc, key: None, map: None });
+    t.edge += duration;
+    t.next_seq += 1;
+    t.target = duration;
+    t.ready = true;
+}
+
+#[tokio::test]
+async fn targeted_reload_waits_at_the_edge_but_not_while_reading_history() {
+    let mut store = Store::memory(20.0);
+    for _ in 0..3 {
+        append_segment(&mut store, 2.0, 0);
+    }
+    let buffer = test_buffer(store);
+    buffer.view(Some(0.5));
+    let state = buffer.shared.clone();
+    let request = |name| Request::builder().uri(format!("/{}/{name}", state.token.expose())).body(Body::empty()).unwrap();
+    assert_eq!(serve(State(state.clone()), request("0.m3u8?view=1")).await.status(), StatusCode::OK);
+    state.view.lock().unwrap().opened = Some(Instant::now() - Duration::from_secs(1));
+    assert_eq!(serve(State(state.clone()), request("0.ts")).await.status(), StatusCode::OK);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(100), serve(State(state.clone()), request("0.m3u8?view=1"))).await.unwrap().status(),
+        StatusCode::OK,
+        "historical playback must not wait for the provider"
+    );
+    assert_eq!(serve(State(state.clone()), request("2.ts")).await.status(), StatusCode::OK);
+    let mut waiting = tokio::spawn(serve(State(state.clone()), request("0.m3u8?view=1")));
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiting).await.is_err(), "do not send a stale playlist at the edge");
+    append_segment(&mut state.store(), 2.0, 0);
+    state.changed.notify_waiters();
+    let response = tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    assert!(std::str::from_utf8(&bytes).unwrap().contains("3.ts"), "the waiting reload receives the newly published segment");
+}
+
+#[test]
+fn live_seek_headroom_stays_in_the_current_epoch_and_retained_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = test_buffer(Store::new(dir.path().into(), 30.0));
+    assert_eq!(buffer.live_target(), None);
+    append_segment(&mut buffer.shared.store(), 6.0, 0);
+    assert_eq!(buffer.live_target(), Some(0.0), "first tune needs only one segment");
+    append_segment(&mut buffer.shared.store(), 6.0, 0);
+    assert_eq!(buffer.live_target(), Some(5.0), "seven seconds of packets before the six-second refresh");
+    append_segment(&mut buffer.shared.store(), 6.0, 1);
+    assert_eq!(buffer.live_target(), Some(12.0), "never replay the old timestamp epoch");
+    for _ in 0..6 {
+        append_segment(&mut buffer.shared.store(), 6.0, 1);
+    }
+    let range = buffer.snapshot().range.unwrap();
+    let target = buffer.live_target().unwrap();
+    assert!(target >= range.start && !range.behind(target));
+    assert_eq!(target, range.end - 1.0);
+}
+
+#[test]
+fn reconnect_after_forty_minutes_and_discontinuity_starts_at_live() {
+    // One second per minute: retain 30 of a 40-minute recording with a timestamp reset.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::new(dir.path().into(), 30.0);
+    for minute in 0..40 {
+        append_segment(&mut s, 1.0, u64::from(minute >= 20));
+    }
+    assert!(s.playlist(0, None).unwrap().ends_with("#EXT-X-ENDLIST\n"));
+    let b = test_buffer(s);
+    b.view(None);
+    assert_eq!(b.snapshot().origin, 39.0);
+    let playlist = b.shared.store().playlist(0, b.shared.view.lock().unwrap().from).unwrap();
+    assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:39\n"));
+    assert!(!playlist.contains("#EXT-X-ENDLIST"));
+    b.view(Some(15.25));
+    assert_eq!(b.snapshot().origin, 15.0, "rewound reconnect retains its position");
+    assert_eq!(b.snapshot().next_view, Some(20.0));
+}
+
+#[test]
+fn realistic_segments_have_a_full_live_segment_and_a_stable_badge() {
+    for duration in [6.0, 10.0] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::new(dir.path().into(), 60.0);
+        for _ in 0..10 {
+            append_segment(&mut store, duration, 0);
+            let r = store.range().unwrap();
+            assert_eq!(store.tracks[0].edge - r.end, duration);
+            // Position advances through the newest segment while its publication is static.
+            for tick in 0..=(duration * 10.0) as u32 {
+                assert_eq!(r.label(r.end + f64::from(tick) / 10.0), "Live");
+            }
+            assert!(r.behind(r.end - duration - 1.0));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn outage_reload_returns_the_unchanged_playlist_with_200() {
+    let b = test_buffer(Store::memory(60.0));
+    append_segment(&mut b.shared.store(), 10.0, 0);
+    b.view(None);
+    let request = || Request::builder().uri(format!("/{}/0.m3u8?view=1", b.shared.token.expose())).body(Body::empty()).unwrap();
+    let first = serve(State(b.shared.clone()), request()).await;
+    let first = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+    b.shared.view.lock().unwrap().opened = Some(Instant::now() - Duration::from_secs(1));
+    let next = serve(State(b.shared.clone()), request()).await;
+    assert_eq!(next.status(), StatusCode::OK);
+    assert_eq!(axum::body::to_bytes(next.into_body(), 4096).await.unwrap(), first);
+}
+
+#[test]
+fn sequence_regression_needs_confirmation_or_more_than_a_window() {
+    let make =
+        || Source { url: String::new(), initial: None, last: Some(103), first: Some(100), discontinuity: Some(0), gap: false, regressed: false };
+    let mut s = make();
+    assert!(s.regression(99, 102, 4));
+    assert_eq!(s.last, Some(103));
+    assert!(!s.regression(101, 104, 4));
+    assert_eq!(s.last, Some(103), "a single stale playlist never resets");
+    assert!(s.regression(99, 102, 4));
+    assert!(!s.regression(99, 102, 4));
+    assert_eq!(s.last, None, "two regressed refreshes confirm a restart");
+    let mut s = make();
+    assert!(!s.regression(0, 3, 4));
+    assert_eq!(s.last, None, "a large regression resets immediately");
+}
+
+#[test]
+fn playlist_sniff_preserves_provider_messages_and_rejects_binary_immediately() {
+    crate::redact::register_secret("hls-sniff-secret");
+    let text = playlist_head(b"<html>Max connections reached: hls-sniff-secret</html>").unwrap_err().unwrap();
+    assert!(text.starts_with("Max connections reached:"));
+    assert!(!text.contains("hls-sniff-secret"));
+    assert_eq!(playlist_head(b"#EXTM3U\n#EXT-X-TARGETDURATION:10\n"), Ok(()));
+    let mut ts = [0; 512];
+    ts[0] = 0x47;
+    ts[188] = 0x47;
+    assert_eq!(playlist_head(&ts), Err(None), "binary takes the mpv cache path after just 512 bytes");
 }

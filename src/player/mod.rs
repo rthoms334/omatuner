@@ -326,7 +326,7 @@ pub struct LiveBufferRange {
 }
 
 impl LiveBufferRange {
-    /// Allow the decoder / last GOP a little room at the live edge.
+    /// Allow decoder jitter around the live point (HLS: newest segment start).
     pub fn behind(self, position: f64) -> bool {
         self.end - position > 3.0
     }

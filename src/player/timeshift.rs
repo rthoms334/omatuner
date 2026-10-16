@@ -102,8 +102,10 @@ impl LiveCache {
         }
         let opts = &mut args[3];
         opts.push_str(",cache=yes,demuxer-seekable-cache=yes,force-seekable=yes,demuxer-donate-buffer=no,demuxer-cache-unlink-files=immediate");
-        // Let the controller handle reconnects: every new load gets an empty cache.
-        opts.push_str(",stream-lavf-o=reconnect=0");
+        // Rewind is confined to the packet cache. FFmpeg's HTTP seek opens its new
+        // connection before closing the old one, including seeks made while probing
+        // a finite TS response. Disable upstream seeks and let the controller reconnect.
+        opts.push_str(&format!(",stream-lavf-o={}", super::mpv::quote("reconnect=0,seekable=0")));
         if self.disk {
             let dir = self.dir.as_ref().expect("disk has directory");
             opts.push_str(&format!(",demuxer-cache-dir={},cache-on-disk=yes", super::mpv::quote(&dir.to_string_lossy())));
