@@ -1491,13 +1491,16 @@ Subtitle auto modes (Settings ▸ Player ▸ **Subtitles automatically**):
 | Mode | Meaning | mpv selection options |
 |---|---|---|
 | Off (default) | No automatic subtitle selection; `s` / `S` still select a track manually | `sid=no`, `slang=<sub_langs>`, `subs-fallback-forced=no`, `subs-fallback=no` |
-| Forced only | Only tracks flagged forced; ordinary and default-only tracks stay off | `sid=auto`, `slang=` (empty), `subs-fallback-forced=always`, `subs-fallback=no` |
+| Forced only | Only tracks flagged forced; Tuner ranks them by language after load (below) | `sid=auto` initially, `slang=` (empty), `subs-fallback-forced=always`, `subs-fallback=no` |
 | Always | Select subtitles, preferring `sub_langs`, with fallback to another available track | `sid=auto`, `slang=<sub_langs>`, `subs-fallback-forced=no`, `subs-fallback=yes` |
 
 mpv 0.41 uses a matching `slang` to enable ordinary tracks even with forced fallback, so
-Forced only clears it for selection without changing the saved `sub_langs`. mpv chooses
-among multiple forced tracks using its own selection rules; this mapping does not guarantee
-the subtitle or audio language preference. There is no separate forced-track language option.
+Forced only clears it for selection without changing the saved `sub_langs`. Once the file
+has loaded, Tuner sets `sid` to the first forced track matching `player.sub_langs` in preference
+order, else one matching the selected audio track's language, else the first forced track.
+With no forced track it sets `sid=no`; ordinary and default-only tracks stay off. Track-list
+and settings changes re-evaluate this choice, but a manual choice with `s` / `S` (including
+Off) takes precedence for the rest of that file. Off and Always keep mpv's selection rules.
 New or missing settings default to Off; an explicit `sub_auto = "forced"` remains Forced only
 (no config migration).
 

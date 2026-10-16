@@ -795,6 +795,76 @@ fn subtitle_auto_selection_respects_track_flags() {
     }
 }
 
+/// Exercise Tuner's controller and real mpv: mpv 0.41's forced fallback alone picks the
+/// first (French) track, despite English audio and the user's English subtitle preference.
+#[test]
+fn subtitle_forced_selection_prefers_languages_then_audio_then_first_track() {
+    let Some((dir, _serial)) = setup() else { return };
+    for (langs, audio, expected) in [
+        (vec!["eng", "fra"], true, "eng"),
+        (vec!["fra", "eng"], true, "fra"),
+        (vec!["deu"], true, "eng"),
+        (vec![], true, "eng"),
+        (vec!["deu"], false, "fra"),
+    ] {
+        let mut cfg = headless_config();
+        cfg.player.sub_auto = SubtitleAuto::Forced;
+        cfg.player.sub_langs = langs.into_iter().map(str::to_owned).collect();
+        if !audio {
+            cfg.player.mpv_options.insert("aid".into(), "no".into());
+        }
+        let m = movie(1, dir.join("subtitles_forced_languages.mkv").to_str().unwrap().into());
+        let mut h = Harness::start(cfg, vec![m.clone()]);
+        h.play(m.media, true);
+        h.wait_state(LONG, is_playing);
+        h.handle.send(PlayerCommand::SetPause(true));
+        let snap = h.wait_snapshot(LONG, |s| s.paused && s.tracks.selected_sub().is_some_and(|t| t.lang.as_deref() == Some(expected)));
+        assert_eq!(snap.tracks.subs.len(), 2);
+        assert_eq!(snap.tracks.subs[0].lang.as_deref(), Some("fra"));
+        assert_eq!(snap.tracks.subs[1].lang.as_deref(), Some("eng"));
+        assert!(snap.tracks.subs.iter().all(|t| t.forced));
+        assert_eq!(snap.tracks.selected_audio().and_then(|t| t.lang.as_deref()), audio.then_some("eng"));
+        assert_eq!(snap.tracks.selected_sub().unwrap().id, snap.tracks.subs[usize::from(expected == "eng")].id);
+    }
+}
+
+#[test]
+fn subtitle_forced_selection_preserves_manual_choices_until_the_next_file() {
+    let Some((dir, _serial)) = setup() else { return };
+    let m = movie(1, dir.join("subtitles_forced_languages.mkv").to_str().unwrap().into());
+    let plain = movie(2, dir.join("subtitles_default.mkv").to_str().unwrap().into());
+    for command in [PlayerCommand::SetSubtitleTrack(Some(1)), PlayerCommand::SetSubtitleTrack(None), PlayerCommand::CycleSubtitle] {
+        let mut cfg = headless_config();
+        cfg.player.sub_auto = SubtitleAuto::Forced;
+        let mut h = Harness::start(cfg.clone(), vec![m.clone(), plain.clone()]);
+        h.play(m.media.clone(), true);
+        h.wait_state(LONG, is_playing);
+        h.handle.send(PlayerCommand::SetPause(true));
+        h.wait_snapshot(LONG, |s| s.paused && s.tracks.selected_sub().is_some_and(|t| t.lang.as_deref() == Some("eng")));
+
+        let expected = if matches!(command, PlayerCommand::SetSubtitleTrack(Some(_))) { Some(1) } else { None };
+        h.handle.send(command.clone());
+        h.wait_snapshot(LONG, |s| s.tracks.selected_sub().map(|t| t.id) == expected);
+        // Both track-list and settings changes must leave the manual choice alone.
+        h.handle.send(PlayerCommand::SetAudioTrack(None));
+        cfg.player.sub_langs = vec!["deu".into(), "eng".into()];
+        cfg.player.sub_scale = 1.1;
+        h.handle.send(PlayerCommand::ApplyConfig(Box::new(cfg)));
+        h.wait_snapshot(LONG, |s| s.tracks.selected_audio().is_none() && (s.sub_scale - 1.1).abs() < 0.001);
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(h.snapshot().tracks.selected_sub().map(|t| t.id), expected, "{command:?} survives updates");
+
+        // The manual choice belongs to one file: a default-only track stays off in the next.
+        h.play(plain.media.clone(), true);
+        let snap = h.wait_snapshot(LONG, |s| s.load_generation == 2 && is_playing(&s.state) && s.tracks.subs.len() == 1);
+        assert!(!snap.tracks.subs[0].forced);
+        assert!(snap.tracks.selected_sub().is_none());
+        // On another load of the two-forced-track file, automatic English selection returns.
+        h.play(m.media.clone(), true);
+        h.wait_snapshot(LONG, |s| s.load_generation == 3 && s.tracks.selected_sub().is_some_and(|t| t.lang.as_deref() == Some("eng")));
+    }
+}
+
 #[test]
 fn vod_eof_ends_saves_progress_and_history() {
     let Some((media, _serial)) = setup() else { return };

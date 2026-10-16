@@ -53,7 +53,7 @@ use super::{
     CopyPlay, LiveBufferRange, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState,
     RenderClock,
 };
-use crate::config::Config;
+use crate::config::{Config, SubtitleAuto};
 use crate::model::{
     CastErrorKind, CastHints, CastPhase, CastView, ChannelId, DeviceId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind,
     SourceId, TileId, WatchProgress,
@@ -181,6 +181,8 @@ fn create(
         last_second: None,
         watched_pct: cfg.player.watched_pct,
         applied: Box::new(cfg.clone()),
+        file_loaded: false,
+        subtitle_selected_manually: false,
         render_clock,
         epoch,
         mpv_log: MpvLog::default(),
@@ -301,6 +303,10 @@ struct Controller {
     watched_pct: u8,
     /// Config whose mpv settings are currently applied (ApplyConfig applies only changes).
     applied: Box<Config>,
+    /// Track selection waits for FILE_LOADED, when mpv has selected the audio track.
+    file_loaded: bool,
+    /// `s` / `S` owns subtitle selection until the next file, including a manual Off.
+    subtitle_selected_manually: bool,
     render_clock: RenderClock,
     epoch: Instant,
     /// Rate limiter of forwarded mpv log lines.
@@ -692,6 +698,15 @@ impl Controller {
             }
             super::hls::Event::Failed(kind, text) => (kind, text),
         };
+        if let Some(text) = &text {
+            let about = (self.target_label(), text.clone());
+            if self.logged.provider.as_ref() == Some(&about) {
+                tracing::debug!("{}: the provider answered with the same message again", self.log);
+            } else {
+                tracing::warn!("{}: the provider answered with a message instead of a stream: {text:?}", self.log);
+                self.logged.provider = Some(about);
+            }
+        }
         let code = match kind {
             PlayerErrorKind::HttpForbidden => Some(403),
             PlayerErrorKind::HttpNotFound => Some(404),
@@ -879,6 +894,8 @@ impl Controller {
         self.snap.duration = p.duration_hint;
         self.snap.stream_info = None;
         self.snap.tracks = Default::default();
+        self.file_loaded = false;
+        self.subtitle_selected_manually = false;
         self.snap.last_error = None;
         let mut args = super::mpv::loadfile_args(&p);
         if let Some(reader) = &self.recording {
@@ -1269,12 +1286,14 @@ impl Controller {
                 let _ = m.set_property("aid", id.map(|i| i.to_string()).unwrap_or_else(|| "no".into()).as_str());
             }
             PlayerCommand::SetSubtitleTrack(id) => {
+                self.subtitle_selected_manually = true;
                 let _ = m.set_property("sid", id.map(|i| i.to_string()).unwrap_or_else(|| "no".into()).as_str());
             }
             PlayerCommand::CycleAudio => {
                 let _ = m.command("cycle", &["audio"]);
             }
             PlayerCommand::CycleSubtitle => {
+                self.subtitle_selected_manually = true;
                 let _ = m.command("cycle", &["sub"]);
             }
             PlayerCommand::AdjustSubDelay(d) => {
@@ -1836,11 +1855,36 @@ impl Controller {
     fn apply_config(&mut self, cfg: &Config) {
         self.machine.set_config(MachineConfig::from_config(cfg));
         self.watched_pct = cfg.player.watched_pct;
+        let manual_sid = if self.subtitle_selected_manually && cfg.player.sub_auto == SubtitleAuto::Forced {
+            self.mpv.get_property::<String>("sid").ok()
+        } else {
+            None
+        };
         super::mpv::apply_runtime(&self.mpv, cfg, &self.applied, self.tile);
+        if let Some(sid) = manual_sid {
+            let _ = self.mpv.set_property("sid", sid.as_str());
+        }
         self.live_cache.apply(&self.mpv);
         *self.applied = cfg.clone();
         if !self.casting() {
             self.apply_lip_sync();
+            self.select_forced_subtitle();
+        }
+    }
+
+    fn select_forced_subtitle(&self) {
+        if !self.file_loaded || self.subtitle_selected_manually || self.applied.player.sub_auto != SubtitleAuto::Forced {
+            return;
+        }
+        // Read current properties: a queued track-list notification can predate FILE_LOADED
+        // or our last selection. Never switch back based on that stale event.
+        let Ok(json) = self.mpv.get_property::<String>("track-list") else { return };
+        let tracks = parse_track_list(&json);
+        let sid = tracks.preferred_forced_sub(&self.applied.player.sub_langs).map_or_else(|| "no".into(), |t| t.id.to_string());
+        if self.mpv.get_property::<String>("sid").ok().as_deref() != Some(sid.as_str())
+            && let Err(e) = self.mpv.set_property("sid", sid.as_str())
+        {
+            tracing::warn!("mpv sid: {}", crate::redact::redact(&e.to_string()));
         }
     }
 
@@ -1993,6 +2037,9 @@ impl Controller {
     /// Feed an END_FILE and release the lease of the stream that just closed (starting a load
     /// that waited for it, see [`Controller::load`]).
     fn end_file(&mut self, reason: EndReason, error: i32, entry_id: i64, inserted: Option<i64>) -> bool {
+        if self.machine.owns_entry(entry_id) {
+            self.file_loaded = false;
+        }
         if !self.casting()
             && reason == EndReason::Eof
             && self.machine.owns_entry(entry_id)
@@ -2053,6 +2100,7 @@ impl Controller {
         }
         match ev {
             MpvEvent::StartFile { entry_id } => {
+                self.file_loaded = false;
                 if self.lease_redirected && self.lease.is_some() {
                     // the controller is the only playlist writer: the entry starting after a
                     // redirect is the expansion of our leased playlist
@@ -2062,9 +2110,11 @@ impl Controller {
                 self.feed(Input::StartFile { entry: entry_id }, now)
             }
             MpvEvent::FileLoaded => {
+                self.file_loaded = true;
                 self.cache_ready = true;
                 self.apply_lip_sync();
                 self.read_seekable();
+                self.select_forced_subtitle();
                 self.feed(Input::FileLoaded, now)
             }
             MpvEvent::PlaybackRestart => {
@@ -2234,6 +2284,7 @@ impl Controller {
                     let t = parse_track_list(s);
                     if t != self.snap.tracks {
                         self.snap.tracks = t;
+                        self.select_forced_subtitle();
                         self.emit(PlayerEvent::TracksChanged);
                     }
                 }
