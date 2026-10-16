@@ -504,6 +504,7 @@ impl PlaceIn {
 /// What screens (and the agent) ask multi-view to do; the app applies it after the frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MvRequest {
+    FromInput(Box<MvRequest>, &'static str),
     Place(PlaceIn),
     Focus(TileId),
     /// `w`.

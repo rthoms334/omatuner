@@ -30,8 +30,8 @@ impl TunerApp {
         let ui = UiNow { focused, busy, multiview: self.mv.view.on, view: view_of(self.current_route()) };
         let updater = self.services().updater.clone();
         updater.note_ui(ui);
-        if let Some(on) = updater.take_config_change() {
-            self.config_edits.push(Box::new(move |c| c.updates.passwordless = on));
+        if let Some((on, input)) = updater.take_config_edit() {
+            self.config_edits.push(crate::config::audit::edit(input, move |c| c.updates.passwordless = on));
         }
         let playing = self.snapshot.state != PlayerState::Idle || self.mv.view.on;
         if focused && !busy && !playing && !self.popout.is_out() && !self.video_only && updater.prompt_due() {
@@ -59,8 +59,8 @@ fn view_of(route: &Route) -> Option<ViewArg> {
         Route::Live { .. } | Route::Player => ViewArg::Live,
         Route::Guide { .. } => ViewArg::Guide,
         Route::Movies { .. } | Route::MovieDetail(_) => ViewArg::Movies,
-        Route::Series { .. } | Route::SeriesDetail(_) => ViewArg::Series,
-        Route::Settings(_) | Route::EditPlaylist(_) | Route::Logs | Route::EpgMapping { .. } => ViewArg::Settings,
+        Route::Series { .. } | Route::SeriesDetail(_) | Route::SeriesDetailAt { .. } => ViewArg::Series,
+        Route::Settings(_) | Route::Setting(_) | Route::EditPlaylist(_) | Route::Logs | Route::EpgMapping { .. } => ViewArg::Settings,
         Route::Onboarding(_) | Route::Queue | Route::Watchlists { .. } => return None,
     })
 }

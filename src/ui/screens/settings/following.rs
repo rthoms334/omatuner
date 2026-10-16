@@ -3,12 +3,11 @@
 //!
 //! * "+ Follow…" opens the Follow sheet on the templates (Team, Show, Event, News flash, Custom).
 //! * Rules, in list order (higher wins a clash): "Arsenal — Team · live · remind 2 min ·
-//!   spoiler-safe · 4 coming". Enter or a click opens the rule in the sheet's editor. `x` /
-//!   Delete / right-click / the gear: the row's menu — Edit…, Pause / Resume, Test against the
+//!   spoiler-safe · 4 coming". Enter or a click opens the rule in the sheet's editor. Delete / right-click / the gear: the row's menu — Edit…, Pause / Resume, Test against the
 //!   guide (a toast of what it finds now), Move up / down, Delete… (cancel or keep its
-//!   reminders). Alt+↑/↓ (K/J) or the drag grip reorder them.
+//!   reminders). Alt+↑/↓ or the drag grip reorder them.
 //! * Upcoming (next 14 days, the ledger): "Arsenal — Sat 12:30 · Sky Sports Main Event · remind".
-//!   Spoiler-safe rules show only the rule's name. Enter, a click or `x` opens the programme
+//!   Spoiler-safe rules show only the rule's name. Enter, a click or Delete opens the programme
 //!   popover (Watch, Cancel reminder = skip this one, Follow…).
 //! * The switches of `[follow]` and the news flash's quiet hours, "not over another app's
 //!   fullscreen" and headlines length.
@@ -206,7 +205,11 @@ pub(super) fn rows(s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
     let mut any = false;
     let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
     // a channel that became explicit (or hidden by parental control) since the evaluation
-    let shown = |u: &Upcoming| u.channel.as_ref().is_none_or(|c| !ctx.lib.conceals(c));
+    let shown = |u: &Upcoming| {
+        u.channel
+            .as_ref()
+            .map_or(!s.search_all || kit::unlocked(ctx), |c| !ctx.lib.conceals(c) && (!s.search_all || super::search::searchable_item(ctx, c)))
+    };
     for (i, u) in d.upcoming.iter().enumerate().filter(|(_, u)| u.start < horizon && shown(u)) {
         any = true;
         let mut detail = crate::ui::widgets::time::local(u.start, if h24 { "%a %-d %b %H:%M" } else { "%a %-d %b %-I:%M %p" }, "");
@@ -291,7 +294,7 @@ pub(super) fn item(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64) {
     }
 }
 
-/// `x` / Delete / right-click / the gear on its rows: a rule's menu (title, items); an Upcoming
+/// Delete / right-click / the gear on its rows: a rule's menu (title, items); an Upcoming
 /// row opens its programme's popover instead (`None`).
 pub(super) fn menu(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64) -> Option<(String, Vec<MenuItem>)> {
     if id < 0 {
@@ -405,7 +408,7 @@ fn test(ctx: &mut UiCtx<'_>, rule: FollowRule) {
     });
 }
 
-/// Alt+↑/↓ (K/J), the drag grip or the menu's Move: move a rule within the list now (higher
+/// Alt+↑/↓, the drag grip or the menu's Move: move a rule within the list now (higher
 /// wins a clash), then check the guide.
 pub(super) fn reorder(s: &SettingsScreen, ctx: &mut UiCtx<'_>, id: i64, delta: isize) {
     let mut data = s.following.data.borrow_mut();
@@ -436,6 +439,11 @@ fn programme_of(ctx: &UiCtx<'_>, u: &Upcoming) -> Option<(crate::model::Programm
 /// The page became current (or its data changed): start loading.
 pub(super) fn enter(s: &mut SettingsScreen, ctx: &UiCtx<'_>) {
     *s.following.loader.borrow_mut() = Some(Loader::start(ctx, load));
+}
+
+pub(super) fn search_ready(s: &SettingsScreen) -> bool {
+    s.following.poll();
+    s.following.loader.borrow().is_none()
 }
 
 #[cfg(test)]
@@ -506,7 +514,7 @@ mod tests {
     /// A rule row's menu and reorder: Alt+↑ and the drag grip change the order (higher wins a
     /// clash), the menu tests the rule against the guide, pauses it (its reminder goes at the
     /// evaluation that follows) and resumes it, and Delete… asks whether to cancel or keep its
-    /// reminders, then stops following. `x` on an Upcoming row opens the programme's popover.
+    /// reminders, then stops following. Delete on an Upcoming row opens the programme's popover.
     #[test]
     fn rule_rows_have_a_menu_and_reorder() {
         use egui_kittest::kittest::Queryable;

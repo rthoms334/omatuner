@@ -219,8 +219,13 @@ impl TunerApp {
 
     /// Apply a multi-view request (after the frame that made it).
     pub(super) fn apply_mv(&mut self, r: MvRequest) {
+        self.apply_mv_from(r, "system");
+    }
+
+    fn apply_mv_from(&mut self, r: MvRequest, input: &'static str) {
         let on = self.mv.view.on;
         match r {
+            MvRequest::FromInput(r, input) => self.apply_mv_from(*r, input),
             MvRequest::Place(p) => self.mv_place(p),
             MvRequest::Focus(t) if on => self.mv_focus(t),
             MvRequest::FocusNext if on => self.mv_focus(self.mv.view.unfocused()),
@@ -229,10 +234,15 @@ impl TunerApp {
             MvRequest::CycleLayout if on => {
                 let cfg = self.services().config();
                 let next = Layout::effective(cfg.player.multiview.layout, self.window_size.x, self.theme.rem(), self.video_only).next();
-                self.config_edits.push(Box::new(move |c: &mut crate::config::Config| c.player.multiview.layout = next.config()));
+                self.config_edits
+                    .push(crate::config::audit::edit(input, move |c: &mut crate::config::Config| c.player.multiview.layout = next.config()));
             }
-            MvRequest::SetLayout(l) => self.config_edits.push(Box::new(move |c: &mut crate::config::Config| c.player.multiview.layout = l.config())),
-            MvRequest::SetCorner(k) => self.config_edits.push(Box::new(move |c: &mut crate::config::Config| c.player.multiview.pip_corner = k)),
+            MvRequest::SetLayout(l) => {
+                self.config_edits.push(crate::config::audit::edit(input, move |c: &mut crate::config::Config| c.player.multiview.layout = l.config()))
+            }
+            MvRequest::SetCorner(k) => {
+                self.config_edits.push(crate::config::audit::edit(input, move |c: &mut crate::config::Config| c.player.multiview.pip_corner = k))
+            }
             MvRequest::Close(t) => {
                 let t = t.unwrap_or(self.mv.view.focus);
                 self.send_to(t, PlayerCommand::Stop);
@@ -253,7 +263,7 @@ impl TunerApp {
     pub(super) fn on_agent_multiview(&mut self, r: &crate::agent::AgentMultiView, egui_ctx: &egui::Context) {
         use crate::agent::{AgentMultiView as M, MultiViewKeep as Keep, MultiViewSwap as Swap};
         let set_layout = |app: &mut Self, l: crate::config::MultiViewLayout| {
-            app.config_edits.push(Box::new(move |c: &mut crate::config::Config| c.player.multiview.layout = l));
+            app.config_edits.push(crate::config::audit::edit("agent", move |c: &mut crate::config::Config| c.player.multiview.layout = l));
         };
         match r {
             M::Open { targets, layout, sound, rearrange } => {

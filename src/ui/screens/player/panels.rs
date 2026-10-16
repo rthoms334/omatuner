@@ -111,6 +111,20 @@ impl PlayerScreen {
                 self.panel = None;
                 self.show_banner(ctx);
             }
+            Out::PlayList { list, entry } => {
+                crate::ui::watchlists::play(ctx, list, Some(entry), false);
+                self.panel = None;
+                self.show_banner(ctx);
+            }
+            Out::PreviewMenu(entry) => {
+                if let Some(q) = self.panel.as_mut().and_then(|p| p.queue.as_mut()) {
+                    q.open_preview_menu(ctx, entry);
+                }
+            }
+            Out::OpenList(list) => {
+                self.panel = None;
+                ctx.push(Route::Watchlists { list: Some(list) });
+            }
             Out::Send(cmds) => {
                 for c in cmds {
                     crate::queue::ui::send(ctx, c);
@@ -144,6 +158,11 @@ impl PlayerScreen {
             }
             _ => None,
         }
+    }
+
+    pub(super) fn queue_panel_choice(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        let out = self.panel.as_mut().and_then(|p| p.queue.as_mut()).and_then(|q| q.preview_choice(ctx, action));
+        out.is_some_and(|out| self.queue_out(ctx, out).is_some())
     }
 
     pub(super) fn panel_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> Option<bool> {
@@ -218,7 +237,7 @@ impl PlayerScreen {
         let title = match panel.kind {
             PanelKind::Channels => "CHANNELS (c)",
             PanelKind::MiniGuide => "NOW / NEXT (g)",
-            PanelKind::History => "HISTORY (h)",
+            PanelKind::History => "HISTORY (H)",
             PanelKind::Queue => "UP NEXT (u)",
         };
         let head_h = (caption.size * 2.0).round();
@@ -378,7 +397,8 @@ impl PlayerScreen {
         let head_h = (caption.size * 2.0).round();
         let close = Rect::from_min_size(egui::pos2(area.right() - pad / 2.0 - head_h, area.top() + pad / 2.0), egui::vec2(head_h, head_h));
         let query = panel.list.filter.query().to_owned();
-        let head = if query.is_empty() { "UP NEXT (u)".to_owned() } else { format!("UP NEXT (u)  ·  {query}") };
+        let title = snap.watchlist.as_ref().map_or_else(|| "Up next".to_owned(), |w| format!("Up next · {}", w.name));
+        let head = if query.is_empty() { title } else { format!("{title} · {query}") };
         osd_text(
             &p,
             egui::pos2(area.left() + pad, close.center().y),
@@ -402,16 +422,10 @@ impl PlayerScreen {
         let row_h = (font.size * 2.0).round();
         let empty = q.lines().is_empty();
         let out = if empty {
-            let msg = if query.is_empty() { "Nothing to play next · Ctrl+N adds" } else { "No matches" };
-            osd_text(
-                &p,
-                egui::pos2(area.left() + pad, list_top + row_h / 2.0),
-                Align2::LEFT_CENTER,
-                msg,
-                small.clone(),
-                with_alpha(t.osd_text, 0.7),
-                area.width() - 2.0 * pad,
-            );
+            let msg = if query.is_empty() { "Up next is empty · Ctrl+N adds what you're looking at" } else { "No matches" };
+            ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect.shrink(pad / 2.0)), |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(msg).font(small.clone()).color(with_alpha(t.osd_text, 0.7))).wrap());
+            });
             Out::None
         } else {
             ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| q.ui(ui, ctx, &Look::osd(theme), row_h)).inner

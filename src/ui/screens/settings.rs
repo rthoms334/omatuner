@@ -1,6 +1,6 @@
 //! Settings (DESIGN §13.9): page list (Playlists, EPG, Player, Interface, Favourites,
 //! Reminders, Parental, AI agents, Cast, Backup, Hidden, Orphans, About) | page content. Panel idiom; reorder
-//! rows (playlists, EPG priority, favourites lists, Following rules) with Alt+↑/↓ or K/J or the
+//! rows (playlists, EPG priority, favourites lists, Following rules) with Alt+↑/↓ or the
 //! drag grip.
 //! Playlists page: sources with status, account info (expiry, connections, formats),
 //! refresh/edit/delete/reorder, "+ Add" (→ `Route::Onboarding(AddSource)`); EPG page: ordered
@@ -11,9 +11,9 @@
 //! Model: every page is a list of [`Row`]s rebuilt from the config, the library and the rows
 //! read off the UI thread (sources, EPG sources, reminders, orphans, hidden VOD — re-read on
 //! the matching `DataScope`). Keys (Panel idiom, `[Panel]` / `[TextInput, Panel]`):
-//! ↑/↓ (j/k) move, ← (h) steps back to the page list from any row (spatial panes, DESIGN
-//! §15.1), → (l) / Shift+→ (L) increase or pick the next option, Shift+← (H) decrease,
-//! Enter/Space toggle or open, x/Delete the row's menu, Alt+↑/↓ (K/J) reorder, Tab switches
+//! ↑/↓ move, ← steps back to the page list from any row (spatial panes, DESIGN
+//! §15.1), → / Shift+→ increase or pick the next option, Shift+← decrease,
+//! Enter/Space toggle or open, Delete the row's menu, Alt+↑/↓ reorder, Tab switches
 //! between the page list and the page (→ / Enter back into it), Esc leaves a text field, then
 //! the page. A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in the
 //! page list say so and return to the editor instead of dropping the changes. Config rows
@@ -74,6 +74,9 @@ use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, Scr
 // The batch features' parts of Settings (base-B): each file is its track's, with the same
 // hooks — `rows` (its rows on the pages it adds to), `act` (its `Act::Feature` buttons), `item`
 // (Enter on its `Item::Feature` rows) and, for a page of its own, `enter` (load on entering).
+mod search;
+pub(crate) use search::IndexedRow;
+pub use search::SettingTarget;
 mod agents; // the AI agents page (DESIGN §39)
 mod cast; // CAST-9: the Cast page (DESIGN §40 §3.6)
 mod following; // F-C: the Following page (DESIGN §33)
@@ -463,6 +466,7 @@ enum Act {
     ImportBackup,
     OpenLogs,
     ExportLog,
+    CopyAbout,
     SaveSource,
     RefreshSource,
     DeleteSource,
@@ -554,6 +558,7 @@ enum Row {
     Toggle(&'static CfgToggle),
     Choice(&'static CfgChoice),
     Number(&'static CfgNumber),
+    LipSync { output: crate::player::audio_output::AudioOutput, reset: bool },
     Text(&'static CfgText),
     Act { act: Act, icon: &'static str, label: String, danger: bool },
     Item { item: Item, icon: String, color: Option<SourceColor>, label: String, detail: Option<String>, reorder: bool },
@@ -814,6 +819,14 @@ enum Pane {
 
 #[derive(Default)]
 pub struct SettingsScreen {
+    filter: String,
+    filter_return: Option<(SettingsPage, Pane, usize)>,
+    search_focused: bool,
+    release_search_focus: bool,
+    search_all: bool,
+    jump_pending: Option<SettingTarget>,
+    submit_input: &'static str,
+
     /// The feature files' own state (base-B: one field per file, so they never collide).
     #[allow(dead_code)] // base-B: F-C's
     following: following::State,
@@ -821,6 +834,7 @@ pub struct SettingsScreen {
     spoiler: spoiler::State,
     agents: agents::State,
     cast: cast::State,
+    copy: Option<String>,
     page: SettingsPage,
     pane: Pane,
     /// Focused row (index into the page's rows; only focusable rows are chosen).
@@ -874,6 +888,7 @@ pub struct SettingsScreen {
     release_focus: bool,
     /// A guide offset changed with Shift+←/→ that isn't saved yet (and when it last changed).
     offset_pending: Option<(EpgSourceId, std::time::Instant)>,
+    offset_input: &'static str,
     /// Hidden channels of the library generation `hidden_built` (Settings ▸ Hidden items).
     hidden_channels: Vec<(ChannelId, String)>,
     /// Hidden ▸ filtered tags whose categories are listed (→ / Shift+←).
@@ -1083,10 +1098,21 @@ impl SettingsScreen {
     // -------------------------------------------------------------- page rows
 
     fn rows(&self, ctx: &UiCtx<'_>) -> Vec<Row> {
-        if let Some(a) = &self.attach {
+        if !self.filter.is_empty() {
+            return self.search_rows(ctx).into_iter().map(|(_, row)| row).collect();
+        }
+        self.page_rows(ctx, self.page)
+    }
+
+    fn page_rows(&self, ctx: &UiCtx<'_>, page: SettingsPage) -> Vec<Row> {
+        if page == self.page
+            && let Some(a) = &self.attach
+        {
             return self.attach_rows(a);
         }
-        if let Some(e) = &self.editor {
+        if page == self.page
+            && let Some(e) = &self.editor
+        {
             return self.editor_rows(ctx, e);
         }
         let mut v = Vec::new();
@@ -1098,7 +1124,7 @@ impl SettingsScreen {
             detail,
             reorder: false,
         };
-        match self.page {
+        match page {
             SettingsPage::Playlists => {
                 v.push(Row::Section("Playlists".into()));
                 if self.sources.is_empty() && self.sources_loader.is_none() {
@@ -1208,6 +1234,22 @@ impl SettingsScreen {
                 v.extend(PLAYER_TEXT[..2].iter().map(Row::Text));
                 v.push(Row::Choice(&PLAYER_SUB));
                 v.push(Row::Number(&PLAYER_N[6]));
+                v.push(Row::Section("Audio delay".into()));
+                v.push(Row::Note(
+                    "Sound earlier / later for each audio output. [ / ] in the player step by 50 ms; negative is earlier.".into(),
+                    false,
+                ));
+                if ctx.config.player.lip_sync.is_empty() {
+                    v.push(Row::Note("Play something to identify this computer's audio output.".into(), false));
+                }
+                for (name, saved) in &ctx.config.player.lip_sync {
+                    let output = crate::player::audio_output::AudioOutput {
+                        name: name.clone(),
+                        label: if saved.label.is_empty() { name.clone() } else { saved.label.clone() },
+                    };
+                    v.push(Row::LipSync { output: output.clone(), reset: false });
+                    v.push(Row::LipSync { output, reset: true });
+                }
                 v.push(Row::Section("Network".into()));
                 v.push(Row::Text(&PLAYER_TEXT[2]));
                 v.push(Row::Text(&PLAYER_TEXT[3]));
@@ -1365,7 +1407,7 @@ impl SettingsScreen {
                 if self.hidden_channels.is_empty() {
                     v.push(Row::Note("Nothing hidden.".into(), false));
                 }
-                for (id, name) in &self.hidden_channels {
+                for (id, name) in self.hidden_channels.iter().filter(|(id, _)| ctx.lib.live.get(*id).is_some()) {
                     v.push(item(Item::HiddenChannel(*id), glyphs::HIDDEN, name.clone(), Some("Enter unhides".into())));
                 }
                 v.push(Row::Section("Hidden movies & series".into()));
@@ -1401,7 +1443,7 @@ impl SettingsScreen {
                                 .iter()
                                 .filter(|o| o.action == LinkAction::Join && o.group == l.group && o.item != l.item)
                                 // an explicit partner isn't named while the session is locked
-                                .filter(|o| !ctx.lib.conceals(&o.item))
+                                .filter(|o| !ctx.lib.conceals(&o.item) && (!self.search_all || search::searchable_item(ctx, &o.item)))
                                 .map(|o| {
                                     let n = o.name.clone().unwrap_or_else(|| o.item.key.to_string());
                                     match ctx.lib.source(o.item.source) {
@@ -1436,14 +1478,10 @@ impl SettingsScreen {
                 }
             }
             SettingsPage::About => {
-                let p = &ctx.services.paths;
                 v.push(Row::Section("Tuner".into()));
-                v.push(Row::Note(format!("Version {}", env!("CARGO_PKG_VERSION")), false));
-                v.push(Row::Note(format!("Settings: {}", p.config_file().display()), false));
-                v.push(Row::Note(format!("Data: {}", p.data_dir.display()), false));
-                v.push(Row::Note(format!("Cache: {}", p.cache_dir.display()), false));
-                v.push(Row::Note(format!("Log: {}", p.log_file().display()), false));
+                v.extend(Self::about_details(ctx).into_iter().map(|s| Row::Note(s, false)));
                 updates::rows(self, ctx, &mut v);
+                v.push(Row::Act { act: Act::CopyAbout, icon: glyphs::COPY, label: "Copy app details".into(), danger: false });
                 v.push(Row::Section("Logs".into()));
                 v.push(Row::Toggle(&IFACE_T[11]));
                 v.push(Row::Act { act: Act::OpenLogs, icon: glyphs::INFO, label: "Open the log viewer".into(), danger: false });
@@ -1754,7 +1792,7 @@ impl SettingsScreen {
 
     // -------------------------------------------------------------- actions
 
-    /// A value change on a row: → / Shift+→ / L (`dir` 1), Shift+← / H (`dir` -1). Plain ←
+    /// A value change on a row: → / Shift+→ (`dir` 1), Shift+← (`dir` -1). Plain ←
     /// never comes here: it steps back to the page list.
     fn adjust(&mut self, ctx: &mut UiCtx<'_>, row: &Row, dir: i32) {
         if self.page == SettingsPage::Parental && self.parental_locked(ctx) && !matches!(row, Row::Local { .. }) {
@@ -1791,6 +1829,7 @@ impl SettingsScreen {
                     set(c, ((v / step).round() * step).clamp(min, max));
                 });
             }
+            Row::LipSync { output, reset: false } => ctx.edit_lip_sync(output.clone(), Some(dir)),
             Row::Local { field: Local::SrcUseXtream, .. } => self.set_use_xtream(ctx, dir > 0),
             Row::Local { field, .. } => self.adjust_local(*field, dir),
             Row::Item { item: Item::Epg(id), .. } => self.epg_offset(ctx, *id, dir * 15),
@@ -1818,6 +1857,7 @@ impl SettingsScreen {
                 self.adjust(ctx, row, if cur { -1 } else { 1 });
             }
             Row::Choice(_) | Row::Number(_) => self.adjust(ctx, row, 1),
+            Row::LipSync { output, reset } => ctx.edit_lip_sync(output.clone(), if *reset { None } else { Some(1) }),
             Row::Text(t) => {
                 if self.editing {
                     self.commit_text(ctx, t);
@@ -1874,6 +1914,10 @@ impl SettingsScreen {
 
     fn act(&mut self, ctx: &mut UiCtx<'_>, act: Act) {
         match act {
+            Act::CopyAbout => {
+                self.copy = Some(Self::about_details(ctx).join("\n"));
+                ctx.toast(Toast::info("Copied app details"));
+            }
             Act::Feature(f, n) => self.feature_act(ctx, f, n),
             Act::DistinctColours => {
                 let theme = ctx.theme;
@@ -2041,8 +2085,11 @@ impl SettingsScreen {
                 let id = src.id;
                 let name = src.name.clone();
                 let jobs = ctx.services.jobs.clone();
+                let input = ctx.config_input;
                 let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
+                    let old = crate::store::sources::get_source(c, src.id)?;
                     crate::store::sources::update_source(c, &src)?;
+                    crate::config::audit::source_changes(&old, &src, input);
                     if refresh {
                         jobs.submit(JobKind::RefreshSource { source: id, force: true });
                     }
@@ -2088,10 +2135,12 @@ impl SettingsScreen {
         let (id, name) = (e.original.id, e.original.name.clone());
         let check = on && e.original.kind != SourceKind::Xtream;
         let jobs = ctx.services.jobs.clone();
+        let input = ctx.config_input;
         let ticket = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
             let mut settings = crate::store::sources::get_source(c, id)?.settings;
             settings.keep_m3u = !on;
             crate::store::sources::set_source_settings(c, id, &settings)?;
+            tracing::info!("settings: use the Xtream login {} → {on} ({input})", !on);
             // submitted once saved (autocommit): the job that runs it reads the new setting
             Ok(jobs.submit_tracked(JobKind::RefreshSource { source: id, force: true }))
         });
@@ -2142,6 +2191,7 @@ impl SettingsScreen {
             self.flush_epg_offset(ctx);
         }
         self.offset_pending = Some((id, std::time::Instant::now()));
+        self.offset_input = ctx.config_input;
     }
 
     /// Write a pending offset change now.
@@ -2149,8 +2199,14 @@ impl SettingsScreen {
         let Some((id, _)) = self.offset_pending.take() else { return };
         let Some(src) = self.epg_sources.iter().find(|e| e.id == id).cloned() else { return };
         let jobs = ctx.services.jobs.clone();
+        let input = self.offset_input;
         let _ = ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| {
+            let old = crate::store::sources::get_epg_source(c, src.id)?.offset_min;
             crate::store::sources::update_epg_source(c, &src)?;
+            let new = src.offset_min;
+            if old != new {
+                tracing::info!("settings: guide offset {old} min → {new} min ({input})");
+            }
             jobs.submit(JobKind::RefreshEpg { epg_source: src.id, force: true });
             Ok(())
         });
@@ -2220,8 +2276,10 @@ impl SettingsScreen {
         let Some(e) = self.epg_sources.iter_mut().find(|e| e.id == id) else { return };
         e.enabled = !e.enabled;
         let src = e.clone();
+        let input = ctx.config_input;
         let _ = ctx.services.store.writer().submit_notify(DataScope::Epg, move |c| {
             crate::store::sources::update_epg_source(c, &src)?;
+            tracing::info!("settings: guide enabled {} → {} ({input})", !src.enabled, src.enabled);
             crate::store::epg::resolve_mappings(c)
         });
     }
@@ -2291,7 +2349,7 @@ impl SettingsScreen {
         self.row = 0;
     }
 
-    /// x / Delete / right-click: the row's menu.
+    /// Delete / right-click: the row's menu.
     fn item_menu(&mut self, ctx: &mut UiCtx<'_>, item: Item) {
         let mi = |icon: &'static str, label: &str, code: u8| MenuItem {
             icon,
@@ -2395,7 +2453,13 @@ impl SettingsScreen {
                 if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
                     s.enabled = !s.enabled;
                     let src = s.clone();
-                    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| crate::store::sources::update_source(c, &src));
+                    let input = ctx.config_input;
+                    let _ = ctx.services.store.writer().submit_notify(DataScope::Sources, move |c| {
+                        let old = crate::store::sources::get_source(c, src.id)?;
+                        crate::store::sources::update_source(c, &src)?;
+                        crate::config::audit::source_changes(&old, &src, input);
+                        Ok(())
+                    });
                 }
             }
             (Item::Source(id), MENU_RENAME) => {
@@ -2470,7 +2534,7 @@ impl SettingsScreen {
         ctx.toast(Toast::info("Reminder cancelled"));
     }
 
-    /// Alt+↑/↓ / K/J / drag: move an item within its list and persist the order.
+    /// Alt+↑/↓ / drag: move an item within its list and persist the order.
     fn reorder(&mut self, ctx: &mut UiCtx<'_>, item: Item, delta: isize) {
         fn moved<T: Copy + PartialEq>(order: &mut Vec<T>, x: T, delta: isize) -> bool {
             let Some(i) = order.iter().position(|y| *y == x) else { return false };
@@ -2700,17 +2764,35 @@ impl Screen for SettingsScreen {
     }
 
     fn key_contexts(&self) -> Vec<KeyContext> {
-        if self.editing { vec![KeyContext::TextInput, KeyContext::Panel] } else { vec![KeyContext::Panel] }
+        if self.editing {
+            vec![KeyContext::TextInput, KeyContext::Settings]
+        } else if !self.filter.is_empty() || self.search_focused {
+            vec![KeyContext::ListFiltering, KeyContext::Settings]
+        } else {
+            vec![KeyContext::Settings]
+        }
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let page = match route {
             Route::Settings(p) => *p,
+            Route::Setting(target) => target.page,
             Route::EditPlaylist(_) => SettingsPage::Playlists,
             _ => self.page,
         };
+        self.clear_filter();
+        if matches!(route, Route::Setting(_)) {
+            if !self.may_leave_editor(ctx) {
+                self.pane = Pane::Content;
+                self.jump_pending = None;
+                return;
+            }
+            self.editor = None;
+            self.attach = None;
+        }
         self.flush_epg_offset(ctx);
         self.set_page(ctx, page);
+        self.jump_pending = if let Route::Setting(target) = route { Some(target.clone()) } else { None };
         self.editing = false;
         // a scope tab's "Edit playlist…" (DESIGN §29): its editor, once the list is read
         if let Route::EditPlaylist(id) = route {
@@ -2723,6 +2805,22 @@ impl Screen for SettingsScreen {
     fn on_event(&mut self, ctx: &mut UiCtx<'_>, ev: &AppEvent) {
         match ev {
             AppEvent::Data(scope) => {
+                if !self.filter.is_empty()
+                    && matches!(
+                        scope,
+                        DataScope::Sources
+                            | DataScope::Live
+                            | DataScope::Vod
+                            | DataScope::Epg
+                            | DataScope::Reminders
+                            | DataScope::Overrides
+                            | DataScope::Follow
+                            | DataScope::Spoiler
+                            | DataScope::All
+                    )
+                {
+                    self.load_search_pages(ctx);
+                }
                 let relevant = match scope {
                     DataScope::Sources | DataScope::Live | DataScope::Vod => self.page == SettingsPage::Playlists,
                     DataScope::Epg => self.page == SettingsPage::Epg,
@@ -2824,6 +2922,11 @@ impl Screen for SettingsScreen {
     }
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        ctx.config_input = crate::config::audit::key_input(action);
+        if !self.editing && self.filter_action(ctx, action) {
+            return true;
+        }
+
         if self.pane == Pane::Pages {
             let pages: Vec<_> = pages().collect();
             let i = pages.iter().position(|p| p.0 == self.page).unwrap_or(0);
@@ -2854,6 +2957,7 @@ impl Screen for SettingsScreen {
                 Action::Activate => {
                     // acted on after this frame's text events reached the field
                     self.submit = true;
+                    self.submit_input = ctx.config_input;
                 }
                 Action::Back => {
                     // leaving a field keeps what was typed (as Tab does, and as the form
@@ -2891,7 +2995,10 @@ impl Screen for SettingsScreen {
                     self.adjust(ctx, r, if action == Action::Decrease { -1 } else { 1 });
                 }
             }
-            Action::Activate => self.submit = true,
+            Action::Activate => {
+                self.submit = true;
+                self.submit_input = ctx.config_input;
+            }
             Action::ContextMenu => {
                 if let Some(Row::Item { item, .. }) = row {
                     self.item_menu(ctx, item);
@@ -2995,7 +3102,18 @@ impl Screen for SettingsScreen {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
+        if let Some(text) = self.copy.take() {
+            ui.ctx().copy_text(text);
+        }
         self.poll_loaders(ctx);
+        if let Some(target) = self.jump_pending.clone() {
+            if self.focus_target(ctx, &target) {
+                self.jump_pending = None;
+            } else if self.poll_search_pages(ctx) {
+                self.jump_pending = None;
+                ctx.toast(Toast::info("This setting is no longer available"));
+            }
+        }
         agents::frame(self, ui);
         cast::frame(self, ui, ctx);
         let theme = ctx.theme;
@@ -3027,9 +3145,20 @@ impl Screen for SettingsScreen {
 }
 
 impl SettingsScreen {
+    fn about_details(ctx: &UiCtx<'_>) -> [String; 5] {
+        let p = &ctx.services.paths;
+        [
+            format!("Version {}", env!("CARGO_PKG_VERSION")),
+            format!("Settings: {}", p.config_file().display()),
+            format!("Data: {}", p.data_dir.display()),
+            format!("Cache: {}", p.cache_dir.display()),
+            format!("Log: {}", p.log_file().display()),
+        ]
+    }
+
     fn poll_loaders(&mut self, ctx: &mut UiCtx<'_>) {
         // `generation`, not `built_at`: two builds within a second (hide, then unhide) share it
-        if self.page == SettingsPage::Hidden && self.hidden_built != ctx.lib.generation {
+        if (self.page == SettingsPage::Hidden || self.search_all) && self.hidden_built != ctx.lib.generation {
             // one pass per library build, not one per `rows()` call
             self.hidden_built = ctx.lib.generation;
             let live = &ctx.lib.live;
@@ -3115,6 +3244,20 @@ impl SettingsScreen {
             ui.add_space(theme.space(SpaceToken::Sm));
         }
         section::section_header(ui, theme, "Settings");
+        let mut query = self.filter.clone();
+        let response = ui.add(egui::TextEdit::singleline(&mut query).hint_text("Search settings…").desired_width(f32::INFINITY));
+        response.widget_info(|| egui::WidgetInfo {
+            label: Some("Search settings".into()),
+            ..egui::WidgetInfo::text_edit(true, &self.filter, &query, "Search settings…")
+        });
+        if std::mem::take(&mut self.release_search_focus) {
+            response.surrender_focus();
+        }
+        self.search_focused = response.has_focus();
+        if response.changed() {
+            self.set_filter(ctx, query);
+        }
+
         ui.add_space(theme.space(SpaceToken::Md));
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt("settings-pages-scroll").auto_shrink([false, false]).show(ui, |ui| {
@@ -3134,6 +3277,7 @@ impl SettingsScreen {
                 self.pane = Pane::Content;
                 return;
             }
+            self.clear_filter();
             self.set_page(ctx, p);
             self.pane = Pane::Content;
             // at Compact the page replaces the list: a double-click's second click mustn't act
@@ -3146,6 +3290,7 @@ impl SettingsScreen {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let rows = self.rows(ctx);
+        let search_targets = if self.filter.is_empty() { Vec::new() } else { self.search_rows(ctx).into_iter().map(|(target, _)| target).collect() };
         self.clamp_row(&rows);
         let focused_pane = self.pane == Pane::Content;
         let row_h = theme.space(SpaceToken::ControlHeight) + 2.0 * theme.space(SpaceToken::Md);
@@ -3201,7 +3346,8 @@ impl SettingsScreen {
                             } else {
                                 t.text_secondary
                             }))
-                            .wrap(),
+                            .wrap()
+                            .selectable(true),
                         );
                         continue;
                     }
@@ -3256,6 +3402,23 @@ impl SettingsScreen {
                         let value = number_text(n, (n.get)(ctx.config));
                         if let Some(d) = value_row(&mut inner, theme, n.label, &value, label_color) {
                             clicked = Some((i, d));
+                        }
+                    }
+                    Row::LipSync { output, reset } => {
+                        if *reset {
+                            inner
+                                .label(RichText::new(format!("Reset delay · {}", output.label)).size(theme.font(TypeToken::Body)).color(label_color));
+                        } else {
+                            let playing = std::iter::once(ctx.player).chain(ctx.multiview.snaps.iter().flatten()).any(|snap| {
+                                snap.cast.is_none()
+                                    && (snap.state.is_active() || matches!(snap.state, crate::player::PlayerState::Paused))
+                                    && snap.audio_output.name == output.name
+                            });
+                            let label = format!("Audio delay · {}{}", output.label, if playing { " · Playing now" } else { "" });
+                            let ms = ctx.config.player.lip_sync.get(&output.name).map_or(0, crate::config::LipSync::offset_ms);
+                            if let Some(d) = value_row(&mut inner, theme, &label, &format!("{ms:+} ms"), label_color) {
+                                clicked = Some((i, d));
+                            }
                         }
                     }
                     Row::Text(tx) => {
@@ -3365,7 +3528,7 @@ impl SettingsScreen {
                                 let (glyph, tip) = if matches!(item, Item::Reminder(_)) {
                                     (glyphs::CLOSE, "Cancel reminder (Delete)")
                                 } else {
-                                    (glyphs::SETTINGS, "More (x)")
+                                    (glyphs::SETTINGS, "More (Delete)")
                                 };
                                 if icon_button(ui, theme, glyph, tip, ButtonStyle::default()).clicked() {
                                     clicked = Some((i, 2));
@@ -3397,8 +3560,9 @@ impl SettingsScreen {
                 }
             }
         });
-        if rows.iter().all(|r| !r.focusable()) && rows.is_empty() {
-            empty_state::empty_state(ui, theme, glyphs::SETTINGS, "Nothing here", None, None);
+        if rows.is_empty() {
+            let message = if self.filter.is_empty() { "Nothing here".to_owned() } else { format!("No settings match “{}”", self.filter) };
+            empty_state::empty_state(ui, theme, glyphs::SETTINGS, &message, None, None);
         }
         // drag & drop reorder (grip)
         if let Some(i) = drag_started {
@@ -3408,8 +3572,28 @@ impl SettingsScreen {
             if let (Some(from), Some(to)) = (self.drag_from.take(), drag_target)
                 && let (Some(Row::Item { item, .. }), true) = (rows.get(from), from != to)
             {
-                let delta = rows[from.min(to)..=from.max(to)].iter().filter(|r| matches!(r, Row::Item { reorder: true, .. })).count() as isize - 1;
-                self.reorder(ctx, item.clone(), if to > from { delta } else { -delta });
+                // Search order is ranked and can omit intervening rows. Resolve both ends
+                // against the page's real order; never drag an item into another page.
+                let order = if search_targets.is_empty() {
+                    Some((rows.clone(), from, to))
+                } else {
+                    search_targets[from].as_ref().zip(search_targets[to].as_ref()).and_then(|(a, b)| {
+                        if a.page != b.page {
+                            return None;
+                        }
+                        let page = self.page_rows(ctx, a.page);
+                        let position = |row: &Row| {
+                            page.iter().position(|r| matches!((r, row), (Row::Item { item: a, .. }, Row::Item { item: b, .. }) if a == b))
+                        };
+                        let (from, to) = (position(&rows[from])?, position(&rows[to])?);
+                        Some((page, from, to))
+                    })
+                };
+                if let Some((order, from, to)) = order {
+                    let delta =
+                        order[from.min(to)..=from.max(to)].iter().filter(|r| matches!(r, Row::Item { reorder: true, .. })).count() as isize - 1;
+                    self.reorder(ctx, item.clone(), if to > from { delta } else { -delta });
+                }
             }
             self.drag_from = None;
         }
@@ -3417,14 +3601,41 @@ impl SettingsScreen {
             self.row = i;
         }
         if let Some(i) = text_clicked {
+            if let Some(Some(target)) = search_targets.get(i)
+                && !self.jump_to(ctx, target)
+            {
+                return;
+            }
             self.pane = Pane::Content;
-            self.row = i;
+            if search_targets.is_empty() {
+                self.row = i;
+            }
             if let Some(Row::Text(tx)) = rows.get(i) {
                 self.edit_buf = (tx.get)(ctx.config);
             }
             self.editing = true;
         }
         if let Some((i, how)) = clicked {
+            ctx.config_input = "click";
+            if let Some(Some(target)) = search_targets.get(i) {
+                if how == 0 || how == 2 {
+                    if !self.jump_to(ctx, target) {
+                        return;
+                    }
+                    if let Some(r) = rows.get(i) {
+                        if how == 2 {
+                            if let Row::Item { item, .. } = r {
+                                self.item_menu(ctx, item.clone());
+                            }
+                        } else if matches!(r, Row::Act { .. } | Row::Item { .. } | Row::LipSync { reset: true, .. }) {
+                            self.activate(ctx, r);
+                        }
+                    }
+                } else if let Some(r) = rows.get(i) {
+                    self.adjust_hit(ctx, target, r, how);
+                }
+                return;
+            }
             self.pane = Pane::Content;
             self.row = i;
             self.editing = false;
@@ -3441,6 +3652,7 @@ impl SettingsScreen {
             }
         }
         if std::mem::take(&mut self.submit) {
+            ctx.config_input = self.submit_input;
             let rows = self.rows(ctx);
             if let Some(r) = rows.get(self.row).cloned() {
                 self.activate(ctx, &r);
@@ -3525,6 +3737,243 @@ mod tests {
     use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
 
     type H = egui_kittest::Harness<'static, testkit::App<SettingsScreen>>;
+
+    fn search_type(h: &mut H, text: &str) {
+        for c in text.chars() {
+            let action = crate::keymap::resolve(&h.state().s.key_contexts(), &egui::Event::Text(c.to_string())).unwrap();
+            h.state_mut().act(action);
+        }
+        h.run_steps(2);
+    }
+
+    #[test]
+    fn settings_search_across_pages_edits_jumps_and_restores() {
+        let (mut t, one) = rig();
+        let mut cfg = (*t.config).clone();
+        cfg.player.lip_sync.insert("private-output".into(), crate::config::LipSync { offset_ms: 0, label: "Private speakers".into() });
+        t.config = std::sync::Arc::new(cfg);
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Epg));
+        focus(&mut h, "Refresh guides every");
+        let before = (h.state().s.page, h.state().s.pane, h.state().s.row);
+        search_type(&mut h, "open on");
+        assert!(has_label(&h, "Start screen"));
+        focus(&mut h, "Start screen");
+        h.state_mut().act(Action::Right);
+        assert_eq!(h.state().t.config_edits[0].input, "key →");
+        h.state_mut().apply_config();
+        assert_eq!(h.state().t.config.general.start_screen, StartScreen::Live);
+        let escape = crate::keymap::resolve(
+            &h.state().s.key_contexts(),
+            &egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        )
+        .unwrap();
+        h.state_mut().act(escape);
+        assert_eq!((h.state().s.page, h.state().s.pane, h.state().s.row), before);
+        search_type(&mut h, "lip sync");
+        assert!(testkit::has_label_containing(&h, "Audio delay"));
+        h.state_mut().act(Action::Activate);
+        assert_eq!(h.state().s.page, SettingsPage::Player);
+        assert!(h.state().s.filter.is_empty());
+        let app = h.state_mut();
+        assert!(matches!(app.t.with_ctx(|ctx| app.s.current_row(ctx)), Some(Row::LipSync { reset: false, .. })));
+        search_type(&mut h, "instant load");
+        h.get_by_role(egui::accesskit::Role::CheckBox).click();
+        h.run_steps(2);
+        assert_eq!(h.state().t.config_edits[0].input, "click");
+        h.state_mut().apply_config();
+        assert!(h.state().t.config.player.instant_load);
+        assert!(!h.state().s.filter.is_empty(), "the toggle works inside the results");
+        h.state_mut().act(Action::FilterClear);
+        search_type(&mut h, "start scr");
+        h.state_mut().act(Action::Activate);
+        assert_eq!(h.state().s.page, SettingsPage::Interface);
+        let app = h.state_mut();
+        assert!(matches!(app.t.with_ctx(|ctx| app.s.current_row(ctx)), Some(Row::Choice(c)) if c.label == "Start screen"));
+        search_type(&mut h, "zzzz-no-setting");
+        assert!(has_label(&h, "No settings match “zzzz-no-setting”"));
+        h.state_mut().act(Action::FilterDeleteWord);
+        assert!(h.state().s.filter.is_empty());
+    }
+
+    #[test]
+    fn settings_search_page_list_returns_to_results_without_editing() {
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        search_type(&mut h, "start");
+        focus(&mut h, "Start screen");
+        let row = h.state().s.row;
+        let before = h.state().t.config.clone();
+        for key in [egui::Key::ArrowRight, egui::Key::Enter] {
+            for key in [egui::Key::ArrowLeft, key] {
+                let action = crate::keymap::resolve(
+                    &h.state().s.key_contexts(),
+                    &egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+                )
+                .unwrap();
+                h.state_mut().act(action);
+                h.run_steps(1);
+            }
+            h.state_mut().apply_config();
+            assert_eq!(h.state().t.config, before);
+            assert_eq!(h.state().s.pane, Pane::Content);
+            assert_eq!(h.state().s.row, row);
+            assert_eq!(h.state().s.filter, "start");
+        }
+        h.state_mut().act(Action::Left);
+        for action in [Action::Increase, Action::Decrease, Action::ContextMenu, Action::Remove] {
+            h.state_mut().act(action);
+            assert_eq!(h.state().s.pane, Pane::Pages);
+            assert_eq!(h.state().s.filter, "start");
+            assert!(h.state().t.config_edits.is_empty());
+            assert!(h.state_mut().nav().is_empty());
+        }
+    }
+
+    #[test]
+    fn settings_search_hides_reminders_on_locked_channels_until_unlock() {
+        let (mut t, _one) = rig();
+        let channel = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::channels(c, src, 1)?;
+            // A group lock must be treated exactly like an individual channel lock.
+            crate::store::user::set_group_override(
+                c,
+                src,
+                ItemKind::Channel,
+                &crate::model::GroupKey("channel:all".into()),
+                &crate::model::GroupOverride { locked: true, ..Default::default() },
+            )?;
+            Ok(ItemRef { source: src, kind: ItemKind::Channel, key: ItemKey(format!("m3u:seed{:011}", 0)) })
+        });
+        let mut cfg = (*t.config).clone();
+        cfg.parental.enabled = true;
+        cfg.parental.pin_salt = Some("s".into());
+        cfg.parental.pin_hash = Some(crate::ui::parental::hash_pin("1234", "s"));
+        t.config = std::sync::Arc::new(cfg);
+        let s = SettingsScreen {
+            reminders: vec![Reminder {
+                id: ReminderId(1),
+                channel,
+                channel_name: "Channel 0".into(),
+                programme_title: "Private programme".into(),
+                start: 4_000_000_000,
+                stop: 4_000_003_600,
+                lead_s: 120,
+                state: crate::model::ReminderState::Pending,
+                mode: Default::default(),
+                offset_s: 0,
+                open_in: None,
+                rule_id: None,
+            }],
+            ..Default::default()
+        };
+        let found = |t: &mut crate::ui::testing::TestUi| t.with_ctx(|ctx| s.indexed_rows(ctx).iter().any(|r| r.target.title == "Private programme"));
+        assert!(!found(&mut t));
+        assert!(t.parental.unlock("1234", &t.config.parental));
+        assert!(found(&mut t));
+        t.parental.lock();
+        assert!(!found(&mut t));
+    }
+
+    #[test]
+    fn settings_search_mouse_field_and_description() {
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        h.run_steps(2);
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search settings").focus();
+        h.run_steps(1);
+        h.event(egui::Event::Text("flagged by".into()));
+        h.run_steps(2);
+        assert_eq!(h.state().s.filter, "flagged by");
+        assert!(has_label(&h, "Show explicit content"), "the parental description is searchable");
+        h.state_mut().act(Action::FilterClear);
+        h.run_steps(2);
+        assert_eq!(h.state().s.page, SettingsPage::Interface);
+        assert!(!h.state().s.search_focused);
+    }
+
+    #[test]
+    fn settings_search_only_indexes_visible_rows_and_runs_actions() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            c.execute(
+                "INSERT INTO grp(source_id, kind, key, name, raw_name, provider_order, item_count, seen_gen, explicit)
+                VALUES (?1, 'channel', 'channel:secret', 'Concealed category', 'Concealed category', 0, 0, 1, 1)",
+                [src],
+            )?;
+            Ok(())
+        });
+        let shown = crate::store::library::load(&t.services().store.reader().unwrap()).unwrap();
+        t.set_library(shown.hiding_explicit());
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Interface));
+        search_type(&mut h, "Concealed");
+        assert!(has_label(&h, "No settings match “Concealed”"));
+        h.state_mut().act(Action::FilterClear);
+        search_type(&mut h, "same title");
+        assert!(has_label(&h, "No settings match “same title”"), "only one eligible playlist");
+        h.state_mut().act(Action::FilterClear);
+        search_type(&mut h, "Add playlist");
+        crate::ui::testing::clicks::click_text(&mut h, "Add playlist…");
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Onboarding(OnboardingStart::AddSource))]);
+        assert_eq!(h.state().s.page, SettingsPage::Playlists);
+        search_type(&mut h, "Show explicit content");
+        h.state_mut().act(Action::Right);
+        assert_eq!(h.state().s.page, SettingsPage::Parental);
+        assert!(h.state().s.filter.is_empty());
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_PIN_FIRST)));
+        let app = h.state_mut();
+        assert!(matches!(app.t.with_ctx(|ctx| app.s.current_row(ctx)), Some(Row::Local { field: Local::PinNew, .. })));
+    }
+
+    #[test]
+    fn clicking_settings_action_text_opens_the_page() {
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
+        until(&mut h, "the playlists to load", |h| h.state().s.sources_loader.is_none());
+        // Reproduce egui's default first, with loading finished so the row stays put.
+        h.ctx.all_styles_mut(|s| s.interaction.selectable_labels = true);
+        h.run_steps(2);
+        crate::ui::testing::clicks::click_text(&mut h, "Add playlist…");
+        assert!(h.state_mut().nav().is_empty(), "the selectable child label takes the click");
+        crate::theme::egui_style::apply(&h.ctx, &h.state().t.theme);
+        h.run_steps(30); // the next click is separate, not the second half of a double-click
+        // The same Label's text bounds, not the enclosing row's padding.
+        crate::ui::testing::clicks::click_text(&mut h, "Add playlist…");
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::Onboarding(OnboardingStart::AddSource))]);
+    }
+
+    #[test]
+    fn settings_toggle_label_clicks_once_and_about_details_copy() {
+        use crate::ui::testing::clicks;
+        let (t, one) = rig();
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::Player));
+        h.run_steps(2);
+        let label = "Instant load (less buffering, faster zaps)";
+        clicks::click_text(&mut h, label);
+        h.state_mut().apply_config();
+        assert!(h.state().t.config.player.instant_load);
+        clicks::click_text(&mut h, label);
+        assert!(h.state().t.config_edits.is_empty(), "double-click does not toggle back");
+
+        h.state_mut().enter(Route::Settings(SettingsPage::About));
+        h.run_steps(2);
+        clicks::click_text(&mut h, "Copy app details");
+        h.run_steps(1); // queued by the row's action, like the agent setup Copy actions
+        let copied = clicks::copied_text(&h).expect("clipboard command");
+        assert!(copied.starts_with(&format!("Version {}\nSettings: ", env!("CARGO_PKG_VERSION"))));
+        assert!(copied.contains(&h.state().t.services().paths.config_file().display().to_string()));
+        for label in ["\nData: ", "\nCache: ", "\nLog: "] {
+            assert!(copied.contains(label), "{copied}");
+        }
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied app details"));
+    }
 
     /// Focus the content row labelled `label` (by moving with ↓ from the top).
     fn focus(h: &mut H, label: &str) {
@@ -3614,7 +4063,7 @@ mod tests {
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Player));
         h.run_steps(2);
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Settings]);
         assert!(has_label(&h, "Hardware decoding") && has_label(&h, "Zapping delay"));
         // Enter toggles; → / Shift+←/→ adjust numbers and choices; everything goes through
         // edit_config
@@ -3625,30 +4074,30 @@ mod tests {
         h.state_mut().act(Action::Right);
         h.state_mut().act(Action::Right);
         focus(&mut h, "Subtitles automatically");
-        h.state_mut().act(Action::Decrease);
+        h.state_mut().act(Action::Increase);
         h.state_mut().apply_config();
         let c = h.state().t.config.clone();
         assert!(c.player.instant_load);
         assert_eq!(c.player.zap_delay_ms, 400);
-        assert_eq!(c.player.sub_auto, SubtitleAuto::Off);
+        assert_eq!(c.player.sub_auto, SubtitleAuto::Forced);
         // a text row: Enter edits ([TextInput, Panel]), typing, Enter commits
         focus(&mut h, "Advanced mpv options");
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::TextInput, KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::TextInput, KeyContext::Settings]);
         type_text(&mut h, "; profile=fast"); // appended to the headless "ao=null; vo=null"
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
         h.state_mut().apply_config();
         assert_eq!(h.state().t.config.player.mpv_options.get("profile").map(String::as_str), Some("fast"));
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Settings]);
         // Esc leaves a field keeping what was typed (like Tab, and like the form fields)
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
         type_text(&mut h, "; cache=no");
         h.state_mut().act(Action::Back);
         h.run_steps(1);
-        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Panel]);
+        assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Settings]);
         h.state_mut().apply_config();
         assert_eq!(h.state().t.config.player.mpv_options.get("cache").map(String::as_str), Some("no"), "Esc keeps the edit");
         // leaving a field unchanged queues nothing
@@ -3698,7 +4147,7 @@ mod tests {
         let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
         h.state_mut().enter(Route::Settings(SettingsPage::Playlists));
         until(&mut h, "the sources", |h| has_label(h, "Beta"));
-        // Alt+↓ / J moves Alpha below Beta
+        // Alt+↓ moves Alpha below Beta
         focus(&mut h, "Alpha");
         h.state_mut().act(Action::MoveDown);
         until(&mut h, "the new order", |h| sources(h).iter().map(|s| s.name.as_str()).collect::<Vec<_>>() == ["Beta", "Alpha"]);
@@ -3716,7 +4165,7 @@ mod tests {
         h.state_mut().act(Action::Activate);
         h.run_steps(1);
         until(&mut h, "the rename", |h| sources(h).iter().any(|s| s.name == "Alpha One"));
-        // x / Delete: the row menu → Delete… → Confirm
+        // Delete: the row menu → Delete… → Confirm
         until(&mut h, "the list", |h| has_label(h, "Alpha One"));
         focus(&mut h, "Beta");
         h.state_mut().act(Action::ContextMenu);
@@ -3761,6 +4210,9 @@ mod tests {
             h.state().s.epg_sources.first().is_some_and(|e| e.name == "Seed EPG")
                 && h.state().s.epg_sources.get(1).is_some_and(|e| e.name == "Third guide")
         });
+        // Drag across a filtered-out row: both displayed guides must use their real priority.
+        search_type(&mut h, "se");
+        until(&mut h, "filtered guides", |h| has_label(h, "Seed EPG") && has_label(h, "Second guide") && !has_label(h, "Third guide"));
         h.run_steps(2);
         let grip = |h: &H, name: &str| {
             let row = h.query_all_by_label(name).next().expect("row").rect();
@@ -3780,6 +4232,12 @@ mod tests {
         h.run_steps(2);
         until(&mut h, "drag reorder", |h| names(h).first().map(String::as_str) == Some("Second guide"));
         assert!(h.state_mut().nav().is_empty(), "a drag ends without a click: the row opens nothing");
+        // ListFiltering resolves Delete to Remove; the result opens the setting's own menu.
+        focus(&mut h, "Second guide");
+        h.state_mut().act(Action::Remove);
+        assert!(h.state().s.filter.is_empty());
+        assert_eq!(h.state().s.page, SettingsPage::Epg);
+        assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(OverlayRequest::ContextMenu(_))]));
     }
 
     #[test]
@@ -4022,7 +4480,7 @@ mod tests {
 
     /// Spatial panes (DESIGN §15.1): ← steps from any content row back to the page list (a
     /// choice or a toggle keeps its value), ↓ there switches the page and → / Enter return;
-    /// values change with → and Shift+←/→ (H/L); Tab and Esc are unchanged. The source editor
+    /// values change with → and Shift+←/→; Tab and Esc are unchanged. The source editor
     /// stays open under ←, and a page switch never drops its unsaved changes.
     #[test]
     fn left_steps_back_to_the_page_list_and_shift_arrows_change_values() {

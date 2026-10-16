@@ -63,7 +63,7 @@ Omarchy theme, foreground-alpha state tints that work in light themes.
 | | Background EPG refresh, "updated N h ago" | MUST | ✅ | §9.5 |
 | Live | Groups, channel list with now/next + progress, preview | MUST | ✅ | Live screen §13.2 |
 | | EPG grid, programme details | MUST | ✅ | Guide §13.4 |
-| | Zapping within collection, last-channel recall, history | MUST | ✅ | `PlayerCommand::Zap/LastChannel`, `h` |
+| | Zapping within collection, last-channel recall, history | MUST | ✅ | `PlayerCommand::Zap/LastChannel`, `H` |
 | | Favourites, **multiple lists** (create/rename/delete/reorder) | MUST/SHOULD | ✅ | `fav_list`, `fav_item`, Ctrl+Shift+F, Settings ▸ Favourites |
 | | Hide categories **and channels**, rename, reorder | MUST/SHOULD | ✅ | `item_override`, `group_override` |
 | | Context menu | MUST | ✅ | `overlays::dialogs::ContextMenuOverlay` |
@@ -119,7 +119,7 @@ rate, background refresh while closed (`tuner --refresh` flag reserved for a sys
 | Wrong theme path `~/.config/omarchy/current` | `~/.local/state/omarchy/current/` (watched non-recursively). |
 | egui-phosphor vs Nerd glyphs | Nerd glyphs from the UI font (`widgets::glyphs`, code points verified with `fc-query`). |
 | Blit in PaintCallback vs registered texture | Registered texture (spike). Native egui viewports are forbidden (§3.1), so PaintCallback is never needed. |
-| Keymap collisions | Per-context tables (§15): `f` = fullscreen in player, favourite = Ctrl+F everywhere; `←` = last channel (live) / seek (VOD); `h` = history (live) / left (guide); digits = channel entry in the live player and the guide. |
+| Keymap collisions | Per-context tables (§15): `f` = fullscreen in player, favourite = Ctrl+F everywhere; `←`/`→` = skip in live and VOD; `H` = history (live), Backspace = last channel; `h` = left (guide); digits = channel entry in the live player and the guide. |
 | Adaptive frame rate claim | No VRR here → judder of 25/50 fps on 60 Hz is a known v1 limitation; measured in WP-07; `mpv_options` lets users try `video-sync=display-resample` (§11.8). |
 | Spike "verified" too narrow | WP-07/WP-13 acceptance adds hidden-workspace, fullscreen, 1-hour soak, audio, frame-pacing measurements (§25). |
 | Event draining in `ui()` | Moved to dedicated threads (D2). **Correction (review round 2):** eframe's `logic` does NOT run while the window is on a hidden Hyprland workspace — winit-wayland reports no visibility and `RedrawRequested` needs a compositor frame callback, which Hyprland withholds from hidden workspaces. Mitigations: the `render_unfocused` window rule (frame callbacks at `misc:render_unfocused_fps`, default 15) and the controller's video watchdog (`vid=no` after 10 s without a rendered frame, resumed when the UI renders again) — §11.1. **Correction (hidden-workspace ANR):** with eframe's default vsync the UI thread did not merely idle there — it **blocked** in Mesa's `eglSwapBuffers` (swap interval 1 waits for the previous frame's callback), stopped answering `xdg_wm_base` pings, and after `misc:anr_missed_pings` Hyprland showed "application not responding" while mpv played on. Now vsync is off and frames are paced by winit frame callbacks (`pre_present_notify` in `App::ui`): hidden, the UI thread sits in its event loop and answers pings, with or without the window rule (§11.1). |
@@ -1022,10 +1022,11 @@ Daily `Maintenance`: programmes with `stop < now − max(epg_keep_past_days, max
 generation beside the old one, so the file briefly holds two guides; with `auto_vacuum=NONE`
 it never shrank back (a user's 690 MB file was 270 MB free pages). After every generation sweep
 and in `Maintenance`, `store::release_free_pages` runs `PRAGMA incremental_vacuum` in 8 MiB
-steps (one short write transaction each) until nothing is free. A database from before this is
-converted once by `Store::open` (one `VACUUM`, its scratch copy in a temp file rather than
-memory: 2.2 s for that 690 MB file, leaving 390 MB). A failed conversion is logged and tried
-again on the next start.
+steps (one short write transaction each) until nothing is free. New databases get the mode
+before their first table. 0.3.2 converted existing databases once, as `Store::open` opened them
+(one `VACUUM`: 14 s for that 690 MB file, leaving 389 MB). Later builds dropped the conversion
+(user decision, 2026-10-15), so a database made before 0.3.2 that never ran 0.3.2 keeps
+`auto_vacuum=NONE`: `incremental_vacuum` does nothing there and its file stays at its peak.
 
 ---
 
@@ -1334,7 +1335,8 @@ CPU, video resumes; fullscreen toggling; 1-hour soak; HDR/10-bit sample.
 ### 11.2 Event pump & controller (implemented)
 `events::EventPump` observes properties (pause, paused-for-cache, cache-buffering-state,
 core-idle, time-pos, duration, demuxer-cache-duration, volume, mute, track-list (JSON), seekable,
-sub-delay, sub-scale, video-params/w,h, hwdec-current, aid, sid, eof-reached), requests `warn`
+sub-delay, sub-scale, audio-device, current-ao, video-params/w,h,
+hwdec-current, aid, sid, eof-reached), requests `warn`
 log messages (redacted; `HTTP error NNN` is parsed for classification) and forwards owned
 `MpvEvent`s. The controller (`player/controller.rs`) multiplexes commands, events and a 250 ms
 tick, feeds `PlayerMachine`, executes `Effect`s (load, stop, emit, save progress, push history,
@@ -1483,6 +1485,79 @@ reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5`,
 then user `player.mpv_options`. Per file: `loadfile <url> replace -1
 force-media-title=%n%…,user-agent=…,referrer=…,http-header-fields=…,start=…` (values `%len%`
 quoted). The title never comes from the URL (credentials).
+
+Subtitle auto modes (Settings ▸ Player ▸ **Subtitles automatically**):
+
+| Mode | Meaning | mpv selection options |
+|---|---|---|
+| Off (default) | No automatic subtitle selection; `s` / `S` still select a track manually | `sid=no`, `slang=<sub_langs>`, `subs-fallback-forced=no`, `subs-fallback=no` |
+| Forced only | Only tracks flagged forced; Tuner ranks them by language after load (below) | `sid=auto` initially, `slang=` (empty), `subs-fallback-forced=always`, `subs-fallback=no` |
+| Always | Select subtitles, preferring `sub_langs`, with fallback to another available track | `sid=auto`, `slang=<sub_langs>`, `subs-fallback-forced=no`, `subs-fallback=yes` |
+
+mpv 0.41 uses a matching `slang` to enable ordinary tracks even with forced fallback, so
+Forced only clears it for selection without changing the saved `sub_langs`. Once the file
+has loaded, Tuner sets `sid` to the first forced track matching `player.sub_langs` in preference
+order, else one matching the selected audio track's language, else the first forced track.
+With no forced track it sets `sid=no`; ordinary and default-only tracks stay off. Track-list
+and settings changes re-evaluate this choice, but a manual choice with `s` / `S` (including
+Off) takes precedence for the rest of that file. Off and Always keep mpv's selection rules.
+New or missing settings default to Off; an explicit `sub_auto = "forced"` remains Forced only
+(no config migration).
+
+### 11.7.1 Local live rewind
+
+HTTP(S) live `.m3u8` channels use `player/hls/`: one provider fetcher per picture caches
+provider HLS bytes unchanged on disk; mpv reads only a token-protected loopback server.
+There is no probe, remux or second provider reader. Playlist, segment, AES key, init-map
+and selected audio requests are serialized through casting's upstream socket-close
+acknowledgement and existing header handling. The controller's connection lease belongs
+to the recorder, survives local seeks/END_FILE, and is released only after its provider
+socket closes on stop/zap/cast handover/exit. Each multi-view picture owns a separate store.
+
+A private **0700** folder under `cache/live-rewind/` holds numeric segment/key/map names.
+The store prunes before writing: media ending at or before `new_edge - 1800` is removed,
+retaining the segment crossing the cutoff. Media disk use is bounded by **30 minutes ×
+bitrate plus one source segment**, with referenced init maps/keys; slow local readers
+cannot retain unlinked disk files. Folders start empty, are removed on channel change
+and exit, and dead-process folders are cleaned at startup. No provider URLs, credentials,
+titles or arbitrary playlist tags reach names/logs/local playlists.
+
+The local media playlist advances its media sequence and has no ENDLIST while live,
+except at a timestamp discontinuity, where the controller hands off to the next local
+view without discarding the recording or changing the provider connection.
+It uses a private **EVENT** marker for libavformat seeking (not a public RFC EVENT
+publication). To avoid stale decoder playlists after pause and timestamp resets, a seek
+opens a fresh **localhost view at the containing segment**, with `start` set to the offset within it. The view continues growing/rolling;
+the controller maps mpv's relative position to the recorded timeline. Provider recording,
+lease, history and channel generation stay unchanged. −10/+10, the oldest-point clamp
+and "That's as far back as Tuner has", Live / lag text, and Back to live use that timeline.
+Pause records independently; an expired paused point advances to the oldest retained
+point while remaining paused. A half-second edge guard leaves video for exact seeks.
+
+Masters select the highest-bandwidth variant with the existing selector and cache its
+separate default audio rendition if present. Relative URLs use the redirected playlist
+base. AES-128 identity keys, explicit/implicit IVs, maps, byte ranges, sequence gaps and
+discontinuities are handled locally. Retry refreshes playlists to replace expired segment
+URLs; 403/404 also refreshes the master. Continuing provider sequences retain the buffer;
+a backwards sequence starts an empty epoch. Sticky retry timing comes from the player.
+
+Below **3 GB free** (or on disk write failure), log once, unlink the recording, and continue
+with a short bounded local segment supply and mpv's **two-minute memory rewind** on the
+same fetcher. The range comes from mpv's packet cache then; 128 MiB forward/backward byte
+limits may shorten it. Disk allocation stays disabled until a new channel. Unavailable
+local storage uses the same fetcher with memory-only storage. A listener failure reports
+an error, without handing the provider URL to mpv.
+
+Raw TS and other live inputs keep `player/timeshift.rs` from 523a89f: mpv's append-only
+30-minute disk cache, stopped near **2 GiB** (32 MiB headroom) or below 3 GB free, followed
+by two minutes in memory. Existing disk data remains until closure; reconnect resets that
+cache. VOD, catch-up and casting retain their transports.
+
+Hidden live playback at the edge suspends video decoding after the existing watchdog
+delay. A paused/rewound picture keeps or restores video selection; HLS recording continues
+either way. Black video until a keyframe after rewinding through a suspended stretch is
+accepted. See [the implementation and test record](design/timeshift-design.md), including
+the strict **0.15 s** production HTTP zap gate and the tests requiring an outside run.
 
 ### 11.8 Frame pacing (known limitation)
 UI frames follow the compositor's frame callbacks (§11.1: vsync off, `pre_present_notify`), so
@@ -1805,6 +1880,13 @@ favourites rail per non-empty list. Empty rails are omitted; when fewer than 2 r
 **"Get started" rail** appears: Browse Live TV · Open guide · Add favourites (Ctrl+F) · the
 first group's channels with now/next. An empty library routes to onboarding. The default start
 screen is Home (`StartScreen::Home`; an old `"auto"` loads as Home).
+Rail scroll bars float without a reserved gutter. Mouse movement over an overflowing rail
+shows its bar; it fades after about 1.5 s without movement or on keyboard input, even when the
+pointer rests over the rail. A bar being dragged stays visible until release. Keyboard use
+never shows rail bars. Horizontal touchpad swipes and Shift+wheel scroll within the rail;
+hiding its bar preserves its scroll position.
+Keyboard moves reveal the whole rail, including its header. ↑/↓ and PgUp/PgDn reach the
+same page top/bottom as touchpad scrolling; Home/End reach the first/last tile within a rail.
 Medium: rails narrower, same structure.
 
 ### 13.4 TV Guide & EPG grid widget
@@ -1903,6 +1985,13 @@ Movie                                           Series
 Key context `[Detail]` for both pages: ↑/↓/←/→ move between buttons and episodes, `[`/`]`
 switch seasons, Tab cycles sections (buttons · seasons · episodes), Enter plays/resumes,
 Shift+Enter plays from the start, Ctrl+W marks watched, Ctrl+F favourite, Backspace/Esc back.
+When a film or any episode of a series has unfinished progress above zero (Continue watching),
+show **Remove from Continue watching** after **Mark watched** (**Mark season watched** on a
+series). It is part of the button focus walk and the page's menu (Ctrl+Enter / Shift+F10),
+with Delete while the buttons have focus. Removal forgets progress without marking watched;
+for a combined title it covers every copy, and for a series every episode. The toast says
+"Removed from Continue watching" with Undo. Once removed, the button disappears and the
+film's Resume becomes Play; Undo restores the progress and the action.
 With two or more playlists of that kind (Auto, §13.0) the playlist's badge leads the meta
 line — Xtream pages included.
 Details load lazily with a skeleton; failures keep list-level data with a toast. Resume prompt
@@ -1915,7 +2004,7 @@ to its detail page.
 ```
             ┌──────────────────────────────────────────────────────────────────┐
             │ 󰍉 bbc▏                                                            │
-            │ All · Live · Movies · Series · Guide                    Tab cycles│
+            │ All · Live · Movies · Series · Guide · Settings         Tab cycles│
             │ LIVE ──────────────────────────────────────────────────────────── │
             │ ▣ BBC One HD        [󰐹 My IPTV]   News at Eight · 20:00     ▕██░▏ │
             │ ▣ BBC Two           [󰒍 Free]      Gardeners' World               │
@@ -1929,6 +2018,12 @@ Launcher card (width 720, grows downward once typing starts), header is the quer
 highlighting (accent), source badges. Enter plays channels FULLSCREEN (no preview here; zap
 collection = the channel's primary group) and opens VOD/series details; Shift+Enter plays
 VOD directly. Locked items are excluded while the session is locked (`SearchItem.locked`).
+A **Settings** section shows up to five matching settings, labelled `Start screen · Interface`.
+Enter or a click opens Settings on that row and scrolls it into view. Channels, movies and
+series come first unless the query exactly matches a setting title. Tab also offers a Settings
+section with all matching settings. The settings index is built once per opening, after its
+stored lists load off the UI thread; typing only matches the cached documents. A change in
+parental visibility or the library invalidates it, so concealed rows cannot survive relocking.
 No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 
 ### 13.8 Player & OSD
@@ -1936,21 +2031,35 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
 │ 󰁍 ▣ 101  BBC One HD                                                              20:26  │ ← top OSD
 │                                                                                          │
-│                                        VIDEO                                             │
+│                              ⟲ 10       ▶ / ❚❚       10 ⟳                                │
 │                                                                    ┌ CHANNELS (c) ─────┐ │
 │                                                                    │ 100 BBC Parliament │ │
 │                                                                    │▸101 BBC One        │ │
 │ News at Eight                                     20:00 – 21:00    │ 102 BBC Two        │ │
 │ ▕██████████████████░░░░░░░░░░░░░░░▏                34 min left     └────────────────────┘ │
 │ Next  21:00 Drama                                    [HD] [5.1] [CC] [⟲]                  │
-│ 󰒮 󰐊 󰒭  󰗅 English (AC-3 5.1)  󰨖 Off  󰐑 Channels  󰃰 Guide  󰋚 History  󰋽 Info 󰊓 󰏌  󰕾 ━━━●─┊─ 80 % │
+│ 󰒮   󰒭  󰗅 English (AC-3 5.1)  󰨖 Off  󰐑 Channels  󰃰 Guide  󰋚 History  󰋽 Info 󰊓 󰏌  󰕾 ━━━●─┊─ 80 % │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
 ```
+The centre transport is **⟲ 10 · play/pause · 10 ⟳**, sized for the picture; the
+bottom row retains channel navigation, tracks, Up next, Next, Info, volume and window controls.
+Skip buttons appear only while the snapshot is seekable (including a live cache with a
+range). All three centre buttons share banner visibility and the controls focus walk;
+clicking acts without entering focus mode. Narrow full-player layouts use smaller centre
+buttons. The mini player keeps its existing compact UI; the pop-out keeps its transport
+strip and uses the full controls row in focus mode.
+
+A successful skip paints a non-interactive circle on its side of the picture for one second.
+Same-direction skips within one second add up; the target is a VOD clock or live offset.
+The circle expands/fades with egui animations enabled and stays static with animations off.
+Live badges show **Live** within three seconds of the cached edge, otherwise **−MM:SS**;
+**Back to live** appears among the controls when behind. `L` resumes at that edge.
+
 The OSD has two layers (UX review B1):
 * **Info banner** (passive): the top and bottom bars drawn above, shown on zap, on any key and
   on mouse motion; hides after `osd_timeout_ms` (3.5 s) and never while a side panel/menu is
-  open. It **does not change the key context**: ↑/↓ keep zapping, ←/→ keep recalling/seeking,
+  open. It **does not change the key context**: ↑/↓ keep zapping, ←/→ keep skipping,
   however often they are pressed.
 * **Controls focus mode**: entered only with Enter, `i` or Tab (`FocusOsdControls`) — a mouse
   click on a control just activates it, so the arrows keep zapping / seeking; pushes
@@ -1962,7 +2071,7 @@ The OSD has two layers (UX review B1):
 * **Which playlist**: with two or more playlists of the item's kind, the top bar shows
   `● TV` left of the clock (§13.0, §29).
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
-  700 pt the controls row collapses to previous · play/pause · next (live) · audio · subtitles
+  700 pt the controls row collapses to previous · next (live) · audio · subtitles
   · info, and the volume to its speaker (the level stays in the top bar).
 * **Mouse** (every control is an OSD button: hover fill, pointing hand, tooltip with its key):
   ← at the left of the top bar leaves the player like `p`; the controls row adds Channels
@@ -1980,18 +2089,22 @@ The OSD has two layers (UX review B1):
   it never vanishes under a drag of the volume or the seek bar, yet a pointer parked on a bar
   (a keyboard user's, pushed out of the way) doesn't hold it for good; with the banner gone
   the pointer hides over the video (not over a control that set its own cursor). A failed /
-  reconnecting stream shows Retry (and Last channel) buttons under the message; the
+  reconnecting stream shows Retry (and Last channel) buttons under the message; errors also
+  offer **Copy error**, which copies the heading and redacted details and toasts "Copied error". The
   next-episode card has "Play now · Enter" / "Cancel · Esc" buttons and plays on a click.
   Nothing playing: a "‹ Back to {where}" button, and a click anywhere goes back.
 
 Side panels: channel list `c` (current collection with now), mini guide `g` (now/next for the
-group), history `h`/→ — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
+group), history `H` — each with key contexts `[List|ListFiltering, PlayerLive]`: ↑/↓ move the
 panel cursor (no zap), Enter tunes, ←/Esc close (← also while the panel filters; Esc clears the
 filter first), letters filter. Mouse: a ✕ in the header, the
 wheel scrolls, hovering moves the cursor only with real pointer motion, one click tunes and
 keeps the panel open for the next channel. Stream info `I` (codec,
 resolution, fps, pixel format, HDR badge from gamma pq/hlg, audio codec/layout/rate, bitrates,
-hwdec, dropped frames, cache seconds). Digits open numeric entry (`[NumericEntry, PlayerLive]`:
+hwdec, dropped frames, cache seconds), with **Copy stream info** to copy the displayed diagnostics
+and toast "Copied stream info". The panel's text lets the video's mouse handling through
+(including wheel volume and double-click fullscreen); the Copy button takes its own clicks.
+Digits open numeric entry (`[NumericEntry, PlayerLive]`:
 digits, Enter = go now, Backspace = delete digit, Esc = cancel; auto-commit after 1.5 s).
 States inside the video rect: Loading (logo + name + spinner), Buffering (%), Reconnecting
 (n/max + countdown), Error (glyph + copy + "r Retry · Backspace Last channel"), Radio (logo +
@@ -2014,7 +2127,7 @@ TV's name. The mini player shows the same card with a cast glyph, the compact la
 and quitting asks first. Multi-view shows "Leave multi-view to cast".
 
 **Video-only (popped-out window, §12.3).** Same screen, same keys (zap ↑/↓, volume, pause,
-mute, tracks, `c`/`g`/`h` panels) plus `PopOut` (Esc / `o` = back to the full window). The
+mute, tracks, `c`/`g`/`H` panels) plus `PopOut` (Esc / `o` = back to the full window). The
 passive banner is one bottom strip — title (⏸ when paused) and volume, then the programme on
 now (live) or position / duration (VOD), Body/Caption type, no scale factor; the full OSD
 returns only in controls focus mode or with a side panel open. With the pointer in the window
@@ -2028,6 +2141,34 @@ video senses drags: a drag-sensing video would count as hovered under every butt
 it). Nothing playing: "Nothing playing · o · Esc" on black, with a "Back to the full window"
 button.
 
+
+### 13.8.1 Delay
+
+Local playback remembers one audio offset per output in `player.lip_sync`, a map from the
+output's name to `{ offset_ms, label }`. Negative means sound earlier. `[` / `]` step by 50 ms,
+clamped to ±2000 ms, apply immediately and flash “Delay: sound 150 ms earlier · MacBook Air Speakers”
+(at zero, “Delay: in step”). The keys are shared by live, VOD and the pop-out; the guide's
+day keys and detail's season keys stay in their own contexts. Saves wait for 500 ms without a
+change, and pending values are saved on exit.
+
+The controller uses mpv's explicit `audio-device` when set. With `auto`, it identifies the
+default PipeWire/Pulse sink through `pactl --format=json get-default-sink` and `list sinks`.
+Explicit PipeWire/Pulse devices also get their descriptions from the sink list; other explicit
+devices use their device name. Queries run on a helper thread with a shared 750 ms timeout,
+one at a time; output events within 1.5 s of the last query are ignored. A failed lookup keeps
+the current output and its last good label; before any identification, `auto` uses one “This
+computer” entry. The controller applies the cached output's saved `audio-delay` in seconds on
+every local load and checks again every 15 s while playing or paused. Changing output names
+applies that output's offset (zero when unseen) and flashes “Delay for ‹label›: ‹offset›”.
+Every discovered output is remembered, including at zero; the first identification is silent.
+
+Audio tracks (`A`) has a Delay stepper (←/→, earlier/later buttons) and Reset delay; stream info
+(`I`) shows “Audio delay: ‹offset›” and the output. Settings ▸ Player ▸ Audio delay lists the
+remembered outputs with the current output marked, the usual value-row stepper and a Reset row. Its keys use
+the Settings model: → / l increases, Shift+← / H decreases, Enter on Reset resets; ← / h
+returns to the page list. Config edits apply to every local picture in multi-view. Casting
+has no audio delay controls and never receives the offset. Delay owns `audio-delay` even if
+raw mpv options set it; backups keep this computer's saved outputs.
 
 ### 13.9 Settings
 ```
@@ -2046,15 +2187,40 @@ button.
 │        │   About & logs       │                                                             │
 └────────┴──────────────────────┴─────────────────────────────────────────────────────────────┘
 ```
-Panel idiom (h/j/k/l allowed, Enter toggles; ← / h steps back to the page list from every row
-(§15.1 spatial panes; the source editor and the attach view stay open), → / l / Shift+→ / L
-increase or pick the next option, Shift+← / H decrease or pick the previous one; → / Enter / Tab
+**Search settings** sits above the page list. Typing starts a filter from either pane;
+letters, including h/j/k/l and their capitals, type instead of navigating. Backspace deletes
+a character, Ctrl+Backspace a word, Ctrl+U / Esc clears and restores the original page, row
+and pane. While filtering the context is `[ListFiltering, Settings]`; a setting's own focused
+text editor still owns typing through `TextInput`. The mouse can focus the visible search
+field. No results: `No settings match “xyz”`.
+
+Results contain the real controls from **every visible page**, grouped under page headers.
+Toggles and value arrows work in place; Enter or a row click jumps to the setting on its page
+so its neighbours are visible. Action clicks run the action and text clicks open the editor
+on that page. Clearing a filter keeps any changes already made. An unsaved playlist editor
+still prevents leaving its page.
+
+Each searchable row carries a page, stable target, title, description (its existing section,
+notes and detail) and short aliases, derived from the same row builders as the pages. A new
+row is searchable automatically. Page feature flags, per-playlist conditions and parental
+concealment run before indexing; explicit category names are absent while hidden. Matching
+uses the shared `textmatch::fold` case/accent folding and requires every query word to prefix
+a word. Exact titles rank first, then title words, descriptions, and aliases. Page groups are
+ordered by their best match. Aliases include open on / launch / startup / home; lip sync /
+audio offset / out of sync; hwdec / gpu; captions / cc; menu; pin / lock / kids; spoilers;
+airplay / tv / apple tv; claude / mcp / codex; export / restore; upgrade / version; look / size.
+There are also short aliases for providers, guides, saved lists, notifications, automatic
+rules, hidden categories, missing items, buffering, seeking, languages, pop-out and diagnostics.
+
+Panel idiom (Enter toggles; ← steps back to the page list from every row
+(§15.1 spatial panes; the source editor and the attach view stay open), → / Shift+→
+increase or pick the next option, Shift+← decreases or picks the previous one; → / Enter / Tab
 in the page list return to the page; focused text fields push `TextInput`, which owns
 ←/→/Delete/Space). A source editor with unsaved changes keeps its page: ↑/↓, Esc or a click in
 the page list show "Unsaved playlist changes: Enter on Save, or Esc to discard" and return the
 highlight to the editor instead of dropping them (Esc there then discards).
 Reorderable rows (playlists, **EPG source priority**,
-favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every edit goes through
+favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓. Every edit goes through
 `ctx.edit_config` / the store and applies live (`PlayerCommand::ApplyConfig`). Settings list:
 
 | Page | Setting | Key / storage | Default |
@@ -2079,7 +2245,8 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | | Buffer seconds · instant load · demuxer max MiB · network timeout | `player.cache_secs`, `instant_load`, `demuxer_max_mib`, `network_timeout_s` | 10 · off · 150 · 15 |
 | | Zapping delay | `player.zap_delay_ms` | 300 |
 | | Skip small / big | `player.skip_small_s`, `skip_large_s` | 10 · 60 |
-| | Audio / subtitle languages · subtitle auto · subtitle size | `player.audio_langs`, `sub_langs`, `sub_auto`, `sub_scale` | eng · eng · forced · 1.0 |
+| | Audio / subtitle languages · Subtitles automatically: Off / Forced only / Always (§11.7) · subtitle size | `player.audio_langs`, `sub_langs`, `sub_auto`, `sub_scale` | eng · eng · off · 1.0 |
+| | Audio delay per output (stepper · Reset; §13.8.1) | `player.lip_sync` → `{ offset_ms, label }` | {} (0 ms) |
 | | Reconnect attempts | `player.reconnect_max_attempts` | 8 |
 | | Resume threshold · watched % | `player.resume_min_s`, `watched_pct` | 60 · 92 |
 | | Default User-Agent | `player.user_agent` | VLC/3.0.21 |
@@ -2103,9 +2270,10 @@ favourites lists) show a 󰇙 drag grip and move with Alt+↑/↓ or K/J. Every 
 | Parental | enable · set/change PIN · relock after · lock groups/channels (from lists via Ctrl+L) · Explicit content: "Show explicit content" without a PIN (offers a PIN first), the categories treated as explicit (only while shown; Enter = Not explicit / Mark as explicit) | `parental.*`, overrides | off; explicit hidden |
 | Backup | export (include passwords? history?) · import (merge/replace, restore settings?) | §19 | — |
 | Hidden items | unhide groups/channels/VOD | overrides | — |
-| Orphans | Enter = attach to…, Delete/x → menu with Forget | §8.3 | — |
+| Orphans | Enter = attach to…, Delete → menu with Forget | §8.3 | — |
 | AI agents (§39, after Parental) | offer to connect agents after updates · keep Claude Code's plugin up to date · agents play in (Pop-out / Tuner window, §30.13) · per agent: Connect / Update / Disconnect… / Copy | `agents.offer_connect`, `agents.keep_in_sync`, `agents.play_in` (+ `agents.checked_version`) | on · on · Pop-out |
 | About & logs | version, paths · Updates (§41.7): status, last check, Check now, Install now / Restart now, automatically install updates, install without asking for my password · debug logging, log viewer, export log | `updates.auto_install`, `updates.passwordless`, `general.debug_log` | on · off · off |
+| | Copy app details: version and settings / data / cache / log paths; toasts "Copied app details". Follows the update controls, so Check now stays the first focusable row when available | — | — |
 Per channel (Ctrl+I "Edit information", `OverlayRequest::EditItem`, WP-11): rename, catch-up
 offset (minutes), EPG assignment, lock, hide.
 
@@ -2159,9 +2327,13 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   right-aligned; opened by a right-click it hangs from the pointer (kept on the window).
 * Confirm (destructive = urgent button, Cancel focused), PIN (`[TextInput, Modal]`), Rename
   (`[TextInput, Modal]` — Space types a space), favourites-list picker (checklist + "New
-  list…"), Edit information (Ctrl+I).
+  list…"), Edit information (Ctrl+I). Backend failures in Rename and the favourites-list picker
+  offer **Copy error** (the redacted message, with a "Copied error" toast); PIN prompts,
+  validation messages and confirmation hints have no Copy action.
 * EPG mapping (§9.4; `[EpgMapping, List]`: Enter assigns, Delete clears) and Logs (type to
-  filter text; Ctrl+S view menu: minimum level, Export…) are full screens.
+  filter text; Ctrl+S view menu: minimum level, Export…) are full screens. Enter or a click
+  expands a log line; **Copy line** copies its time, level, target and full redacted message,
+  with a "Copied log line" toast.
 * **Rule: no screen reads raw keys** — every key a screen reacts to is in a keymap table, so
   the help overlay and the hint line are complete.
 * *Decided in phase 3:* Help and Jobs are toggles — requesting the one on top again (`?`/F1,
@@ -2194,6 +2366,7 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 | No VOD in any source | sidebar, Alt+4/5 | Movies/Series entries hidden; Alt+4/5 toast "Your playlists have no movies or series" |
 | Empty favourites list | Live groups pane, Home | "Press Ctrl+F on any channel to add it here" |
 | Empty history | History group | 󰋚 "Nothing watched yet" |
+| No settings match | Settings | `No settings match “xyz”` (the active query); Esc clears and restores the original page, row and pane |
 | No search results | search overlay | "No matches — Ctrl+K searches everything, Tab switches sections" |
 | Source disabled | lists, settings row | its groups hidden; settings row "Disabled" + Enable action |
 | Source needs credentials (restored) | settings row, Live empty state | "Needs credentials" → opens the onboarding Details step |
@@ -2210,12 +2383,18 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   movies and series from the `Library` (one column "name · group · source"); rebuilt when the
   snapshot changes (injection < 100 ms for 170k items; kept by the app across overlay opens);
   `reparse(append=true)` when the query extends; `tick(10 ms)` per frame; top 200; sections All
-  (interleaved by score, grouped by kind), Live, Movies, Series, Guide. Locked items excluded
+  (interleaved by score, grouped by kind), Live, Movies, Series, Guide, Settings. Locked items excluded
   until unlocked (`SearchItem.locked`); hidden items never indexed. Search results that are
   channels play fullscreen and zap through their primary group (§13.0).
 * **EPG** (`search::EpgSearch`): debounced 150 ms; FTS query (§6.3) on a runtime task with its
   own reader; stale results dropped by sequence number; results show airing/upcoming first,
   then past with ⟲ when catch-up is possible.
+* **Settings** (`search::SettingDocument`): the visible Settings row builders supply both
+  the in-page filter and Ctrl+K. Folded title, description and alias fields are matched by
+  word prefix with that ranking (§13.9); the overlay caches the small index per opening and
+  rebuilds it when the session lock changes. Ctrl+K indexes settings only, excluding user-data
+  rows such as reminders, hidden items and orphans. The in-page filter retains those rows
+  subject to the same item and group locks as content search.
 * **List filter** (`search::ListFilter`, implemented in the skeleton): per pane,
   `nucleo_matcher` scoring, ties keep list order; < 5 ms for 20k rows; leading spaces ignored;
   Ctrl+Backspace deletes a word. Channel haystacks are `"<number> <name>"`; an all-digit query
@@ -2243,10 +2422,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
 * **Rules** (`keymap::resolve`): first matching binding wins, innermost context first;
   printable symbols match `Event::Text` (layout-independent, shift applied), named keys and
   Ctrl/Alt chords match `Event::Key`.
-  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search, Help):
+  * Filterable contexts (List, ListFiltering, PosterGrid, PosterGridFiltering, Search, Panel, Help):
     an unbound printable char becomes `FilterInput(c)` — **launcher idiom: letters type in lists
-    and grids, so no j/k there**; vim keys exist only in the guide, the player and settings
-    panels.
+    and grids, so no j/k there**; Settings also types to filter. Vim keys remain in the guide
+    and player.
   * **TextInput owns the keyboard**: after its own table only Ctrl/Alt chords and F-keys may
     reach `Global`; Space, ←/→, Delete, Backspace… return `None` and go to the text widget;
     contexts below it are never consulted (typing a space in Rename can't confirm the dialog).
@@ -2265,8 +2444,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     candidates → channels; menus and pickers close; a player side panel closes.
   * Grids: ←/→ move between posters; ← on the first column is `Parent` → the categories
     (drawer at Medium) — also while filtering (the filter is kept) and on an empty grid.
-  * Settings: ← / h is the page list from every content row; values change with → / l and
-    Shift+←/→ / H / L (Interface is almost all value rows, so "← changes a value where there
+  * Settings: ← is the page list from every content row; values change with → and
+    Shift+←/→ (Interface is almost all value rows, so "← changes a value where there
     is one" would almost never reach the page list). The page list has nothing on its left.
   * ←/→ keep their own meaning where there is no pane to the left or they move within the
     pane: the guide (← is the previous programme, into the past for catch-up; the channel
@@ -2287,6 +2466,10 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
   Logs and EPG mapping → Settings, the player → Live TV.
 * *Decided in phase 3:* Ctrl+P (open the player) acts only while something is playing (any
   non-Idle player state); with nothing playing it does nothing rather than open an empty player.
+* **Label selection**: labels are not selectable app-wide, so a label inside a clickable row
+  leaves the click to that row. Standalone notes and errors with no click target beneath them
+  may opt into selection (Settings notes and onboarding failures). Use explicit Copy controls
+  for diagnostics and paths in interactive panels; each copy gives a "Copied …" toast.
 * **Mouse parity**: everything is clickable; hover moves list cursors only after real pointer
   motion (Omarchy `pointerGate`) and never acts; **one click = exactly what Enter does in that
   context** on every selectable item (list rows of every kind, poster cards, Home tiles,
@@ -2412,6 +2595,8 @@ no Ctrl+Shift+C (the terminal's copy).
 | Keys | Action |
 |---|---|
 | `→` | Open entries / move right |
+| `Ctrl+I` | Episodes… / film details |
+| `Ctrl+W` | Mark current episode / title watched; done entry unwatched |
 | `Ctrl+Shift+Enter` | Play just this one |
 | `s` | Skip in this list / unskip |
 | `o` | In order / Any order |
@@ -2648,8 +2833,11 @@ no Ctrl+Shift+C (the terminal's copy).
 | Keys | Action |
 |---|---|
 | `↑` / `k` / `↓` / `j` / `PgUp` / `PgDn` | Previous / next channel (in this list) |
-| `Backspace` / `←` | Last channel |
-| `→` / `h` | Channel history |
+| `Backspace` | Last channel |
+| `←` / `→` | Skip back / forward (small step) |
+| `Shift+←` / `Shift+→` | Skip back / forward (big step) |
+| `H` | Channel history |
+| `L` | Back to live |
 | `c` | Channel list |
 | `g` | Mini guide (now / next) |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Type a channel number |
@@ -2662,6 +2850,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
+| `[` / `]` | Delay: sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |
@@ -2700,6 +2889,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
+| `[` / `]` | Delay: sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |
@@ -2815,7 +3005,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Enter` | Confirm |
 | `Esc` | Leave the field |
 
-#### Settings (`Panel`)
+#### Panel (`Panel`)
 
 | Keys | Action |
 |---|---|
@@ -2829,6 +3019,25 @@ no Ctrl+Shift+C (the terminal's copy).
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+#### Settings (`Settings`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `←` | Back to the page list |
+| `→` / `Shift+→` | Increase / next option |
+| `Shift+←` | Decrease / previous option |
+| `Alt+↑` / `Alt+↓` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
+| `Tab` / `Shift+Tab` | Next / previous section |
+| `Enter` | Toggle / open |
+| `Space` | Toggle / open (types a space while filtering) |
+| `Delete` | Delete / more actions |
+| `Esc` | Back |
+| `Backspace` | Delete filter character |
+| `Ctrl+Backspace` | Delete filter word |
+| `Ctrl+U` | Clear filter |
+| `a–z, 0–9 …` | Type to filter |
 
 #### Keyboard help (`Help`)
 
@@ -2966,6 +3175,20 @@ the current settings; the onboarding restore always applies them). Machine-speci
 ---
 
 ## 20. Security & redaction
+
+* **Settings change log**: every applied config edit emits INFO in the existing log, e.g.
+  `settings: start screen Home → Live TV (key →)`. The queued edit carries its input: key,
+  click, agent or restore (automatic housekeeping uses system / exit). Text fields and
+  dynamic maps say `changed`; log labels come from the fixed schema, never playlist names,
+  URLs, credentials, device names or programme titles. Enum-like strings are allowlisted.
+  Per-output corrections say `audio delay for the current output`, with the old/new ms,
+  once after 500 ms without a change to that output (also flushed on exit). Other config
+  settings batch independently the same way, keeping the first old and last new values,
+  never one line per key repeat.
+  Restoring a backup logs each changed preference with `restore`. Agent multi-view layout
+  edits use `agent`; asynchronous update-switch edits retain the initiating key/click.
+  Playlist editor saves and guide enable/offset changes also log without identifying the
+  playlist or guide. No-op config edits emit nothing.
 
 * **At rest**: DB 0600 inside a 0700 data dir (created before SQLite opens it; WAL/SHM inherit
   the mode); `~/.cache/tuner/{playlists,epg}` are 0700 and downloads are created 0600 (Xtream
@@ -5981,9 +6204,9 @@ an agent's switches win, then rule priority, then the earlier start; the loser n
   toasted as "Arsenal: 4 in the next 14 days · next Sat 12:30 on Sky Sports Main Event · 2 left
   out (repeat)": the rule's name, times and channels only), **Move up / down**, **Delete…**
   ("Delete it and cancel its N reminders" / "keep the reminders as my own").
-* Reorder: Alt+↑/↓ (K/J), the drag grip (shown with two rules or more) or the menu's Move; the
-  order is saved at once and the guide checked again. The Panel hint's "reorder" covers them.
-* Upcoming rows: Enter, a click or `x` opens the programme's popover (Watch, Cancel reminder =
+* Reorder: Alt+↑/↓, the drag grip (shown with two rules or more) or the menu's Move; the
+  order is saved at once and the guide checked again. The Settings hint's "reorder" covers them.
+* Upcoming rows: Enter, a click or Delete opens the programme's popover (Watch, Cancel reminder =
   skip this one, Follow…).
 
 ## 34. Spoiler guard
@@ -6816,6 +7039,17 @@ In the lists pane, Enter, → and a click select the list and open its entries; 
 its menu, header and Home tile. A ticked list toggles off a single title or the exact series
 range with Undo. Batch additions skip duplicates and report “N already there”. Save Up next
 keeps pending film/series/episode rows and reports live or unavailable rows left out.
+
+In the entries pane, Ctrl+W on a series or season range marks only its current episode:
+the S/E shown by the row and the episode Play would start. The toast “Marked S01E04 watched”
+offers Undo; the entry advances, becoming Done after its last unwatched episode. The menu
+names this action “Mark S01E04 watched” (Ctrl+W) and offers “Mark all watched” for the whole
+range (no key). A done series' “Mark unwatched” still clears the range; film and episode
+toggles are unchanged. S/E numbers always show; episode titles obey the spoiler guard.
+“Episodes…” / Ctrl+I opens series details with that episode's season selected and its row
+focused, including for a range. Ctrl+I reuses List's Details key and opens film details too.
+Esc / Alt+← returns to the same watchlist and entry with refreshed progress; a newly done
+entry remains visible for that return even when other watched entries are folded.
 
 ### 42.2 Playing through Up next
 `QueueCommand::PlayList` sets `QueueMachine.context` and adds one entry. When the queue's

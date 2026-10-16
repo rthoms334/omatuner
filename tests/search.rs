@@ -201,6 +201,7 @@ fn sections_split_by_kind_and_all_groups_kinds() {
     assert_eq!(targets(&idx.results(SearchSection::Movies, 200)), vec![SearchTarget::Movie(MovieId(1))]);
     assert_eq!(targets(&idx.results(SearchSection::Series, 200)), vec![SearchTarget::Series(SeriesId(1))]);
     assert!(idx.results(SearchSection::Guide, 200).is_empty(), "guide comes from EpgSearch");
+    assert!(idx.results(SearchSection::Settings, 200).is_empty(), "settings have their own index");
     assert_eq!(idx.results(SearchSection::All, 2).len(), 2, "limit");
 }
 

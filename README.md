@@ -672,6 +672,9 @@ The full reference is generated from `src/keymap.rs`:
 
 | Keys | Action |
 |---|---|
+| `→` | Open entries / move right |
+| `Ctrl+I` | Episodes… / film details |
+| `Ctrl+W` | Mark current episode / title watched; done entry unwatched |
 | `Ctrl+Shift+Enter` | Play just this one |
 | `s` | Skip in this list / unskip |
 | `o` | In order / Any order |
@@ -892,7 +895,7 @@ The full reference is generated from `src/keymap.rs`:
 | `f` | Collection: favourites lists, groups, all |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Jump to channel number |
 | `Ctrl+F` | Add channel to Favourites |
-| `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
+| `Ctrl+Shift+F` | Favourites lists… |
 | `Ctrl+E` | Assign guide channel |
 | `Ctrl+I` | Edit channel information |
 | `F2` | Rename channel |
@@ -908,8 +911,11 @@ The full reference is generated from `src/keymap.rs`:
 | Keys | Action |
 |---|---|
 | `↑` / `k` / `↓` / `j` / `PgUp` / `PgDn` | Previous / next channel (in this list) |
-| `Backspace` / `←` | Last channel |
-| `→` / `h` | Channel history |
+| `Backspace` | Last channel |
+| `←` / `→` | Skip back / forward (small step) |
+| `Shift+←` / `Shift+→` | Skip back / forward (big step) |
+| `H` | Channel history |
+| `L` | Back to live |
 | `c` | Channel list |
 | `g` | Mini guide (now / next) |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Type a channel number |
@@ -922,6 +928,7 @@ The full reference is generated from `src/keymap.rs`:
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
+| `[` / `]` | Delay: sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |
@@ -960,6 +967,7 @@ The full reference is generated from `src/keymap.rs`:
 | `A` | Audio tracks… |
 | `s` | Next subtitle track |
 | `S` | Subtitles… |
+| `[` / `]` | Delay: sound earlier / later (50 ms) |
 | `z` / `x` | Subtitle delay −/+ 100 ms |
 | `Z` | Reset subtitle delay |
 | `{` / `}` | Subtitle size −/+ |
@@ -1075,7 +1083,7 @@ The full reference is generated from `src/keymap.rs`:
 | `Enter` | Confirm |
 | `Esc` | Leave the field |
 
-#### Settings (`Panel`)
+#### Panel (`Panel`)
 
 | Keys | Action |
 |---|---|
@@ -1089,6 +1097,25 @@ The full reference is generated from `src/keymap.rs`:
 | `x` / `Delete` | Delete / more actions |
 | `Esc` | Back |
 | `?` | Keyboard help |
+
+#### Settings (`Settings`)
+
+| Keys | Action |
+|---|---|
+| `↑` / `↓` | Move |
+| `←` | Back to the page list |
+| `→` / `Shift+→` | Increase / next option |
+| `Shift+←` | Decrease / previous option |
+| `Alt+↑` / `Alt+↓` | Move up / down (reorder: guide priority, playlists, lists, Following rules) |
+| `Tab` / `Shift+Tab` | Next / previous section |
+| `Enter` | Toggle / open |
+| `Space` | Toggle / open (types a space while filtering) |
+| `Delete` | Delete / more actions |
+| `Esc` | Back |
+| `Backspace` | Delete filter character |
+| `Ctrl+Backspace` | Delete filter word |
+| `Ctrl+U` | Clear filter |
+| `a–z, 0–9 …` | Type to filter |
 
 #### Keyboard help (`Help`)
 

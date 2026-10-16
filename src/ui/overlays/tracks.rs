@@ -1,5 +1,5 @@
-//! Audio / subtitle track menu over the video (fixed dark scrim). Subtitle menu also has delay
-//! (−/+ 100 ms) and size rows. Owner: WP-11.
+//! Audio / subtitle track menu over the video (fixed dark scrim). Audio also has delay
+//! (−/+ 50 ms) and Reset; subtitles have delay (−/+ 100 ms) and size rows. Owner: WP-11.
 //!
 //! A panel at the right edge of the window, vertically centred (clear of the OSD bars and the
 //! controls row it is opened from), in OSD colours (`osd_scrim`, `osd_text`, `osd_accent`)
@@ -28,6 +28,8 @@ enum Row {
     Track { id: i64, label: String, selected: bool },
     SubsOff { selected: bool },
     Delay(f64),
+    LipSync(i32),
+    LipSyncReset,
     Size(f64),
 }
 
@@ -59,6 +61,10 @@ impl TracksOverlay {
             for t in &snap.tracks.audio {
                 v.push(Row::Track { id: t.id, label: t.label(), selected: t.selected });
             }
+            if snap.cast.is_none() {
+                v.push(Row::LipSync(snap.lip_sync_ms));
+                v.push(Row::LipSyncReset);
+            }
         } else {
             v.push(Row::SubsOff { selected: snap.tracks.selected_sub().is_none() });
             for t in &snap.tracks.subs {
@@ -79,7 +85,7 @@ impl TracksOverlay {
     }
 
     /// Enter / click on a row.
-    fn choose(&self, ctx: &UiCtx<'_>, row: &Row) -> OverlayOutcome {
+    fn choose(&self, ctx: &mut UiCtx<'_>, row: &Row) -> OverlayOutcome {
         match row {
             Row::Track { id, .. } => {
                 ctx.play(if self.audio { PlayerCommand::SetAudioTrack(Some(*id)) } else { PlayerCommand::SetSubtitleTrack(Some(*id)) });
@@ -97,15 +103,20 @@ impl TracksOverlay {
                 ctx.play(PlayerCommand::AdjustSubScale(1.0 - s));
                 OverlayOutcome::Keep
             }
+            Row::LipSync(_) | Row::LipSyncReset => {
+                ctx.edit_lip_sync(ctx.player.audio_output.clone(), None);
+                OverlayOutcome::Keep
+            }
         }
     }
 
     /// ←/→ on the delay / size rows.
-    fn adjust(&self, ctx: &UiCtx<'_>, row: &Row, up: bool) {
+    fn adjust(&self, ctx: &mut UiCtx<'_>, row: &Row, up: bool) {
         let sign = if up { 1.0 } else { -1.0 };
         match row {
             Row::Delay(_) => ctx.play(PlayerCommand::AdjustSubDelay(0.1 * sign)),
             Row::Size(_) => ctx.play(PlayerCommand::AdjustSubScale(0.1 * sign)),
+            Row::LipSync(_) => ctx.edit_lip_sync(ctx.player.audio_output.clone(), Some(if up { 1 } else { -1 })),
             _ => {}
         }
     }
@@ -117,6 +128,8 @@ fn row_label(row: &Row) -> (String, bool) {
         Row::SubsOff { selected } => ("Off".into(), *selected),
         Row::Delay(d) => (format!("Delay  ‹ {:+.1} s ›", d), false),
         Row::Size(s) => (format!("Size  ‹ {:.0} % ›", s * 100.0), false),
+        Row::LipSync(ms) => (format!("Delay: {}", crate::player::audio_output::offset_text(*ms)), false),
+        Row::LipSyncReset => ("Reset delay".into(), false),
     }
 }
 
@@ -125,6 +138,7 @@ fn stepped(row: &Row) -> Option<(&'static str, String)> {
     match row {
         Row::Delay(d) => Some(("Delay", format!("{:+.1} s", d))),
         Row::Size(s) => Some(("Size", format!("{:.0} %", s * 100.0))),
+        Row::LipSync(ms) => Some(("Delay", format!("{ms:+} ms"))),
         _ => None,
     }
 }
@@ -180,7 +194,8 @@ impl Overlay for TracksOverlay {
         let pad = theme.space(SpaceToken::PopupPadding) * s;
         let width = (360.0 * theme.rem() * s).min(screen.width() - 2.0 * pad);
         let title_h = theme.font(TypeToken::Caption) * s * 2.0;
-        let body_h = row_h * rows.len().max(1) as f32;
+        let no_audio = self.audio && snap.tracks.audio.is_empty();
+        let body_h = row_h * (rows.len() + usize::from(no_audio)).max(1) as f32;
         let height = (title_h + body_h + 2.0 * pad).min(screen.height() - 2.0 * pad);
         let panel = Rect::from_min_size(
             egui::pos2(screen.right() - width - pad, screen.center().y - height / 2.0).max(screen.min),
@@ -203,7 +218,7 @@ impl Overlay for TracksOverlay {
             row_h,
             value_w: 80.0 * theme.rem() * s,
         };
-        let fixed = rows.iter().filter(|r| stepped(r).is_some()).count();
+        let fixed = rows.iter().filter(|r| stepped(r).is_some() || matches!(r, Row::LipSyncReset)).count();
         let mut click = None;
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
         let audio = self.audio;
@@ -218,7 +233,7 @@ impl Overlay for TracksOverlay {
             if let Some(c) = look.header(&mut ui, audio, title_h) {
                 click = Some(c);
             }
-            if rows.is_empty() {
+            if no_audio {
                 let (r, _) = ui.allocate_exact_size(egui::vec2(inner.width(), row_h), egui::Sense::hover());
                 let muted = with_alpha(t.osd_text, 0.7);
                 osd_text(
@@ -376,7 +391,7 @@ impl Look<'_> {
         let more = Rect::from_min_size(egui::pos2(r.right() - side, r.top()), egui::vec2(side, side));
         let val = Rect::from_min_size(egui::pos2(more.left() - self.value_w, r.top()), egui::vec2(self.value_w, side));
         let less = Rect::from_min_size(egui::pos2(val.left() - side, r.top()), egui::vec2(side, side));
-        let delay = name == "Delay";
+        let delay = matches!(row, Row::Delay(_) | Row::LipSync(_));
         let mut click = None;
         for (slot, (rect, text, tip, step)) in [
             (less, glyphs::CHEVRON_LEFT, if delay { "Earlier (←)" } else { "Smaller (←)" }, Some(false)),
@@ -392,5 +407,48 @@ impl Look<'_> {
             osd_text(ui.painter(), rect.center(), Align2::CENTER_CENTER, text, self.font.clone(), color, rect.width());
         }
         click
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lip_sync_controls_do_not_hide_the_no_audio_tracks_message() {
+        let (mut t, _one) = crate::ui::screens::home::testkit::rig();
+        let ctx = egui::Context::default();
+        let mut overlay = TracksOverlay::new(true);
+        let mut draw = |audio: bool, tracks: &str| {
+            overlay.audio = audio;
+            t.snapshot = std::sync::Arc::new(PlayerSnapshot { tracks: crate::player::tracks::parse_track_list(tracks), ..Default::default() });
+            let mut out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() },
+                |ui| {
+                    t.with_ctx(|ctx| overlay.ui(ui.ctx(), ctx));
+                },
+            );
+            out.textures_delta.clear();
+            out
+        };
+        fn has_text(shape: &egui::epaint::Shape, text: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(t) => t.galley.text() == text,
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|s| has_text(s, text)),
+                _ => false,
+            }
+        }
+        let shows = |out: &egui::FullOutput, text| out.shapes.iter().any(|s| has_text(&s.shape, text));
+        draw(true, "[]"); // egui's first Area frame measures it before painting
+        let empty = draw(true, "[]");
+        assert!(shows(&empty, "No audio tracks"));
+        assert!(shows(&empty, "Delay"));
+        assert!(shows(&empty, "+0 ms"));
+        assert!(shows(&empty, "Reset delay"));
+        let tracks = draw(true, r#"[{"id":1,"type":"audio","title":"English"}]"#);
+        assert!(!shows(&tracks, "No audio tracks"));
+        assert!(shows(&tracks, "English"));
+        let subtitles = draw(false, "[]");
+        assert!(!shows(&subtitles, "No audio tracks"));
     }
 }

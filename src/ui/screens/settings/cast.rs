@@ -33,7 +33,7 @@
 //! keeps discovery running while it is open (`CastHandle::browse`, on demand only). A TV's
 //! version comes from its TXT `osvers` or `/info` (§7.6): a sanitized device string, shown only
 //! here. No address is shown: the TV is named by its name, this computer by its interface.
-//! Enter (or `x`, the gear) on a TV opens its menu: Pair / Pair again (the PIN overlay), Test
+//! Enter (or Delete, the gear) on a TV opens its menu: Pair / Pair again (the PIN overlay), Test
 //! on TV, Make default, Forget… (a destructive confirm).
 //!
 //! The firewall row shows the detected state (§9.4): **Allow on firewall** only for ufw with

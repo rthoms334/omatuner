@@ -918,7 +918,7 @@ mod tests {
         h.run_steps(1);
 
         // Live TV shows Bravo: so does the guide
-        h.state_mut().t.config_edits.push(Box::new(move |c| c.interface.playlist_scope.live = Some(b)));
+        h.state_mut().t.config_edits.push(crate::config::audit::edit("key", move |c| c.interface.playlist_scope.live = Some(b)));
         h.state_mut().apply_config();
         h.run_steps(2);
         assert!(!matches!(h.state().s.collection, Some(Collection::Group(g)) if g == news_of_a), "Alpha's group falls back");

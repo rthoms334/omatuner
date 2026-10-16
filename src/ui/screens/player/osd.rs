@@ -10,6 +10,7 @@ pub(super) enum Control {
     Next,
     SkipBack,
     SkipForward,
+    BackToLive,
     Audio,
     Subtitles,
     Channels,
@@ -63,6 +64,7 @@ impl Control {
             Control::Next => glyphs::NEXT,
             Control::SkipBack => glyphs::SKIP_BACK,
             Control::SkipForward => glyphs::SKIP_FORWARD,
+            Control::BackToLive => glyphs::NEXT,
             Control::Audio => glyphs::AUDIO_TRACK,
             Control::Subtitles => glyphs::SUBTITLES,
             Control::Channels => glyphs::PLAYLIST,
@@ -84,6 +86,7 @@ impl Control {
             Control::Next => "Next channel",
             Control::SkipBack => "Back",
             Control::SkipForward => "Forward",
+            Control::BackToLive => "Back to live",
             Control::Audio => "Audio",
             Control::Subtitles => "Subtitles",
             Control::Channels => "Channels",
@@ -216,7 +219,7 @@ impl PlayerScreen {
         self.visible
             .get(self.control)
             .and_then(|c| controls.iter().position(|x| x == c))
-            .unwrap_or_else(|| self.control.min(controls.len().saturating_sub(1)))
+            .unwrap_or_else(|| controls.iter().position(|c| *c == Control::PlayPause).unwrap_or(0))
     }
 
     /// Below 700 pt (× rem) the controls row collapses (DESIGN §13.8).
@@ -234,14 +237,26 @@ impl PlayerScreen {
         let casting = snap.cast.is_some();
         let tracks = [C::Audio, C::Subtitles].into_iter().filter(|_| !casting);
         let up_next = [queue.panel.then_some(C::UpNext), queue.next.then_some(C::QueueNext)];
+        let mut v = Vec::new();
+        if snap.seekable {
+            v.push(C::SkipBack);
+        }
+        v.push(C::PlayPause);
+        if snap.seekable {
+            v.push(C::SkipForward);
+        }
+        if live {
+            if snap.live_buffer.is_some_and(|r| r.behind(snap.position.unwrap_or(r.end))) {
+                v.push(C::BackToLive);
+            }
+            v.extend([C::Prev, C::Next]);
+        }
         if narrow {
-            let mut v = if live { vec![C::Prev, C::PlayPause, C::Next] } else { vec![C::PlayPause] };
             v.extend(tracks);
             v.extend(queue.next.then_some(C::QueueNext));
             v.push(C::Info);
             return v;
         }
-        let mut v = if live { vec![C::Prev, C::PlayPause, C::Next] } else { vec![C::SkipBack, C::PlayPause, C::SkipForward] };
         v.extend(tracks);
         if live {
             v.extend([C::Channels, C::Guide, C::History]);
@@ -367,6 +382,7 @@ impl PlayerScreen {
             Control::PlayPause => ctx.play(PlayerCommand::TogglePause),
             Control::SkipBack => ctx.play(PlayerCommand::SeekBy(-f64::from(cfg.skip_small_s))),
             Control::SkipForward => ctx.play(PlayerCommand::SeekBy(f64::from(cfg.skip_small_s))),
+            Control::BackToLive => ctx.play(PlayerCommand::JumpToLive),
             Control::Audio => ctx.open(OverlayRequest::Tracks { audio: true }),
             Control::Subtitles => ctx.open(OverlayRequest::Tracks { audio: false }),
             Control::Channels => self.open_panel(ctx, PanelKind::Channels),
@@ -718,18 +734,63 @@ impl PlayerScreen {
 
         // controls row: labelled where the design labels them; all glyphs when that doesn't
         // fit; whatever still doesn't fit isn't drawn (and focus mode skips it)
+        let centred = !ctx.video_only;
+        let transport = |c: Control| matches!(c, Control::SkipBack | Control::PlayPause | Control::SkipForward);
         let mut cx = inner.left();
         let mut clicked = None;
         let text_of = |c: Control, glyphs_only: bool| {
             if glyphs_only || c.glyph_only() { c.glyph(snap).to_owned() } else { format!("{}  {}", c.glyph(snap), control_text(c, snap)) }
         };
         let row_width = |glyphs_only: bool| -> f32 {
-            controls.iter().map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5).sum()
+            controls
+                .iter()
+                .filter(|c| !centred || !transport(**c))
+                .map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5)
+                .sum()
         };
         let glyphs_only = narrow || row_width(false) > controls_right - inner.left();
         self.control = self.focused_index(&controls);
         let mut drawn = Vec::with_capacity(controls.len());
         for (i, c) in controls.iter().enumerate() {
+            if centred && transport(*c) {
+                let side = (80.0 * s).min(rect.width() / 5.0).min((bottom.top() - top.bottom()).max(36.0) * 0.65);
+                let offset = match c {
+                    Control::SkipBack => -1.35,
+                    Control::SkipForward => 1.35,
+                    _ => 0.0,
+                };
+                let centre = egui::pos2(
+                    rect.center().x + side * offset,
+                    rect.center().y.clamp(top.bottom() + side / 2.0, (bottom.top() - side / 2.0).max(top.bottom() + side / 2.0)),
+                );
+                let r = Rect::from_center_size(centre, egui::vec2(side, side));
+                p.circle_filled(centre, side / 2.0, t.osd_scrim);
+                let text = match c {
+                    Control::SkipBack => format!("⟲ {}", ctx.config.player.skip_small_s),
+                    Control::SkipForward => format!("{} ⟳", ctx.config.player.skip_small_s),
+                    _ => c.glyph(snap).to_owned(),
+                };
+                let focused = self.osd_focus && self.row == OsdRow::Buttons && i == self.control;
+                if osd_button(
+                    ui,
+                    &p,
+                    theme,
+                    r,
+                    ui.id().with(("osd-control", i)),
+                    &text,
+                    FontId::proportional(side * 0.38),
+                    c.label(),
+                    Some(c.label()),
+                    focused,
+                )
+                .clicked()
+                {
+                    clicked = Some((i, *c));
+                }
+                self.bars.push(r);
+                drawn.push(*c);
+                continue;
+            }
             let text = text_of(*c, glyphs_only);
             let w = p.layout_no_wrap(text.clone(), small_font.clone(), t.osd_text).size().x;
             let r = Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(w + pad, ctrl_h));
@@ -805,6 +866,7 @@ impl PlayerScreen {
             let dur = snap.duration.or_else(|| playable.and_then(|p| p.duration_hint)).unwrap_or(0.0);
             format!("{} / {}", clock(snap.position.unwrap_or(0.0)), clock(dur))
         };
+        let second = if is_live(snap) { format!("{} · {second}", live_label(snap)) } else { second };
         let second_pos = egui::pos2(inner.left(), inner.top() + line);
         let mut second_w = inner.width();
         if buttons {
@@ -851,7 +913,7 @@ impl PlayerScreen {
         let square = |right: f32| Rect::from_min_size(egui::pos2(right - side, inner.top()), egui::vec2(side, side));
         let rem = theme.rem();
         let wide = inner.width() >= 560.0 * rem;
-        let skips = inner.width() >= 420.0 * rem;
+        let skips = inner.width() >= 420.0 * rem && (live || snap.seekable);
         // right to left: stop, pop in, volume, next, play, previous
         let stop = square(inner.right());
         let pop_in = square(stop.left() - gap);
@@ -911,6 +973,9 @@ impl PlayerScreen {
     ) -> Rect {
         let t = &theme.tokens;
         let mut labels: Vec<String> = Vec::new();
+        if is_live(snap) {
+            labels.push(live_label(snap));
+        }
         if let Some(q) = snap.video_size.and_then(|(w, h)| Quality::of_video(w, h)) {
             labels.push(q.label().into());
         }

@@ -85,6 +85,8 @@ struct OpenOverlay {
     /// A menu an overlay opened (search's item menu): the index of that overlay, which gets
     /// the result instead of the screen.
     owner: Option<usize>,
+    /// Retain keyboard submissions that finish during a later UI pass (e.g. the PIN form).
+    input: &'static str,
 }
 
 /// The key the mouse back button stands for.
@@ -122,6 +124,8 @@ pub struct TunerApp {
     nav_owner: Vec<(usize, usize)>,
     pending_toasts: Vec<Toast>,
     config_edits: Vec<crate::ui::ConfigEdit>,
+    /// Lip-sync repeats apply live, then save once the keys have been quiet for 500 ms.
+    config_save_at: Option<std::time::Instant>,
     /// Actions resolved in `raw_input_hook`, dispatched at the start of `ui`, with the context
     /// stack they were resolved against.
     pending_actions: Vec<(Action, Vec<KeyContext>)>,
@@ -323,6 +327,7 @@ impl TunerApp {
             nav_owner: Vec::new(),
             pending_toasts: Vec::new(),
             config_edits: Vec::new(),
+            config_save_at: None,
             pending_actions: Vec::new(),
             drop_alt_text: false,
             window_title: crate::APP_NAME.to_owned(),
@@ -392,7 +397,9 @@ impl TunerApp {
         use crate::agent::connect::{AgentId, Offer, PassOutcome, Status};
         match self.services().agent_connect.take_pass_outcome() {
             Some(PassOutcome::Offer(o)) => self.agent_offer = Some(o),
-            Some(PassOutcome::Settled) => self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned()))),
+            Some(PassOutcome::Settled) => {
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())))
+            }
             Some(PassOutcome::Retry) | None => {}
         }
         if self.agent_offer.is_none() {
@@ -416,7 +423,7 @@ impl TunerApp {
             if self.services().config().agents.offer_connect && !agents.is_empty() {
                 self.nav.push(NavRequest::Open(OverlayRequest::AgentConnect(Offer { agents, connected })));
             } else {
-                self.config_edits.push(Box::new(|c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())));
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.agents.checked_version = Some(TUNER_VERSION.to_owned())));
             }
         }
     }
@@ -450,7 +457,7 @@ impl TunerApp {
         {
             self.services().tiles.a().handle().send(PlayerCommand::SetPlayOn(Some(id)));
         } else if c.play_on.is_some() {
-            self.config_edits.push(Box::new(|c| c.cast.play_on = None));
+            self.config_edits.push(crate::config::audit::edit("system", |c| c.cast.play_on = None));
         }
     }
 
@@ -479,7 +486,7 @@ impl TunerApp {
         match cast.take_pass_outcome() {
             Some(crate::cast::PassOutcome { offer: Some(o) }) => self.cast.offer = Some(o),
             Some(crate::cast::PassOutcome { offer: None }) => {
-                self.config_edits.push(Box::new(|c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
             }
             None => {}
         }
@@ -496,7 +503,7 @@ impl TunerApp {
             if cfg.cast.enabled && cfg.cast.offer_setup && !paired {
                 self.nav.push(NavRequest::Open(OverlayRequest::CastOffer(offer)));
             } else {
-                self.config_edits.push(Box::new(|c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
+                self.config_edits.push(crate::config::audit::edit("system", |c| c.cast.checked_version = Some(TUNER_VERSION.to_owned())));
             }
         }
     }
@@ -851,6 +858,15 @@ impl TunerApp {
     }
 
     fn handle_event(&mut self, ev: AppEvent, egui_ctx: &egui::Context) {
+        // Output discovery belongs to every local picture, including one without focus.
+        if let AppEvent::Player(crate::player::PlayerEvent::AudioOutputChanged { output, .. })
+        | AppEvent::Tile(crate::player::tiles::TileEvent::Player(_, crate::player::PlayerEvent::AudioOutputChanged { output, .. })) = &ev
+        {
+            let output = output.clone();
+            self.config_edits.push(crate::config::audit::edit("system", move |cfg| {
+                cfg.player.lip_sync.entry(output.name).or_default().label = output.label;
+            }));
+        }
         // multi-view: the focused picture's player events are "the player's" for the screens
         // (picture B's arrive as `TileEvent::Player`); the other picture's only toast
         let ev = match ev {
@@ -1076,7 +1092,7 @@ impl TunerApp {
             // Settings screen, which the user may have left while the restore ran
             Ok(JobOutcome::Restored(r)) => {
                 if let Some(cfg) = r.settings.clone() {
-                    self.config_edits.push(Box::new(move |c: &mut Config| *c = *cfg));
+                    self.config_edits.push(crate::config::audit::edit("restore", move |c: &mut Config| *c = *cfg));
                 }
             }
             Ok(_) => {}
@@ -1370,7 +1386,7 @@ impl TunerApp {
         // pages and groups of explicit titles
         self.routes.retain(|r| match r {
             Route::MovieDetail(id) => !x.vod.contains(&crate::model::VodKind::Movie(*id)),
-            Route::SeriesDetail(id) => !x.vod.contains(&crate::model::VodKind::Series(*id)),
+            Route::SeriesDetail(id) | Route::SeriesDetailAt { series: id, .. } => !x.vod.contains(&crate::model::VodKind::Series(*id)),
             _ => true,
         });
         for r in &mut self.routes {
@@ -2351,7 +2367,13 @@ impl TunerApp {
             return;
         }
         let opener = self.view_screen();
-        self.overlays.push(OpenOverlay { overlay: Box::new(overlays::help::HelpOverlay::with_contexts(contexts)), opener, kind, owner: None });
+        self.overlays.push(OpenOverlay {
+            overlay: Box::new(overlays::help::HelpOverlay::with_contexts(contexts)),
+            opener,
+            kind,
+            owner: None,
+            input: "click",
+        });
     }
 
     /// `owner`: the overlay that asked (its menus answer it); `at`: where a right-click
@@ -2372,7 +2394,7 @@ impl TunerApp {
                     overlay.anchor_at(pos);
                 }
                 let owner = owner.filter(|_| menu);
-                self.overlays.push(OpenOverlay { overlay, opener, kind, owner });
+                self.overlays.push(OpenOverlay { overlay, opener, kind, owner, input: "click" });
             }
         }
     }
@@ -2403,13 +2425,25 @@ impl TunerApp {
                 continue;
             }
             let handled = if let Some(top) = self.overlays.len().checked_sub(1) {
-                let outcome = self.as_overlay(top, |app| app.with_ctx(|ctx, _, ovs| ovs[top].overlay.on_action(ctx, action)));
+                let outcome = self.as_overlay(top, |app| {
+                    app.with_ctx(|ctx, _, ovs| {
+                        ctx.config_input = crate::config::audit::key_input(action);
+                        let outcome = ovs[top].overlay.on_action(ctx, action);
+                        if !matches!(outcome, OverlayOutcome::Ignored) {
+                            ovs[top].input = ctx.config_input;
+                        }
+                        outcome
+                    })
+                });
                 let ignored = matches!(outcome, OverlayOutcome::Ignored);
-                self.apply_overlay_outcome(outcome);
+                self.apply_overlay_outcome(outcome, crate::config::audit::key_input(action));
                 !ignored
             } else {
                 let idx = self.screen_index(self.view_screen());
-                self.with_ctx(|ctx, screens, _| screens[idx].on_action(ctx, action))
+                self.with_ctx(|ctx, screens, _| {
+                    ctx.config_input = crate::config::audit::key_input(action);
+                    screens[idx].on_action(ctx, action)
+                })
             };
             if !handled {
                 self.global_action(action, &stack, egui_ctx);
@@ -2417,7 +2451,7 @@ impl TunerApp {
         }
     }
 
-    fn apply_overlay_outcome(&mut self, outcome: OverlayOutcome) {
+    fn apply_overlay_outcome(&mut self, outcome: OverlayOutcome, input: &'static str) {
         match outcome {
             OverlayOutcome::Close => {
                 self.overlays.pop();
@@ -2467,13 +2501,22 @@ impl TunerApp {
                     match o.owner {
                         // a menu of the overlay now on top: its answer applies to that overlay
                         Some(owner) if owner + 1 == self.overlays.len() => {
-                            let outcome = self.as_overlay(owner, |app| app.with_ctx(|ctx, _, ovs| ovs[owner].overlay.on_overlay_result(ctx, result)));
-                            self.apply_overlay_outcome(outcome);
+                            let outcome = self.as_overlay(owner, |app| {
+                                app.with_ctx(|ctx, _, ovs| {
+                                    ctx.config_input = input;
+                                    ovs[owner].input = input;
+                                    ovs[owner].overlay.on_overlay_result(ctx, result)
+                                })
+                            });
+                            self.apply_overlay_outcome(outcome, input);
                         }
                         Some(_) => {}
                         None => {
                             let idx = self.screen_index(o.opener);
-                            self.with_ctx(|ctx, screens, _| screens[idx].on_overlay_result(ctx, result));
+                            self.with_ctx(|ctx, screens, _| {
+                                ctx.config_input = input;
+                                screens[idx].on_overlay_result(ctx, result);
+                            });
                         }
                     }
                 }
@@ -2533,12 +2576,43 @@ impl TunerApp {
             self.entered = Some(route.clone());
             let idx = self.screen_index(route.screen());
             self.with_ctx(|ctx, screens, _| screens[idx].on_enter(ctx, &route));
+            if let Route::SeriesDetailAt { series, .. } = route {
+                // The page now owns the pending episode. Returning from a child route
+                // must keep the user's selection, while a new Episodes… visit applies anew.
+                let route = Route::SeriesDetail(series);
+                *self.routes.last_mut().expect("current route") = route.clone();
+                self.entered = Some(route);
+            }
         }
     }
 
-    /// Apply queued Settings edits: save, swap the shared config, re-apply to the player, the
-    /// integrations and the theme scale (no restart needed for any v1 setting).
     fn apply_config_edits(&mut self, egui_ctx: &egui::Context) {
+        self.apply_pending_config(egui_ctx);
+        if let Some(wait) = self.services().config_audit.flush_ready(std::time::Instant::now()) {
+            egui_ctx.request_repaint_after(wait);
+        }
+        if let Some(at) = self.config_save_at {
+            if let Some(wait) = at.checked_duration_since(std::time::Instant::now()).filter(|wait| !wait.is_zero()) {
+                egui_ctx.request_repaint_after(wait);
+            } else {
+                self.save_pending_config();
+            }
+        }
+    }
+
+    fn save_pending_config(&mut self) {
+        if self.config_save_at.take().is_some()
+            && let Some(services) = &self.services
+            && let Err(e) = services.config().save(&services.paths.config_file())
+        {
+            tracing::warn!("saving settings: {e}");
+            self.toast(Toast::error(format!("Couldn't save settings: {e}")));
+        }
+    }
+
+    /// Apply queued Settings edits immediately. Only lip-sync-only edits defer the disk write;
+    /// another setting saves the whole current config, including any pending correction.
+    fn apply_pending_config(&mut self, egui_ctx: &egui::Context) {
         if self.config_edits.is_empty() {
             return;
         }
@@ -2547,12 +2621,22 @@ impl TunerApp {
         let old = services.config();
         let mut cfg: Config = (*old).clone();
         for e in edits {
-            e(&mut cfg);
+            let before = cfg.clone();
+            (e.apply)(&mut cfg);
+            services.config_audit.record(&before, &cfg, e.input);
         }
         if cfg == *old {
             return;
         }
-        let saved = cfg.save(&services.paths.config_file());
+        let mut with_lip_sync = (*old).clone();
+        with_lip_sync.player.lip_sync.clone_from(&cfg.player.lip_sync);
+        let saved = if cfg == with_lip_sync {
+            self.config_save_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+            Ok(())
+        } else {
+            self.config_save_at = None;
+            cfg.save(&services.paths.config_file())
+        };
         let cfg = Arc::new(cfg);
         *services.config.write().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
         services.apply_config(&old, &cfg);
@@ -2628,7 +2712,7 @@ impl TunerApp {
                     Place::Forget => None,
                     Place::Keep => self.services().config().player.popout_last,
                 };
-                self.config_edits.push(Box::new(move |c: &mut Config| c.player.popout_last = last));
+                self.config_edits.push(crate::config::audit::edit("system", move |c: &mut Config| c.player.popout_last = last));
                 if std::mem::take(&mut self.fullscreen_after_pop_in) {
                     self.set_window_fullscreen(true, egui_ctx);
                 }
@@ -2678,7 +2762,7 @@ impl TunerApp {
             self.toast(Toast::info(text));
         }
         if !reset.is_empty() {
-            self.config_edits.push(Box::new(move |c: &mut Config| {
+            self.config_edits.push(crate::config::audit::edit("system", move |c: &mut Config| {
                 for k in reset {
                     *k.slot(&mut c.interface.playlist_scope) = None;
                 }
@@ -2747,8 +2831,10 @@ impl TunerApp {
         if last.is_none() || last == cfg.interface.last_screen {
             return;
         }
+        let before = cfg.clone();
         let mut cfg = (*cfg).clone();
         cfg.interface.last_screen = last;
+        services.config_audit.record(&before, &cfg, "exit");
         if let Err(e) = cfg.save(&services.paths.config_file()) {
             tracing::warn!("remembering the last screen: {e}");
         }
@@ -2839,6 +2925,7 @@ impl eframe::App for TunerApp {
             self.devshot_commands(cmds);
         }
         let stack = self.key_stack();
+        crate::ui::screens::home::rail_bar_keyboard_input(ctx, &raw.events);
         let mut resolved: Vec<(Action, Vec<KeyContext>)> = Vec::new();
         let mut drop_text = self.drop_alt_text;
         raw.events.retain(|ev| {
@@ -3058,8 +3145,17 @@ impl eframe::App for TunerApp {
         }
 
         if let Some(i) = self.overlays.len().checked_sub(1) {
-            let outcome = self.as_overlay(i, |app| app.with_ctx(|ctx, _, ovs| ovs[i].overlay.ui(&egui_ctx, ctx)));
-            self.apply_overlay_outcome(outcome);
+            if egui_ctx.input(|i| i.pointer.any_click()) {
+                self.overlays[i].input = "click";
+            }
+            let input = self.overlays[i].input;
+            let outcome = self.as_overlay(i, |app| {
+                app.with_ctx(|ctx, _, ovs| {
+                    ctx.config_input = input;
+                    ovs[i].overlay.ui(&egui_ctx, ctx)
+                })
+            });
+            self.apply_overlay_outcome(outcome, input);
         }
         for t in std::mem::take(&mut self.pending_toasts) {
             self.toast(t);
@@ -3092,7 +3188,11 @@ impl eframe::App for TunerApp {
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        self.save_pending_config();
         self.remember_last_screen();
+        if let Some(services) = &self.services {
+            services.config_audit.flush();
+        }
         // SHUTDOWN ORDER: render context (needs GL) → FBO → services (player/mpv, then writer).
         self.video.destroy(gl);
         if let Some(s) = self.services.take() {
@@ -3686,6 +3786,207 @@ mod tests {
     /// A button by its label (the sidebar entries; screens may show the same words as text).
     fn button<'a>(texts: &'a [Node], text: &str) -> Option<&'a egui::accesskit::Rect> {
         texts.iter().find(|(t, _, role)| t == text && *role == egui::accesskit::Role::Button).map(|(_, r, _)| r)
+    }
+
+    /// A film before a season range ensures Back must restore the entry, not the list's
+    /// first unfinished title. Two copies exercise the global watched/Undo paths.
+    fn watchlist_episode_rig(season: u32) -> (Rig, crate::model::WatchlistId) {
+        use crate::store::watchlist as wl;
+        use crate::ui::screens::home::testkit;
+        let mut rig = Rig::with(test_config(), live(), 1.0, move |c| {
+            for name in ["TV", "TV 2"] {
+                let src = testkit::source(c, name)?;
+                testkit::series(c, src, 1, 3, 5)?;
+                c.execute("UPDATE series SET year=2020 WHERE source_id=?1", [src])?;
+                crate::store::titles::refresh_source(c, src)?;
+            }
+            testkit::movies(c, SourceId(1), 1)?;
+            let lib = crate::store::library::load(c)?;
+            let list = wl::create(c, "Episodes to watch", None, crate::watchlist::PlayOrder::Ordered, "app", 1)?;
+            let film = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000000".into()) };
+            let series = ItemRef { source: SourceId(1), kind: ItemKind::Series, key: ItemKey("m3u:series000000000".into()) };
+            let mut range = wl::new_entry(c, &series)?;
+            range.season_from = Some(season);
+            range.season_to = Some(season);
+            wl::add(c, &lib, list, &[wl::new_entry(c, &film)?, range], crate::watchlist::Insert::End, 1)?;
+            let finished = (1..=3).map(|n| (watchlist_episode_ref(1, season, n), format!("Episode {n}"))).collect::<Vec<_>>();
+            crate::store::user::mark_watched(c, &finished, true, 2)?;
+            crate::store::user::save_progress(
+                c,
+                &crate::model::WatchProgress {
+                    item: watchlist_episode_ref(1, season, 4),
+                    position_s: 90.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 3,
+                    finished: false,
+                    title: "Episode 4".into(),
+                    fingerprint: Default::default(),
+                },
+            )?;
+            Ok(())
+        });
+        rig.settle();
+        let list = wl::lists(&rig.app.db).unwrap().into_iter().find(|l| l.name == "Episodes to watch").unwrap().id;
+        rig.app.nav.push(NavRequest::Switch(Route::Watchlists { list: Some(list) }));
+        rig.frame_with(vec![]);
+        wait_watchlist_episode(&mut rig, list, (season, 4));
+        rig.press(Key::ArrowDown, NONE);
+        (rig, list)
+    }
+
+    fn watchlist_episode_ref(source: i64, season: u32, episode: u32) -> ItemRef {
+        ItemRef { source: SourceId(source), kind: ItemKind::Episode, key: ItemKey(format!("m3u:ep0-{season}-{episode}")) }
+    }
+
+    fn wait_watchlist_episode(rig: &mut Rig, list: crate::model::WatchlistId, episode: (u32, u32)) {
+        rig.until("watchlist current episode", |r| {
+            r.app.with_ctx(|ctx, _, _| crate::ui::watchlists::snapshot(ctx).list(list).is_some_and(|l| l.entries[1].episode == Some(episode)))
+        });
+        rig.frame_with(vec![]);
+    }
+
+    fn choose_watchlist_menu(rig: &mut Rig, label: &str) {
+        rig.press(Key::Enter, CTRL);
+        rig.frame_with(vec![]);
+        let nodes = texts(&rig.frame_with(vec![]));
+        let pos = centre(button(&nodes, label).unwrap_or_else(|| panic!("missing {label}: {nodes:?}")));
+        rig.click(pos, egui::PointerButton::Primary);
+        rig.frame_with(vec![]);
+    }
+
+    #[test]
+    fn watchlist_ctrl_w_marks_current_episode_only_and_undo_restores_its_progress() {
+        let (mut rig, list) = watchlist_episode_rig(1);
+        let before = crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 1, 4)).unwrap();
+        rig.press(Key::W, CTRL);
+        wait_watchlist_episode(&mut rig, list, (1, 5));
+        for source in [1, 2] {
+            assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 1, 4)).unwrap().unwrap().finished);
+            assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 1, 5)).unwrap().is_none());
+            assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 2, 1)).unwrap().is_none());
+        }
+        let toast = rig.log().toasts.iter().find(|t| t.text == "Marked S01E04 watched").cloned().expect("numbered toast");
+        let (label, undo) = toast.action.unwrap();
+        assert_eq!(label, "Undo");
+        let ctx = rig.ctx.clone();
+        rig.app.global_action(undo, &[], &ctx);
+        wait_watchlist_episode(&mut rig, list, (1, 4));
+        assert_eq!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 1, 4)).unwrap(), before);
+        assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(2, 1, 4)).unwrap().is_none());
+        // The numbered menu action takes the same path, and the final episode completes
+        // the range without touching other seasons.
+        choose_watchlist_menu(&mut rig, "Mark S01E04 watched");
+        wait_watchlist_episode(&mut rig, list, (1, 5));
+        rig.press(Key::W, CTRL);
+        rig.until("range done", |r| {
+            crate::store::watchlist::view(&r.app.db, &r.app.lib, list, true, false).unwrap().unwrap().entries[1].status
+                == crate::watchlist::EntryStatus::Done
+        });
+        assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 2, 1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn watchlist_mark_all_watched_menu_marks_only_the_range_across_copies() {
+        let (mut rig, list) = watchlist_episode_rig(1);
+        choose_watchlist_menu(&mut rig, "Mark all watched");
+        rig.until("whole range watched", |r| {
+            crate::store::watchlist::view(&r.app.db, &r.app.lib, list, true, false).unwrap().unwrap().entries[1].status
+                == crate::watchlist::EntryStatus::Done
+        });
+        for source in [1, 2] {
+            for episode in 1..=5 {
+                assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 1, episode)).unwrap().unwrap().finished);
+                assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 2, episode)).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn watchlist_details_focus_current_season_and_episode_and_back_restores_entry() {
+        let (mut rig, list) = watchlist_episode_rig(2);
+        // Select a different list in the pane without changing the route that Back keeps.
+        let mine = crate::store::watchlist::default_list(&rig.app.db).unwrap();
+        let origin = Route::Watchlists { list: Some(mine) };
+        rig.app.nav.push(NavRequest::Switch(origin.clone()));
+        rig.frame_with(vec![]);
+        rig.press(Key::ArrowLeft, NONE);
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::ArrowRight, NONE);
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::I, CTRL);
+        assert!(matches!(rig.route(), Route::SeriesDetail(_)));
+        // The page's focused row owns Ctrl+W. Earlier seasons remain unwatched, so this
+        // also proves the route overrides the series' ordinary next episode.
+        rig.until("focused S2E4", |r| find(&texts(&r.frame_with(vec![])), "S2E4").is_some());
+        rig.press(Key::W, CTRL);
+        rig.until("focused episode watched", |r| {
+            crate::store::user::progress(&r.app.db, &watchlist_episode_ref(1, 2, 4)).unwrap().is_some_and(|p| p.finished)
+        });
+        assert!(crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 1, 1)).unwrap().is_none());
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &origin);
+        wait_watchlist_episode(&mut rig, list, (2, 5));
+        choose_watchlist_menu(&mut rig, "Episodes…");
+        assert!(matches!(rig.route(), Route::SeriesDetail(_)));
+        rig.until("focused S2E5", |r| find(&texts(&r.frame_with(vec![])), "S2E5").is_some());
+        rig.press(Key::W, CTRL);
+        rig.until("last episode watched", |r| {
+            crate::store::user::progress(&r.app.db, &watchlist_episode_ref(1, 2, 5)).unwrap().is_some_and(|p| p.finished)
+        });
+        rig.press(Key::ArrowLeft, ALT);
+        assert_eq!(rig.route(), &origin);
+        rig.until("done row returned", |r| {
+            r.app.with_ctx(|ctx, _, _| {
+                crate::ui::watchlists::snapshot(ctx).list(list).is_some_and(|l| l.entries[1].status == crate::watchlist::EntryStatus::Done)
+            })
+        });
+        rig.press(Key::W, CTRL); // The returned done entry unmarks its range, not the film.
+        wait_watchlist_episode(&mut rig, list, (2, 1));
+        for source in [1, 2] {
+            for episode in 1..=5 {
+                assert!(!crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(source, 2, episode)).unwrap().is_some_and(|p| p.finished));
+            }
+        }
+        rig.press(Key::ArrowUp, NONE);
+        rig.press(Key::I, CTRL);
+        assert_eq!(rig.route(), &Route::MovieDetail(crate::model::MovieId(1)), "films use the same Details key");
+    }
+
+    #[test]
+    fn watchlist_episodes_keeps_selection_after_a_child_route_and_reapplies_on_a_new_visit() {
+        let (mut rig, _) = watchlist_episode_rig(2);
+        let origin = rig.route().clone();
+        choose_watchlist_menu(&mut rig, "Episodes…");
+        let page = rig.route().clone();
+        assert!(matches!(page, Route::SeriesDetail(_)));
+        let focused = |r: &mut Rig| {
+            let idx = r.app.screen_index(ScreenId::SeriesDetail);
+            let target = r.app.with_ctx(|ctx, screens, _| screens[idx].reveal_target(ctx));
+            match target {
+                Some(crate::ui::item_menu::Target::Episode { episode, .. }) => {
+                    let ep = crate::store::vod::episode(&r.app.db, episode).unwrap();
+                    Some((ep.season, ep.episode))
+                }
+                _ => None,
+            }
+        };
+        rig.until("opened at S2E4", |r| focused(r) == Some((2, 4)));
+        rig.press(Key::ArrowDown, NONE);
+        assert_eq!(focused(&mut rig), Some((2, 5)));
+        rig.app.nav.push(NavRequest::Push(Route::MovieDetail(crate::model::MovieId(1))));
+        rig.frame_with(vec![]);
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &page);
+        assert_eq!(focused(&mut rig), Some((2, 5)), "return keeps the user's episode");
+        rig.press(Key::W, CTRL);
+        rig.until("selected episode watched after returning", |r| {
+            crate::store::user::progress(&r.app.db, &watchlist_episode_ref(1, 2, 5)).unwrap().is_some_and(|p| p.finished)
+        });
+        assert!(!crate::store::user::progress(&rig.app.db, &watchlist_episode_ref(1, 2, 4)).unwrap().unwrap().finished);
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.route(), &origin);
+        choose_watchlist_menu(&mut rig, "Episodes…");
+        rig.until("new visit reapplies S2E4", |r| focused(r) == Some((2, 4)));
     }
 
     // ---- key consumption -----------------------------------------------------------------
@@ -4403,7 +4704,7 @@ mod tests {
         // picked again, then removed
         rig.writer().blocking(|c| Ok(c.execute("UPDATE source SET enabled = 1 WHERE id = 2", [])?)).unwrap();
         deliver_library(&mut rig);
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.interface.playlist_scope.live = Some(SourceId(2))));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.interface.playlist_scope.live = Some(SourceId(2))));
         rig.frame_with(vec![]);
         rig.frame_with(vec![]);
         assert_eq!(rig.app.window_title, "Tuner — Live TV · Bravo");
@@ -4889,14 +5190,14 @@ mod tests {
         assert_eq!(rig.log().toasts.last().map(|t| t.text.as_str()), Some("This channel is hidden by parental control (Settings ▸ Parental)"));
         assert!(no_late_night(&rig.log()));
 
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.parental.show_explicit = true));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.parental.show_explicit = true));
         rig.frame_with(vec![]);
         rig.until("explicit content shown", |r| r.app.lib.live.by_ref(&explicit_ref()).is_some());
         let xxx = rig.app.lib.live.groups.iter().find(|g| g.name == "XXX").map(|g| g.id).unwrap();
         let cfg = rig.app.services().config();
         assert_eq!(rig.app.zap_list(xxx, &cfg).map(|z| z.channels.len()), Some(1));
 
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.parental.show_explicit = false));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.parental.show_explicit = false));
         rig.frame_with(vec![]);
         assert_eq!(rig.app.lib.live.by_ref(&explicit_ref()), None, "hidden in the same frame");
         assert!(rig.app.zap_list(xxx, &cfg).is_none());
@@ -5704,7 +6005,7 @@ mod tests {
     fn network_settings_reach_the_shared_http_client_live() {
         let mut rig = Rig::new();
         let images_and_jobs = rig.app.services().jobs.context().http.clone();
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.player.user_agent = "Live/1".into()));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.player.user_agent = "Live/1".into()));
         rig.frame_with(vec![]);
         assert_eq!(rig.app.services().http.default_user_agent(), "Live/1");
         assert_eq!(images_and_jobs.default_user_agent(), "Live/1", "every clone follows");
@@ -5727,7 +6028,7 @@ mod tests {
     fn config_edits_are_saved_and_applied() {
         let mut rig = Rig::new();
         let file = rig.app.services().paths.config_file();
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.player.cache_secs = 33));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.player.cache_secs = 33));
         rig.frame_with(vec![]);
         assert_eq!(rig.app.services().config().player.cache_secs, 33);
         assert_eq!(Config::load(&file).unwrap().player.cache_secs, 33);
@@ -5742,14 +6043,182 @@ mod tests {
             .collect();
         assert_eq!(applied, [33]);
         // an edit that changes nothing sends nothing
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.player.cache_secs = 33));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.player.cache_secs = 33));
         rig.frame_with(vec![]);
         assert_eq!(rig.log().commands.iter().filter(|c| matches!(c, PlayerCommand::ApplyConfig(_))).count(), 1);
         // UI scale re-derives the theme
         let rem = rig.app.theme.rem();
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.interface.ui_scale = 1.5));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.interface.ui_scale = 1.5));
         rig.frame_with(vec![]);
         assert!((rig.app.theme.rem() - rem * 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn settings_search_ctrl_k_opens_and_focuses_a_real_setting() {
+        let mut rig = Rig::new();
+        rig.settle();
+        rig.press(Key::K, CTRL);
+        assert_eq!(rig.app.overlays.len(), 1);
+        for c in "start screen".chars() {
+            rig.frame_with(vec![Event::Text(c.to_string())]);
+        }
+        rig.until("the settings hit", |r| {
+            let out = r.frame_with(vec![]);
+            find(&texts(&out), "Start screen · Interface").is_some()
+        });
+        rig.press(Key::Enter, NONE);
+        assert!(matches!(rig.route(), Route::Setting(target) if target.page == crate::ui::SettingsPage::Interface));
+        assert!(rig.app.overlays.is_empty());
+        let log = crate::config::audit::capture(|| {
+            rig.press(Key::ArrowRight, NONE);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert_eq!(rig.app.services().config().general.start_screen, crate::config::StartScreen::Live);
+        assert_eq!(log.lines().filter(|line| line.contains("settings:")).count(), 1, "{log}");
+        assert!(log.contains("start screen Home → Live TV (key →)"), "{log}");
+        rig.frame_with("open on".chars().map(|c| Event::Text(c.to_string())).collect());
+        assert_eq!(rig.app.key_stack().first(), Some(&KeyContext::ListFiltering), "a batch of text, including space, keeps filtering");
+        rig.press(Key::Escape, NONE);
+        assert_eq!(rig.app.key_stack().first(), Some(&KeyContext::Settings));
+    }
+
+    #[test]
+    fn settings_audit_overlay_result_uses_the_key_that_closed_it() {
+        let mut rig = Rig::with(test_config(), live(), 1.0, |c| seed_channels(c, 2, None));
+        rig.settle();
+        rig.press(Key::ArrowRight, NONE);
+        // Ctrl+S opens the real Live sort menu; Down selects Channel number.
+        rig.press(Key::S, CTRL);
+        assert_eq!(rig.app.overlays.len(), 1);
+        rig.press(Key::ArrowDown, NONE);
+        let log = crate::config::audit::capture(|| {
+            rig.press(Key::Enter, NONE);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(rig.app.services().config().interface.live_sort, crate::model::SortMode::Number);
+        assert!(log.contains("settings: interface live sort provider → number (key Enter)"), "{log}");
+        assert!(!log.contains("(click)"), "{log}");
+    }
+
+    #[test]
+    fn settings_audit_deferred_pin_result_keeps_the_confirming_key() {
+        let mut rig = Rig::with(pin_config(), live(), 1.0, |_| Ok(()));
+        rig.settle();
+        let before = rig.app.services().config().parental.relock_min;
+        rig.press(Key::K, CTRL);
+        rig.frame_with("lock again after".chars().map(|c| Event::Text(c.to_string())).collect());
+        rig.until("the relock setting", |r| {
+            let out = r.frame_with(vec![]);
+            find(&texts(&out), "Lock again after · Parental").is_some()
+        });
+        rig.press(Key::Enter, NONE);
+        rig.press(Key::ArrowRight, NONE);
+        assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
+        let log = crate::config::audit::capture(|| {
+            type_pin(&mut rig);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert!(rig.app.overlays.is_empty());
+        assert_eq!(rig.app.services().config().parental.relock_min, before + 5);
+        assert!(log.contains(&format!("parental relock min {before} → {} (key Enter)", before + 5)), "{log}");
+    }
+
+    #[test]
+    fn settings_audit_logs_real_edits_once_with_redacted_input() {
+        use crate::player::audio_output::AudioOutput;
+        let mut rig = Rig::new();
+        let log = crate::config::audit::capture(|| {
+            rig.app.with_ctx(|ctx, _, _| {
+                ctx.config_input = "key →";
+                ctx.edit_config(|c| c.general.start_screen = crate::config::StartScreen::Live);
+            });
+            rig.app.apply_config_edits(&rig.ctx);
+            rig.app.apply_config_edits(&rig.ctx);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert_eq!(log.lines().filter(|line| line.contains("settings:")).count(), 1, "{log}");
+        assert!(log.contains("INFO") && log.contains("settings: start screen Home → Live TV (key →)"), "{log}");
+        let output = AudioOutput { name: "private-output".into(), label: "Private living room".into() };
+        let presses = crate::config::audit::capture(|| {
+            for _ in 0..4 {
+                rig.app.with_ctx(|ctx, _, _| {
+                    ctx.config_input = "key ]";
+                    ctx.edit_lip_sync(output.clone(), Some(1));
+                });
+                rig.app.apply_config_edits(&rig.ctx);
+            }
+        });
+        assert!(!presses.contains("settings:"), "{presses}");
+        let saved = crate::config::audit::capture(|| {
+            rig.app.config_save_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+            rig.app.apply_config_edits(&rig.ctx);
+            rig.app.apply_config_edits(&rig.ctx);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert_eq!(saved.lines().filter(|line| line.contains("settings:")).count(), 1, "{saved}");
+        assert!(saved.contains("audio delay for the current output +0 ms → +200 ms (key ])"), "{saved}");
+        assert!(!saved.contains("private-output") && !saved.contains("Private living room"), "{saved}");
+        let agent = crate::config::audit::capture(|| {
+            rig.event(AppEvent::Agent(crate::agent::AgentCommand::MultiView(crate::agent::AgentMultiView::Swap(
+                crate::agent::MultiViewSwap::Layout(crate::config::MultiViewLayout::Pip),
+            ))));
+            rig.app.apply_config_edits(&rig.ctx);
+            rig.app.services().config_audit.flush_ready(Instant::now() + Duration::from_millis(500));
+        });
+        assert!(agent.contains("settings:") && agent.contains("(agent)"), "{agent}");
+    }
+
+    #[test]
+    fn lip_sync_repeats_apply_immediately_save_after_quiet_and_flush_on_exit() {
+        use crate::player::audio_output::AudioOutput;
+        let mut rig = Rig::new();
+        let file = rig.app.services().paths.config_file();
+        let output = AudioOutput { name: "speakers".into(), label: "Laptop speakers".into() };
+        rig.event(AppEvent::Player(crate::player::PlayerEvent::AudioOutputChanged { previous: None, output: output.clone(), offset_ms: 0 }));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert_eq!(rig.app.services().config().player.lip_sync.len(), 1, "discovery is applied");
+        rig.app.config_save_at = Some(Instant::now() - Duration::from_millis(1));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert!(rig.app.config_save_at.is_none(), "the quiet period expired");
+        assert!(file.exists(), "settings saved: {:?}", rig.log().toasts);
+        let saved = Config::load(&file).unwrap();
+        assert_eq!(saved.player.lip_sync.len(), 1);
+        assert_eq!(saved.player.lip_sync["speakers"].label, "Laptop speakers");
+        assert!(!saved.player.lip_sync.contains_key("this-computer"));
+        for step in 1..=4 {
+            let previous_deadline = rig.app.config_save_at;
+            rig.app.with_ctx(|ctx, _, _| ctx.edit_lip_sync(output.clone(), Some(-1)));
+            rig.app.apply_config_edits(&rig.ctx);
+            assert_eq!(rig.app.services().config().player.lip_sync["speakers"].offset_ms, -50 * step);
+            assert!(
+                matches!(rig.log().commands.last(), Some(PlayerCommand::ApplyConfig(cfg)) if cfg.player.lip_sync["speakers"].offset_ms == -50 * step)
+            );
+            assert_eq!(Config::load(&file).unwrap(), saved, "repeats must leave the file alone");
+            assert!(rig.app.config_save_at > previous_deadline, "each change restarts the quiet period");
+        }
+        rig.app.config_save_at = Some(Instant::now() - Duration::from_millis(1));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert_eq!(Config::load(&file).unwrap().player.lip_sync["speakers"].offset_ms, -200);
+        assert!(rig.app.config_save_at.is_none());
+        // Quitting before another quiet period ends must still persist the final value.
+        rig.app.with_ctx(|ctx, _, _| ctx.edit_lip_sync(output, Some(-1)));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert!(rig.app.config_save_at.is_some());
+        rig.app.on_exit(None);
+        assert_eq!(Config::load(&file).unwrap().player.lip_sync["speakers"].offset_ms, -250);
+    }
+
+    #[test]
+    fn lip_sync_pending_save_survives_a_direct_exit_without_another_frame() {
+        let mut rig = Rig::new();
+        let file = rig.app.services().paths.config_file();
+        rig.app.with_ctx(|ctx, _, _| ctx.edit_lip_sync(Default::default(), Some(1)));
+        rig.app.apply_config_edits(&rig.ctx);
+        assert!(rig.app.config_save_at.is_some());
+        let cleanup = rig.app.services().exit_cleanup();
+        rig.app.services().rt.block_on(cleanup);
+        assert_eq!(Config::load(&file).unwrap().player.lip_sync["this-computer"].offset_ms, 50);
     }
 
     #[test]
@@ -5759,20 +6228,20 @@ mod tests {
         // notification reminders on and off
         let notifies = |rig: &Rig| rig.app.services().integrations.reminders.as_ref().map(|r| r.notifies());
         assert_eq!(notifies(&rig), Some(false));
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.reminders.enabled = true));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.reminders.enabled = true));
         rig.frame_with(vec![]);
         assert_eq!(notifies(&rig), Some(true));
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.reminders.enabled = false));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.reminders.enabled = false));
         rig.frame_with(vec![]);
         assert_eq!(notifies(&rig), Some(false));
         // follow the Omarchy theme (fake home: nothing there → fallback palette, loaded on a
         // worker), then stop following
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.integration.follow_omarchy_theme = true));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.integration.follow_omarchy_theme = true));
         rig.frame_with(vec![]);
         assert!(rig.app.services().integrations.theme_watch.is_some());
         let before = Arc::as_ptr(&rig.app.theme);
         rig.until("the reloaded theme", |r| Arc::as_ptr(&r.app.theme) != before);
-        rig.app.config_edits.push(Box::new(|c: &mut Config| {
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| {
             c.integration.follow_omarchy_theme = false;
             c.interface.ui_scale = 1.25;
         }));
@@ -6556,7 +7025,7 @@ mod tests {
         // an offer that waited while the switch was turned off isn't shown; the version is
         // recorded instead
         rig.press(Key::Escape, NONE);
-        rig.app.config_edits.push(Box::new(|c: &mut Config| {
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| {
             c.agents.offer_connect = false;
             c.agents.checked_version = None;
         }));
@@ -6881,7 +7350,7 @@ mod tests {
         assert!(rig.app.overlays.is_empty());
         assert_eq!(rig.app.services().config().cast.checked_version.as_deref(), Some(TUNER_VERSION), "Not now answers this version");
 
-        rig.app.config_edits.push(Box::new(|c: &mut Config| c.cast.checked_version = None));
+        rig.app.config_edits.push(crate::config::audit::edit("key", |c: &mut Config| c.cast.checked_version = None));
         let mut paired =
             crate::cast::Device::new(living_room(), "Living Room", crate::model::cast::ReceiverKind::AppleTv, crate::cast::Protocol::AirPlay);
         paired.pairing = crate::cast::Pairing::Paired(crate::cast::PairVariant::Hkp3);
@@ -6973,7 +7442,7 @@ mod tests {
             token: QUIT_TOKEN,
         });
         assert_eq!(rig.overlay_kinds(), [kind(ask)]);
-        rig.app.apply_overlay_outcome(OverlayOutcome::CloseWith(OverlayResult::Confirmed(QUIT_TOKEN)));
+        rig.app.apply_overlay_outcome(OverlayOutcome::CloseWith(OverlayResult::Confirmed(QUIT_TOKEN)), "click");
         let out = rig.frame_with(vec![]);
         assert!(out.viewport_output.values().any(|v| v.commands.contains(&egui::ViewportCommand::Close)));
         rig.close = true;

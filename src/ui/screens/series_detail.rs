@@ -44,12 +44,19 @@ enum Section {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollTarget {
+    Cursor,
+    SelectedEpisode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Btn {
     Play,
     /// "Play from ▾": the series' copies (DESIGN §29.14).
     PlayFrom,
     Favourite,
     SeasonWatched,
+    RemoveContinue,
 }
 
 /// Context-menu choices (echoed back as `Action::Digit`).
@@ -74,6 +81,8 @@ struct Data {
     across: HashMap<ItemKey, WatchProgress>,
     /// The next episode from the copy with the newest progress, as this copy's episode.
     next_across: Option<EpisodeId>,
+    /// An unfinished episode in another copy, including episodes absent from this copy.
+    continuing_others: bool,
 }
 
 impl Data {
@@ -101,6 +110,7 @@ fn load(c: &rusqlite::Connection, id: SeriesId, others: Vec<SeriesId>) -> crate:
         }
     }
     let next = vod::next_episode(c, id)?.map(|e| e.id);
+    let continuing_others = crate::store::copies::series_in_continue_watching(c, &others)?;
     let mut across = progress.clone();
     let (mut next_across, mut unloaded) = (next, Vec::new());
     if !others.is_empty() {
@@ -123,7 +133,7 @@ fn load(c: &rusqlite::Connection, id: SeriesId, others: Vec<SeriesId>) -> crate:
                 if s == id { Some(ep.id) } else { episodes.iter().find(|x| (x.season, x.episode) == (ep.season, ep.episode)).map(|x| x.id).or(next) };
         }
     }
-    Ok(Data { series, seasons, episodes, progress, next, others, unloaded, across, next_across })
+    Ok(Data { series, seasons, episodes, progress, next, others, unloaded, across, next_across, continuing_others })
 }
 
 fn episode_ref(e: &Episode) -> ItemRef {
@@ -149,7 +159,8 @@ pub struct SeriesDetailScreen {
     ep: usize,
     /// Place the cursor on the next episode when the data arrives (first load of a series).
     position_pending: bool,
-    scroll_to_cursor: bool,
+    episode_pending: Option<(u32, u32)>,
+    scroll_target: Option<ScrollTarget>,
     copies: super::copies::Copies,
     /// Episodes of other copies being loaded before a combined ✓ (DESIGN §29.15, P3).
     fetch: crate::ui::copies::EpisodeFetch,
@@ -248,7 +259,7 @@ impl SeriesDetailScreen {
         if let Some(si) = d.seasons.iter().position(|s| *s == e.season) {
             self.season = si;
             self.ep = d.season_episodes(e.season).iter().position(|x| x.id == id).unwrap_or(0);
-            self.scroll_to_cursor = true;
+            self.scroll_target = Some(ScrollTarget::SelectedEpisode);
         }
     }
 
@@ -261,7 +272,7 @@ impl SeriesDetailScreen {
         if idx != self.season {
             self.season = idx;
             self.ep = 0;
-            self.scroll_to_cursor = true;
+            self.scroll_target = Some(ScrollTarget::SelectedEpisode);
         }
     }
 
@@ -284,11 +295,35 @@ impl SeriesDetailScreen {
     }
 
     fn buttons(&self) -> Vec<Btn> {
-        if self.copies.is_stacked() {
+        let mut buttons = if self.copies.is_stacked() {
             vec![Btn::Play, Btn::PlayFrom, Btn::Favourite, Btn::SeasonWatched]
         } else {
             vec![Btn::Play, Btn::Favourite, Btn::SeasonWatched]
+        };
+        if self.in_continue_watching() {
+            buttons.push(Btn::RemoveContinue);
         }
+        buttons
+    }
+
+    fn in_continue_watching(&self) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|d| d.progress.values().any(|p| !p.finished && p.position_s > 0.0) || self.copies.combined() && d.continuing_others)
+    }
+
+    fn remove_continue(&mut self, ctx: &mut UiCtx<'_>) {
+        if !self.in_continue_watching() {
+            return;
+        }
+        if self.copies.combined() {
+            crate::ui::copies::forget_series(ctx, self.copies.plan());
+        } else if let Some(id) = self.id {
+            crate::ui::copies::write_with_undo(ctx, DataScope::Progress, "Removed from Continue watching".into(), move |c| {
+                crate::store::copies::forget_series(c, &[id])
+            });
+        }
+        self.btn = 0;
     }
 
     /// The copy Play uses when it isn't this page's (DESIGN §29.14).
@@ -416,6 +451,7 @@ impl SeriesDetailScreen {
                 let eps = self.current_episodes().into_iter().cloned().collect();
                 self.mark(ctx, eps, on);
             }
+            Btn::RemoveContinue => self.remove_continue(ctx),
         }
     }
 
@@ -432,7 +468,7 @@ impl SeriesDetailScreen {
         if self.section == Section::Copies && self.copies.focus.is_none() {
             self.copies.focus = Some(0);
         }
-        self.scroll_to_cursor = true;
+        self.scroll_target = Some(ScrollTarget::Cursor);
     }
 
     /// After an episode ended: the episode after `key` (next in season order), if any.
@@ -458,7 +494,11 @@ impl Screen for SeriesDetailScreen {
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
-        let Route::SeriesDetail(id) = route else { return };
+        let (id, episode) = match route {
+            Route::SeriesDetail(id) => (id, None),
+            Route::SeriesDetailAt { series, season, episode } => (series, Some((*season, *episode))),
+            _ => return,
+        };
         if self.id != Some(*id) {
             self.data = None;
             self.section = Section::Episodes;
@@ -466,8 +506,21 @@ impl Screen for SeriesDetailScreen {
             self.ep = 0;
             self.btn = 0;
             self.position_pending = true;
+            self.episode_pending = None;
         }
         self.id = Some(*id);
+        if let Some((season, episode)) = episode {
+            self.episode_pending = Some((season, episode));
+            self.section = Section::Episodes;
+            self.position_pending = true;
+            // Reopening a cached page must focus the requested row before another key
+            // can act. Once applied, a refresh must keep any later user selection.
+            if let Some(id) = self.data.as_ref().and_then(|d| d.episodes.iter().find(|e| (e.season, e.episode) == (season, episode))).map(|e| e.id) {
+                self.select_episode(id);
+                self.position_pending = false;
+                self.episode_pending = None;
+            }
+        }
         self.missing = false;
         self.reload(ctx);
     }
@@ -507,6 +560,7 @@ impl Screen for SeriesDetailScreen {
             Action::Up => self.move_vertical(false),
             Action::Down => self.move_vertical(true),
             Action::Left | Action::Right => {
+                self.scroll_target = Some(ScrollTarget::Cursor);
                 let d: isize = if action == Action::Left { -1 } else { 1 };
                 match self.section {
                     Section::Buttons => self.btn = (self.btn as isize + d).clamp(0, self.buttons().len() as isize - 1) as usize,
@@ -521,6 +575,7 @@ impl Screen for SeriesDetailScreen {
             Action::TabPrev => self.set_season(self.season.saturating_sub(1)),
             Action::TabNext => self.set_season(self.season + 1),
             Action::FocusNext | Action::FocusPrev => {
+                self.scroll_target = Some(ScrollTarget::Cursor);
                 let order = self.sections();
                 let n = order.len();
                 let i = order.iter().position(|s| *s == self.section).unwrap_or(0);
@@ -539,11 +594,11 @@ impl Screen for SeriesDetailScreen {
             Action::PlayFrom => self.copies.play_from_menu(ctx),
             Action::PageUp | Action::Home if self.section == Section::Episodes => {
                 self.ep = 0;
-                self.scroll_to_cursor = true;
+                self.scroll_target = Some(ScrollTarget::Cursor);
             }
             Action::PageDown | Action::End if self.section == Section::Episodes => {
                 self.ep = self.current_episodes().len().saturating_sub(1);
-                self.scroll_to_cursor = true;
+                self.scroll_target = Some(ScrollTarget::Cursor);
             }
             Action::Activate => match self.section {
                 Section::Buttons => {
@@ -570,6 +625,7 @@ impl Screen for SeriesDetailScreen {
                     self.mark(ctx, vec![e], on);
                 }
             }
+            Action::Remove if self.section == Section::Buttons => self.remove_continue(ctx),
             Action::ToggleFavourite if self.section == Section::Episodes => {
                 if let Some(e) = self.focused_episode() {
                     kit::toggle_favourite(ctx, &ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key });
@@ -630,6 +686,11 @@ impl Screen for SeriesDetailScreen {
                     mi(glyphs::CHECK, "Mark season watched", Action::Digit(MENU_SEASON_WATCHED), None),
                     mi(glyphs::CLOSE, "Mark season unwatched", Action::Digit(MENU_SEASON_UNWATCHED), None),
                     episode,
+                ]);
+                if self.in_continue_watching() {
+                    items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, Some("Delete")));
+                }
+                items.extend([
                     mi(glyphs::FAVOURITE, "Save to / remove from My list", Action::ToggleFavourite, Some("Ctrl+F")),
                     mi(glyphs::FAV_LIST, "Watchlists…", Action::AddToList, Some("Ctrl+Shift+F")),
                     mi(glyphs::TAG, if every { "Rename every copy…" } else { "Rename…" }, Action::Rename, Some("F2")),
@@ -665,6 +726,7 @@ impl Screen for SeriesDetailScreen {
         }
         match result {
             OverlayResult::Chosen(Action::PlayFrom) => self.copies.play_from_menu(ctx),
+            OverlayResult::Chosen(Action::Remove) => self.remove_continue(ctx),
             OverlayResult::Chosen(Action::Digit(super::copies::SAME_TITLE)) => {
                 if let Some((item, d)) = self.series_ref().zip(self.data.as_ref()) {
                     let name = d.series.display_name().to_owned();
@@ -711,11 +773,13 @@ impl Screen for SeriesDetailScreen {
                     self.details_requested = Some(d.series.id);
                     ctx.services.jobs.submit(JobKind::LoadSeriesDetails(d.series.id));
                 }
-                let next = if self.copies.combined() { d.next_across } else { d.next };
+                let target = self.episode_pending.and_then(|(s, n)| d.episodes.iter().find(|e| (e.season, e.episode) == (s, n)).map(|e| e.id));
+                let next = target.or(if self.copies.combined() { d.next_across } else { d.next });
                 let had_episodes = !d.episodes.is_empty();
                 self.data = Some(d);
-                if self.position_pending && had_episodes {
+                if self.position_pending && had_episodes && (self.episode_pending.is_none() || target.is_some() || !lazy) {
                     self.position_pending = false;
+                    self.episode_pending = None;
                     if let Some(n) = next {
                         self.select_episode(n);
                     }
@@ -804,7 +868,8 @@ impl Screen for SeriesDetailScreen {
         let season_watched = self.season_watched();
         let loading = data.episodes.is_empty() && (self.loader.is_some() || !sparse && s.details_loaded_at.is_none());
         let (section, btn_focus, season_idx, ep_idx) = (self.section, self.btn, self.season, self.ep);
-        let scroll = std::mem::take(&mut self.scroll_to_cursor);
+        let target = self.scroll_target.take();
+        let scroll = target == Some(ScrollTarget::Cursor);
         let buttons = self.buttons();
         // several copies: Play names the playlist it plays from; another copy opens at its own
         // next episode
@@ -817,6 +882,8 @@ impl Screen for SeriesDetailScreen {
         let mut menu = detail_bar(ui, ctx, true);
         let mut ep_menu = None;
         egui::ScrollArea::vertical().id_salt("series-detail").auto_shrink([false, false]).show(ui, |ui| {
+            let top = ui.cursor().min;
+            let mut button_rect = None;
             let header = DetailHeader {
                 title: s.display_name(),
                 meta: &meta.join(" · "),
@@ -860,6 +927,7 @@ impl Screen for SeriesDetailScreen {
                                 false,
                                 season_watched,
                             ),
+                            Btn::RemoveContinue => (glyphs::CLOSE, "Remove from Continue watching".into(), false, false),
                         };
                         let style = ButtonStyle {
                             primary,
@@ -869,7 +937,11 @@ impl Screen for SeriesDetailScreen {
                             ..Default::default()
                         };
                         let enabled = !matches!(b, Btn::Play) || next.is_some() || other.is_some();
-                        if ui.add_enabled_ui(enabled, |ui| button(ui, ctx.theme, Some(icon), &label, style)).inner.clicked() {
+                        let resp = ui.add_enabled_ui(enabled, |ui| button(ui, ctx.theme, Some(icon), &label, style)).inner;
+                        if section == Section::Buttons && i == btn_focus {
+                            button_rect = Some(resp.rect);
+                        }
+                        if resp.clicked() {
                             clicked_btn = Some(i);
                         }
                     }
@@ -883,6 +955,12 @@ impl Screen for SeriesDetailScreen {
                     }
                 }
             });
+            if scroll && let Some(rect) = button_rect {
+                let header = egui::Rect::from_min_max(top, ui.cursor().min);
+                // Show the title as well when it fits; a long synopsis must not keep the
+                // focused control below the viewport.
+                ui.scroll_to_rect(if header.height() <= ui.clip_rect().height() { rect.union(header) } else { rect }, None);
+            }
             if let Some((done, n)) = fetching {
                 // a combined ✓ waits for the other copies' episodes (P3)
                 ui.add_space(theme.space(SpaceToken::Md));
@@ -900,7 +978,7 @@ impl Screen for SeriesDetailScreen {
             if section != Section::Copies {
                 self.copies.focus = None;
             }
-            copy_click = self.copies.show(ui, ctx);
+            copy_click = self.copies.show(ui, ctx, scroll && section == Section::Copies);
             ui.add_space(theme.space(SpaceToken::Xxl));
             if data.seasons.is_empty() {
                 if loading {
@@ -941,18 +1019,24 @@ impl Screen for SeriesDetailScreen {
                 });
             }
             // season tabs
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xs);
-                for (i, n) in data.seasons.iter().enumerate() {
-                    let style =
-                        ButtonStyle { selected: i == season_idx, focused: section == Section::Seasons && i == season_idx, ..Default::default() };
-                    let label = if *n == 0 { "Specials".to_owned() } else { format!("Season {n}") };
-                    if button(ui, theme, None, &label, style).clicked() {
-                        clicked_season = Some(i);
+            let seasons_rect = ui
+                .horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xs);
+                    for (i, n) in data.seasons.iter().enumerate() {
+                        let style =
+                            ButtonStyle { selected: i == season_idx, focused: section == Section::Seasons && i == season_idx, ..Default::default() };
+                        let label = if *n == 0 { "Specials".to_owned() } else { format!("Season {n}") };
+                        if button(ui, theme, None, &label, style).clicked() {
+                            clicked_season = Some(i);
+                        }
                     }
-                }
-                ui.label(egui::RichText::new("[ ]").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
-            });
+                    ui.label(egui::RichText::new("[ ]").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary));
+                })
+                .response
+                .rect;
+            if scroll && section == Section::Seasons {
+                ui.scroll_to_rect(seasons_rect, None);
+            }
             ui.add_space(theme.space(SpaceToken::Md));
             let season = data.seasons.get(season_idx).copied().unwrap_or(0);
             for (i, e) in data.season_episodes(season).into_iter().enumerate() {
@@ -964,8 +1048,11 @@ impl Screen for SeriesDetailScreen {
                 let selected = section != Section::Episodes && i == ep_idx;
                 let resp =
                     rows::episode_row(ui, theme, e, p.and_then(fraction), watched, playing_ep == Some(e.id), RowState::from_flags(cursor, selected));
-                if (cursor || selected) && scroll {
-                    ui.scroll_to_rect(resp.rect, None);
+                // Selection changes (playback / season) reveal the episode even when
+                // focus stays on buttons or copies; cursor moves reveal only the cursor.
+                if cursor && scroll || i == ep_idx && target == Some(ScrollTarget::SelectedEpisode) {
+                    let rect = if i == 0 { resp.rect.union(seasons_rect) } else { resp.rect };
+                    ui.scroll_to_rect(rect, None);
                 }
                 // a click plays it, as Enter does (a double-click plays once)
                 if crate::ui::widgets::fresh_click(&resp) {
@@ -1072,6 +1159,7 @@ mod tests {
                 unloaded: Vec::new(),
                 across: HashMap::new(),
                 next_across: Some(EpisodeId(4)),
+                continuing_others: false,
             }),
             ..Default::default()
         }
@@ -1083,6 +1171,111 @@ mod tests {
     fn ep_progress(t: &crate::ui::testing::TestUi, key: &str) -> Option<WatchProgress> {
         let item = ItemRef { source: SourceId(1), kind: ItemKind::Episode, key: ItemKey(key.into()) };
         crate::store::user::progress(&t.services().store.reader().unwrap(), &item).unwrap()
+    }
+
+    #[test]
+    fn returning_during_a_load_keeps_pending_and_cached_episode_selections() {
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            Ok(testkit::series(c, src, 1, 2, 3)?[0])
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::SeriesDetailAt { series: id, season: 2, episode: 3 });
+        // The app consumes the route target immediately, while the page is still loading.
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "requested episode", |h| h.state().s.focused_episode().is_some_and(|e| (e.season, e.episode) == (2, 3)));
+        // A cached page applies the target immediately. Moving before its refresh arrives
+        // must survive that refresh as well as re-entering the consumed route.
+        h.state_mut().enter(Route::SeriesDetailAt { series: id, season: 2, episode: 1 });
+        h.state_mut().act(Action::Down);
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "refreshed page", |h| h.state().s.loader.is_none());
+        assert_eq!(h.state().s.focused_episode().map(|e| (e.season, e.episode)), Some((2, 2)));
+    }
+
+    #[test]
+    fn keyboard_scroll_returns_from_last_episode_to_seasons_and_page_header() {
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            Ok(testkit::series(c, s, 1, 1, 20)?[0])
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(800.0, 500.0));
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "episodes", |h| has_label(h, "Episode 20"));
+        h.run_steps(30);
+        h.state_mut().act(Action::End);
+        h.run_steps(30);
+        let last = h.get_by_label("Episode 20").rect();
+        assert!(last.top() >= 8.0 && last.bottom() <= 492.0, "last episode: {last:?}");
+        h.event(egui::Event::PointerMoved(egui::pos2(400.0, 250.0)));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -10000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(30);
+        assert!((h.get_by_label("Episode 20").rect().bottom() - last.bottom()).abs() < 1.0, "keyboard reaches touchpad bottom");
+        h.event(egui::Event::PointerGone);
+        h.state_mut().act(Action::Home);
+        h.run_steps(30);
+        h.state_mut().act(Action::Up);
+        h.run_steps(30);
+        let seasons = h.get_by_label("Season 1").rect();
+        assert!(seasons.top() >= 8.0 && seasons.bottom() <= 492.0, "season tabs: {seasons:?}");
+        h.state_mut().act(Action::Up);
+        h.run_steps(30);
+        let title = h.get_by_label("Series 0").rect();
+        let play = h.get_by_label("Play S01E01").rect();
+        assert!(title.top() >= 8.0 && play.bottom() <= 492.0, "header and controls: {title:?} {play:?}");
+        h.event(egui::Event::PointerMoved(egui::pos2(400.0, 250.0)));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 10000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(30);
+        assert!((h.get_by_label("Series 0").rect().top() - title.top()).abs() < 1.0, "keyboard reaches touchpad top");
+    }
+
+    #[test]
+    fn ended_episode_and_season_changes_reveal_selection_while_buttons_have_focus() {
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            Ok(testkit::series(c, s, 1, 2, 20)?[0])
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(800.0, 500.0));
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "episodes", |h| has_label(h, "Episode 20"));
+        h.run_steps(30);
+        h.state_mut().act(Action::FocusNext);
+        h.run_steps(30);
+        assert_eq!(h.state().s.section, Section::Buttons);
+        assert!(h.get_by_label("Episode 20").rect().top() > 492.0, "next episode starts below the viewport");
+        let ended = h.state().s.current_episodes()[18].clone();
+        h.state().t.services().bus.send(AppEvent::Player(PlayerEvent::Ended { item: Some(episode_ref(&ended)), finished: true }));
+        h.run_steps(30);
+        assert_eq!(h.state().s.section, Section::Buttons, "playback does not move focus");
+        assert_eq!(h.state().s.ep, 19);
+        let next = h.get_by_label("Episode 20").rect();
+        assert!(next.top() >= 8.0 && next.bottom() <= 492.0, "next episode revealed: {next:?}");
+
+        h.state_mut().act(Action::TabNext);
+        h.run_steps(30);
+        assert_eq!(h.state().s.section, Section::Buttons);
+        assert_eq!((h.state().s.season, h.state().s.ep), (1, 0));
+        let first = h.get_by_label("Episode 1").rect();
+        assert!(first.top() >= 8.0 && first.bottom() <= 492.0, "new season's selected episode revealed: {first:?}");
+        // A subsequent cursor move still reveals the controls, not the selected episode.
+        h.state_mut().act(Action::Right);
+        h.run_steps(30);
+        assert!(h.get_by_label("Series 0").rect().top() >= 8.0);
     }
 
     #[test]
@@ -1227,6 +1420,81 @@ mod tests {
             title: String::new(),
             fingerprint: Default::default(),
         }
+    }
+
+    #[test]
+    fn remove_from_continue_watching_series_button_delete_and_undo() {
+        let (mut t, one) = rig();
+        let (id, source) = seed(&mut t, |c| {
+            let source = testkit::source(c, "Alpha")?;
+            let id = testkit::named_series(c, source, &[("EN ★ Severance - 2022", "Severance")], 3)?[0];
+            crate::store::user::save_progress(c, &named_progress(source, 1, 1.0, false, 10))?;
+            crate::store::user::save_progress(c, &named_progress(source, 2, 2700.0, true, 20))?;
+            Ok((id, source))
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        let label = "Remove from Continue watching";
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "series removal", |h| has_label(h, label));
+        // Delete in the episode list leaves the series alone.
+        assert_eq!(h.state().s.section, Section::Episodes);
+        h.state_mut().act(Action::Remove);
+        h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
+        assert!(named_ep(&h, source, 1).is_some());
+        // Tab to buttons, then right past Play, My list and Mark season watched.
+        h.state_mut().act(Action::FocusNext);
+        for _ in 0..3 {
+            h.state_mut().act(Action::Right);
+        }
+        h.state_mut().act(Action::Activate);
+        let toast = h.state_mut().undo_toast().expect("series removal offers Undo");
+        assert_eq!(toast.text, "Removed from Continue watching");
+        assert!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().is_empty());
+        assert!(named_ep(&h, source, 1).is_none() && named_ep(&h, source, 2).is_none());
+        until(&mut h, "series Remove disappears", |h| !has_label(h, label));
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "series Undo", |h| has_label(h, label) && named_ep(h, source, 1).is_some() && named_ep(h, source, 2).is_some());
+        assert_eq!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().len(), 1);
+        h.state_mut().act(Action::Remove);
+        until(&mut h, "Delete with buttons focused", |h| {
+            !has_label(h, label) && crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().is_empty()
+        });
+    }
+
+    #[test]
+    fn remove_from_continue_watching_series_menu_forgets_every_copy() {
+        let (mut t, one) = rig();
+        let (id, a, b) = seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            let b = testkit::source(c, "Bravo")?;
+            let id = testkit::named_series(c, a, &[("EN ★ Severance - 2022", "Severance")], 2)?[0];
+            testkit::named_series(c, b, &[("EN - Severance (2022)", "Severance")], 3)?;
+            crate::store::user::save_progress(c, &named_progress(a, 1, 2700.0, true, 30))?;
+            crate::store::user::save_progress(c, &named_progress(b, 1, 600.0, false, 10))?;
+            crate::store::user::save_progress(c, &named_progress(b, 2, 2700.0, true, 40))?;
+            // This episode is absent from Alpha; Bravo's latest progress is finished.
+            crate::store::user::save_progress(c, &named_progress(b, 3, 300.0, false, 20))?;
+            Ok((id, a, b))
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        let label = "Remove from Continue watching";
+        h.state_mut().enter(Route::SeriesDetail(id));
+        until(&mut h, "combined series removal", |h| has_label(h, "COPIES · 2") && has_label(h, label));
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::ContextMenu(menu))] = nav.as_slice() else { panic!("{nav:?}") };
+        assert!(menu.items.iter().any(|i| i.label == label && i.action == Action::Remove && i.shortcut.as_deref() == Some("Delete")));
+        // Menu removal works even with the episode list focused.
+        h.state_mut().result(OverlayResult::Chosen(Action::Remove));
+        let toast = h.state_mut().undo_toast().expect("combined series removal offers Undo");
+        assert_eq!(toast.text, "Removed from Continue watching");
+        assert!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().is_empty());
+        assert!([a, b].iter().all(|&s| (1..=3).all(|n| named_ep(&h, s, n).is_none())));
+        until(&mut h, "combined series Remove disappears", |h| !has_label(h, label));
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "combined series Undo", |h| has_label(h, label) && named_ep(h, b, 3).is_some());
+        assert_eq!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().len(), 2);
+        assert!(named_ep(&h, a, 1).unwrap().finished && named_ep(&h, b, 2).unwrap().finished);
     }
 
     /// P3 (DESIGN §29.15): a combined series' page matches episodes across its copies by

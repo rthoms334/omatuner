@@ -1,5 +1,6 @@
 //! Movie detail (DESIGN §13.6): backdrop (dimmed), poster, title, year · duration · rating ·
-//! genre, plot, cast/director, buttons Play/Resume · Start over · Favourite · Mark watched.
+//! genre, plot, cast/director, buttons Play/Resume · Start over · Favourite · Mark watched ·
+//! Remove from Continue watching (while unfinished progress exists).
 //! Loads details lazily (`JobKind::LoadMovieDetails`) with a skeleton state; a playlist (M3U)
 //! movie has none to load and shows a sparse page instead (DESIGN §27.7). Key context
 //! `[Detail]`. When a movie ends in the fullscreen player (marked watched by the player) the
@@ -87,6 +88,7 @@ enum Btn {
     PlayFrom,
     Favourite,
     Watched,
+    RemoveContinue,
 }
 
 #[derive(Default)]
@@ -101,6 +103,7 @@ pub struct MovieDetailScreen {
     details_requested: Option<MovieId>,
     /// The focused button, then the Copies mini-cards (`buttons().len() + k`).
     focus: usize,
+    scroll_to_cursor: bool,
     copies: super::copies::Copies,
 }
 
@@ -165,6 +168,13 @@ impl MovieDetailScreen {
         self.progress.as_ref().filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s)
     }
 
+    fn in_continue_watching(&self) -> bool {
+        if self.copies.combined() {
+            return self.copies.plan().copies.iter().any(|c| c.progress.as_ref().is_some_and(|p| !p.finished && p.position_s > 0.0));
+        }
+        self.progress.as_ref().is_some_and(|p| !p.finished && p.position_s > 0.0)
+    }
+
     fn buttons(&self, ctx: &UiCtx<'_>) -> Vec<Btn> {
         let mut v = vec![Btn::Play];
         if self.resume_at(ctx).is_some() {
@@ -174,6 +184,9 @@ impl MovieDetailScreen {
             v.push(Btn::PlayFrom);
         }
         v.extend([Btn::Favourite, Btn::Watched]);
+        if self.in_continue_watching() {
+            v.push(Btn::RemoveContinue);
+        }
         v
     }
 
@@ -286,6 +299,11 @@ impl MovieDetailScreen {
                     mi(glyphs::FAVOURITE, if fav { "Remove from My list" } else { "Save to My list" }, Action::ToggleFavourite, "Ctrl+F"),
                     mi(glyphs::FAV_LIST, "Watchlists…", Action::AddToList, "Ctrl+Shift+F"),
                     mi(glyphs::CHECK, if self.watched() { "Mark unwatched" } else { "Mark watched" }, Action::MarkWatched, "Ctrl+W"),
+                ]);
+                if self.in_continue_watching() {
+                    items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, "Delete"));
+                }
+                items.extend([
                     mi(glyphs::TAG, if every { "Rename every copy…" } else { "Rename…" }, Action::Rename, "F2"),
                     mi(glyphs::LOCK, if every { "Lock / unlock every copy" } else { "Lock / unlock" }, Action::ToggleLock, "Ctrl+L"),
                     mi(glyphs::HIDDEN, if every { "Hide every copy" } else { "Hide" }, Action::ToggleHidden, "Ctrl+H"),
@@ -331,7 +349,25 @@ impl MovieDetailScreen {
                 }
             }
             Btn::Watched => self.toggle_watched(ctx),
+            Btn::RemoveContinue => self.remove_continue(ctx),
         }
+    }
+
+    fn remove_continue(&mut self, ctx: &mut UiCtx<'_>) {
+        if !self.in_continue_watching() {
+            return;
+        }
+        let title = self.title(ctx);
+        if self.copies.combined() {
+            crate::ui::copies::mark_watched(ctx, self.copies.plan(), &title, false);
+        } else if let Some(item) = self.item(ctx) {
+            let now = ctx.now;
+            crate::ui::copies::write_with_undo(ctx, DataScope::Progress, "Removed from Continue watching".into(), move |c| {
+                crate::store::copies::watched_items(c, &[(item, title)], false, now)
+            });
+        }
+        self.focus = 0;
+        self.sync_focus(ctx);
     }
 
     fn toggle_watched(&mut self, ctx: &mut UiCtx<'_>) {
@@ -424,6 +460,21 @@ impl Screen for MovieDetailScreen {
         }
         let n = self.focus_len(ctx);
         let buttons = self.buttons(ctx).len();
+        if matches!(
+            action,
+            Action::Left
+                | Action::Right
+                | Action::Up
+                | Action::Down
+                | Action::FocusPrev
+                | Action::FocusNext
+                | Action::Home
+                | Action::End
+                | Action::PageUp
+                | Action::PageDown
+        ) {
+            self.scroll_to_cursor = true;
+        }
         let handled = match action {
             Action::Left | Action::Up | Action::FocusPrev => {
                 self.focus = self.focus.saturating_sub(1);
@@ -464,6 +515,10 @@ impl Screen for MovieDetailScreen {
             }
             Action::MarkWatched => {
                 self.toggle_watched(ctx);
+                true
+            }
+            Action::Remove if self.focus < buttons => {
+                self.remove_continue(ctx);
                 true
             }
             Action::ToggleFavourite => {
@@ -508,6 +563,7 @@ impl Screen for MovieDetailScreen {
             OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),
             OverlayResult::Chosen(Action::ToggleFavourite) => self.press(ctx, Btn::Favourite),
             OverlayResult::Chosen(Action::MarkWatched) => self.toggle_watched(ctx),
+            OverlayResult::Chosen(Action::Remove) => self.remove_continue(ctx),
             OverlayResult::Chosen(a) if a != Action::ContextMenu => self.item_action(ctx, a),
             _ => {}
         }
@@ -538,6 +594,8 @@ impl Screen for MovieDetailScreen {
         if let Some(id) = self.id {
             self.copies.sync(ctx, VodKind::Movie(id));
         }
+        self.focus = self.focus.min(self.focus_len(ctx).saturating_sub(1));
+        self.sync_focus(ctx);
         let summary = self.summary(ctx).cloned();
         if self.movie.is_none() && summary.is_none() {
             detail_bar(ui, ctx, false);
@@ -602,7 +660,10 @@ impl Screen for MovieDetailScreen {
         let plays_from = self.copies.plays().and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
         let mut pressed = None;
         let mut copy_click = None;
+        let scroll = std::mem::take(&mut self.scroll_to_cursor);
         egui::ScrollArea::vertical().id_salt("movie-detail").auto_shrink([false, false]).show(ui, |ui| {
+            let top = ui.cursor().min;
+            let mut button_rect = None;
             let header = DetailHeader {
                 title: &title,
                 meta: &meta.join(" · "),
@@ -636,6 +697,7 @@ impl Screen for MovieDetailScreen {
                                 false,
                             ),
                             Btn::Watched => (Some(glyphs::CHECK), if watched { "Watched".into() } else { "Mark watched".into() }, false),
+                            Btn::RemoveContinue => (Some(glyphs::CLOSE), "Remove from Continue watching".into(), false),
                         };
                         let style = ButtonStyle {
                             primary,
@@ -644,7 +706,11 @@ impl Screen for MovieDetailScreen {
                             bordered: true,
                             ..Default::default()
                         };
-                        if button(ui, ctx.theme, icon, &label, style).clicked() {
+                        let resp = button(ui, ctx.theme, icon, &label, style);
+                        if i == self.focus {
+                            button_rect = Some(resp.rect);
+                        }
+                        if resp.clicked() {
                             pressed = Some((i, *b));
                         }
                     }
@@ -658,7 +724,11 @@ impl Screen for MovieDetailScreen {
                     }
                 }
             });
-            copy_click = self.copies.show(ui, ctx);
+            if scroll && let Some(rect) = button_rect {
+                let header = egui::Rect::from_min_max(top, ui.cursor().min);
+                ui.scroll_to_rect(if header.height() <= ui.clip_rect().height() { rect.union(header) } else { rect }, None);
+            }
+            copy_click = self.copies.show(ui, ctx, scroll);
         });
         if let Some((i, b)) = pressed {
             self.focus = i;
@@ -839,6 +909,44 @@ pub(crate) mod tests {
     use crate::model::{ItemKey, SourceId};
     use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
 
+    #[test]
+    fn keyboard_scroll_reaches_wrapped_copies_and_returns_to_page_header() {
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        let id = seed(&mut t, |c| {
+            let mut ids = Vec::new();
+            for i in 0..10 {
+                let s = testkit::source(c, &format!("Playlist {i}"))?;
+                ids.push(testkit::named_movies(c, s, &[("EN ★ Dune - 2021", "Dune")])?[0]);
+            }
+            Ok(ids[0])
+        });
+        let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(800.0, 500.0));
+        h.state_mut().enter(Route::MovieDetail(id));
+        until(&mut h, "copies", |h| has_label(h, "COPIES · 10"));
+        h.run_steps(30);
+        let top = h.get_by_label("Dune").rect().top();
+        h.state_mut().act(Action::End);
+        h.run_steps(30);
+        let last = h.get_by_label("Playlist 9 · EN").rect();
+        assert!(last.top() >= 8.0 && last.bottom() <= 492.0, "last copy: {last:?}");
+        h.event(egui::Event::PointerMoved(egui::pos2(400.0, 250.0)));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -10000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(30);
+        assert!((h.get_by_label("Playlist 9 · EN").rect().bottom() - last.bottom()).abs() < 1.0, "keyboard reaches touchpad bottom");
+        h.event(egui::Event::PointerGone);
+        h.state_mut().act(Action::Home);
+        h.run_steps(30);
+        assert!((h.get_by_label("Dune").rect().top() - top).abs() < 1.0, "Home returns to the top");
+        let play = h.get_by_label("Play · Playlist 0").rect();
+        assert!(play.top() >= 8.0 && play.bottom() <= 492.0, "Play is visible: {play:?}");
+    }
+
     /// Pretend the fullscreen player drew the video last frame (end-of-playback returns).
     pub(crate) fn fullscreen_placement(t: &mut crate::ui::testing::TestUi) {
         let theme = t.theme.clone();
@@ -856,6 +964,115 @@ pub(crate) mod tests {
     fn progress_row(t: &crate::ui::testing::TestUi, key: &str) -> Option<WatchProgress> {
         let item = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey(key.into()) };
         crate::store::user::progress(&t.services().store.reader().unwrap(), &item).unwrap()
+    }
+
+    #[test]
+    fn remove_from_continue_watching_button_menu_delete_and_undo() {
+        use egui_kittest::kittest::Queryable;
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            let ids = testkit::movies(c, s, 5)?;
+            for (i, pos, finished) in [(0, 600.0, false), (2, 0.0, false), (3, 600.0, true), (4, 1.0, false)] {
+                crate::store::user::save_progress(
+                    c,
+                    &WatchProgress {
+                        item: ItemRef { source: s, kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{i:010}")) },
+                        ..wp(pos, Some(1200.0), finished)
+                    },
+                )?;
+            }
+            Ok(ids)
+        });
+        let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        let label = "Remove from Continue watching";
+        h.state_mut().enter(Route::MovieDetail(ids[0]));
+        until(&mut h, "Resume and Remove", |h| has_label(h, "Resume 10:00") && has_label(h, label));
+        h.get_by_label(label).click();
+        h.run_steps(2);
+        let toast = h.state_mut().undo_toast().expect("removal offers Undo");
+        assert_eq!(toast.text, "Removed from Continue watching");
+        let (_, undo) = toast.action.unwrap();
+        assert!(progress_row(&h.state().t, "m3u:movie0000000000").is_none(), "forgotten, not marked watched");
+        assert!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().iter().all(|p| p.item.key.as_str() != "m3u:movie0000000000"));
+        until(&mut h, "Play without Remove", |h| has_label(h, "Play") && !has_label(h, label) && !has_label(h, "Start over"));
+        h.state_mut().act(undo);
+        until(&mut h, "progress restored", |h| has_label(h, "Resume 10:00") && has_label(h, label));
+        assert!(
+            crate::store::user::continue_watching(&h.state().t.db, 10)
+                .unwrap()
+                .iter()
+                .any(|p| p.item.key.as_str() == "m3u:movie0000000000" && p.position_s == 600.0)
+        );
+
+        // Delete resolves through the page's real key context, with the buttons focused.
+        let delete = crate::keymap::resolve(
+            &h.state().s.key_contexts(),
+            &egui::Event::Key { key: egui::Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        )
+        .unwrap();
+        assert_eq!(delete, Action::Remove);
+        h.state_mut().act(delete);
+        let (_, undo) = h.state_mut().undo_toast().unwrap().action.unwrap();
+        until(&mut h, "Delete removed progress", |h| !has_label(h, label));
+        h.state_mut().act(undo);
+        until(&mut h, "Undo restored Remove", |h| has_label(h, label));
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::ContextMenu(menu))] = nav.as_slice() else { panic!("{nav:?}") };
+        assert!(menu.items.iter().any(|i| i.label == label && i.action == Action::Remove && i.shortcut.as_deref() == Some("Delete")));
+        h.state_mut().result(OverlayResult::Chosen(Action::Remove));
+        until(&mut h, "menu removed progress", |h| !has_label(h, label) && progress_row(&h.state().t, "m3u:movie0000000000").is_none());
+
+        // No progress, zero progress and finished progress offer no removal action.
+        for id in &ids[1..4] {
+            h.state_mut().enter(Route::MovieDetail(*id));
+            until(&mut h, "the next film", |h| h.state().s.movie.as_ref().is_some_and(|m| m.id == *id));
+            assert!(!has_label(&h, label));
+            h.state_mut().act(Action::ContextMenu);
+            let nav = h.state_mut().nav();
+            let [NavRequest::Open(OverlayRequest::ContextMenu(menu))] = nav.as_slice() else { panic!("{nav:?}") };
+            assert!(menu.items.iter().all(|i| i.action != Action::Remove));
+        }
+        // Continue watching starts before the configurable Resume threshold.
+        h.state_mut().enter(Route::MovieDetail(ids[4]));
+        until(&mut h, "short progress can be removed", |h| has_label(h, "Play") && has_label(h, label));
+    }
+
+    #[test]
+    fn remove_from_continue_watching_forgets_every_movie_copy() {
+        let (mut t, one) = rig();
+        let (id, refs) = seed(&mut t, |c| {
+            let mut ids = Vec::new();
+            let mut refs = Vec::new();
+            for (name, finished) in [("Alpha", true), ("Bravo", false)] {
+                let source = testkit::source(c, name)?;
+                ids.push(testkit::named_movies(c, source, &[("EN ★ Dune - 2021", "Dune")])?[0]);
+                let item = ItemRef { source, kind: ItemKind::Movie, key: ItemKey("m3u:named0000".into()) };
+                crate::store::user::save_progress(c, &WatchProgress { item: item.clone(), ..wp(600.0, Some(1200.0), finished) })?;
+                refs.push(item);
+            }
+            Ok((ids[0], refs))
+        });
+        let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::MovieDetail(id));
+        until(&mut h, "combined film removal", |h| has_label(h, "COPIES · 2") && has_label(h, "Remove from Continue watching"));
+        // The usual focus walk reaches Remove after Watched, before the copy cards.
+        for _ in 0..5 {
+            h.state_mut().act(Action::FocusNext);
+        }
+        h.state_mut().act(Action::Activate);
+        let toast = h.state_mut().undo_toast().expect("removal offers Undo");
+        assert_eq!(toast.text, "Removed from Continue watching");
+        assert!(refs.iter().all(|r| crate::store::user::progress(&h.state().t.db, r).unwrap().is_none()));
+        assert!(crate::store::user::continue_watching(&h.state().t.db, 10).unwrap().is_empty());
+        until(&mut h, "Play without Remove", |h| !has_label(h, "Remove from Continue watching") && testkit::has_label_containing(h, "Play ·"));
+        h.state_mut().act(toast.action.unwrap().1);
+        until(&mut h, "both copies restored", |h| {
+            has_label(h, "Remove from Continue watching") && refs.iter().all(|r| crate::store::user::progress(&h.state().t.db, r).unwrap().is_some())
+        });
+        assert!(crate::store::user::progress(&h.state().t.db, &refs[0]).unwrap().unwrap().finished);
+        assert!(!crate::store::user::progress(&h.state().t.db, &refs[1]).unwrap().unwrap().finished);
     }
 
     #[test]

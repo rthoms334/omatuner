@@ -89,12 +89,32 @@ pub(super) fn runtime_settings(cfg: &Config, tile: TileId) -> Vec<(&'static str,
         ("cache-pause-wait", if p.instant_load { "0.5" } else { "1" }.into()),
         ("user-agent", p.user_agent.clone()),
         ("alang", p.audio_langs.join(",")),
-        ("slang", p.sub_langs.join(",")),
+        // A matching slang enables ordinary tracks even with subs-fallback-forced=always
+        // (mpv 0.41). The controller ranks forced tracks by language after the file loads.
+        ("slang", if p.sub_auto == SubtitleAuto::Forced { String::new() } else { p.sub_langs.join(",") }),
         ("sid", if p.sub_auto == SubtitleAuto::Off { "no" } else { "auto" }.into()),
         ("subs-fallback-forced", if p.sub_auto == SubtitleAuto::Forced { "always" } else { "no" }.into()),
-        ("subs-fallback", if p.sub_auto == SubtitleAuto::Always { "yes" } else { "default" }.into()),
+        ("subs-fallback", if p.sub_auto == SubtitleAuto::Always { "yes" } else { "no" }.into()),
         ("sub-scale", p.sub_scale.to_string()),
     ]
+}
+
+/// Reuse the normal per-picture cache settings for localhost HLS. The disk recording
+/// supplies rewind history, so only its default packet back buffer needs to be smaller.
+pub(super) fn hls_options(cfg: &Config, tile: TileId, memory: bool, base: &str) -> String {
+    let mut options = base.to_owned();
+    let mut cache: BTreeMap<_, _> = runtime_settings(cfg, tile)
+        .into_iter()
+        .filter(|(key, _)| matches!(*key, "cache-secs" | "demuxer-readahead-secs" | "demuxer-max-bytes"))
+        .collect();
+    cache.insert("demuxer-max-back-bytes", if memory && tile == TileId::A { "32MiB" } else { SECOND_PICTURE_BACK }.into());
+    for (key, value) in cache {
+        let value = cfg.player.mpv_options.get(key).unwrap_or(&value);
+        options.push_str(&format!(",{key}={}", quote(value)));
+    }
+    let lavf = cfg.player.mpv_options.get("demuxer-lavf-o").map(String::as_str).unwrap_or(DEMUXER_LAVF_O);
+    options.push_str(&format!(",demuxer-lavf-o={}", quote(&format!("{lavf},live_start_index=0"))));
+    options
 }
 
 /// Apply what changed from `previous` (the config currently applied) to a running instance:
@@ -264,6 +284,28 @@ mod tests {
     }
 
     #[test]
+    fn hls_cache_options_follow_tile_config_and_user_overrides() {
+        let mut cfg = Config::default();
+        cfg.player.instant_load = false;
+        cfg.player.cache_secs = 7;
+        cfg.player.demuxer_max_mib = 192;
+        let a = hls_options(&cfg, TileId::A, false, "cache-on-disk=no");
+        let b = hls_options(&cfg, TileId::B, false, "cache-on-disk=no");
+        assert!(a.contains("cache-secs=%1%7") && a.contains("demuxer-max-bytes=%6%192MiB"));
+        assert!(b.contains("demuxer-max-bytes=%5%64MiB") && b.contains("demuxer-max-back-bytes=%4%8MiB"));
+        cfg.player.instant_load = true;
+        assert!(hls_options(&cfg, TileId::A, false, "").contains("cache-secs=%1%1"));
+        cfg.player.mpv_options.insert("cache-secs".into(), "4".into());
+        cfg.player.mpv_options.insert("demuxer-max-bytes".into(), "20MiB".into());
+        cfg.player.mpv_options.insert("demuxer-max-back-bytes".into(), "2MiB".into());
+        cfg.player.mpv_options.insert("demuxer-lavf-o".into(), "http_persistent=1".into());
+        let custom = hls_options(&cfg, TileId::B, false, "");
+        assert!(custom.contains("cache-secs=%1%4") && custom.contains("demuxer-max-bytes=%5%20MiB"));
+        assert!(custom.contains("demuxer-max-back-bytes=%4%2MiB"));
+        assert!(custom.contains("http_persistent=1,live_start_index=0"));
+    }
+
+    #[test]
     fn loadfile_args_quote_every_value() {
         let p = playable(
             HttpHeaders {
@@ -300,7 +342,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.player.hwdec = "vaapi".into();
         cfg.player.cache_secs = 7;
-        cfg.player.sub_auto = SubtitleAuto::Off;
+        assert_eq!(cfg.player.sub_auto, SubtitleAuto::Off);
         let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
         for name in [
             "hwdec",
@@ -321,10 +363,28 @@ mod tests {
         assert_eq!(s["hwdec"], "vaapi");
         assert_eq!(s["cache-secs"], "7");
         assert_eq!(s["sid"], "no");
+        assert_eq!(s["slang"], "eng,en");
+        assert_eq!(s["subs-fallback-forced"], "no");
+        assert_eq!(s["subs-fallback"], "no");
         cfg.player.instant_load = true;
         let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
         assert_eq!(s["cache-secs"], "1");
         assert_eq!(s["demuxer-readahead-secs"], "1");
+    }
+
+    #[test]
+    fn subtitle_modes_map_to_selection_options() {
+        let mut cfg = Config::default();
+        cfg.player.sub_langs = vec!["fra".into(), "eng".into()];
+        for (mode, slang, sid, forced, fallback) in [
+            (SubtitleAuto::Off, "fra,eng", "no", "no", "no"),
+            (SubtitleAuto::Forced, "", "auto", "always", "no"),
+            (SubtitleAuto::Always, "fra,eng", "auto", "no", "yes"),
+        ] {
+            cfg.player.sub_auto = mode;
+            let s: BTreeMap<_, _> = runtime_settings(&cfg, TileId::A).into_iter().collect();
+            assert_eq!((&*s["slang"], &*s["sid"], &*s["subs-fallback-forced"], &*s["subs-fallback"]), (slang, sid, forced, fallback), "{mode:?}");
+        }
     }
 
     fn headless() -> Mpv {
@@ -432,9 +492,13 @@ mod tests {
         assert_eq!(mpv.get_property::<String>("sid").unwrap(), "3", "track choice kept");
         assert!((mpv.get_property::<f64>("sub-scale").unwrap() - 1.4).abs() < 1e-3, "per-stream sub scale kept");
         // the subtitle mode itself changed: applied
-        let mut off = cfg.clone();
+        let mut always = cfg.clone();
+        always.player.sub_auto = SubtitleAuto::Always;
+        apply_runtime(&mpv, &always, &cfg, TileId::A);
+        assert_eq!(mpv.get_property::<String>("sid").unwrap(), "auto");
+        let mut off = always.clone();
         off.player.sub_auto = SubtitleAuto::Off;
-        apply_runtime(&mpv, &off, &cfg, TileId::A);
+        apply_runtime(&mpv, &off, &always, TileId::A);
         assert_eq!(mpv.get_property::<String>("sid").unwrap(), "no");
     }
 }

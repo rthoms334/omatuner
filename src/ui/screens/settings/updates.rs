@@ -101,7 +101,7 @@ pub(super) fn rows(_s: &SettingsScreen, ctx: &UiCtx<'_>, v: &mut Vec<Row>) {
 /// The passwordless switch moved (Enter, a click, Shift+←/→).
 pub(super) fn passwordless(ctx: &mut UiCtx<'_>, on: bool) {
     if on != ctx.config.updates.passwordless {
-        ctx.services.updater.set_passwordless(on);
+        ctx.services.updater.set_passwordless_from(on, ctx.config_input);
     }
 }
 

@@ -98,6 +98,18 @@ impl QueueScreen {
                 self.menu(ctx, id);
                 true
             }
+            Out::PlayList { list, entry } => {
+                crate::ui::watchlists::play(ctx, list, Some(entry), false);
+                true
+            }
+            Out::PreviewMenu(entry) => {
+                self.list.open_preview_menu(ctx, entry);
+                true
+            }
+            Out::OpenList(list) => {
+                ctx.push(Route::Watchlists { list: Some(list) });
+                true
+            }
             Out::Send(cmds) => {
                 Self::sends(ctx, cmds);
                 true
@@ -463,6 +475,12 @@ impl Screen for QueueScreen {
     }
 
     fn on_overlay_result(&mut self, ctx: &mut UiCtx<'_>, result: OverlayResult) {
+        if let OverlayResult::Chosen(action) = &result
+            && let Some(out) = self.list.preview_choice(ctx, *action)
+        {
+            self.out(ctx, out);
+            return;
+        }
         match result {
             OverlayResult::Chosen(Action::Digit(d)) if (COPY..code::PLAY).contains(&d) => {
                 if let (Some(id), Some(copy)) = (self.menu_row, self.copies.get(usize::from(d - COPY)).cloned()) {
@@ -494,14 +512,15 @@ impl Screen for QueueScreen {
         self.list.sync(s.clone(), mode, crate::queue::ui::sleep_mark(ctx));
         let h24 = ctx.config.interface.clock_24h;
         let summary = crate::queue::ui::summary(&s, ctx.now, h24);
-        section::page_header(ui, ctx, "Up next", |ui| {
+        let title = s.watchlist.as_ref().map_or_else(|| "Up next".to_owned(), |w| format!("Up next · {}", w.name));
+        section::page_header(ui, ctx, &title, |ui| {
             if let Some(text) = &summary {
                 ui.label(egui::RichText::new(text).size(theme.font(TypeToken::Body)).color(theme.tokens.text_secondary));
             }
         });
         ui.add_space(theme.space(SpaceToken::Md));
         self.banner(ui, ctx, &s);
-        if s.rows.is_empty() {
+        if s.rows.is_empty() && s.watchlist.is_none() {
             empty_state::empty_state(
                 ui,
                 theme,
@@ -622,6 +641,110 @@ pub(crate) mod tests {
     }
 
     type H = egui_kittest::Harness<'static, crate::ui::screens::home::testkit::App<QueueScreen>>;
+
+    pub(crate) fn seed_watchlist(
+        t: &mut crate::ui::testing::TestUi,
+        name: &'static str,
+        order: crate::watchlist::PlayOrder,
+        count: usize,
+    ) -> (crate::model::WatchlistId, Vec<crate::model::WatchlistItemId>) {
+        use crate::ui::screens::home::testkit::{movies, seed, source};
+        seed(t, move |c| {
+            let src = source(c, "TV")?;
+            movies(c, src, count)?;
+            let lib = crate::store::library::load(c)?;
+            let list = crate::store::watchlist::create(c, name, None, order, "app", 1)?;
+            let entries = (0..count)
+                .map(|n| {
+                    crate::store::watchlist::new_entry(
+                        c,
+                        &ItemRef { source: src, kind: ItemKind::Movie, key: crate::model::ItemKey(format!("m3u:movie{n:010}")) },
+                    )
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let added = crate::store::watchlist::add(c, &lib, list, &entries, crate::watchlist::Insert::End, 1)?;
+            if let Some(first) = added.added.first() {
+                crate::store::watchlist::make_next(c, list, *first)?;
+            }
+            Ok((list, added.added))
+        })
+    }
+
+    #[test]
+    fn watchlist_previews_on_the_screen_play_skip_open_and_stop() {
+        use crate::ui::screens::home::testkit::until;
+        let (mut t, one) = rig();
+        let (list, entries) = seed_watchlist(&mut t, "Star Wars", crate::watchlist::PlayOrder::Ordered, 3);
+        start_engine(&t);
+        let mut h = harness(t, one, QueueScreen::default(), egui::vec2(1200.0, 800.0));
+        h.state_mut().enter(Route::Queue);
+        h.state_mut().t.with_ctx(|ctx| crate::queue::ui::send(ctx, QueueCommand::PlayList { list, from: None, just_one: false }));
+        until(&mut h, "watchlist previews", |h| has_label(h, "Then from Star Wars · 1 of 3") && has_label(h, "Movie 2"));
+        assert!(has_label(&h, "Movie 0 (1980)") && has_label(&h, "Movie 1"));
+        assert!(painted(&h).iter().any(|t| t == "Up next · Star Wars"));
+        h.state_mut().act(Action::Home);
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let Some(crate::ui::NavRequest::Open(OverlayRequest::ContextMenu(menu))) = nav.last() else { panic!("{nav:?}") };
+        assert_eq!(menu.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["Play from here", "Skip in this list", "Open the list"]);
+        h.state_mut().result(OverlayResult::Chosen(menu.items[1].action));
+        h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
+        assert!(crate::store::watchlist::entries(&h.state().t.db, list).unwrap()[1].skipped);
+        // Deliver the app's refresh after the watchlist write.
+        h.state_mut().t.with_ctx(|ctx| crate::queue::ui::send(ctx, QueueCommand::RefreshLists));
+        until(&mut h, "skipped preview gone", |h| !has_label(h, "Movie 1"));
+        h.state_mut().act(Action::Home);
+        h.state_mut().act(Action::Down);
+        h.state_mut().act(Action::ContextMenu);
+        let nav = h.state_mut().nav();
+        let Some(crate::ui::NavRequest::Open(OverlayRequest::ContextMenu(menu))) = nav.last() else { panic!("{nav:?}") };
+        h.state_mut().result(OverlayResult::Chosen(menu.items[2].action));
+        assert!(h.state_mut().nav().iter().any(|n| matches!(n, crate::ui::NavRequest::Push(Route::Watchlists { list: Some(id) }) if *id == list)));
+        h.get_by_label("Movie 2").click();
+        until(&mut h, "clicked preview plays", |h| {
+            let s = h.state().t.services().agent.queue();
+            s.current.and_then(|id| s.row(id)).is_some_and(|r| r.entry.watchlist_item_id == Some(entries[2]))
+        });
+        h.run_steps(2);
+        h.get_by_label("Stop the list").click();
+        until(&mut h, "list stopped", |h| h.state().t.services().agent.queue().context.is_none());
+    }
+
+    #[test]
+    fn watchlist_context_without_queue_rows_still_shows_on_the_screen() {
+        let (mut t, one) = rig();
+        let (list, entries) = seed_watchlist(&mut t, "Christmas films", crate::watchlist::PlayOrder::Any, 6);
+        publish(&t, &[], |s| {
+            s.context = Some(list);
+            s.watchlist = Some(crate::queue::ListContext {
+                id: list,
+                name: "Christmas films".into(),
+                any_order: true,
+                position: 1,
+                total: 6,
+                playing_through: false,
+                then: entries[1..4]
+                    .iter()
+                    .enumerate()
+                    .map(|(n, id)| crate::queue::ListPreview {
+                        id: *id,
+                        kind: ItemKind::Movie,
+                        title: format!("Movie {}", n + 1),
+                        series: None,
+                        season: None,
+                        episode: None,
+                        locked: n == 0,
+                    })
+                    .collect(),
+            });
+        });
+        let mut h = harness(t, one, QueueScreen::default(), egui::vec2(800.0, 700.0));
+        h.state_mut().enter(Route::Queue);
+        crate::ui::screens::home::testkit::until(&mut h, "context-only previews", |h| has_label(h, "Another from Christmas films · 1 of 6"));
+        assert!(has_label(&h, "󰌾 Movie 1") && has_label(&h, "and 2 more") && has_label(&h, "Stop the list"));
+        assert!(!has_label(&h, "Up next is empty"));
+    }
 
     /// The stored order, by movie number.
     fn order(h: &H) -> Vec<String> {

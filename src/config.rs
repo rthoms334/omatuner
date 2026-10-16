@@ -3,12 +3,14 @@
 //! Contract:
 //! * Every field has a serde default, so a partial (or empty) file is valid and new fields can be
 //!   added without migrations. Unknown keys are ignored (forward compatible).
-//! * [`Config::save`] writes atomically (tmp file + rename) and is called from the UI thread only
-//!   when the Settings screen commits a change; it is cheap (< 1 ms).
+//! * [`Config::save`] writes atomically (tmp file + rename) for Settings edits and exit flushes;
+//!   it is cheap (< 1 ms). Lip-sync repeats defer the write until the keys are quiet.
 //! * Per-source and per-channel settings live in the database, NOT here (see `model::source`).
 //! * Credentials are NEVER stored here.
 //!
 //! Ownership: struct shape frozen by the skeleton; the Settings screen (WP-12) renders it.
+
+pub mod audit;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -253,9 +255,9 @@ impl Default for InterfaceConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum SubtitleAuto {
     /// Never auto-select subtitles.
-    Off,
-    /// Only forced tracks in the preferred language.
     #[default]
+    Off,
+    /// Only forced tracks; mpv chooses among them without `sub_langs`.
     Forced,
     /// Always select the first subtitle in a preferred language.
     Always,
@@ -283,10 +285,12 @@ pub struct PlayerConfig {
     pub muted: bool,
     /// ISO-639 codes in preference order (`alang`).
     pub audio_langs: Vec<String>,
-    /// ISO-639 codes in preference order (`slang`).
+    /// ISO-639 codes in preference order (`slang`; ignored for forced-only selection).
     pub sub_langs: Vec<String>,
     pub sub_auto: SubtitleAuto,
     pub sub_scale: f64,
+    /// Per audio output, in milliseconds (negative = sound earlier; DESIGN §13.8.1).
+    pub lip_sync: BTreeMap<String, LipSync>,
     /// Reconnect attempts before giving up on a live channel that has not played yet (one that
     /// played keeps reconnecting until stopped, DESIGN §11.4).
     pub reconnect_max_attempts: u32,
@@ -309,6 +313,28 @@ pub struct PlayerConfig {
     pub popout_last: Option<[i32; 4]>,
     /// Multi-view (`[player.multiview]`, DESIGN §35).
     pub multiview: MultiViewConfig,
+}
+
+/// One remembered audio output (`[player.lip_sync]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LipSync {
+    pub offset_ms: i32,
+    pub label: String,
+}
+
+impl LipSync {
+    pub const STEP_MS: i32 = 50;
+    pub const LIMIT_MS: i32 = 2000;
+
+    pub fn offset_ms(&self) -> i32 {
+        self.offset_ms.clamp(-Self::LIMIT_MS, Self::LIMIT_MS)
+    }
+
+    /// Relative to the saved value, so several key presses in one frame all count.
+    pub fn adjust(&mut self, steps: i32) {
+        self.offset_ms = self.offset_ms().saturating_add(steps.saturating_mul(Self::STEP_MS)).clamp(-Self::LIMIT_MS, Self::LIMIT_MS);
+    }
 }
 
 /// `[player.multiview]` (DESIGN §35).
@@ -385,8 +411,9 @@ impl Default for PlayerConfig {
             muted: false,
             audio_langs: vec!["eng".into(), "en".into()],
             sub_langs: vec!["eng".into(), "en".into()],
-            sub_auto: SubtitleAuto::Forced,
+            sub_auto: SubtitleAuto::Off,
             sub_scale: 1.0,
+            lip_sync: BTreeMap::new(),
             reconnect_max_attempts: 8,
             user_agent: "VLC/3.0.21 LibVLC/3.0.21".into(),
             resume_min_s: 60,
@@ -734,8 +761,8 @@ impl Config {
 
     /// The settings of a restored backup (`raw` = its `config.toml`) for this machine: the
     /// backup's preferences, except what belongs to this machine and stays `local` — fonts,
-    /// hardware decoding, raw mpv options, UI scale, debug logging, the last screen, the agents
-    /// and casting sections. The
+    /// hardware decoding, raw mpv options, lip-sync offsets, UI scale, debug logging, the last
+    /// screen, the agents and casting sections. The
     /// parental settings (PIN) come from the backup only while no PIN is set here: a restore
     /// must not remove or replace an existing PIN.
     pub fn restored(raw: &str, local: &Config) -> Result<Config> {
@@ -743,6 +770,7 @@ impl Config {
         c.fonts = local.fonts.clone();
         c.player.hwdec.clone_from(&local.player.hwdec);
         c.player.mpv_options.clone_from(&local.player.mpv_options);
+        c.player.lip_sync.clone_from(&local.player.lip_sync);
         c.interface.ui_scale = local.interface.ui_scale;
         c.interface.last_screen.clone_from(&local.interface.last_screen);
         c.general.debug_log = local.general.debug_log;
@@ -839,6 +867,20 @@ mod tests {
         assert_eq!(c, Config::default());
     }
 
+    #[test]
+    fn subtitles_default_off_and_preserve_explicit_modes() {
+        assert_eq!(SubtitleAuto::default(), SubtitleAuto::Off);
+        assert_eq!(Config::default().player.sub_auto, SubtitleAuto::Off);
+        let old: Config = toml::from_str("[player]\nsub_langs = [\"fra\"]\n").unwrap();
+        assert_eq!(old.player.sub_auto, SubtitleAuto::Off);
+        for (value, mode) in [("off", SubtitleAuto::Off), ("forced", SubtitleAuto::Forced), ("always", SubtitleAuto::Always)] {
+            let cfg: Config = toml::from_str(&format!("[player]\nsub_auto = \"{value}\"\n")).unwrap();
+            assert_eq!(cfg.player.sub_auto, mode);
+            let saved = toml::to_string_pretty(&cfg).unwrap();
+            assert_eq!(toml::from_str::<Config>(&saved).unwrap().player.sub_auto, mode);
+        }
+    }
+
     /// Agents play in the pop-out unless the user chose the full window; a config from before
     /// the setting (0.2.4) loads with the pop-out.
     #[test]
@@ -867,6 +909,26 @@ mod tests {
         let s = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn lip_sync_roundtrip_keeps_outputs_and_defaults_old_configs() {
+        let raw = r#"
+            [player.lip_sync."audio_effect.j413-convolver"]
+            offset_ms = -150
+            label = "MacBook Air Speakers"
+            [player.lip_sync."pulse/alsa_output.headphones"]
+            offset_ms = 50
+            label = "Headphones"
+        "#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let speakers = &cfg.player.lip_sync["audio_effect.j413-convolver"];
+        assert_eq!((speakers.offset_ms, speakers.label.as_str()), (-150, "MacBook Air Speakers"));
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        let old: Config = toml::from_str("[player]\nvolume = 80.0").unwrap();
+        assert!(old.player.lip_sync.is_empty());
+        assert_eq!(Config::restored(raw, &old).unwrap().player.lip_sync, old.player.lip_sync, "outputs belong to this machine");
     }
 
     /// Audit fix: restoring a backup ignored its settings. They come back except what belongs

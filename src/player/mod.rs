@@ -38,9 +38,11 @@
 //! a picture that isn't placed or rendered suspends on its own. B starts muted
 //! ([`PlayerCommand::SetAudible`]) with smaller demuxer caches (`mpv::create`).
 
+pub mod audio_output;
 pub mod budget;
 pub mod controller;
 pub mod events;
+pub mod hls;
 pub mod mpv;
 pub mod mpv_log;
 pub mod reconnect;
@@ -48,6 +50,7 @@ pub mod remote;
 pub mod render;
 pub mod state;
 pub mod tiles;
+mod timeshift;
 pub mod tracks;
 
 use std::ptr::NonNull;
@@ -125,7 +128,7 @@ pub enum PlayerCommand {
     Stop,
     TogglePause,
     SetPause(bool),
-    /// Relative seek in seconds (negative = back). Ignored for non-seekable live.
+    /// Relative seek in seconds (negative = back). Unavailable seeks emit `SeekUnavailable`.
     SeekBy(f64),
     /// Absolute position in seconds.
     SeekTo(f64),
@@ -152,7 +155,7 @@ pub enum PlayerCommand {
     LastChannel {
         unlocked: bool,
     },
-    /// From catch-up back to the live stream of the same channel.
+    /// Return to the local live edge, or from catch-up to the live channel.
     JumpToLive,
     SetVolume(f64),
     AdjustVolume(f64),
@@ -316,6 +319,28 @@ impl PlayerState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveBufferRange {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl LiveBufferRange {
+    /// Allow decoder jitter around the live point (HLS: newest segment start).
+    pub fn behind(self, position: f64) -> bool {
+        self.end - position > 3.0
+    }
+
+    pub fn label(self, position: f64) -> String {
+        if !self.behind(position) {
+            "Live".into()
+        } else {
+            let seconds = (self.end - position).round().max(0.0) as u64;
+            format!("−{:02}:{:02}", seconds / 60, seconds % 60)
+        }
+    }
+}
+
 /// Everything the UI/MPRIS need, published through a `watch` channel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerSnapshot {
@@ -333,8 +358,13 @@ pub struct PlayerSnapshot {
     pub volume: f64,
     pub muted: bool,
     pub seekable: bool,
+    /// Local live cache's usable range. Never a provider's catch-up window.
+    pub live_buffer: Option<LiveBufferRange>,
     pub tracks: Tracks,
     pub sub_delay: f64,
+    /// The local audio output and its saved correction (negative = sound earlier).
+    pub audio_output: audio_output::AudioOutput,
+    pub lip_sync_ms: i32,
     pub sub_scale: f64,
     pub aspect: AspectMode,
     pub zoom: f64,
@@ -388,8 +418,11 @@ impl Default for PlayerSnapshot {
             volume: 100.0,
             muted: false,
             seekable: false,
+            live_buffer: None,
             tracks: Tracks::default(),
             sub_delay: 0.0,
+            audio_output: audio_output::AudioOutput::default(),
+            lip_sync_ms: 0,
             sub_scale: 1.0,
             aspect: AspectMode::Auto,
             zoom: 0.0,
@@ -424,6 +457,12 @@ pub enum PlayerEvent {
     },
     Failed(PlayerError),
     TracksChanged,
+    /// The local output was identified or changed; only a change from a previous output flashes.
+    AudioOutputChanged {
+        previous: Option<audio_output::AudioOutput>,
+        output: audio_output::AudioOutput,
+        offset_ms: i32,
+    },
     /// The first copy of a title failed before its first frame (`error`) and the player went
     /// on with the next one ([`CopyPlay::fallback`]): the app toasts "TV couldn't play Dune —
     /// playing from TV 2".
@@ -444,6 +483,17 @@ pub enum PlayerEvent {
     /// Casting: a catch-up seek past what the relay has loaded stopped at its edge (DESIGN §40
     /// §8.5); the app says "Catch-up can only seek as far as it has loaded".
     SeekClamped,
+    /// The output cannot seek, or rejected the seek command: flash a skip-unavailable notice.
+    SeekUnavailable,
+    /// Successful local seek, with the actual clamped target for the OSD ripple.
+    Skipped {
+        seconds: f64,
+        target: f64,
+        live_edge: Option<f64>,
+    },
+    LiveSeekBoundary {
+        oldest: bool,
+    },
     /// Casting ended without the user asking in Tuner (DESIGN §40 §3.4, §3.8): `kind` is
     /// `StoppedOnTv` (the TV's remote stopped it, or another device took over). The output is
     /// local again and nothing plays; no error state. The app alerts where the user is (the
@@ -511,6 +561,8 @@ impl PlayerStore for NullPlayerStore {
 
 /// Dependencies injected into the controller.
 pub struct PlayerDeps {
+    /// Profile cache directory; None uses the environment (standalone players).
+    pub cache_dir: Option<std::path::PathBuf>,
     pub bus: EventBus,
     pub store: Box<dyn PlayerStore>,
     pub resolver: Box<dyn MediaResolver>,
@@ -589,6 +641,16 @@ impl Player {
     /// heard before the app gives it the sound) with smaller caches. mpv init takes 30–80 ms:
     /// call it off the UI thread for a picture started while the app runs.
     pub fn start_tile(cfg: &Config, deps: PlayerDeps, tile: TileId, budget: budget::SharedBudget) -> Result<Self> {
+        Self::start_tile_with_window(cfg, deps, tile, budget, hls::WINDOW)
+    }
+
+    /// Scale the recorder window for real decoder integration tests without a global env var.
+    #[doc(hidden)]
+    pub fn start_with_hls_window_for_tests(cfg: &Config, deps: PlayerDeps, window: f64) -> Result<Self> {
+        Self::start_tile_with_window(cfg, deps, TileId::A, budget::SharedBudget::default(), window)
+    }
+
+    fn start_tile_with_window(cfg: &Config, deps: PlayerDeps, tile: TileId, budget: budget::SharedBudget, hls_window: f64) -> Result<Self> {
         let audible = tile == TileId::A;
         let mpv = Arc::new(mpv::create(cfg, tile)?);
         if tile == TileId::A {
@@ -611,7 +673,7 @@ impl Player {
         let pump = events::EventPump::start(mpv.clone(), evt_tx, pump_name).map_err(crate::error::Error::other)?;
         let render_clock: RenderClock = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
-        let setup = controller::TileSetup { tile, budget: budget.clone(), audible };
+        let setup = controller::TileSetup { tile, budget: budget.clone(), audible, hls_window };
         let controller = controller::spawn(mpv.clone(), cfg, deps, cmd_rx, evt_rx, snap_tx, render_clock.clone(), epoch, setup)
             .map_err(crate::error::Error::other)?;
         Ok(Self {
@@ -639,6 +701,13 @@ impl Player {
     /// The connection budget it shares.
     pub fn budget(&self) -> &budget::SharedBudget {
         &self.budget
+    }
+
+    /// Headless integration tests: stamp a rendered frame without creating a GL surface.
+    /// Leaving this clock alone afterwards exercises the real hidden-window watchdog.
+    #[doc(hidden)]
+    pub fn mark_rendered_for_tests(&self) {
+        self.render_clock.store(self.epoch.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
     }
 
     /// Raw core for `VideoSurface::new` ONLY (see module docs: no other mpv access from the UI).
@@ -692,7 +761,7 @@ mod tests {
         fn resolve(&mut self, media: &MediaRef, _resume: bool) -> std::result::Result<Playable, PlayerError> {
             Ok(Playable {
                 media: media.clone(),
-                kind: PlayableKind::Live,
+                kind: if matches!(media, MediaRef::Movie(_)) { PlayableKind::Movie } else { PlayableKind::Live },
                 item: None,
                 source_id: None,
                 title: "lavfi".into(),
@@ -728,7 +797,8 @@ mod tests {
     }
 
     fn start_with(cfg: &Config, resolver: Lavfi) -> Player {
-        let deps = PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(resolver), cast: None };
+        let deps =
+            PlayerDeps { cache_dir: None, bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(resolver), cast: None };
         Player::start(cfg, deps).expect("headless mpv")
     }
 
@@ -771,14 +841,93 @@ mod tests {
         assert_eq!(mpv.get_property::<String>("user-agent").unwrap(), "ApplyConfig/1");
     }
 
+    /// Real mpv properties, headless output: every local picture uses the saved offset on
+    /// load, follows device changes, and never carries speakers' correction onto a new output.
+    #[test]
+    fn lip_sync_applies_on_play_and_follows_the_output_in_each_picture() {
+        use crate::config::LipSync;
+        let mut cfg = headless_config();
+        cfg.player.mpv_options.insert("audio-device".into(), "null/speakers".into());
+        cfg.player.lip_sync.insert("null/speakers".into(), LipSync { offset_ms: -150, label: "Speakers".into() });
+        cfg.player.lip_sync.insert("null/headphones".into(), LipSync { offset_ms: 100, label: "Headphones".into() });
+        let budget = budget::SharedBudget::default();
+        let players: Vec<_> = [TileId::A, TileId::B]
+            .into_iter()
+            .map(|tile| {
+                let deps = PlayerDeps {
+                    cache_dir: None,
+                    bus: EventBus::new(None).0,
+                    store: Box::new(NullPlayerStore),
+                    resolver: Box::new(Lavfi(Vec::new(), Vec::new())),
+                    cast: None,
+                };
+                Player::start_tile(&cfg, deps, tile, budget.clone()).unwrap()
+            })
+            .collect();
+        for p in &players {
+            let mpv = p.mpv.as_ref().unwrap();
+            // mpv stores this option as a float; compare at the millisecond precision we save.
+            let delay_ms = || (mpv.get_property::<f64>("audio-delay").unwrap() * 1000.0).round() as i32;
+            let h = p.handle();
+            play(p);
+            assert!(wait_until(Duration::from_secs(5), || h.snapshot().state == PlayerState::Playing && h.snapshot().lip_sync_ms == -150));
+            assert_eq!(delay_ms(), -150);
+            for (name, ms) in [("null/headphones", 100), ("null/hdmi", 0), ("null/speakers", -150)] {
+                // Output triggers within 1.5 s of a lookup are deliberately ignored.
+                std::thread::sleep(Duration::from_millis(1600));
+                mpv.set_property("audio-device", name).unwrap();
+                assert!(
+                    wait_until(Duration::from_secs(5), || {
+                        let s = h.snapshot();
+                        s.audio_output.name == name && s.lip_sync_ms == ms
+                    }),
+                    "output {name}"
+                );
+                assert_eq!(delay_ms(), ms);
+            }
+            // A fresh load restores the saved correction, even if mpv's value was changed.
+            mpv.set_property("audio-delay", 1.0).unwrap();
+            let generation = h.snapshot().load_generation;
+            play(p);
+            assert!(wait_until(Duration::from_secs(5), || h.snapshot().load_generation > generation && h.snapshot().state == PlayerState::Playing));
+            assert_eq!(delay_ms(), -150);
+        }
+        // Settings applies live to each picture; repeated presses add up and clamp.
+        let saved = cfg.player.lip_sync.get_mut("null/speakers").unwrap();
+        saved.adjust(-1);
+        saved.adjust(-1);
+        assert_eq!(saved.offset_ms, -250);
+        saved.adjust(i32::MIN);
+        assert_eq!(saved.offset_ms, -2000);
+        saved.adjust(i32::MAX);
+        assert_eq!(saved.offset_ms, 2000);
+        for p in &players {
+            p.handle().send(PlayerCommand::ApplyConfig(Box::new(cfg.clone())));
+            assert!(wait_until(Duration::from_secs(5), || p.handle().snapshot().lip_sync_ms == 2000));
+            assert_eq!(p.mpv.as_ref().unwrap().get_property::<f64>("audio-delay").unwrap(), 2.0);
+        }
+    }
+
     /// Also per picture (multi-view): picture B, still rendered, keeps decoding while A — not
     /// placed or not rendered — is suspended.
     #[test]
     fn video_is_suspended_while_nothing_renders_and_resumed_on_request() {
+        // VOD and live at the edge share this power-saving path. Paused/rewound live
+        // pictures are covered by the controller and real-HLS tests.
+        let play = |p: &Player| {
+            p.handle().send(PlayerCommand::Play(PlayRequest {
+                media: MediaRef::Movie(crate::model::MovieId(1)),
+                zap: None,
+                origin: PlayOrigin::Cli,
+                resume: false,
+                immediate: true,
+            }))
+        };
         let p = start();
         let mpv = p.mpv.clone().expect("mpv");
         let h = p.handle();
         let deps = PlayerDeps {
+            cache_dir: None,
             bus: EventBus::new(None).0,
             store: Box::new(NullPlayerStore),
             resolver: Box::new(Lavfi(Vec::new(), Vec::new())),
@@ -891,7 +1040,8 @@ mod tests {
     /// `events`).
     fn two_pictures() -> (Tiles, crossbeam_channel::Receiver<crate::msg::AppEvent>) {
         let (bus, events) = EventBus::new(None);
-        let deps = |bus: EventBus| PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(TwoPlaylists), cast: None };
+        let deps =
+            |bus: EventBus| PlayerDeps { cache_dir: None, bus, store: Box::new(NullPlayerStore), resolver: Box::new(TwoPlaylists), cast: None };
         let a = Player::start(&headless_config(), deps(EventBus::new(None).0)).expect("picture A");
         a.budget().set_limit(SourceId(1), Some(1));
         a.budget().set_limit(SourceId(2), Some(1));
@@ -1147,7 +1297,7 @@ mod tests {
     fn a_copy_that_fails_before_its_first_frame_falls_back_to_the_next_once() {
         use crate::model::{MovieId, SourceId};
         let (bus, events) = EventBus::new(None);
-        let deps = PlayerDeps { bus, store: Box::new(NullPlayerStore), resolver: Box::new(Copies), cast: None };
+        let deps = PlayerDeps { cache_dir: None, bus, store: Box::new(NullPlayerStore), resolver: Box::new(Copies), cast: None };
         let p = Player::start(&headless_config(), deps).expect("headless mpv");
         let h = p.handle();
         let copy = |media: i64, fallback: Option<i64>, start_at: Option<f64>| {
@@ -1269,7 +1419,13 @@ mod tests {
         cfg.player.hwdec = "no".into();
         cfg.player.mpv_options.insert("loop-file".into(), "inf".into());
         let path = media.to_string_lossy().into_owned();
-        let deps = || PlayerDeps { bus: EventBus::new(None).0, store: Box::new(NullPlayerStore), resolver: Box::new(File(path.clone())), cast: None };
+        let deps = || PlayerDeps {
+            cache_dir: None,
+            bus: EventBus::new(None).0,
+            store: Box::new(NullPlayerStore),
+            resolver: Box::new(File(path.clone())),
+            cast: None,
+        };
         let cpu_s = || {
             let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
             let f: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split_whitespace().collect();

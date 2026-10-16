@@ -5,12 +5,70 @@ use crate::model::cast::{CastFeed, FeedPicture, FeedSound, FeedSurround, Positio
 use crate::model::{CastLevel, CastView};
 use crate::player::tracks::StreamInfo;
 
+pub(super) fn live_label(snap: &PlayerSnapshot) -> String {
+    snap.live_buffer.map_or_else(|| "Live".into(), |r| r.label(snap.position.unwrap_or(r.end)))
+}
+
+pub(super) struct SkipFeedback {
+    seconds: f64,
+    target: f64,
+    presses: u32,
+    live_edge: Option<f64>,
+    pub(super) at: Instant,
+}
+
+impl PlayerScreen {
+    pub(super) fn show_skip(&mut self, seconds: f64, target: f64, live_edge: Option<f64>) {
+        if seconds == 0.0 {
+            return;
+        }
+        let previous = self.skip_feedback.as_ref().filter(|f| f.at.elapsed() < Duration::from_secs(1) && f.seconds.signum() == seconds.signum());
+        let total = previous.map_or(seconds, |f| f.seconds + seconds);
+        let presses = previous.map_or(1, |f| f.presses.saturating_add(1));
+        self.skip_feedback = Some(SkipFeedback { seconds: total, target, presses, live_edge, at: Instant::now() });
+    }
+
+    pub(super) fn draw_skip_feedback(&mut self, ui: &egui::Ui, ctx: &UiCtx<'_>, rect: Rect) {
+        let Some(f) = &self.skip_feedback else { return };
+        let elapsed = f.at.elapsed().as_secs_f32();
+        if elapsed >= 1.0 {
+            self.skip_feedback = None;
+            return;
+        }
+        let t = &ctx.theme.tokens;
+        let centre = egui::pos2(rect.left() + rect.width() * if f.seconds < 0.0 { 0.25 } else { 0.75 }, rect.center().y);
+        // egui's animation setting also lets reduced-motion users suppress the expansion.
+        let motion = ui.style().animation_time > 0.0;
+        let radius = (48.0 * scale_of(ui)).min(rect.height() * 0.15);
+        let p = ui.painter_at(rect);
+        p.circle_filled(centre, radius, t.osd_scrim);
+        p.circle_stroke(
+            centre,
+            radius * (1.0 + if motion { elapsed * 0.3 } else { 0.0 }),
+            egui::Stroke::new(2.0, with_alpha(t.osd_text, if motion { 1.0 - elapsed } else { 1.0 })),
+        );
+        let text = if f.seconds < 0.0 {
+            format!("⟲ {:.0}", f.seconds.abs())
+        } else if f.presses > 1 {
+            format!("⟳ {:.0}", f.seconds)
+        } else {
+            format!("{:.0} ⟳", f.seconds)
+        };
+        let target = f.live_edge.map_or_else(|| clock(f.target), |end| crate::player::LiveBufferRange { start: 0.0, end }.label(f.target));
+        p.text(centre - egui::vec2(0.0, radius * 0.2), Align2::CENTER_CENTER, text, FontId::proportional(radius * 0.55), t.osd_text);
+        p.text(centre + egui::vec2(0.0, radius * 0.4), Align2::CENTER_CENTER, target, FontId::proportional(radius * 0.3), t.osd_text);
+        // Paint only: the feedback never captures a click or changes focus.
+        ui.ctx().request_repaint_after(Duration::from_millis(if motion { 16 } else { 1000 }));
+    }
+}
+
 /// A transient message at the top of the video (track / delay / volume changes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Flash {
     Audio,
     Subtitles,
     SubDelay,
+    LipSync,
     SubSize,
     Volume,
     Aspect,
@@ -32,6 +90,7 @@ pub(super) fn flash_text(f: Flash, snap: &PlayerSnapshot, zoom: &usize) -> Strin
         Flash::Audio => format!("{} {}", glyphs::AUDIO_TRACK, snap.tracks.selected_audio().map_or_else(|| "No audio track".into(), |a| a.label())),
         Flash::Subtitles => format!("{} {}", glyphs::SUBTITLES, snap.tracks.selected_sub().map_or_else(|| "Subtitles off".into(), |a| a.label())),
         Flash::SubDelay => format!("Subtitle delay {:+.1} s", snap.sub_delay),
+        Flash::LipSync => crate::player::audio_output::adjustment_text(&snap.audio_output, snap.lip_sync_ms),
         Flash::SubSize => format!("Subtitle size {:.0} %", snap.sub_scale * 100.0),
         Flash::Volume => {
             if snap.muted {
@@ -76,22 +135,28 @@ impl PlayerScreen {
 
     /// The stream info panel (`I`, the OSD's Info, the menu's Stream info): mpv's view of what
     /// plays, or while casting what the TV is fed ([`cast_lines`]). Drawn over the casting card.
-    pub(super) fn draw_info(&self, ui: &egui::Ui, ctx: &UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
+    pub(super) fn draw_info(&self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let s = scale_of(ui);
         let pad = (theme.space(SpaceToken::PopupPadding) * s).round();
         let font = FontId::monospace((theme.font(TypeToken::Body) * s).round());
-        let lines = match (&snap.cast, &snap.stream_info) {
+        let mut lines = match (&snap.cast, &snap.stream_info) {
             (Some(view), _) => cast_lines(ctx, snap, view),
             (None, Some(i)) => local_lines(ctx, snap, i),
             (None, None) => vec!["Reading stream info…".into()],
         };
+        if snap.cast.is_none() {
+            lines.push(format!("Audio delay: {}", crate::player::audio_output::offset_text(snap.lip_sync_ms)));
+            lines.push(format!("Output   {}", snap.audio_output.label));
+        }
         let p = ui.painter_at(rect);
         let lh = font.size * 1.4;
         // the TV's path needs the longer lines
         let w = (if snap.cast.is_some() { 560.0 } else { 420.0 } * s).min(rect.width() - 2.0 * pad);
-        let area = Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad));
+        let button_h = lh + pad;
+        let area =
+            Rect::from_min_size(egui::pos2(rect.left() + pad, rect.top() + pad * 6.0), egui::vec2(w, lh * lines.len() as f32 + 2.0 * pad + button_h));
         p.rect_filled(area, t.rounding, t.osd_scrim);
         for (i, l) in lines.iter().enumerate() {
             osd_text(
@@ -103,6 +168,25 @@ impl PlayerScreen {
                 t.osd_text,
                 w - 2.0 * pad,
             );
+        }
+        let copy_rect =
+            Rect::from_min_max(egui::pos2(area.left() + pad, area.bottom() - pad - button_h), egui::pos2(area.right() - pad, area.bottom() - pad));
+        if super::osd::osd_button(
+            ui,
+            &p,
+            theme,
+            copy_rect,
+            ui.id().with("copy-stream-info"),
+            &format!("{}  Copy stream info", crate::ui::widgets::glyphs::COPY),
+            font,
+            "Copy stream info",
+            None,
+            false,
+        )
+        .clicked()
+        {
+            ui.ctx().copy_text(lines.join("\n"));
+            ctx.toast(Toast::info("Copied stream info"));
         }
     }
 }
@@ -282,6 +366,44 @@ mod tests {
     use crate::model::{CastPhase, ChannelId, DeviceId, Playable, ReceiverKind};
     use crate::redact::Secret;
     use crate::ui::screens::home::testkit::{harness, painted, rig};
+
+    #[test]
+    fn stream_info_copy_text_copies_the_displayed_diagnostics() {
+        use crate::ui::testing::clicks;
+        let (mut t, one) = rig();
+        t.snapshot = Arc::new(PlayerSnapshot {
+            state: crate::player::PlayerState::Playing,
+            stream_info: Some(StreamInfo { video_codec: Some("h264".into()), ..Default::default() }),
+            ..Default::default()
+        });
+        let mut h = harness(t, one, PlayerScreen { info: true, ..Default::default() }, egui::vec2(1600.0, 900.0));
+        clicks::click_text(&mut h, &format!("{}  Copy stream info", crate::ui::widgets::glyphs::COPY));
+        let copied = clicks::copied_text(&h).expect("clipboard command");
+        assert!(copied.starts_with("Video    h264 · "), "{copied}");
+        assert!(copied.contains("\nDecoder  software\n"), "{copied}");
+        assert_eq!(h.state().t.toasts.last().map(|t| t.text.as_str()), Some("Copied stream info"));
+        assert!(h.state().s.info);
+    }
+
+    #[test]
+    fn double_click_over_stream_info_toggles_fullscreen() {
+        use crate::ui::testing::clicks;
+        let (mut t, one) = rig();
+        t.snapshot = Arc::new(PlayerSnapshot {
+            state: crate::player::PlayerState::Playing,
+            stream_info: Some(StreamInfo { video_codec: Some("h264".into()), ..Default::default() }),
+            ..Default::default()
+        });
+        let mut h = harness(t, one, PlayerScreen { info: true, ..Default::default() }, egui::vec2(1600.0, 900.0));
+        let over_info = clicks::text_rect(&h, "Video    h264 · – · –").center();
+        clicks::click_at(&mut h, over_info);
+        clicks::click_at(&mut h, over_info);
+        assert!(
+            h.output().viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(true))),
+            "the video receives the double-click through Stream info"
+        );
+        assert!(h.state().s.info);
+    }
 
     /// Field report: "Info had no effect while casting". The panel shows over the casting card:
     /// the TV and what it is, "Starting on …" until the relay's first report, then what the TV

@@ -3,6 +3,8 @@
 # usage: scripts/gen-test-media.sh [outdir] [--live]   (default outdir: target/test-media)
 # Requires ffmpeg (libx264 + the native aac encoder). Produces:
 #   testsrc.mp4      10 s 640x360 25 fps H.264 + 1 kHz sine AAC (VOD, seek tests)
+#   subtitles_none.mkv, subtitles_forced.mkv, subtitles_default.mkv
+#                    2 s 160x90 H.264 + English AAC + one English subrip track, flagged as named
 #   bars.ts          10 s 1280x720 30 fps SMPTE bars MPEG-TS (colour checks: 75% green ≈ 191)
 #   hls/index.m3u8   6 x 2 s segments, VOD-type HLS (segment-404 fault injection)
 #   long/index.m3u8  60 x 1 s segments, 320x180, VOD-type HLS. Played as VOD for progress tests;
@@ -42,6 +44,27 @@ x264=(-c:v libx264 -preset veryfast -pix_fmt yuv420p)
 
 ff -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=1000:sample_rate=48000 \
    -t 10 "${x264[@]}" -g 50 -c:a aac -shortest "$out/testsrc.mp4"
+
+# Explicit dispositions avoid ffmpeg marking the first subtitle as default automatically.
+cat > "$out/.subtitles.srt" <<'EOF'
+1
+00:00:00,000 --> 00:00:02,000
+English subtitle
+EOF
+for flag in none forced default; do
+  disposition="$flag"
+  if [[ "$flag" == none ]]; then disposition=0; fi
+  ff -f lavfi -i color=c=black:size=160x90:rate=5 -f lavfi -i anullsrc=r=48000:cl=stereo \
+     -i "$out/.subtitles.srt" -map 0:v -map 1:a -map 2:s -t 2 "${x264[@]}" -c:a aac -c:s srt \
+     -metadata:s:a:0 language=eng -metadata:s:s:0 language=eng -disposition:s:0 "$disposition" "$out/subtitles_$flag.mkv"
+done
+# French comes first deliberately: mpv's forced fallback may otherwise choose it over
+# English audio. Tuner must apply the user's subtitle language preferences after load.
+ff -i "$out/subtitles_forced.mkv" -map 0:v -map 0:a -map 0:s -map 0:s -c copy \
+   -metadata:s:s:0 language=fra -metadata:s:s:1 language=eng \
+   -disposition:s:0 forced -disposition:s:1 forced "$out/subtitles_forced_languages.mkv"
+rm "$out/.subtitles.srt"
+
 ff -f lavfi -i smptebars=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
    -t 10 "${x264[@]}" -c:a aac -shortest -f mpegts "$out/bars.ts"
 ff -f lavfi -i testsrc2=size=640x360:rate=25 -f lavfi -i sine=frequency=880 \

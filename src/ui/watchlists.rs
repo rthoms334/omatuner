@@ -285,22 +285,45 @@ pub fn label(ctx: &UiCtx<'_>, e: &EntryState) -> String {
     title
 }
 
+/// S/E coordinates always show under the spoiler guard; episode titles do not belong in
+/// the current-episode action or its toast.
+pub fn episode_number(e: &EntryState) -> Option<String> {
+    e.episode.map(|(s, n)| format!("S{s:02}E{n:02}"))
+}
+
+/// Capture the row's coordinates before writing (or loading other copies), so a refreshed
+/// snapshot cannot redirect the edit to the following episode.
+pub fn mark_current_watched(ctx: &UiCtx<'_>, e: EntryState) {
+    let Some(number) = episode_number(&e) else { return };
+    let episode = e.episode;
+    write_watched(ctx, e, true, episode, format!("Marked {number} watched"));
+}
+
 /// A global watched/unwatched edit follows every copy; ranges include only their episodes.
 pub fn mark_watched(ctx: &UiCtx<'_>, e: EntryState, on: bool) {
+    write_watched(ctx, e, on, None, if on { "Marked as watched" } else { "Marked unwatched" }.into());
+}
+
+fn write_watched(ctx: &UiCtx<'_>, e: EntryState, on: bool, episode: Option<(u32, u32)>, text: String) {
     let Some(item) = e.entry.item else { return };
     let lib = ctx.lib.clone();
     let now = ctx.now;
-    crate::ui::copies::write_with_undo(ctx, DataScope::Progress, if on { "Marked as watched" } else { "Marked unwatched" }.into(), move |c| {
+    crate::ui::copies::write_with_undo(ctx, DataScope::Progress, text, move |c| {
         let copies = store::title_copies(c, &lib, &item)?;
         let mut items = Vec::new();
         if item.kind == ItemKind::Series {
             let from = e.entry.season_from.unwrap_or(1);
             let to = e.entry.season_to.unwrap_or(u32::MAX);
             for series in copies {
-                let mut q=c.prepare_cached("SELECT e.source_id,e.key,e.title FROM episode e JOIN series s ON s.id=e.series_id WHERE s.source_id=?1 AND s.key=?2 AND e.season BETWEEN ?3 AND ?4")?;
-                let rows = q.query_map(rusqlite::params![series.source, series.key.as_str(), from, to], |r| {
-                    Ok((ItemRef { source: r.get(0)?, kind: ItemKind::Episode, key: crate::model::ItemKey(r.get(1)?) }, r.get(2)?))
-                })?;
+                let mut q = c.prepare_cached(
+                    "SELECT e.source_id,e.key,e.title FROM episode e JOIN series s ON s.id=e.series_id
+                     WHERE s.source_id=?1 AND s.key=?2 AND e.season BETWEEN ?3 AND ?4
+                       AND (?5 IS NULL OR (e.season=?5 AND e.episode=?6))",
+                )?;
+                let rows = q
+                    .query_map(rusqlite::params![series.source, series.key.as_str(), from, to, episode.map(|e| e.0), episode.map(|e| e.1)], |r| {
+                        Ok((ItemRef { source: r.get(0)?, kind: ItemKind::Episode, key: crate::model::ItemKey(r.get(1)?) }, r.get(2)?))
+                    })?;
                 items.extend(rows.collect::<rusqlite::Result<Vec<(ItemRef, String)>>>()?);
             }
         } else {

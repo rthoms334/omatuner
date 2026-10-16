@@ -1633,7 +1633,9 @@ impl OnboardingScreen {
         }
         ui.add_space(theme.space(SpaceToken::Lg));
         if let Some(e) = &self.import.error {
-            ui.label(RichText::new(format!("Couldn't import: {e}")).size(theme.font(TypeToken::Body)).color(t.urgent));
+            ui.add(
+                egui::Label::new(RichText::new(format!("Couldn't import: {e}")).size(theme.font(TypeToken::Body)).color(t.urgent)).selectable(true),
+            );
             ui.add_space(theme.space(SpaceToken::Md));
             return button_row(ui, theme, &["Retry", "Back to details"], self.focus);
         }
@@ -1786,7 +1788,12 @@ impl OnboardingScreen {
                 button_row(ui, theme, &["Open Live TV"], 0)
             }
             Some(Err(e)) => {
-                ui.label(RichText::new(format!("Couldn't restore: {}", crate::redact::redact(e))).size(theme.font(TypeToken::Body)).color(t.urgent));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Couldn't restore: {}", crate::redact::redact(e))).size(theme.font(TypeToken::Body)).color(t.urgent),
+                    )
+                    .selectable(true),
+                );
                 ui.add_space(theme.space(SpaceToken::Lg));
                 let r = button_row(ui, theme, &["Back"], 0);
                 if r.is_some() {

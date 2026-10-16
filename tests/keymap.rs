@@ -155,8 +155,14 @@ fn info_banner_never_changes_the_keys_only_controls_focus_does() {
     let live = [K::PlayerLive];
     assert_eq!(resolve(&live, &key(Key::ArrowUp)), Some(Action::ZapPrev));
     assert_eq!(resolve(&live, &key(Key::ArrowDown)), Some(Action::ZapNext));
-    assert_eq!(resolve(&live, &key(Key::ArrowLeft)), Some(Action::LastChannel));
-    assert_eq!(resolve(&live, &key(Key::ArrowRight)), Some(Action::ChannelHistory));
+    assert_eq!(resolve(&live, &key(Key::ArrowLeft)), Some(Action::SeekBack));
+    assert_eq!(resolve(&live, &key(Key::ArrowRight)), Some(Action::SeekForward));
+    assert_eq!(resolve(&live, &shift(Key::ArrowLeft)), Some(Action::SeekBackBig));
+    assert_eq!(resolve(&live, &shift(Key::ArrowRight)), Some(Action::SeekForwardBig));
+    assert_eq!(resolve(&live, &text("H")), Some(Action::ChannelHistory));
+    assert_eq!(resolve(&live, &text("h")), None);
+    assert_eq!(resolve(&live, &key(Key::Backspace)), Some(Action::LastChannel));
+    assert_eq!(resolve(&live, &text("L")), Some(Action::JumpToLive));
     let vod = [K::PlayerVod];
     assert_eq!(resolve(&vod, &key(Key::ArrowLeft)), Some(Action::SeekBack));
     assert_eq!(resolve(&vod, &shift(Key::ArrowRight)), Some(Action::SeekForwardBig));
@@ -185,7 +191,7 @@ fn info_banner_never_changes_the_keys_only_controls_focus_does() {
 
 #[test]
 fn letters_filter_lists_and_grids_but_drive_guide_player_and_panels() {
-    for ctx in [K::List, K::ListFiltering, K::PosterGrid, K::PosterGridFiltering, K::Search] {
+    for ctx in [K::List, K::ListFiltering, K::PosterGrid, K::PosterGridFiltering, K::Search, K::Settings] {
         for c in ['a', 'j', 'k', 'Z', 'é', '1', 'ß'] {
             assert_eq!(resolve(&[ctx], &text(&c.to_string())), Some(Action::FilterInput(c)), "{ctx:?} {c}");
         }
@@ -199,7 +205,7 @@ fn letters_filter_lists_and_grids_but_drive_guide_player_and_panels() {
         }
     }
     assert_eq!(resolve(&[K::Guide], &text("k")), Some(Action::Up));
-    assert_eq!(resolve(&[K::Panel], &text("l")), Some(Action::Right));
+    assert_eq!(resolve(&[K::Settings], &text("l")), Some(Action::FilterInput('l')));
     assert_eq!(resolve(&[K::PlayerLive], &text("k")), Some(Action::ZapPrev));
     // IME commits of several characters and control characters are not filter input
     assert_eq!(resolve(&[K::List], &text("ab")), None);
@@ -384,6 +390,21 @@ fn no_binding_is_shadowed_inside_a_context() {
 }
 
 #[test]
+fn lip_sync_keys_reach_both_players_and_the_pop_out_without_stealing_typing() {
+    for player in [K::PlayerLive, K::PlayerVod] {
+        for mut stack in [vec![], vec![K::PopOut], vec![K::PlayerOsd], vec![K::PopOut, K::MultiView], vec![K::NumericEntry]] {
+            stack.push(player);
+            assert_eq!(resolve(&stack, &text("[")), Some(Action::LipSyncEarlier), "{stack:?}");
+            assert_eq!(resolve(&stack, &text("]")), Some(Action::LipSyncLater), "{stack:?}");
+        }
+        assert_eq!(resolve(&[K::List, player], &text("[")), Some(Action::FilterInput('[')));
+        assert_eq!(resolve(&[K::TextInput, player], &text("]")), None);
+    }
+    assert_eq!(resolve(&[K::Guide], &text("[")), Some(Action::GuidePrevDay));
+    assert_eq!(resolve(&[K::Guide], &text("]")), Some(Action::GuideNextDay));
+}
+
+#[test]
 fn help_is_complete_for_every_context() {
     let mut titles = Vec::new();
     for ctx in K::ALL {
@@ -448,4 +469,26 @@ fn hint_line_comes_from_the_tables() {
     assert_eq!(hint_line(&[K::PlayerOsd, K::List]), hint_line(&[K::List]));
     assert!(hint_line(&[K::Modal]).starts_with("Enter confirm"));
     assert_eq!(hint_line(&[]), "");
+}
+
+#[test]
+fn epg_mapping_adjust_keeps_panel_shortcuts() {
+    let stack = [K::EpgMapping, K::Panel];
+    assert_eq!(resolve(&stack, &key(Key::Space)), Some(Action::Activate));
+    for (ch, action) in [
+        ('j', Action::Down),
+        ('k', Action::Up),
+        ('h', Action::Left),
+        ('l', Action::Right),
+        ('H', Action::Decrease),
+        ('L', Action::Increase),
+        ('J', Action::MoveDown),
+        ('K', Action::MoveUp),
+        ('x', Action::ContextMenu),
+        ('?', Action::ToggleHelp),
+    ] {
+        assert_eq!(resolve(&stack, &text(&ch.to_string())), Some(action));
+        assert_eq!(resolve(&[K::Settings], &text(&ch.to_string())), Some(Action::FilterInput(ch)));
+    }
+    assert_eq!(resolve(&stack, &text("z")), None, "Adjust does not filter");
 }
