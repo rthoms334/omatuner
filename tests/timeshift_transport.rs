@@ -1,6 +1,7 @@
 //! Real-mpv transport checks. The original remux experiments remain for comparison;
 //! `*_provider_hls` and `rolling_hls_http_mpv` exercise the production HLS recorder.
-//! See docs/design/timeshift-design.md.
+//! `downloaded_hls_*` are the filesystem-only Downloads finishing gates (DESIGN §43 §8.4).
+//! See docs/design/timeshift-design.md and docs/design/downloads-design.md.
 //!
 //! Run outside the sandbox:
 //! cargo test --test timeshift_transport zap_gate_http -- --ignored --nocapture
@@ -194,6 +195,7 @@ fn zap_gate_http() {
 fn hls_playable(url: String) -> tuner::model::Playable {
     use tuner::model::*;
     Playable {
+        from_download: false,
         media: MediaRef::Channel(ChannelId(1)),
         kind: PlayableKind::Live,
         source_id: Some(SourceId(1)),
@@ -237,6 +239,143 @@ fn playback_state(mpv: &Mpv) -> String {
         mpv.get_property::<f64>("demuxer-cache-duration").ok(),
         mpv.get_property::<bool>("eof-reached").ok(),
     )
+}
+
+/// DESIGN §43 §3, §8.4: three minutes of encrypted provider bytes, a rotating key and an
+/// optional timestamp reset. The durable index is the same input the keeping store writes.
+fn downloaded_hls_fixture(discontinuity: bool) -> tempfile::TempDir {
+    use aws_lc_rs::cipher::{AES_128, PaddedBlockEncryptingKey, UnboundCipherKey};
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let media = support::media::ensure_rolling_media();
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, bytes: &[u8]| {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.path().join(name)).unwrap();
+        file.write_all(bytes).unwrap();
+    };
+    // Synthetic fixture keys, rotated at the midpoint. Never provider data.
+    let keys = [[0x31; 16], [0x72; 16]];
+    write("0.key", &keys[0]);
+    write("1.key", &keys[1]);
+    let mut segments = Vec::new();
+    for seq in 0..90 {
+        let source = if discontinuity { (seq + 45) % 90 } else { seq };
+        let mut bytes = fs::read(media.join(format!("rolling/seg{source:03}.ts"))).unwrap();
+        let key_id = usize::from(seq >= 45);
+        let key = PaddedBlockEncryptingKey::cbc_pkcs7(UnboundCipherKey::new(&AES_128, &keys[key_id]).unwrap()).unwrap();
+        let context = key.encrypt(&mut bytes).unwrap();
+        let iv: &[u8] = (&context).try_into().unwrap();
+        let iv = iv.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        write(&format!("{seq}.ts"), &bytes);
+        segments.push(tuner::player::hls::finish::Segment {
+            id: seq,
+            extension: "ts".into(),
+            start: seq as f64 * 2.0,
+            end: (seq + 1) as f64 * 2.0,
+            discontinuity: u64::from(discontinuity && seq >= 45),
+            key: Some((key_id as u64, format!("0x{iv}"))),
+            map: None,
+        });
+    }
+    tuner::player::hls::finish::Recording { tracks: vec![segments] }.save(dir.path()).unwrap();
+    dir
+}
+
+fn finish_downloaded_hls(discontinuity: bool) -> (tempfile::TempDir, PathBuf) {
+    let source = downloaded_hls_fixture(discontinuity);
+    let result = tempfile::tempdir().unwrap();
+    let output = result.path().join("1.mkv");
+    let input = source.path().to_owned();
+    let path = output.clone();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(rt.spawn(async move {
+        // A killed finish must leave everything needed to retry; restarting uses the durable
+        // index and replaces any incomplete intermediate files (DESIGN §43 §8.4).
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stop = cancel.clone();
+        assert!(matches!(
+            tuner::player::hls::finish::finish(&input, &path, &cancel, move |fraction| {
+                if fraction > 0.0 {
+                    stop.cancel();
+                }
+            })
+            .await,
+            Err(tuner::player::hls::finish::FinishError::Cancelled)
+        ));
+        assert!(input.join("index.json").exists());
+        assert!(input.join("0.mkv").exists(), "interrupt a real finish after remuxing has started");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tuner::player::hls::finish::finish(&input, &path, &cancel, |_| {}).await.unwrap();
+        assert!(!input.exists(), "verified output replaces the kept folder");
+    }))
+    .unwrap();
+    (result, output)
+}
+
+fn downloaded_hls_plays_to_end(discontinuity: bool) {
+    let (_dir, output) = finish_downloaded_hls(discontinuity);
+    let mpv = mpv();
+    // Three minutes of media, decoded at 10x so the transport gate takes about 18 seconds.
+    mpv.set_property("speed", 10.0).unwrap();
+    mpv.command("loadfile", &[output.to_str().unwrap(), "replace"]).unwrap();
+    let started = Instant::now();
+    first_frame(&mpv, started);
+    let duration = mpv.get_property::<f64>("duration").unwrap();
+    assert!((duration - 180.0).abs() <= 2.0, "three-minute recording, got {duration}");
+    let mut last = mpv.get_property::<f64>("time-pos").unwrap();
+    loop {
+        let event = mpv.wait_event(0.01);
+        if let Ok(position) = mpv.get_property::<f64>("time-pos") {
+            assert!((0.0..=duration + 0.5).contains(&position), "downloaded HLS timeline outside the recording: {position:.3}/{duration:.3} s");
+            assert!(position + 0.5 >= last, "downloaded HLS timeline went backwards: {last:.3} -> {position:.3}; {}", playback_state(&mpv));
+            last = position;
+        }
+        if matches!(event, Some(Ok(Event::EndFile(_)))) {
+            assert!(last >= 179.0, "recording must play through the final segment, stopped at {last:.3}");
+            eprintln!("downloaded HLS: decoded {last:.3}/180 s in {:.2} s", started.elapsed().as_secs_f64());
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(35), "recording stalled: {}", playback_state(&mpv));
+    }
+}
+
+#[test]
+fn downloaded_hls_continuous_timestamps_play_to_end() {
+    downloaded_hls_plays_to_end(false);
+}
+
+#[test]
+fn downloaded_hls_discontinuity_plays_to_end() {
+    downloaded_hls_plays_to_end(true);
+}
+
+/// Resume beyond the timestamp reset, outside the packet cache (DESIGN §43 §8.4).
+#[test]
+fn downloaded_hls_finished_discontinuity_seeks() {
+    for discontinuity in [false, true] {
+        let (_dir, output) = finish_downloaded_hls(discontinuity);
+        let mpv = mpv();
+        mpv.command("loadfile", &[output.to_str().unwrap(), "replace", "-1", "start=120"]).unwrap();
+        let started = Instant::now();
+        let mut restarted = false;
+        loop {
+            match mpv.wait_event(0.01) {
+                Some(Ok(Event::EndFile(_))) => panic!("downloaded HLS ended before decoding at 120 s (discontinuity={discontinuity})"),
+                Some(Ok(Event::PlaybackRestart)) => restarted = true,
+                _ => {}
+            }
+            if restarted
+                && mpv.get_property::<String>("video-frame-info/picture-type").is_ok_and(|p| matches!(p.as_str(), "I" | "P" | "B"))
+                && let Ok(position) = mpv.get_property::<f64>("time-pos")
+            {
+                assert!((position - 120.0).abs() < 0.5, "resume target 120 s, got {position:.3} (discontinuity={discontinuity})");
+                eprintln!("downloaded HLS: resumed at {position:.3} s (discontinuity={discontinuity})");
+                break;
+            }
+            assert!(started.elapsed() < TIMEOUT, "resume stalled (discontinuity={discontinuity}): {}", playback_state(&mpv));
+        }
+    }
 }
 
 fn decoded_at(mpv: &Mpv, buffer: &tuner::player::hls::Buffer, target: f64, advance: f64) {

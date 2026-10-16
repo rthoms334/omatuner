@@ -747,6 +747,7 @@ fn status_names_nothing_explicit_that_still_plays() {
     let playing = |kind: PlayableKind, item: ItemRef, title: &str, subtitle: Option<&str>| PlayerSnapshot {
         state: PlayerState::Playing,
         playable: Some(Arc::new(Playable {
+            from_download: false,
             media: MediaRef::Channel(tuner::model::ChannelId(1)),
             kind,
             item: Some(item),
@@ -2257,6 +2258,7 @@ fn watchlist_play_and_stop_echo_the_list_and_the_title_being_stopped() {
         origin: Some(PlayOrigin::Queue),
         load_generation: 1,
         playable: Some(Arc::new(Playable {
+            from_download: false,
             media: MediaRef::Movie(tuner::model::MovieId(1)),
             kind: PlayableKind::Movie,
             source_id: Some(row.item.source),
@@ -2281,4 +2283,77 @@ fn watchlist_play_and_stop_echo_the_list_and_the_title_being_stopped() {
     assert_eq!(stopped["list"], "Evening films");
     assert!(stopped["stopped_after"].as_str().is_some_and(|title| title.contains("Airplane")), "{stopped}");
     assert_eq!(w.err("watchlist", json!({"action": "stop"})), ErrorCode::Unavailable);
+}
+
+/// DESIGN §43 §8.10: the downloads tool never returns a title/address, cannot add a locked
+/// ref, and omits concealed jobs while retaining their bytes in the anonymous used total.
+#[test]
+fn downloads_tool_refuses_locked_refs_and_keeps_concealed_jobs_private() {
+    let mut cfg = pin_config();
+    cfg.downloads.reserve_gb = 0;
+    let mut w = World::new(cfg);
+    w.publish(Visibility::NO_EXPLICIT);
+    let s = w.ui.services();
+    let handle = tuner::downloads::service::spawn(
+        s.rt.handle(),
+        tuner::downloads::service::Deps {
+            store: s.store.clone(),
+            config: s.config.clone(),
+            shared: s.agent.clone(),
+            budget: s.tiles.budget().clone(),
+            http: s.http.clone(),
+            bus: s.bus.clone(),
+            tiles: s.tiles.registry(),
+            paths: s.paths.clone(),
+        },
+    );
+    s.agent.set_downloads(Some(handle.clone()));
+    s.rt.block_on(handle.request(tuner::downloads::DownloadCommand::PauseAll(true)));
+    let locked = w.ok("downloads", json!({"action":"add","refs":["movie:1:m3u:lockedfilm"]}));
+    assert!(locked["added"].as_array().unwrap().is_empty());
+    assert!(locked["refused"].as_array().unwrap().iter().any(|r| r["error"].as_str().unwrap_or("").starts_with("locked")));
+    let added = w.ok("downloads", json!({"action":"add","refs":["movie:1:m3u:airplane"]}));
+    assert_eq!(added["added"].as_array().unwrap().len(), 1);
+    let s = w.ui.services();
+    let now = w.now;
+    s.store
+        .writer()
+        .blocking(move |c| {
+            let lib = tuner::store::library::load_visible(c, Visibility::ALL)?;
+            let target = tuner::downloads::Target {
+                item: ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:adult".into()) },
+                programme: None,
+                minutes: None,
+                any_copy: false,
+            };
+            let mut job = tuner::downloads::planning::new_job(
+                c,
+                &lib,
+                tuner::shared::ParentalView { unlocked: true, hides_explicit: false, pin_active: true },
+                &Config::default(),
+                &target,
+                false,
+                now,
+            )?;
+            job.bytes_done = 12345;
+            job.state = tuner::downloads::State::Paused;
+            tuner::store::downloads::add(c, &job)?;
+            Ok(())
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let list = loop {
+        let list = w.ok("downloads", json!({"action":"list"}));
+        if list["items"].as_array().unwrap().len() == 1 && list["used_gb"].as_f64().unwrap() > 0.0 {
+            break list;
+        }
+        assert!(Instant::now() < deadline, "snapshot published");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let wire = list.to_string();
+    for secret in ["Airplane", "Adult", "Locked Film", "http", "://"] {
+        assert!(!wire.contains(secret), "{wire}");
+    }
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    w.ui.services().rt.block_on(handle.request(tuner::downloads::DownloadCommand::Shutdown));
 }
