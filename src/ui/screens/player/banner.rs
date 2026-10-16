@@ -146,6 +146,9 @@ impl PlayerScreen {
             (None, Some(i)) => local_lines(ctx, snap, i),
             (None, None) => vec!["Reading stream info…".into()],
         };
+        if snap.playable.as_ref().is_some_and(|p| p.from_download) {
+            lines.insert(0, "⤓ Playing from your download".into());
+        }
         if snap.cast.is_none() {
             lines.push(format!("Audio delay: {}", crate::player::audio_output::offset_text(snap.lip_sync_ms)));
             lines.push(format!("Output   {}", snap.audio_output.label));
@@ -432,6 +435,7 @@ mod tests {
             volume: false,
         };
         let playable = Arc::new(Playable {
+            from_download: false,
             media: MediaRef::Channel(ChannelId(1)),
             kind: PlayableKind::Live,
             item: None,

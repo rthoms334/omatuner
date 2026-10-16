@@ -1397,6 +1397,7 @@ mod tests {
         // picture B plays the bulletin's copy, then the bulletin itself
         let on_b = |id: i64| {
             let playable = crate::model::Playable {
+                from_download: false,
                 media: MediaRef::Channel(crate::model::ChannelId(id)),
                 kind: crate::model::PlayableKind::Live,
                 item: None,

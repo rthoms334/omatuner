@@ -20,6 +20,7 @@ pub mod act;
 pub mod actions;
 pub mod client;
 pub mod connect;
+pub mod downloads;
 pub mod follow;
 pub mod guard;
 pub mod guide;
@@ -117,6 +118,8 @@ pub enum MultiViewKeep {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentPlay {
+    /// Consent already given in chat, applied only after the PIN succeeds (DESIGN §43 §6).
+    pub pause_after_pin: Option<crate::model::SourceId>,
     pub target: PlayTarget,
     /// Movies / episodes: ignore saved progress (else resume unless finished).
     pub from_start: bool,

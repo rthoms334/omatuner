@@ -10,6 +10,7 @@ use crate::player::LiveBufferRange;
 
 pub(super) const MEMORY_BYTES: u64 = 128 << 20;
 
+#[derive(Clone)]
 pub(super) struct Blob {
     pub resource: Resource,
     pub data: Option<Bytes>,
@@ -17,6 +18,7 @@ pub(super) struct Blob {
     pub extension: &'static str,
 }
 
+#[derive(Clone)]
 pub(super) struct Segment {
     pub id: u64,
     pub seq: u64,
@@ -27,7 +29,7 @@ pub(super) struct Segment {
     pub map: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Track {
     pub segments: VecDeque<Segment>,
     pub edge: f64,
@@ -38,6 +40,7 @@ pub(super) struct Track {
     pub discontinuity: u64,
 }
 
+#[derive(Clone)]
 pub(super) struct Store {
     pub dir: PathBuf,
     pub tracks: Vec<Track>,
@@ -48,6 +51,8 @@ pub(super) struct Store {
     pub closed: bool,
     pub next: u64,
     pub pending: Vec<u64>,
+    /// A download owns these bytes past the live window and past `Drop` (DESIGN §43 §3).
+    pub keep: bool,
 }
 
 impl Store {
@@ -62,6 +67,7 @@ impl Store {
             closed: false,
             next: 0,
             pending: Vec::new(),
+            keep: false,
         }
     }
 
@@ -84,6 +90,9 @@ impl Store {
     /// retained duration is at most window + one source segment, including the new write.
     pub fn prepare(&mut self, track: usize, duration: f64) {
         self.pending.clear();
+        if self.keep {
+            return;
+        }
         let t = &mut self.tracks[track];
         let window = if self.memory { 6.0 } else { self.window };
         let cutoff = t.edge + duration - window;
@@ -109,6 +118,13 @@ impl Store {
     }
 
     pub fn reset(&mut self) {
+        if self.keep {
+            for t in &mut self.tracks {
+                t.ended = true;
+            }
+            let _ = self.save();
+            return;
+        }
         self.tracks.iter_mut().for_each(|t| *t = Track::default());
         self.epoch += 1;
         self.pending.clear();
@@ -154,7 +170,7 @@ impl Store {
             Some(bytes)
         } else {
             let path = self.dir.join(format!("{id}.{extension}"));
-            if let Err(e) = fs::write(&path, &bytes) {
+            if let Err(e) = super::finish::write_private(&path, &bytes) {
                 let _ = fs::remove_file(path);
                 return Err(e);
             }
@@ -169,6 +185,91 @@ impl Store {
         self.blobs.iter().find(|(_, b)| b.resource == *r).map(|(id, _)| *id)
     }
 
+    /// Preserve the retained history from the programme's start (or the earliest available
+    /// segment), then stop pruning. The provider reader and its lease stay where they are.
+    pub fn adopt(&mut self, dir: PathBuf, from: f64) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        if self.memory || self.keep {
+            return Err(std::io::Error::other("recording store unavailable"));
+        }
+        fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let mut next = self.clone();
+        next.dir = dir;
+        next.keep = false;
+        next.memory = false;
+        for track in &mut next.tracks {
+            while track.segments.front().is_some_and(|s| s.end <= from) {
+                track.segments.pop_front();
+            }
+        }
+        next.prune();
+        // Switch only after every retained blob and the durable index are safe. A failed
+        // move leaves both the current reader and its rewind history untouched.
+        for (id, blob) in &next.blobs {
+            let name = format!("{id}.{}", blob.extension);
+            let bytes = fs::read(self.dir.join(&name))?;
+            super::finish::write_private(&next.dir.join(name), &bytes)?;
+        }
+        next.keep = true;
+        if let Err(error) = next.save() {
+            next.keep = false;
+            return Err(error);
+        }
+        *self = next;
+        Ok(())
+    }
+
+    pub fn resume_rolling(&mut self, dir: PathBuf) -> std::io::Result<()> {
+        self.save()?;
+        let mut next = self.clone();
+        next.dir = dir;
+        next.keep = false;
+        let from = next.tracks[0].edge - next.window;
+        for track in &mut next.tracks {
+            while track.segments.front().is_some_and(|s| s.end < from) {
+                track.segments.pop_front();
+            }
+        }
+        next.prune();
+        for (id, blob) in &next.blobs {
+            let name = format!("{id}.{}", blob.extension);
+            if std::fs::hard_link(self.dir.join(&name), next.dir.join(&name)).is_err() {
+                let bytes = fs::read(self.dir.join(&name))?;
+                super::finish::write_private(&next.dir.join(name), &bytes)?;
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        if !self.keep {
+            return Ok(());
+        }
+        let tracks = self
+            .tracks
+            .iter()
+            .map(|t| {
+                t.segments
+                    .iter()
+                    .filter_map(|s| {
+                        let blob = self.blobs.get(&s.id)?;
+                        Some(super::finish::Segment {
+                            id: s.id,
+                            extension: blob.extension.into(),
+                            start: s.start,
+                            end: s.end,
+                            discontinuity: s.disc,
+                            key: s.key.clone(),
+                            map: s.map,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        super::finish::Recording { tracks }.save(&self.dir)
+    }
+
     pub fn boundary(&self, from: f64) -> Option<f64> {
         self.tracks
             .iter()
@@ -177,6 +278,39 @@ impl Store {
                 t.segments.iter().find(|s| s.seq > first.seq && s.disc != first.disc).map(|s| s.start)
             })
             .min_by(f64::total_cmp)
+    }
+
+    /// A relay consumes RFC discontinuities itself; unlike mpv's per-epoch reader it must
+    /// see every run and may refresh independently of a picture's seek (DESIGN §43 §2.4).
+    pub fn relay_playlist(&self, track: usize) -> Option<String> {
+        let t = self.tracks.get(track)?;
+        let first = t.segments.front()?;
+        let target = t.target.max(t.segments.iter().map(|s| s.end - s.start).fold(1.0, f64::max)).ceil();
+        let mut out = format!(
+            "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:{}\n#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+            first.seq, first.disc
+        );
+        let mut disc = first.disc;
+        for s in &t.segments {
+            if s.disc != disc {
+                out.push_str("#EXT-X-DISCONTINUITY\n");
+                disc = s.disc;
+            }
+            if let Some((id, iv)) = &s.key {
+                out.push_str(&format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{id}.key\",IV={iv}\n"));
+            } else {
+                out.push_str("#EXT-X-KEY:METHOD=NONE\n");
+            }
+            if let Some(id) = s.map {
+                out.push_str(&format!("#EXT-X-MAP:URI=\"{id}.mp4\"\n"));
+            }
+            let b = self.blobs.get(&s.id)?;
+            out.push_str(&format!("#EXTINF:{:.6},\n{}.{}\n", s.end - s.start, s.id, b.extension));
+        }
+        if t.ended {
+            out.push_str("#EXT-X-ENDLIST\n");
+        }
+        Some(out)
     }
 
     pub fn playlist(&self, track: usize, from: Option<f64>) -> Option<String> {
@@ -213,7 +347,7 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        if !self.dir.as_os_str().is_empty() {
+        if !self.keep && !self.dir.as_os_str().is_empty() {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
@@ -260,5 +394,38 @@ mod tests {
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
         add(&mut s, 2.0);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn adopt_keeps_history_then_finishes_without_stopping_the_picture() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let rolling = root.path().join("1");
+        fs::create_dir(&rolling).unwrap();
+        let mut s = Store::new(rolling.clone(), 1800.0);
+        for _ in 0..900 {
+            add(&mut s, 2.0);
+        }
+        let kept = root.path().join("2");
+        s.adopt(kept.clone(), 600.0).unwrap();
+        assert!(!rolling.exists());
+        assert_eq!(s.range().unwrap().start, 600.0);
+        for _ in 0..900 {
+            add(&mut s, 2.0);
+        }
+        s.save().unwrap();
+        assert_eq!(s.range().unwrap().start, 600.0, "keep mode has no rolling cut");
+        assert!(kept.join("300.ts").exists());
+        assert_eq!(fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(kept.join("300.ts")).unwrap().permissions().mode() & 0o777, 0o600);
+        let index = fs::read_to_string(kept.join("index.json")).unwrap();
+        assert!(!index.contains("http") && !index.contains("secret"));
+        let next = root.path().join("3");
+        fs::create_dir(&next).unwrap();
+        s.resume_rolling(next.clone()).unwrap();
+        assert!(!s.keep);
+        assert!(s.range().unwrap().start >= 1798.0);
+        drop(s);
+        assert!(!next.exists());
+        assert!(kept.join("300.ts").exists(), "the finishing worker owns the kept bytes");
     }
 }

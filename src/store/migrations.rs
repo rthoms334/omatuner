@@ -32,6 +32,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     // casting (DESIGN §40; skeleton CAST-0, architect sign-off)
     ("0014_cast", include_str!("migrations/0014_cast.sql")),
     ("0015_watchlists", include_str!("migrations/0015_watchlists.sql")),
+    ("0016_downloads", include_str!("migrations/0016_downloads.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -64,11 +65,22 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         {
             tracing::warn!("watchlists: could not back up user data before migration: {e}");
         }
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        backfill(&tx, name)?;
-        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
-        tx.commit()?;
+        let rebuild = *name == "0016_downloads";
+        if rebuild {
+            conn.pragma_update(None, "foreign_keys", false)?;
+        }
+        let result = (|| -> Result<()> {
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)?;
+            backfill(&tx, name)?;
+            tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if rebuild {
+            conn.pragma_update(None, "foreign_keys", true)?;
+        }
+        result?;
     }
     Ok(())
 }
@@ -167,6 +179,7 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
         "0009_guide_fixes" => guide_fix_columns(conn),
         "0011_follow" => follow_columns(conn),
         "0013_agent_names" => agent_names(conn),
+        "0016_downloads" => download_follow_action(conn),
         "0015_watchlists" => {
             add_column_if_missing(conn, "queue_item", "watchlist_item_id", "INTEGER")?;
             add_column_if_missing(conn, "queue_item", "list_context", "INTEGER NOT NULL DEFAULT 0")?;
@@ -174,6 +187,41 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+/// Extend Following's CHECK once, keeping ledger and reminder foreign keys intact (§43 §4).
+/// `migrate` disables foreign keys before beginning this transaction; a rerun is a no-op.
+fn download_follow_action(conn: &Connection) -> Result<()> {
+    let schema: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE name='follow_rule'", [], |r| r.get(0))?;
+    if schema.contains("'record'") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"-- Foreign keys are disabled outside this migration transaction for the CHECK rebuild.
+CREATE TABLE IF NOT EXISTS follow_rule_record (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT    NOT NULL,                       -- "Arsenal"
+  kind         TEXT    NOT NULL CHECK (kind IN ('team', 'show', 'event', 'custom', 'news')),
+  spec         TEXT    NOT NULL,                       -- JSON follow::spec::FollowSpec {"v":1,…}
+  mode         TEXT    NOT NULL DEFAULT 'notify' CHECK (mode IN ('notify', 'switch', 'list', 'flash', 'record')),
+  lead_s       INTEGER NOT NULL DEFAULT 120,
+  offset_s     INTEGER NOT NULL DEFAULT 0,             -- e.g. +900 = skip build-up
+  spoiler_safe INTEGER NOT NULL DEFAULT 0,             -- also a spoiler-guard topic (B4)
+  max_per_week INTEGER NOT NULL DEFAULT 10,
+  priority     INTEGER NOT NULL,                       -- list order; lower wins clashes
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  origin       TEXT    NOT NULL DEFAULT 'user' CHECK (origin IN ('user', 'agent')),
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  agent        TEXT
+);
+
+INSERT INTO follow_rule_record SELECT * FROM follow_rule;
+DROP TABLE follow_rule;
+ALTER TABLE follow_rule_record RENAME TO follow_rule;
+"#,
+    )?;
+    Ok(())
 }
 
 /// 0008 (owner: remind track): the reminder's mode, start offset and where it opens; rows made
@@ -459,7 +507,8 @@ mod tests {
                 "0012_spoiler_guard",
                 "0013_agent_names",
                 "0014_cast",
-                "0015_watchlists"
+                "0015_watchlists",
+                "0016_downloads"
             ]
         );
         for (t, col) in [
@@ -921,7 +970,7 @@ mod tests {
             }
             let mut c = Connection::open(&path).unwrap();
             migrate(&mut c).unwrap();
-            assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 15);
+            assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), latest_version());
             let backup = dir.path().join("before-watchlists.json");
             assert_eq!(backup.exists(), favourites && !fail);
             if backup.exists() {
@@ -942,5 +991,26 @@ mod tests {
         let mut fresh = Connection::open(dir.path().join("fresh.db")).unwrap();
         migrate(&mut fresh).unwrap();
         assert!(!dir.path().join("before-watchlists.json").exists());
+    }
+    #[test]
+    fn downloads_upgrade_preserves_follow_ledger_and_reminder_links() {
+        let mut c = migrated_to(15);
+        c.execute_batch(
+            "PRAGMA foreign_keys=ON;
+            INSERT INTO source(id,name,kind,created_at) VALUES(1,'TV','m3u-url',0);
+            INSERT INTO follow_rule(id,name,kind,spec,priority,created_at,updated_at) VALUES(1,'Show','show','{}',0,0,0);
+            INSERT INTO reminder(id,source_id,channel_key,channel_name,title,start,stop,rule_id) VALUES(1,1,'c','Channel','Show',100,200,1);
+            INSERT INTO follow_match(rule_id,event_key,start,stop,title,state,reminder_id,seen_at) VALUES(1,'show',100,200,'Show','scheduled',1,0);",
+        )
+        .unwrap();
+        migrate(&mut c).unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM follow_match WHERE rule_id=1 AND reminder_id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(c.query_row("SELECT rule_id FROM reminder WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(c.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        c.execute("UPDATE follow_rule SET mode='record' WHERE id=1", []).unwrap();
+        c.execute("DELETE FROM follow_rule WHERE id=1", []).unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM follow_match", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(c.query_row("SELECT rule_id FROM reminder WHERE id=1", [], |r| r.get::<_, Option<i64>>(0)).unwrap(), None);
     }
 }

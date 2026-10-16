@@ -49,6 +49,7 @@ fn playable(kind: PlayableKind, url: String, headers: HttpHeaders) -> Arc<Playab
         _ => MediaRef::Url(String::new()),
     };
     Arc::new(Playable {
+        from_download: false,
         media,
         kind,
         item: None,

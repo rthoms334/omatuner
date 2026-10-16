@@ -26,33 +26,56 @@
 //! released on that END_FILE, never before the command (DESIGN §11.5).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
-use crate::model::{MediaRef, SourceId, TileId};
+use crate::model::{DownloadId, MediaRef, SourceId, TileId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
     pub source: SourceId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{}", self.describe())]
-pub struct BudgetExceeded {
-    pub in_use: u32,
-    pub limit: u32,
-    /// The other picture holding the playlist (`None`: this picture's own streams).
-    pub holder: Option<TileId>,
-    /// The other pictures hold the playlist only with streams that are closing (their claims
-    /// moved elsewhere): it frees up within moments.
-    pub closing: bool,
+/// Pictures and background jobs share the same account limit (DESIGN §43 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Holder {
+    Picture(TileId),
+    Download(DownloadId),
+}
+impl From<TileId> for Holder {
+    fn from(value: TileId) -> Self {
+        Self::Picture(value)
+    }
+}
+impl From<DownloadId> for Holder {
+    fn from(value: DownloadId) -> Self {
+        Self::Download(value)
+    }
+}
+impl Holder {
+    fn picture(self) -> Option<TileId> {
+        if let Self::Picture(tile) = self { Some(tile) } else { None }
+    }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BudgetExceeded {
+    #[error("This playlist is being used by download #{id}")]
+    Download { id: DownloadId },
+    #[error("{}", Self::describe(*in_use, *limit, *holder))]
+    Limit { in_use: u32, limit: u32, holder: Option<TileId>, closing: bool },
+}
 impl BudgetExceeded {
-    fn describe(&self) -> String {
-        match self.holder {
-            Some(t) => format!("This playlist allows {} at a time and picture {t} is using it", streams(self.limit)),
-            None => format!("connection limit reached for this provider ({}/{})", self.in_use, self.limit),
+    pub fn closing(&self) -> bool {
+        matches!(self, Self::Limit { closing: true, .. })
+    }
+    pub fn holder(&self) -> Option<TileId> {
+        if let Self::Limit { holder, .. } = self { *holder } else { None }
+    }
+    fn describe(in_use: u32, limit: u32, holder: Option<TileId>) -> String {
+        match holder {
+            Some(t) => format!("This playlist allows {} at a time and picture {t} is using it", streams(limit)),
+            None => format!("connection limit reached for this provider ({in_use}/{limit})"),
         }
     }
 }
@@ -91,9 +114,13 @@ struct SharedState {
     limits: HashMap<SourceId, u32>,
     /// Limits learned this session (a refused second stream on an unknown limit).
     observed: HashMap<SourceId, u32>,
-    open: HashMap<(TileId, SourceId), u32>,
-    claims: HashMap<TileId, SourceId>,
+    open: HashMap<(Holder, SourceId), u32>,
+    claims: HashMap<Holder, SourceId>,
     released: HashMap<SourceId, Released>,
+    shared: HashMap<(Holder, SourceId), u64>,
+    next_shared: u64,
+    raw: HashMap<MediaRef, (Holder, SourceId, Weak<crate::downloads::reader::Reader>)>,
+    live: HashMap<MediaRef, (Holder, SourceId, Weak<super::hls::Buffer>)>,
 }
 
 impl SharedState {
@@ -102,13 +129,13 @@ impl SharedState {
     }
 
     /// No other tile claims `source` (whoever holds it only has a stream still closing).
-    fn only_closing(&self, tile: TileId, source: SourceId) -> bool {
+    fn only_closing(&self, tile: Holder, source: SourceId) -> bool {
         !self.claims.iter().any(|(t, s)| *t != tile && *s == source)
     }
 
     /// The tiles other than `tile` that hold `source` (a claim or an open lease), lowest first.
-    fn holders(&self, tile: TileId, source: SourceId) -> Vec<TileId> {
-        let mut t: Vec<TileId> = self
+    fn holders(&self, tile: Holder, source: SourceId) -> Vec<Holder> {
+        let mut t: Vec<Holder> = self
             .claims
             .iter()
             .filter(|(t, s)| **t != tile && **s == source)
@@ -120,7 +147,22 @@ impl SharedState {
         t
     }
 
-    fn own_open(&self, tile: TileId, source: SourceId) -> u32 {
+    fn count(&self, holders: &[Holder], source: SourceId) -> u32 {
+        let mut groups = std::collections::HashSet::new();
+        let mut count = 0;
+        for holder in holders {
+            if let Some(group) = self.shared.get(&(*holder, source)) {
+                if groups.insert(*group) {
+                    count += 1;
+                }
+            } else {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn own_open(&self, tile: Holder, source: SourceId) -> u32 {
         self.open.get(&(tile, source)).copied().unwrap_or(0)
     }
 }
@@ -159,7 +201,8 @@ impl SharedBudget {
 
     /// The source `tile` targets (`None`: nothing). The controller keeps it in step with its
     /// state machine (`Controller::sync_claim`).
-    pub fn claim(&self, tile: TileId, source: Option<SourceId>) {
+    pub fn claim(&self, tile: impl Into<Holder>, source: Option<SourceId>) {
+        let tile = tile.into();
         let mut s = self.state();
         match source {
             Some(src) => s.claims.insert(tile, src),
@@ -168,18 +211,21 @@ impl SharedBudget {
     }
 
     /// What `tile` claims.
-    pub fn claim_of(&self, tile: TileId) -> Option<SourceId> {
+    pub fn claim_of(&self, tile: impl Into<Holder>) -> Option<SourceId> {
+        let tile = tile.into();
         self.state().claims.get(&tile).copied()
     }
 
     /// May `tile` play from `source` now: the other pictures holding it stay under its limit.
-    pub fn admits(&self, tile: TileId, source: SourceId) -> bool {
+    pub fn admits(&self, tile: impl Into<Holder>, source: SourceId) -> bool {
+        let tile = tile.into();
         let s = self.state();
-        s.limit(source).is_none_or(|limit| (s.holders(tile, source).len() as u32) < limit)
+        s.limit(source).is_none_or(|limit| s.count(&s.holders(tile, source), source) < limit)
     }
 
     /// Another picture holds any playlist (single view: never — zaps skip the copy lookup).
-    pub fn others_active(&self, tile: TileId) -> bool {
+    pub fn others_active(&self, tile: impl Into<Holder>) -> bool {
+        let tile = tile.into();
         let s = self.state();
         s.claims.keys().any(|t| *t != tile) || s.open.iter().any(|((t, _), n)| *t != tile && *n > 0)
     }
@@ -187,25 +233,122 @@ impl SharedBudget {
     /// Another picture targets a playlist (multi-view is on): its claim. A stream it is still
     /// closing doesn't count — it stopped, single view again — the leases wait for that stream
     /// (casting's checks, DESIGN §40 §0.6, §3.9).
-    pub fn others_claim(&self, tile: TileId) -> bool {
+    pub fn others_claim(&self, tile: impl Into<Holder>) -> bool {
+        let tile = tile.into();
         self.state().claims.keys().any(|t| *t != tile)
     }
 
     /// The first other picture holding `source` (banner: "TV is in use by picture A").
     pub fn holder(&self, tile: TileId, source: SourceId) -> Option<TileId> {
-        self.state().holders(tile, source).first().copied()
+        self.state().holders(tile.into(), source).into_iter().find_map(Holder::picture)
+    }
+
+    /// An active download holding this account, for the Ask prompt and MCP busy result.
+    pub fn download_holder(&self, source: SourceId) -> Option<DownloadId> {
+        self.state().open.iter().find_map(|((h, s), n)| {
+            if *s == source
+                && *n > 0
+                && let Holder::Download(id) = h
+            {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The recorder stays alive while either its picture or its recording owns it. A weak
+    /// registry never keeps a socket open on its own (DESIGN §43 §3, §5).
+    pub fn register_live(&self, media: MediaRef, owner: impl Into<Holder>, source: SourceId, buffer: &Arc<super::hls::Buffer>) {
+        self.state().live.insert(media, (owner.into(), source, Arc::downgrade(buffer)));
+    }
+
+    pub fn has_reader(&self, media: &MediaRef) -> bool {
+        let s = self.state();
+        s.live.get(media).is_some_and(|(_, _, b)| b.strong_count() > 0)
+            || s.raw.get(media).is_some_and(|(_, _, r)| r.upgrade().is_some_and(|r| r.active()))
+    }
+    pub fn register_raw(&self, media: MediaRef, owner: impl Into<Holder>, source: SourceId, reader: &Arc<crate::downloads::reader::Reader>) {
+        self.state().raw.insert(media, (owner.into(), source, Arc::downgrade(reader)));
+    }
+    pub fn share_raw(&self, media: &MediaRef, owner: impl Into<Holder>) -> Option<(Arc<crate::downloads::reader::Reader>, Lease)> {
+        let mut s = self.state();
+        let (from, source, weak) = s.raw.get(media)?.clone();
+        let reader = weak.upgrade()?;
+        if !reader.active() || s.own_open(from, source) == 0 {
+            return None;
+        }
+        let group = if let Some(group) = s.shared.get(&(from, source)) {
+            *group
+        } else {
+            s.next_shared += 1;
+            let group = s.next_shared;
+            s.shared.insert((from, source), group);
+            group
+        };
+        let owner = owner.into();
+        s.shared.insert((owner, source), group);
+        *s.open.entry((owner, source)).or_default() += 1;
+        Some((reader, Lease { source }))
+    }
+
+    pub fn has_live(&self, media: &MediaRef) -> bool {
+        self.state().live.get(media).is_some_and(|(_, _, b)| b.upgrade().is_some_and(|b| !b.is_recording()))
+    }
+
+    pub fn share_live(&self, media: &MediaRef, owner: impl Into<Holder>) -> Option<(Arc<super::hls::Buffer>, Lease)> {
+        let owner = owner.into();
+        let mut s = self.state();
+        let (mut from, source, weak) = s.live.get(media)?.clone();
+        let buffer = weak.upgrade()?;
+        if s.own_open(from, source) == 0 {
+            // The original picture may have left while the recording kept the reader.
+            let group = buffer.budget_group();
+            from = s.shared.iter().find(|((_, src), g)| *src == source && Some(**g) == group)?.0.0;
+        }
+        let group = if let Some(group) = s.shared.get(&(from, source)) {
+            *group
+        } else {
+            s.next_shared += 1;
+            let group = s.next_shared;
+            s.shared.insert((from, source), group);
+            buffer.set_budget_group(group);
+            group
+        };
+        s.shared.insert((owner, source), group);
+        *s.open.entry((owner, source)).or_default() += 1;
+        Some((buffer, Lease { source }))
+    }
+
+    /// Adoption changes the owner without closing or opening a provider connection.
+    pub fn transfer(&self, from: impl Into<Holder>, to: impl Into<Holder>, lease: &Lease) {
+        let mut s = self.state();
+        let (from, to) = (from.into(), to.into());
+        if let Some(n) = s.open.get_mut(&(from, lease.source))
+            && *n > 0
+        {
+            *n -= 1;
+            if *n == 0 {
+                s.open.remove(&(from, lease.source));
+            }
+            *s.open.entry((to, lease.source)).or_insert(0) += 1;
+        }
     }
 
     /// Open a stream of `tile` on `source`.
-    pub fn acquire(&self, tile: TileId, source: SourceId) -> Result<Lease, BudgetExceeded> {
+    pub fn acquire(&self, tile: impl Into<Holder>, source: SourceId) -> Result<Lease, BudgetExceeded> {
+        let tile = tile.into();
         let mut s = self.state();
         let holders = s.holders(tile, source);
-        let in_use = holders.len() as u32 + s.own_open(tile, source);
+        let in_use = s.count(&holders, source) + s.own_open(tile, source);
         if let Some(limit) = s.limit(source)
             && in_use >= limit
         {
             let closing = !holders.is_empty() && s.only_closing(tile, source);
-            return Err(BudgetExceeded { in_use, limit, holder: holders.first().copied(), closing });
+            if let Some(id) = holders.iter().find_map(|h| if let Holder::Download(id) = h { Some(*id) } else { None }) {
+                return Err(BudgetExceeded::Download { id });
+            }
+            return Err(BudgetExceeded::Limit { in_use, limit, holder: holders.iter().find_map(|h| h.picture()), closing });
         }
         *s.open.entry((tile, source)).or_insert(0) += 1;
         Ok(Lease { source })
@@ -213,15 +356,19 @@ impl SharedBudget {
 
     /// The leased stream closed. `closed` = what it played and whether it reached Playing (the
     /// race window; `None` for a stream that never really started).
-    pub fn release(&self, tile: TileId, lease: Lease, closed: Option<(MediaRef, bool)>) {
+    pub fn release(&self, tile: impl Into<Holder>, lease: Lease, closed: Option<(MediaRef, bool)>) {
+        let tile = tile.into();
         let mut s = self.state();
         if let Some(n) = s.open.get_mut(&(tile, lease.source)) {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 s.open.remove(&(tile, lease.source));
+                s.shared.remove(&(tile, lease.source));
             }
         }
-        if let Some((media, played)) = closed {
+        if let Some((media, played)) = closed
+            && let Holder::Picture(tile) = tile
+        {
             s.released.insert(lease.source, Released { at: Instant::now(), media, played, tile });
         }
     }
@@ -234,7 +381,8 @@ impl SharedBudget {
     /// `tile` was refused with a 403 on `source` outside the race window. With an unknown
     /// limit while another picture holds the playlist, the playlist evidently allows one
     /// stream at a time: learned for the session. Returns true when this taught it.
-    pub fn observe_refusal(&self, tile: TileId, source: SourceId) -> bool {
+    pub fn observe_refusal(&self, tile: impl Into<Holder>, source: SourceId) -> bool {
+        let tile = tile.into();
         let mut s = self.state();
         if s.limits.contains_key(&source) || s.observed.contains_key(&source) || s.holders(tile, source).is_empty() {
             return false;
@@ -244,10 +392,12 @@ impl SharedBudget {
     }
 
     /// The tile's player shut down: its claim and any leases left go.
-    pub fn forget(&self, tile: TileId) {
+    pub fn forget(&self, tile: impl Into<Holder>) {
+        let tile = tile.into();
         let mut s = self.state();
         s.claims.remove(&tile);
         s.open.retain(|(t, _), _| *t != tile);
+        s.shared.retain(|(t, _), _| *t != tile);
     }
 
     /// Per playlist with a limit, a claim or an open stream: its limit and how many pictures
@@ -261,7 +411,7 @@ impl SharedBudget {
         sources
             .into_iter()
             .map(|source| {
-                let mut tiles: Vec<TileId> = s
+                let mut tiles: Vec<Holder> = s
                     .claims
                     .iter()
                     .filter(|(_, c)| **c == source)
@@ -270,7 +420,7 @@ impl SharedBudget {
                     .collect();
                 tiles.sort();
                 tiles.dedup();
-                StreamUse { source, limit: s.limit(source), in_use: tiles.len() as u32 }
+                StreamUse { source, limit: s.limit(source), in_use: s.count(&tiles, source) }
             })
             .collect()
     }
@@ -297,7 +447,7 @@ mod tests {
         b.release(A, lease, Some((MediaRef::Url("a".into()), true)));
         assert!(!b.admits(B, TV));
         let refused = b.acquire(B, TV).unwrap_err();
-        assert_eq!((refused.holder, refused.closing), (Some(A), false));
+        assert_eq!((refused.holder(), refused.closing()), (Some(A), false));
         assert_eq!(refused.to_string(), "This playlist allows one stream at a time and picture A is using it");
         assert!(b.admits(B, TV2), "the other playlist is free");
         assert!(b.admits(A, TV), "A itself may reconnect");
@@ -322,7 +472,7 @@ mod tests {
         // only until it closes
         let lease = b.acquire(A, TV).unwrap();
         assert!(!b.admits(B, TV));
-        assert!(b.acquire(B, TV).unwrap_err().closing);
+        assert!(b.acquire(B, TV).unwrap_err().closing());
         b.release(A, lease, None);
         assert!(b.admits(B, TV));
         // limit 2: both pictures on one playlist
@@ -346,7 +496,7 @@ mod tests {
         assert!(!b.observe_refusal(B, TV), "once");
         assert!(b.learned(TV) && b.limit(TV) == Some(1));
         assert!(!b.admits(B, TV));
-        assert_eq!(b.acquire(B, TV).unwrap_err().holder, Some(A));
+        assert_eq!(b.acquire(B, TV).unwrap_err().holder(), Some(A));
         b.set_limit(TV, Some(2));
         assert!(!b.learned(TV) && b.admits(B, TV));
     }
@@ -372,5 +522,25 @@ mod tests {
         b.forget(B);
         assert!(b.admits(A, TV) && b.claim_of(B).is_none());
         b.acquire(A, TV).expect("free");
+    }
+    #[test]
+    fn a_download_blocks_only_its_account_and_returns_it_after_pause() {
+        let b = SharedBudget::default();
+        b.set_limit(TV, Some(1));
+        b.set_limit(TV2, Some(1));
+        let id = DownloadId(17);
+        let download = b.acquire(id, TV).unwrap();
+        assert_eq!(b.acquire(A, TV), Err(BudgetExceeded::Download { id }));
+        let other = b.acquire(B, TV2).unwrap();
+        b.claim(A, Some(TV));
+        assert!(!b.admits(A, TV), "a claim cannot steal an open download socket");
+        b.release(id, download, None);
+        let play = b.acquire(A, TV).unwrap();
+        assert!(!b.admits(id, TV));
+        b.release(A, play, None);
+        b.claim(A, None);
+        assert!(b.admits(id, TV), "the paused job may resume after playback stops");
+        assert_eq!(b.usage().iter().find(|s| s.source == TV2).unwrap().in_use, 1);
+        b.release(B, other, None);
     }
 }

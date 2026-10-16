@@ -83,6 +83,7 @@ fn playable(media: MediaRef, kind: PlayableKind, url: String) -> Playable {
         _ => ItemKind::Channel,
     };
     Playable {
+        from_download: false,
         media,
         kind,
         item: Some(item(&key, item_kind)),

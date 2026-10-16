@@ -640,6 +640,7 @@ mod tests {
         let mut s = (*t.services().tiles.focused().snapshot()).clone();
         s.state = PlayerState::Playing;
         s.playable = Some(Arc::new(Playable {
+            from_download: false,
             media: MediaRef::Movie(crate::model::MovieId(1)),
             kind: PlayableKind::Movie,
             item: None,

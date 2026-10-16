@@ -83,7 +83,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     // a launch that opens a window (or shows a closed reminder's note) says on the desktop when
     // it can't: started from the launcher, nobody reads stderr. Not the headless runs (their
     // journal has stderr; the next window launch says it) nor the MCP bridge (its client does).
-    let windowed = cli.command.is_none() && !cli.refresh && !cli.rearm && !cli.is_mcp();
+    let windowed = cli.command.is_none() && !cli.refresh && !cli.rearm && cli.record.is_none() && !cli.is_mcp();
     startup::notify_desktop(windowed);
     let paths = match &cli.profile_dir {
         Some(dir) => AppPaths::rooted(dir),
@@ -139,6 +139,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("Tuner (or a background refresh) is running; it arms the reminder timers itself");
             return Ok(());
         };
+        tuner::downloads::arming::rearm(&paths)?;
         return match tuner::reminders::arming::rearm_at_login(&paths, &config)? {
             tuner::platform::systemd::ArmStatus::Unavailable(e) => Err(anyhow::anyhow!("reminders won't fire while Tuner is closed: {e}")),
             tuner::platform::systemd::ArmStatus::Armed(n) => {
@@ -159,6 +160,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         // switch reminders' launch, the play follows over IPC v2
         popout: cli.popout || cli.agent_popout,
         reminder: cli.reminder,
+        record: cli.record,
     };
     // held until the process exits: the database has one owner; a refresh holding the lock or
     // an instance that doesn't answer ends the start (`platform::startup` tells the desktop)
@@ -195,6 +197,60 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         tracing::error!("{}", bad.log_line());
         bus.toast(tuner::msg::Toast::error(bad.toast_text()));
     }
+    let mut services = Services::start(paths.clone(), config.clone(), logs, bus.clone())?;
+    services.watch_signals();
+    if let Some(id) = cli.record {
+        services.agent.set_recording_headless(true);
+        services.start_integrations();
+        let lib = Arc::new(tuner::store::library::load_visible(&services.store.reader()?, tuner::store::library::Visibility::NO_EXPLICIT)?);
+        drop(services.agent.publish_library(&lib));
+        let started = Instant::now();
+        loop {
+            match events.recv_timeout(Duration::from_millis(250)) {
+                Ok(AppEvent::Ipc(r)) if r.record.is_none() => {
+                    request = r;
+                    break;
+                }
+                Ok(event @ AppEvent::Agent(_)) => {
+                    // The headless recorder becomes the ordinary primary window; replay
+                    // the validated command once the UI can apply its placement and PIN.
+                    bus.send(event);
+                    break;
+                }
+                Ok(AppEvent::Data(_)) => {
+                    if let Ok(lib) =
+                        services.store.reader().and_then(|c| tuner::store::library::load_visible(&c, tuner::store::library::Visibility::NO_EXPLICIT))
+                    {
+                        drop(services.agent.publish_library(&Arc::new(lib)));
+                    }
+                }
+                _ => {}
+            }
+            if started.elapsed() < Duration::from_secs(2) {
+                continue;
+            }
+            let rows = tuner::store::downloads::jobs(&services.store.reader()?)?;
+            let pending = rows.iter().any(|j| {
+                j.id.0 == id
+                    && j.fp.get("download_finish_failed").and_then(|v| v.as_bool()) != Some(true)
+                    && matches!(
+                        j.state,
+                        tuner::downloads::State::Scheduled
+                            | tuner::downloads::State::Waiting
+                            | tuner::downloads::State::Running
+                            | tuner::downloads::State::Finishing
+                    )
+            });
+            let recording = rows
+                .iter()
+                .any(|j| j.kind.recording() && j.state.active() && j.fp.get("download_finish_failed").and_then(|v| v.as_bool()) != Some(true));
+            if !pending && !recording {
+                services.shutdown();
+                return Ok(());
+            }
+        }
+    }
+    services.agent.set_recording_headless(false);
     let ui_scale = config.interface.ui_scale;
     let follow_theme = config.integration.follow_omarchy_theme;
     let font_cfg = config.fonts.clone();
@@ -218,8 +274,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         [1280.0, 800.0]
     };
-    let services = Services::start(paths.clone(), config, logs, bus.clone())?;
-    services.watch_signals();
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
@@ -424,6 +478,7 @@ fn refresh_headless(paths: AppPaths, config: Config, timeout: Duration) -> anyho
     if !store.close(Duration::from_secs(3)) {
         tracing::warn!("database writer did not finish within 3 s");
     }
+    tuner::downloads::arming::rearm(&arm_paths)?;
     Ok(failed)
 }
 

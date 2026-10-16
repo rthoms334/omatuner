@@ -1861,6 +1861,7 @@ fn play_commands_and_the_error_cards_other_copy() {
     let failed = |key: &str| PlayerSnapshot {
         state: PlayerState::Error(tuner::player::PlayerError { kind: tuner::player::PlayerErrorKind::Network, message: "x".into() }),
         playable: Some(Arc::new(Playable {
+            from_download: false,
             media: movie(key),
             kind: PlayableKind::Movie,
             item: None,

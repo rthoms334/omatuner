@@ -248,6 +248,7 @@ impl Inner {
                     }
                 })
             }
+            Call::Downloads(p) => super::downloads::handle(&self, p).await,
             Call::Watchlist(p) => {
                 let starts = p.action == super::params::WatchlistAction::Play;
                 super::watchlist::handle(&self, p, &who).await.inspect_err(|_| {
@@ -415,7 +416,14 @@ impl Inner {
         // where a play without `device` goes: not with two pictures, as `lands_on`
         more.play_on = act::play_on_out(&snap, &self.shared.cast().devices()).filter(|_| !self.window().multiview);
         let v = self.run(false, move |q| act::status_with(q, &snap, &more)).await?;
-        to_value(&v)
+        let mut out = to_value(&v)?;
+        if let Some(handle) = self.shared.downloads() {
+            let snap = handle.snapshot();
+            let (view, _) = self.view();
+            let jobs: Vec<_> = snap.jobs.iter().filter(|j| !view.hides_explicit || !j.explicit()).collect();
+            out["downloads"] = serde_json::json!({"running":jobs.iter().filter(|j| j.state.active()).count(),"waiting":jobs.iter().filter(|j| j.state == crate::downloads::State::Waiting).count(),"used_gb":snap.used_bytes as f64 / 1e9});
+        }
+        Ok(out)
     }
 
     /// The parental state and the snapshot as it may be shown now.
@@ -529,6 +537,56 @@ impl Inner {
         let PlayStep::Ready { mut command, mut out, log_ref } = step else {
             return Err(Fail::new(ErrorCode::Internal, "Tuner couldn't decide what to play"));
         };
+        if let Some((device, true)) = &target {
+            return to_value(&act::pairing_required(&out, device));
+        }
+        if let Some(handle) = self.shared.downloads() {
+            let wanted = command.clone();
+            let resolved = self
+                .run(true, move |q| {
+                    let super::AgentCommand::Play(play) = wanted else { return Ok(None) };
+                    let media = match play.target {
+                        super::PlayTarget::Media(m) => m,
+                        super::PlayTarget::Series(id) => {
+                            let copies =
+                                q.lib.vod.index_of(crate::model::VodKind::Series(id)).map(|i| q.series_copies(i)).unwrap_or_else(|| vec![id]);
+                            let Some((_, ep)) = crate::store::copies::next_episode(q.conn, &copies)? else { return Ok(None) };
+                            crate::model::MediaRef::Episode(ep.id)
+                        }
+                    };
+                    let p = crate::sources::resolve::resolve_with_view(q.conn, q.cfg, &media, true, q.now, q.lib, q.view)?;
+                    Ok(p.source_id.map(|source| (source, media)))
+                })
+                .await?;
+            if let Some((source, media)) = resolved {
+                let budget = handle.budget();
+                if !budget.admits(crate::model::TileId::A, source)
+                    && !budget.has_reader(&media)
+                    && let Some(id) = budget.download_holder(source)
+                {
+                    let snapshot = handle.snapshot();
+                    let job = snapshot.jobs.iter().find(|j| j.id == id);
+                    if again.pause_downloads != Some(true) {
+                        return Ok(
+                            serde_json::json!({"busy":{"id":id.0,"what":if job.is_some_and(|j|j.kind.recording()){"recording"}else{"download"},"progress":job.and_then(|j|j.progress())}}),
+                        );
+                    }
+                    if out.outcome == super::proto::PlayOutcome::PinRequired {
+                        if let super::AgentCommand::Play(play) = &mut command {
+                            play.pause_after_pin = Some(source);
+                        }
+                    } else {
+                        let previous = budget.claim_of(crate::model::TileId::A);
+                        budget.claim(crate::model::TileId::A, Some(source));
+                        let result = handle.request(crate::downloads::DownloadCommand::PauseForPlay(source)).await;
+                        if result.error.is_some() {
+                            budget.claim(crate::model::TileId::A, previous);
+                            return Err(Fail::new(ErrorCode::Busy, "The account has not closed yet"));
+                        }
+                    }
+                }
+            }
+        }
         // the PIN is typed in Tuner's window: the prompt brings it forward
         let pin = out.outcome == super::proto::PlayOutcome::PinRequired;
         if let Some((device, unpaired)) = &target {

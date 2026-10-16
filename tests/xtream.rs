@@ -456,6 +456,7 @@ async fn provider_guide_and_playlist_downloads() {
 
     let dest = dir.path().join("epg/7.xml");
     let mut req = DownloadRequest {
+        resume_from: None,
         url: Secret::new(urls::xmltv_url(&creds)),
         dest: dest.clone(),
         headers: Default::default(),
@@ -477,6 +478,7 @@ async fn provider_guide_and_playlist_downloads() {
 
     let m3u = dir.path().join("playlists/7.m3u");
     let req = DownloadRequest {
+        resume_from: None,
         url: Secret::new(urls::m3u_url(&creds, LiveExt::M3u8)),
         dest: m3u.clone(),
         headers: Default::default(),
@@ -539,6 +541,7 @@ async fn errors_never_contain_the_password() {
         errors.push(c.authenticate(NOW, &cancel).await.unwrap_err());
         errors.push(c.vod_streams(&cancel).await.unwrap_err());
         let req = DownloadRequest {
+            resume_from: None,
             url: Secret::new(urls::xmltv_url(&mock.creds("someuser", pw))),
             dest: dir.path().join("x"),
             headers: Default::default(),

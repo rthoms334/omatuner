@@ -2791,6 +2791,7 @@ mod tests {
         assert_eq!(playing_channel(&s), None);
         s.state = PlayerState::Playing;
         s.playable = Some(std::sync::Arc::new(crate::model::Playable {
+            from_download: false,
             media: MediaRef::Channel(ChannelId(4)),
             kind: crate::model::PlayableKind::Live,
             item: None,

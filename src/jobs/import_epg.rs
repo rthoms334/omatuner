@@ -105,6 +105,7 @@ async fn run(ctx: &JobContext, src: &EpgSource, force: bool, progress: &Progress
         EpgSourceKind::Url { url } | EpgSourceKind::Provider { url, .. } => {
             progress.set(JobPhase::Connecting);
             let req = DownloadRequest {
+                resume_from: None,
                 url: url.clone(),
                 dest: ctx.paths.epg_cache().join(format!("{}.xml", id.0)),
                 headers: guide_headers(ctx, src, &cfg).await,

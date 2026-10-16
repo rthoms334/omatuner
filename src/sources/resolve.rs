@@ -49,7 +49,37 @@ use crate::store;
 const DEFAULT_VOD_EXT: &str = "mp4";
 
 pub fn resolve(conn: &Connection, cfg: &Config, media: &MediaRef, resume: bool, now: Timestamp) -> Result<Playable> {
+    if crate::downloads::ENABLED
+        && let Some(local) = resolve_download(conn, cfg, media, resume, None)?
+    {
+        return Ok(local);
+    }
+    resolve_provider(conn, cfg, media, resume, now)
+}
+
+/// The live library supplies current title stacks and guards, including copies added or
+/// re-keyed after the download was made (DESIGN §43 §3, §6).
+pub fn resolve_with_view(
+    conn: &Connection,
+    cfg: &Config,
+    media: &MediaRef,
+    resume: bool,
+    now: Timestamp,
+    lib: &store::library::Library,
+    view: crate::shared::ParentalView,
+) -> Result<Playable> {
+    if crate::downloads::ENABLED
+        && let Some(local) = resolve_download(conn, cfg, media, resume, Some((lib, view)))?
+    {
+        return Ok(local);
+    }
+    resolve_provider(conn, cfg, media, resume, now)
+}
+
+/// Download workers resolve the provider even when an earlier recording exists.
+pub fn resolve_provider(conn: &Connection, cfg: &Config, media: &MediaRef, resume: bool, now: Timestamp) -> Result<Playable> {
     match media {
+        MediaRef::Download(_) => Err(Error::NotFound("download file missing".into())),
         MediaRef::Channel(id) => resolve_live(conn, cfg, media, *id, now),
         MediaRef::Catchup { channel, start, stop, catchup_id } => {
             resolve_catchup(conn, cfg, media, *channel, (*start, *stop), catchup_id.as_deref(), now)
@@ -58,6 +88,96 @@ pub fn resolve(conn: &Connection, cfg: &Config, media: &MediaRef, resume: bool, 
         MediaRef::Episode(id) => resolve_episode(conn, cfg, media, *id, resume),
         MediaRef::Url(raw) => resolve_url(cfg, media, raw),
     }
+}
+
+/// Read local metadata before source credentials: deleted and disabled playlists' saved
+/// files still play, and a partial recording is only accepted by an explicit Downloads ref.
+fn resolve_download(
+    conn: &Connection,
+    cfg: &Config,
+    media: &MediaRef,
+    resume: bool,
+    context: Option<(&store::library::Library, crate::shared::ParentalView)>,
+) -> Result<Option<Playable>> {
+    use crate::downloads::{Kind, State};
+    let explicit = matches!(media, MediaRef::Download(_));
+    let item = match media {
+        MediaRef::Movie(id) => store::vod::movie(conn, *id).ok().map(|m| ItemRef { source: m.source_id, kind: ItemKind::Movie, key: m.key }),
+        MediaRef::Episode(id) => store::vod::episode(conn, *id).ok().map(|e| ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key }),
+        _ => None,
+    };
+    let root = store::downloads::root(conn, &cfg.downloads)?;
+    let copies = if let (Some(item), Some((lib, _))) = (&item, context) {
+        store::watchlist::title_copies(conn, lib, item)?
+    } else {
+        item.clone().into_iter().collect()
+    };
+    let candidates = if let MediaRef::Download(id) = media {
+        store::downloads::job(conn, *id)?.into_iter().collect()
+    } else if item.is_some() {
+        store::downloads::jobs(conn)?
+    } else {
+        Vec::new()
+    };
+    let candidate = candidates.into_iter().find(|j| {
+        if !(j.state == State::Done || explicit && j.state == State::Partial) || !j.path(&root).is_some_and(|p| p.is_file()) {
+            return false;
+        }
+        if let Some((lib, view)) = context {
+            if crate::downloads::planning::concealed(conn, lib, view, j) {
+                return false;
+            }
+            if !view.unlocked && crate::downloads::planning::locked(conn, lib, j) {
+                return false;
+            }
+        } else if cfg.parental.pin_active() && j.fp.get("download_locked").and_then(|v| v.as_bool()) == Some(true) {
+            return false;
+        }
+        explicit
+            || j.item().is_some_and(|i| copies.contains(&i))
+            || (context.is_none()
+                && item.as_ref().is_some_and(|item| {
+                    let encoded = serde_json::to_value(item).unwrap_or_default();
+                    j.fp.get("download_copies").and_then(serde_json::Value::as_array).is_some_and(|cs| cs.contains(&encoded))
+                }))
+    });
+    let Some(j) = candidate else { return Ok(None) };
+    let Some(path) = j.path(&root) else { return Ok(None) };
+    let item = if j.kind.recording() { None } else { j.item() };
+    let progress = item.as_ref().map(|item| store::user::progress(conn, item)).transpose()?.flatten();
+    let kind = match j.kind {
+        Kind::Movie => PlayableKind::Movie,
+        Kind::Episode => PlayableKind::Episode {
+            season: j.fp.get("download_season").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+            episode: j.fp.get("download_episode").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
+        },
+        _ => PlayableKind::Catchup { start: j.prog_start.unwrap_or(0), stop: j.prog_stop.unwrap_or(0) },
+    };
+    Ok(Some(Playable {
+        from_download: true,
+        media: if j.kind.recording() || item.is_none() {
+            MediaRef::Download(j.id)
+        } else {
+            crate::downloads::planning::media(conn, &j).unwrap_or_else(|_| media.clone())
+        },
+        kind,
+        item,
+        source_id: None,
+        title: j.title,
+        subtitle: j.subtitle,
+        logo: None,
+        number: None,
+        url: Secret::new(path.to_string_lossy().into_owned()),
+        headers: HttpHeaders::default(),
+        start_at: progress.as_ref().filter(|_| resume).and_then(|p| resume_at(p, cfg)).or_else(|| {
+            if resume && j.watched_at.is_none() {
+                j.fp.get("download_position_s").and_then(|v| v.as_f64()).filter(|p| *p >= cfg.player.resume_min_s as f64)
+            } else {
+                None
+            }
+        }),
+        duration_hint: j.fp.get("download_duration_s").and_then(serde_json::Value::as_f64),
+    }))
 }
 
 /// Whether a catch-up of `channel` at `start` is possible (archive flag + window). Used by the
@@ -76,6 +196,7 @@ fn resolve_live(conn: &Connection, cfg: &Config, media: &MediaRef, id: ChannelId
     let url = stream_url(&ch.stream, &src, cfg)?;
     let subtitle = ch.epg_channel_id.and_then(|e| current_programme(conn, e, shown_shift(conn, &ch), now));
     Ok(Playable {
+        from_download: false,
         media: media.clone(),
         kind: PlayableKind::Live,
         item: Some(channel_ref(&ch)),
@@ -126,6 +247,7 @@ fn resolve_catchup(
     let epg_start = start.saturating_sub(i64::from(shown_shift(conn, &ch)) * 60);
     let subtitle = ch.epg_channel_id.and_then(|e| programme_at(conn, e, epg_start));
     Ok(Playable {
+        from_download: false,
         media: media.clone(),
         kind: PlayableKind::Catchup { start, stop },
         item: Some(channel_ref(&ch)),
@@ -148,6 +270,7 @@ fn resolve_movie(conn: &Connection, cfg: &Config, media: &MediaRef, id: MovieId,
     let item = ItemRef { source: m.source_id, kind: ItemKind::Movie, key: m.key.clone() };
     let progress = store::user::progress(conn, &item)?;
     Ok(Playable {
+        from_download: false,
         media: media.clone(),
         kind: PlayableKind::Movie,
         item: Some(item),
@@ -171,6 +294,7 @@ fn resolve_episode(conn: &Connection, cfg: &Config, media: &MediaRef, id: Episod
     let item = ItemRef { source: ep.source_id, kind: ItemKind::Episode, key: ep.key.clone() };
     let progress = store::user::progress(conn, &item)?;
     Ok(Playable {
+        from_download: false,
         media: media.clone(),
         kind: PlayableKind::Episode { season: ep.season, episode: ep.episode },
         item: Some(item),
@@ -211,6 +335,7 @@ fn resolve_url(cfg: &Config, media: &MediaRef, raw: &str) -> Result<Playable> {
         }
     };
     Ok(Playable {
+        from_download: false,
         media: media.clone(),
         kind: PlayableKind::Url,
         item: None,

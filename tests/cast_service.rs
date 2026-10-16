@@ -207,6 +207,7 @@ fn item(kind: ItemKind, key: &str) -> ItemRef {
 
 fn playable(media: MediaRef, kind: PlayableKind, item: ItemRef, start_at: Option<f64>, duration_hint: Option<f64>) -> Arc<Playable> {
     Arc::new(Playable {
+        from_download: false,
         media,
         kind,
         item: Some(item),

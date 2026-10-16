@@ -693,6 +693,17 @@ pub fn epg_grid(
             let reminder = cell.programme.as_ref().is_some_and(|p| state.reminders.get(&row.channel).is_some_and(|s| s.contains(&p.start)));
             let title = cell.programme.as_ref().map(|p| state.titles.title(&state.spoilers, p));
             paint_cell(&grid_painter, &f, &row, cell, title.as_deref(), r, focused, reminder, progs.is_none(), state.clock_24h);
+            if let Some(prog) = &cell.programme
+                && let Some(label) = crate::ui::downloads::programme_badge(ui.ctx(), row.channel, prog.start)
+            {
+                grid_painter.text(
+                    r.right_top() + egui::vec2(-6.0, 4.0),
+                    egui::Align2::RIGHT_TOP,
+                    label,
+                    egui::FontId::proportional(14.0 * theme.rem()),
+                    theme.tokens.urgent,
+                );
+            }
             if let Some(pos) = pointer
                 && r.contains(pos)
                 && grid.contains(pos)

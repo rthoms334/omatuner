@@ -111,6 +111,9 @@ pub struct Backup {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FeatureBackup {
+    /// Jobs and rules only; media is deliberately excluded (DESIGN §43 §4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloads: Option<serde_json::Value>,
     /// `store::queue::export` (Q-core).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<serde_json::Value>,
@@ -130,7 +133,12 @@ pub struct FeatureBackup {
 
 impl FeatureBackup {
     pub fn is_empty(&self) -> bool {
-        self.queue.is_none() && self.follow.is_none() && self.spoiler.is_none() && self.guide_fix.is_none() && self.watchlists.is_none()
+        self.downloads.is_none()
+            && self.queue.is_none()
+            && self.follow.is_none()
+            && self.spoiler.is_none()
+            && self.guide_fix.is_none()
+            && self.watchlists.is_none()
     }
 }
 
@@ -274,6 +282,7 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             spoiler: crate::store::spoiler::export(conn)?,
             guide_fix: crate::store::guide_fix::export(conn)?,
             watchlists: crate::store::watchlist::export(conn)?,
+            downloads: crate::store::downloads::export(conn)?,
         },
         config: config_toml,
     })
@@ -593,6 +602,9 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
         crate::store::watchlist::ImportResult::default()
     };
     rows += watchlists.rows;
+    if let Some(v) = &b.features.downloads {
+        rows += crate::store::downloads::import(&tx, v, &remap)?;
+    }
     if let Some(v) = &b.features.queue {
         rows += crate::store::queue::import_with_watchlists(&tx, v, &remap, &watchlists.entries)?;
     }

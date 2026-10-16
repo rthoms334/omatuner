@@ -476,6 +476,45 @@ impl Screen for PlayerScreen {
 
     fn on_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
         self.live_ctx = is_live(ctx.player);
+        if action == Action::Download
+            && let Some(p) = &ctx.player.playable
+        {
+            if let MediaRef::Catchup { channel, start, stop, ref catchup_id } = p.media
+                && let Some(item) = p.item.clone()
+            {
+                ctx.open(OverlayRequest::DownloadRecording {
+                    channel,
+                    target: crate::downloads::Target {
+                        item,
+                        programme: Some(crate::queue::Slot { start, stop, catchup_id: catchup_id.clone() }),
+                        minutes: None,
+                        any_copy: false,
+                    },
+                });
+                return true;
+            }
+            let target = match p.media {
+                MediaRef::Channel(id) | MediaRef::Catchup { channel: id, .. } => Some(crate::ui::item_menu::Target::Channel(id)),
+                MediaRef::Movie(id) => Some(crate::ui::item_menu::Target::Movie(id)),
+                MediaRef::Episode(id) => {
+                    crate::store::vod::episode(ctx.db, id).ok().map(|e| crate::ui::item_menu::Target::Episode { series: e.series_id, episode: id })
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                let snap = crate::ui::downloads::snapshot(ctx);
+                if let Some(job) = snap
+                    .jobs
+                    .iter()
+                    .find(|j| j.kind.recording() && j.state == crate::downloads::State::Running && j.item().as_ref() == p.item.as_ref())
+                {
+                    crate::ui::downloads::send(ctx, crate::downloads::DownloadCommand::StopRecording(job.id));
+                } else {
+                    ctx.open(crate::ui::OverlayRequest::Download(target));
+                }
+                return true;
+            }
+        }
         self.find_next_episode(ctx);
         if let Some(h) = self.numeric_action(ctx, action) {
             return h;
@@ -903,6 +942,7 @@ mod tests {
 
     fn playable() -> Arc<Playable> {
         Arc::new(Playable {
+            from_download: false,
             media: MediaRef::Channel(ChannelId(1)),
             kind: PlayableKind::Live,
             item: None,

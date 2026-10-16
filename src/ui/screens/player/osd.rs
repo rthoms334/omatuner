@@ -973,6 +973,9 @@ impl PlayerScreen {
     ) -> Rect {
         let t = &theme.tokens;
         let mut labels: Vec<String> = Vec::new();
+        if snap.playable.as_ref().and_then(|p| p.item.as_ref()).is_some_and(|i| crate::ui::downloads::recording(p.ctx(), i)) {
+            labels.push("⏺ Recording".into());
+        }
         if is_live(snap) {
             labels.push(live_label(snap));
         }

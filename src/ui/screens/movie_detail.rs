@@ -82,6 +82,7 @@ pub(crate) fn fraction(p: &WatchProgress) -> Option<f32> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Btn {
+    Download,
     Play,
     StartOver,
     /// "Play from ▾": the title's copies (DESIGN §29.14).
@@ -183,7 +184,7 @@ impl MovieDetailScreen {
         if self.copies.is_stacked() {
             v.push(Btn::PlayFrom);
         }
-        v.extend([Btn::Favourite, Btn::Watched]);
+        v.extend([Btn::Download, Btn::Favourite, Btn::Watched]);
         if self.in_continue_watching() {
             v.push(Btn::RemoveContinue);
         }
@@ -335,6 +336,11 @@ fn return_to_page(ctx: &mut UiCtx<'_>, item: &ItemRef) {
 impl MovieDetailScreen {
     fn press(&mut self, ctx: &mut UiCtx<'_>, b: Btn) {
         match b {
+            Btn::Download => {
+                if let Some(id) = self.id {
+                    ctx.open(OverlayRequest::Download(crate::ui::item_menu::Target::Movie(id)));
+                }
+            }
             Btn::Play => self.play(ctx, true),
             Btn::StartOver => self.play(ctx, false),
             Btn::PlayFrom => self.copies.play_from_menu(ctx),
@@ -690,6 +696,7 @@ impl Screen for MovieDetailScreen {
                                 (Some(glyphs::PLAY), label, true)
                             }
                             Btn::StartOver => (Some(glyphs::SKIP_BACK), "Start over".into(), false),
+                            Btn::Download => (Some("⤓"), "Download ▾".into(), false),
                             Btn::PlayFrom => (Some(glyphs::PLAYLIST), "Play from ▾".into(), false),
                             Btn::Favourite => (
                                 Some(if fav { glyphs::FAVOURITE } else { glyphs::FAVOURITE_OFF }),
@@ -1057,8 +1064,8 @@ pub(crate) mod tests {
         let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
         h.state_mut().enter(Route::MovieDetail(id));
         until(&mut h, "combined film removal", |h| has_label(h, "COPIES · 2") && has_label(h, "Remove from Continue watching"));
-        // The usual focus walk reaches Remove after Watched, before the copy cards.
-        for _ in 0..5 {
+        // The focus walk includes Download and reaches Remove after Watched.
+        for _ in 0..6 {
             h.state_mut().act(Action::FocusNext);
         }
         h.state_mut().act(Action::Activate);
@@ -1103,8 +1110,8 @@ pub(crate) mod tests {
         until(&mut h, "the details", |h| has_label(h, "Plot of movie 0."));
         assert_eq!(h.state().s.key_contexts(), vec![KeyContext::Detail]);
         assert!(has_label(&h, "Resume 10:00") && has_label(&h, "Start over") && has_label(&h, "Save to My list") && has_label(&h, "Mark watched"));
-        // → to "Mark watched", Enter: stored as finished
-        for _ in 0..3 {
+        // → past Start over, Download and My list to Mark watched.
+        for _ in 0..4 {
             h.state_mut().act(Action::Right);
         }
         h.state_mut().act(Action::Activate);
@@ -1193,8 +1200,8 @@ pub(crate) mod tests {
         h.state_mut().enter(Route::MovieDetail(ids[0]));
         h.run_steps(1);
         assert!(has_label(&h, "Play · Alpha"));
-        // → past the four buttons onto the mini-cards; Enter on Bravo's: Play uses it
-        for _ in 0..5 {
+        // → past the five buttons onto the mini-cards; Enter on Bravo's: Play uses it
+        for _ in 0..6 {
             h.state_mut().act(Action::Right);
         }
         h.state_mut().act(Action::Activate);
@@ -1258,8 +1265,8 @@ pub(crate) mod tests {
         h.state_mut().t.config = std::sync::Arc::new(cfg);
         h.run_steps(1);
         assert!(has_label(&h, "Bravo · EN · locked"));
-        // (four buttons, then Bravo's copy second)
-        h.state_mut().s.focus = 5;
+        // Five buttons, then Bravo's copy second.
+        h.state_mut().s.focus = 6;
         h.state_mut().act(Action::Activate);
         assert!(matches!(h.state_mut().nav().as_slice(), [NavRequest::Open(OverlayRequest::Pin { .. })]));
         let app = h.state_mut();

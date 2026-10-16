@@ -142,6 +142,7 @@ fn watchlist_position<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Resu
 tool_actions!(
     /// `follow` (Following, DESIGN §33; news flash included).
     pub enum FollowAction {
+        Record => ("record", true),
         Preview => ("preview", false),
         List => ("list", false),
         Add => ("add", true),
@@ -501,4 +502,26 @@ mod tests {
         assert_wire_names::<RemindersAction>();
         assert_wire_names::<SleepAction>();
     }
+}
+
+// Downloads and recordings (DESIGN §43 §7).
+tool_actions!(pub enum DownloadsAction {
+    List => ("list", false), Add => ("add", true), Series => ("series", true), Record => ("record", true),
+    Pause => ("pause", true), Resume => ("resume", true), Cancel => ("cancel", true), Delete => ("delete", true), Retry => ("retry", true)
+});
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Downloads {
+    pub action: DownloadsAction,
+    pub state: Option<String>,
+    pub refs: Option<Vec<String>>,
+    #[serde(rename = "ref")]
+    pub item: Option<String>,
+    pub channel: Option<String>,
+    pub minutes: Option<u32>,
+    pub copy: Option<String>,
+    pub scope: Option<String>,
+    pub n: Option<u32>,
+    pub season: Option<u32>,
+    pub ids: Option<Vec<i64>>,
 }

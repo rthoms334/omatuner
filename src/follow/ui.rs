@@ -74,7 +74,7 @@ pub fn on_action(ctx: &mut UiCtx<'_>, action: Action, target: &Target) -> bool {
     }
     match target {
         Target::Programme { programme, channel } => {
-            ctx.open(crate::ui::OverlayRequest::FollowSheet(FollowSheetSpec { programme: Some((*programme, *channel)), rule: None }));
+            ctx.open(crate::ui::OverlayRequest::FollowSheet(FollowSheetSpec { record: false, programme: Some((*programme, *channel)), rule: None }));
             true
         }
         // a gap in the guide: nothing to follow there
@@ -215,6 +215,7 @@ pub fn airings_text(a: Airings) -> &'static str {
 pub fn mode_text(r: &FollowRule) -> String {
     let offset = if r.offset_s > 0 { format!(" +{} min", r.offset_s / 60) } else { String::new() };
     match r.mode {
+        FollowMode::Record => "record".into(),
         FollowMode::Notify if r.lead_s <= 0 => "remind at start".into(),
         FollowMode::Notify => format!("remind {} min", (r.lead_s + 59) / 60),
         FollowMode::Switch => format!("switch at start{offset}"),
@@ -263,6 +264,7 @@ pub const WEEKENDS: u8 = 0b110_0000;
 /// "switch", "pop up", "list", "! clash · remind", "over the weekly limit", "skipped".
 pub fn state_text(u: &Upcoming) -> String {
     let what = match u.mode {
+        FollowMode::Record => "record",
         FollowMode::Notify => "remind",
         FollowMode::Switch => "switch",
         FollowMode::List => "list",
@@ -284,6 +286,7 @@ pub fn state_text(u: &Upcoming) -> String {
 pub fn state_glyph(u: &Upcoming) -> &'static str {
     match (u.state, u.mode) {
         (MatchState::OverCap | MatchState::Skipped | MatchState::LeftOut, _) => glyphs::CLOSE,
+        (_, FollowMode::Record) => "⏺",
         (_, FollowMode::Switch) => glyphs::LIVE_TV,
         (_, FollowMode::Flash) => glyphs::POP_OUT,
         (_, FollowMode::List) => glyphs::DOT,

@@ -29,11 +29,19 @@ impl SleepInhibitor {
     /// --list`). `None` off the desktop (tests never touch the system bus) or when logind
     /// isn't there: casting goes on without it.
     pub async fn take(device_name: &str) -> Option<Self> {
+        Self::take_reason(&format!("Casting to {device_name}")).await
+    }
+
+    /// Background media transfers keep sleep blocked, including a headless recording.
+    pub async fn for_downloads() -> Option<Self> {
+        Self::take_reason("Downloading or recording").await
+    }
+
+    async fn take_reason(why: &str) -> Option<Self> {
         if crate::platform::off_desktop() {
             return None;
         }
-        let why = format!("Casting to {device_name}");
-        match tokio::time::timeout(CALL_TIMEOUT, inhibit(&why)).await {
+        match tokio::time::timeout(CALL_TIMEOUT, inhibit(why)).await {
             Ok(Ok(fd)) => {
                 tracing::debug!("cast: sleep inhibited while casting");
                 Some(Self { _fd: fd })
