@@ -474,6 +474,12 @@ async fn refresh(state: &Shared, client: &mut Client, source: &mut Source, track
         None => client.playlist(&source.url).await?,
     };
     let media = playlist::parse(&text, &base).map_err(|_| PlayerErrorKind::Unsupported)?;
+    // A finished playlist (`#EXT-X-ENDLIST`, the "loop" channels some providers serve) has no
+    // live edge to follow: mpv plays it from the start, as before live rewind.
+    if source.last.is_none() && media.ended {
+        client.not_playlist = true;
+        return Err(PlayerErrorKind::Unsupported);
+    }
     let newest = media.segments.last().expect("parser requires segments").seq;
     let first = media.segments[0].seq;
     if source.regression(first, newest, media.segments.len()) {

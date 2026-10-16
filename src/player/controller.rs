@@ -695,6 +695,15 @@ impl Controller {
             }
             super::hls::Event::Failed(kind, text) => (kind, text),
         };
+        if let Some(text) = &text {
+            let about = (self.target_label(), text.clone());
+            if self.logged.provider.as_ref() == Some(&about) {
+                tracing::debug!("{}: the provider answered with the same message again", self.log);
+            } else {
+                tracing::warn!("{}: the provider answered with a message instead of a stream: {text:?}", self.log);
+                self.logged.provider = Some(about);
+            }
+        }
         let code = match kind {
             PlayerErrorKind::HttpForbidden => Some(403),
             PlayerErrorKind::HttpNotFound => Some(404),
