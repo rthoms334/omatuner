@@ -40,12 +40,12 @@
 | **Detail pages** | A `[⤓ Download ▾]` button. Series pages show "8 of 12 downloaded · 19 GB" |
 | **Player** | A "⤓ Playing from your download" line in stream info. While recording live, the OSD shows ⏺ and Ctrl+D stops recording |
 | **Status bar** | "⤓ 2 downloading · 4.1 MB/s" while anything runs |
-| **Settings ▸ Downloads** | Space cap, the free-space reserve, delete after watching, recording padding, folder, and "Pause all" |
+| **Settings ▸ Downloads** | Space cap, the free-space reserve, delete after watching, recording padding, folder, and "Pause downloads" |
 
 ### 2.2 Downloads screen, Wide
 ```
 ┌──────────────┬──────────────────────────────────────────────────────────────────────────────┐
-│ 󰓎 Watchlists  │ DOWNLOADS   38 GB used of 200 GB · 312 GB free           [⏸ Pause all]     │
+│ 󰓎 Watchlists  │ DOWNLOADS   38 GB used of 200 GB · 312 GB free           [⏸ Pause downloads]     │
 │ ⤓ Downloads 2 │ ─ Now ──────────────────────────────────────────────────────────────────────── │
 │ 󰒓 Settings    │  ⤓ Andor · S1E4 · Aldhani            ● TV    ▕██████░░░▏ 62 % · 6.2 MB/s · 4 min │
 │              │  ⏺ Bake Off · Tue 20:00–21:05           ● TV 2  recording · 21 min left          │
@@ -89,6 +89,7 @@ Every choice shows its size (or "~2 GB per hour" for a recording) and the free s
 
 **A download or recording is due on an account you're watching**
 - A toast appears with a 60 s countdown: "*Bake Off* recording starts on TV, which you're watching. [Record (stops this)] [Record from TV 2] [Skip]". When the window is hidden, it's a notification with the same actions.
+- **A download holds the account:** a due recording pauses it automatically, closing its socket before taking the lease. Only a picture holding the account gets this prompt. **Skip** cancels that recording with reason “skipped”.
 - **No answer:** downloads wait. A recording keeps your picture, and after the programme ends Tuner saves it from **catch-up** if the channel has it; otherwise it's marked **Missed (you were watching)**. See "Defaulted" in §11.
 
 **The agent:** `play` on a busy account returns `busy {what, progress}` and never pauses on its own. The agent asks you in chat and then calls `play` with `pause_downloads: true`.
@@ -114,7 +115,7 @@ Every choice shows its size (or "~2 GB per hour" for a recording) and the free s
 | **One at a time per account** | Each download or recording holds one budget lease, like a player tile. With `max_connections = 1`, a playlist runs one job at a time. TV and TV 2 run in parallel. Jobs waiting on an account show "waiting for TV". |
 | **Which copy** | Decided when the job **starts**, by `copies::plan` (latest progress → trouble last → language → playlist order), skipping a busy account when another copy is free. "Download from TV 2" pins it. |
 | **Resume** | Film and episode files use HTTP `Range` from the `.part` length when the server sent `Accept-Ranges: bytes` and the ETag / Last-Modified / length still match; otherwise they start again. Pause keeps the `.part` file. |
-| **Failures** | Retries 3 times with backoff (30 s, 2 min, 10 min), then **Failed** (Retry is in the menu). 403 at the limit counts as busy, not as a failure. Three failed jobs in a row on one account pause that account's queue with a toast, so it never hammers a provider overnight. |
+| **Failures** | Retries 3 times with backoff (30 s, 2 min, 10 min), then **Failed** (Retry is in the menu). 403 counts as busy only when other holders fill the account limit; the failing job’s own lease is excluded. Three failed jobs in a row on one account pause that account's queue with a toast, so it never hammers a provider overnight. |
 | **Playing a download** | `resolve` checks first for a **finished** download of this item, or of **any copy** of the title (for episodes, `same_episode`), and plays the local file: no lease and no network. Progress and watched state are stored against the downloaded copy's item, as today. Up next and watchlists use the download in the same way. |
 | **In-progress downloads** | They play from the provider as usual (through the Ask prompt when it's the downloading account). Playing a half-finished file isn't supported. |
 | **Live recording, HLS** (decided 2026-10-16) | A **keeping** variant of the `player/hls` recorder: no 1,800 s cut; segments, keys and maps are kept in the job's 0700 folder while recording. Saved HLS can't be played directly (mpv's clock resets at provider discontinuities; Codex's `downloaded_hls` probes in `tests/timeshift_transport.rs`). So when the recording stops it is **finished into one file**: each discontinuity run is remuxed with the cast relay's ffmpeg (`-c copy`, no re-encode), then joined with the concat demuxer, which offsets each run's timestamps, into `<id>.mkv`. The folder is deleted once the file is verified (duration within 2 s of the recorded total). The state is `finishing` ("Finishing… 40 %"), which takes about a minute per hour. A failed finish keeps the folder and retries on the next start. The finished file plays, seeks and casts like a downloaded film. |
@@ -125,11 +126,11 @@ Every choice shows its size (or "~2 GB per hour" for a recording) and the free s
 | **Tuner closed** | Recordings arm `tuner-record-<id>` transient units (§36.2 pattern, re-armed at login), which start Tuner headless (no window, the session counts as locked) to record. Downloads don't wake Tuner: they continue the next time it runs. |
 | **Guide changes** | At each EPG import, a scheduled recording follows its programme by (channel, title, start ±30 min). If the programme disappears, the recording keeps its time and is labelled "Not in the guide any more". |
 | **Missed** | If Tuner or the machine was off at the time: catch-up when the channel has it and the programme is inside the window, otherwise "Missed". |
-| **Space** | Before starting, there must be room for the job's size (or, for a recording, ~bitrate × duration) within the cap and above the reserve. Defaults: a cap of 200 GB and 10 GB kept free. A recording that runs out of space stops, keeps what it has, and is marked **Partial**. A download waits as "Waiting for space". |
+| **Space** | Before starting, there must be room for the job's size (or, for a recording, ~bitrate × duration) within the cap and above the reserve. Defaults: a cap of 200 GB and 10 GB kept free. A recording that runs out of space or stops early (including quit, crash, pause or Delete then Undo) keeps what it has and is marked **Partial**. Raw-TS parts recovered after their window are promoted to playable Partial files. A download waits as "Waiting for space". |
 | **Cleanup** (decided) | Kept until you delete them. "Delete downloads [n] days after watching" is off by default. Deleting a watched title in Tuner deletes its file too, after a Confirm. Deleting a playlist keeps its downloads (they still play) and lists them as orphans. |
-| **Series recording** (decided) | "Record every new episode" is a Following rule (§33) whose action is **record** instead of remind or switch. After every guide refresh, Following's evaluation schedules recordings for new matches (new = an S/E or a title not already recorded or downloaded; repeats are skipped). It has the same clash handling, and the rules are listed and edited in Settings ▸ Following. The agent's `follow` tool gains `action: record`. |
-| **Speed and window** (decided) | Full speed, one at a time per account, by default. Settings ▸ Downloads has an optional speed cap (MB/s) and an optional "Only download between [01:00] and [07:00]", both off. Recordings ignore the window. |
-| **Keep N** | A series rule: when an episode in it is watched (or deleted), the next unwatched episode is queued, up to N downloaded and unwatched at any time. |
+| **Series recording** (decided) | "Record every new episode" is a Following rule (§33) whose action is **record** instead of remind or switch. After every guide refresh, Following's evaluation schedules recordings for new matches (new = an S/E or event key not already recorded by this rule or downloaded; repeats within the rule are skipped. Event and fixture keys retain their dates, so daily programmes and subsequent matches remain new. Missed, Failed and Cancelled jobs do not count as recorded). It has the same clash handling, and the rules are listed and edited in Settings ▸ Following. The agent's `follow` tool gains `action: record`. |
+| **Speed and window** (decided) | Full speed, one at a time per account, by default. Settings ▸ Downloads has an optional speed cap (MB/s) and an optional "Only download between [01:00] and [07:00]", both off. Recordings ignore both the speed cap and window and spend none of the downloads’ shared rate budget. When the window closes, active downloads pause and resume when it opens. “Pause downloads” persists across restarts; recordings and finishing jobs continue. |
+| **Keep N** | A series rule: when an episode in it is watched (or deleted), the next unwatched episode is queued, up to N downloaded and unwatched at any time. Rules appear under “Kept topped up” in Downloads and Settings ▸ Downloads; Delete removes a rule, with Undo for 10 seconds, keeping its files. |
 
 ---
 
@@ -170,9 +171,9 @@ CREATE TABLE IF NOT EXISTS download_rule (     -- "Keep the next N unwatched dow
 );
 -- Series recording: follow_rule gains action 'record' (a Rust rebuild step if its CHECK lists the actions).
 ```
-- **Folder** (decided: private). `paths.downloads()` = `~/.local/share/tuner/downloads/`, 0700. Files are 0600 and named only by counters (`17.mkv`, `18/index.m3u8`, `18/000042.ts`). Settings can move it to another folder (an external disk), which is created 0700 and keeps the same layout. Nothing on disk names a title, a URL or a credential.
+- **Folder** (decided: private). `paths.downloads()` = `~/.local/share/tuner/downloads/`, 0700. Files are 0600 and named only by counters (`17.mkv`, `18/index.m3u8`, `18/000042.ts`). Settings can move it to another folder (an external disk), which is created 0700 and keeps the same layout. Folder copying runs off the async runtime while the scheduler continues ticking. Active recordings keep writing in the old folder; the final sync and switch wait for them. Nothing on disk names a title, a URL or a credential.
 - **Container extension** comes from the provider's `container_extension` (it's still a counter name).
-- **Startup reconcile:** `running` jobs → `waiting`; `.part` files without a row are deleted; rows whose file is missing → `failed (file missing)`.
+- **Startup reconcile:** interrupted live HLS recordings resume their kept folder while their stop is still in the future, otherwise finish as Partial; other `running` jobs → `waiting`; `.part` files without a row are deleted; rows whose file is missing → `failed (file missing)`.
 - **Backup** exports the rows and rules, not the media, and says so.
 - **Model.** `row_id!(DownloadId)`. `sources::resolve` gets a `local: Option<PathBuf>` check before building any URL. `Playable` carries `from_download: bool` for stream info.
 - **Config.** `[downloads] cap_gb = 200`, `reserve_gb = 10`, `delete_after_watched_days = 0`, `pad_before_s = 60`, `pad_after_s = 300`, `dir = ""` (default), `max_mbps = 0` (off), `window = ""` (off, e.g. "01:00-07:00").
@@ -218,9 +219,9 @@ CREATE TABLE IF NOT EXISTS download_rule (     -- "Keep the next N unwatched dow
 **A `downloads` tool:**
 | action | params | result |
 |---|---|---|
-| `list` | `state?` | `{used_gb, cap_gb, free_gb, items:[{id, ref, kind, title, s?, e?, state, progress, eta_s?, account, reason?, when?}]}` |
+| `list` | `state?` | `{used_gb, cap_gb, free_gb, items:[{id, ref, kind, series?, season?, episode?, title?, state, progress, eta_s?, account, reason?, when?}], rules:[{id, ref, title, keep}]}` |
 | `add` | `refs[]` (≤ 50: items, programmes, catch-ups), `copy?: best\|this` | `{added, refused:[{ref, error: locked\|not_found\|no_space\|duplicate}], size_gb}` |
-| `series` | `ref`, `scope: next\|next_n\|season\|all\|keep`, `n?`, `season?` | `{added \| rule}` |
+| `series` | `ref`, `scope: next\|next_n\|season\|all\|keep`, `n?`, `season?` | `{added \| rule}` (`scope=keep,n=0` removes the rule) |
 | `record` | programme `ref`, or `channel` + `minutes` | `{id, start, stop, clash?}` |
 | `pause` / `resume` / `cancel` / `delete` / `retry` | `ids[]` | `{items}` |
 
@@ -241,7 +242,7 @@ CREATE TABLE IF NOT EXISTS download_rule (     -- "Keep the next N unwatched dow
 7. **Series recording:** a Following rule with action record schedules each new episode once after a guide refresh, skips ones already recorded or downloaded, and is cancelled with the rule.
 8. **Window and speed cap:** outside the window downloads wait (recordings don't); the cap holds the average rate.
 9. **Keep N:** marking an episode watched queues the next. N is never exceeded.
-10. **Guardrails:** a locked ref is refused over MCP. A concealed download is absent everywhere. No title or `http` substring in file names, logs at INFO or MCP results.
+10. **Guardrails:** a locked ref is refused over MCP. A concealed download is absent everywhere. No title or `http` substring in file names or logs at INFO; MCP includes visible, spoiler-guarded titles but no stream addresses.
 11. **Startup reconcile** for `running` rows, stray `.part` files and missing files.
 
 ---

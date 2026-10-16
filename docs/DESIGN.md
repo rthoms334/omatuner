@@ -7117,6 +7117,10 @@ locally before credentials or a provider lease; partial recordings play only whe
 in Downloads. Private counter names, parental locks, concealment and the spoiler guard apply.
 The screen groups running, waiting, scheduled, downloaded and failed jobs; Settings controls
 the cap, reserve, watched-file retention, padding, folder, speed and optional overnight window.
+“Pause downloads” persists across restarts; recordings and finishing continue. Downloads pause
+when the window closes and resume when it opens. Recordings consume none of the shared rate
+budget. Downloads and Settings list Keep N rules under “Kept topped up”, with Delete and Undo.
+Forgetting a downloaded film or episode offers to delete its file too, after Confirm.
 
 ### 43.2 Recording and account clashes
 Live HLS adopts the existing rewind store when possible and keeps its segments, keys and
@@ -7131,7 +7135,11 @@ Pictures, casting and downloads share the connection budget. Playing on an accou
 a download asks before pausing or stopping it; an available copy on another account is offered.
 The lease is released only after transport closure. Playing the channel being recorded shares
 its recorder. An unanswered recording clash keeps the picture and falls back to catch-up,
-otherwise Missed. Following's record action schedules new episodes once through its ledger.
+otherwise Missed. Skip cancels the recording. A due recording automatically pauses a download
+holding its account; only a picture gets the clash prompt. Following identities are scoped to
+each rule; fixtures and daily events retain their dates, and Missed, Failed and Cancelled jobs
+do not count as recorded. A recording stopped early is Partial. After a crash, live HLS resumes
+its kept folder if its stop is still ahead; expired TS parts become playable Partial files.
 
 ### 43.3 Storage and agents
 Migration 0016 adds `download` and `download_rule` and Following's record action. Fingerprints,
@@ -7142,5 +7150,7 @@ missing files. The actor publishes at most 500 rows and four progress updates a 
 The `downloads` MCP tool lists, queues, records and manages jobs; `play.pause_downloads`
 requires consent, and `status.downloads` reports aggregate activity and space. Locked refs
 are refused and concealed jobs are omitted. Results use opaque references and numeric ids,
-without titles, filenames or stream addresses. Plugin rules and skills cover confirmations,
+with visible titles passed through the spoiler guard, but no filenames or stream addresses.
+Episode results carry series, season, episode and episode title. List includes Keep N rules;
+`series` with `scope=keep,n=0` removes one. Plugin rules and skills cover confirmations,
 recording plans, Keep N and failure recovery.

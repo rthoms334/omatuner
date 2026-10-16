@@ -2074,3 +2074,13 @@ helper's outcome.
       refuses locked refs, and concealed jobs disappear from every count and title surface.
 - [ ] Delete a playlist with downloads, play its orphaned media, restore a metadata backup and
       check missing files are labelled. Move the downloads folder and verify private modes.
+
+### Downloads review regressions
+- [ ] A due recording pauses an account's download without asking; a watched picture still gets Record / other account / Skip. Skip cancels; no answer uses catch-up or Missed.
+- [ ] Pause downloads survives restart; recordings and Finishing continue. A closing download window pauses only downloads and reopening resumes them.
+- [ ] Set a tiny speed cap: raw TS and HLS recordings remain continuous while downloads share the cap.
+- [ ] Kept topped up appears in Downloads and Settings; Delete and Undo remove/restore the rule. Agent list returns rules; `scope=keep,n=0` removes one.
+- [ ] Forget a downloaded movie or episode, including another copy: Confirm offers file deletion and Undo restores it. Ctrl+D recognises the saved copy.
+- [ ] Kill an HLS recording before its stop, restart, and verify it continues in the kept folder. Stop or Delete then Undo a raw TS recording: it stays Partial with its original bytes.
+- [ ] Move a large downloads folder across filesystems while a recording becomes due: it starts on time, the move waits for active recordings, and all saved files play after the switch.
+- [ ] Agent download list and busy play replies show plain titles but omit future episode titles protected by a series spoiler rule.
