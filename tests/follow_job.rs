@@ -261,3 +261,47 @@ fn series_recording_skips_a_downloaded_episode_and_repeated_airings() {
     assert_eq!(rows.len(), 2, "one downloaded episode plus one new recording; no repeat");
     assert_eq!(rows[1].fp["download_event"], "taskmaster#s20e05");
 }
+
+#[test]
+fn recording_identity_keeps_fixture_dates_and_failed_matches_can_be_scheduled_again() {
+    let s = Store::open_temp("follow-dates", None).unwrap();
+    seed(&s);
+    let mut rule = FollowRule::draft("Arsenal", FollowKind::Team, vec!["Arsenal".into()], &Default::default(), NOW);
+    rule.mode = FollowMode::Record;
+    w(&s, move |c| store_follow::save_rule(c, &rule, 100, NOW));
+    guide(&s, 1, SAT);
+    evaluate(&s, FollowReason::Rules, NOW).unwrap();
+    let schedule = |c: &mut Connection| {
+        let lib = library::load(c)?;
+        tuner::downloads::maintenance::following(c, &lib, &Default::default(), NOW)
+    };
+    w(&s, schedule);
+    let first = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap()[0].clone();
+    assert!(first.fp["download_event"].as_str().unwrap().contains('@'));
+    let first_id = first.id;
+    w(&s, move |c| {
+        c.execute("UPDATE download SET state='done',fp=json_set(fp,'$.download_follow_rule',999) WHERE id=?1", [first_id])?;
+        Ok(())
+    });
+    guide(&s, 2, SAT + 3600);
+    evaluate(&s, FollowReason::Guide, NOW + 60).unwrap();
+    w(&s, schedule);
+    assert_eq!(
+        tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap().len(),
+        2,
+        "another rule's completed recording does not consume this rule's identity"
+    );
+    guide(&s, 3, SAT + 86400);
+    evaluate(&s, FollowReason::Guide, NOW + 120).unwrap();
+    w(&s, schedule);
+    let rows = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap();
+    assert_eq!(rows.len(), 3, "the next day's fixture is new");
+    assert_ne!(rows[0].fp["download_event"], rows[2].fp["download_event"]);
+    for state in [tuner::downloads::State::Missed, tuner::downloads::State::Failed, tuner::downloads::State::Cancelled] {
+        let rows = tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap();
+        let id = rows.last().unwrap().id;
+        w(&s, move |c| tuner::store::downloads::set_state(c, id, state, None));
+        w(&s, schedule);
+        assert_eq!(tuner::store::downloads::jobs(&s.reader().unwrap()).unwrap().len(), rows.len() + 1);
+    }
+}

@@ -660,3 +660,56 @@ fn provider_hls_master_keys_headers_and_expiring_urls() {
     drop(mpv);
     drop(buffer);
 }
+
+/// ENDLIST belongs to the archive recorder; live-only fallback must not hand it to mpv.
+#[test]
+fn archive_endlist_is_saved_and_finished_into_a_playable_file() {
+    use tuner::player::hls::{Buffer, RecordingLimits, finish};
+    let media = support::media::ensure_rolling_media();
+    let server = TestServer::start(media, Faults::default());
+    let mut playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n".to_owned();
+    for seq in 0..6 {
+        playlist.push_str(&format!("#EXTINF:2.0,\nseg{seq:03}.ts\n"));
+    }
+    playlist.push_str("#EXT-X-ENDLIST\n");
+    server.set_body("/rolling/archive.m3u8", Some(&playlist));
+    let p = hls_playable(server.url("rolling/archive.m3u8"));
+    let root = tempfile::tempdir().unwrap();
+    let kept = root.path().join("1");
+    let resources = tuner::downloads::limits::Resources::default();
+    resources.configure(u64::MAX, 0.000001);
+    let buffer = Buffer::start_keep(
+        &p,
+        &kept,
+        "fixture",
+        RecordingLimits { reserve_bytes: 0, max_bytes: u64::MAX, limits: Some(resources.job(tuner::model::DownloadId(1)).recording()) },
+        true,
+    )
+    .unwrap();
+    let started = Instant::now();
+    loop {
+        let state = buffer.snapshot();
+        assert!(!state.failed, "archive failed: {:?}", state.failure);
+        if state.ended {
+            break;
+        }
+        assert!(started.elapsed() < TIMEOUT, "archive was throttled or never ended");
+        thread::sleep(POLL);
+    }
+    drop(buffer);
+    let index = finish::Recording::load(&kept).unwrap();
+    assert_eq!(index.tracks[0].len(), 6);
+    let output = root.path().join("1.mkv");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(finish::finish(&kept, &output, &tokio_util::sync::CancellationToken::new(), |_| {})).unwrap();
+    let mpv = mpv();
+    mpv.command("loadfile", &[output.to_str().unwrap(), "replace"]).unwrap();
+    first_frame(&mpv, Instant::now());
+    assert!((mpv.get_property::<f64>("duration").unwrap() - 12.0).abs() < 2.0);
+    mpv.command("seek", &["8", "absolute+exact"]).unwrap();
+    let started = Instant::now();
+    while mpv.get_property::<f64>("time-pos").unwrap_or(0.0) < 7.5 {
+        assert!(started.elapsed() < TIMEOUT);
+        thread::sleep(POLL);
+    }
+}

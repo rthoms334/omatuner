@@ -219,7 +219,7 @@ impl HttpClient {
             let total = until.is_none().then(|| resp.content_length().map(|n| n + offset)).flatten();
             validators(ResumeValidators {
                 streamed:until.is_some(),
-                accepts_ranges: header_string(&resp, header::ACCEPT_RANGES).is_some_and(|s| s.eq_ignore_ascii_case("bytes")),
+                accepts_ranges: (offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT) || header_string(&resp, header::ACCEPT_RANGES).is_some_and(|s| s.eq_ignore_ascii_case("bytes")),
                 etag: etag.clone(),
                 last_modified: last_modified.clone(),
                 length: total,
@@ -266,7 +266,9 @@ impl HttpClient {
                 file.write_all(&chunk).await.map_err(|e| Error::io(&part, e))?;
                 if let Some(permit) = permit { permit.commit(); }
                 done += chunk.len() as u64;
-                if let Some(limits) = &opts.limits {
+                if until.is_some() {
+                    // Recordings share the space cap, never the downloads' rate budget.
+                } else if let Some(limits) = &opts.limits {
                     tokio::select! {
                         () = cancel.cancelled() => { file.flush().await.map_err(|e| Error::io(&part,e))?; progress(done,total); return Err(Error::Cancelled); }
                         () = limits.throttle(chunk.len() as u64) => {}
@@ -1107,11 +1109,7 @@ mod tests {
                     if offset > 0 && mode != "none" {
                         (
                             StatusCode::PARTIAL_CONTENT,
-                            [
-                                ("etag", etag.to_owned()),
-                                ("accept-ranges", "bytes".into()),
-                                ("content-range", format!("bytes {}-{}/{}", offset, body.len() - 1, body.len())),
-                            ],
+                            [("etag", etag.to_owned()), ("content-range", format!("bytes {}-{}/{}", offset, body.len() - 1, body.len()))],
                             body[offset..].to_vec(),
                         )
                             .into_response()
@@ -1138,12 +1136,24 @@ mod tests {
                 ResumeValidators { streamed: false, accepts_ranges: ranges, etag: Some("v1".into()), last_modified: None, length: Some(BIG as u64) },
             ));
             seen.lock().unwrap().clear();
-            client().download(&req, &|_, _| {}, &CancellationToken::new()).await.unwrap();
-            assert_eq!(std::fs::read(dest).unwrap(), plain_body());
+            let saved = Mutex::new(ResumeValidators::default());
+            client()
+                .download_media(&req, &MediaOptions::default(), &|_, _| {}, &|v| *saved.lock().unwrap() = v, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), plain_body());
+            if mode == "same" {
+                let validators = saved.into_inner().unwrap();
+                assert!(validators.accepts_ranges, "206 confirms ranges without Accept-Ranges");
+                std::fs::write(&part, &plain_body()[..23456]).unwrap();
+                req.resume_from = Some((23456, validators));
+                client().download_media(&req, &MediaOptions::default(), &|_, _| {}, &|_| {}, &CancellationToken::new()).await.unwrap();
+                assert_eq!(std::fs::read(&dest).unwrap(), plain_body());
+            }
             assert!(!part.exists());
             let actual = seen.lock().unwrap().clone();
             match mode {
-                "same" => assert_eq!(actual, ["bytes=12345-"]),
+                "same" => assert_eq!(actual, ["bytes=12345-", "bytes=23456-"]),
                 "changed" => assert_eq!(actual, ["bytes=12345-", ""]),
                 _ => assert_eq!(actual, [""]),
             }

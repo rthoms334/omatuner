@@ -994,6 +994,7 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DownloadsConfig {
+    pub paused: bool,
     pub cap_gb: u64,
     pub reserve_gb: u64,
     pub delete_after_watched_days: u32,
@@ -1006,6 +1007,7 @@ pub struct DownloadsConfig {
 impl Default for DownloadsConfig {
     fn default() -> Self {
         Self {
+            paused: false,
             cap_gb: 200,
             reserve_gb: 10,
             delete_after_watched_days: 0,

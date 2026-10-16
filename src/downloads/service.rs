@@ -75,16 +75,21 @@ pub fn spawn(rt: &tokio::runtime::Handle, deps: Deps) -> DownloadsHandle {
     let command_tx = tx.clone();
     let budget = deps.budget.clone();
     rt.spawn(async move {
+        let paused = current(&deps.config).downloads.paused;
         let mut engine = Engine {
             deps,
             resources: super::limits::Resources::default(),
             arming,
             command_tx,
             running: HashMap::new(),
-            paused: false,
+            saved: HashMap::new(),
+            visibility: Mutex::new(Visibility::default()),
+            paused,
             failed: HashMap::new(),
             paused_accounts: HashSet::new(),
             undo: HashMap::new(),
+            moving: None,
+            undo_rules: HashMap::new(),
             snapshot,
             last_progress: (Instant::now(), 0),
             closing: false,
@@ -112,16 +117,34 @@ pub fn spawn(rt: &tokio::runtime::Handle, deps: Deps) -> DownloadsHandle {
     DownloadsHandle { tx, snapshot: watch, budget }
 }
 
+#[derive(Default)]
+struct Visibility {
+    library: Option<Arc<crate::store::library::Library>>,
+    explicit: HashMap<ItemRef, bool>,
+}
+
+struct FolderMove {
+    from: PathBuf,
+    to: PathBuf,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    dirty: bool,
+    reply: Option<oneshot::Sender<DownloadReply>>,
+}
+
 struct Engine {
     resources: super::limits::Resources,
     deps: Deps,
     arming: Option<Arc<Mutex<crate::platform::systemd::ArmSync>>>,
     command_tx: mpsc::UnboundedSender<(DownloadCommand, Option<oneshot::Sender<DownloadReply>>)>,
     running: HashMap<DownloadId, Running>,
+    saved: HashMap<DownloadId, Job>,
+    visibility: Mutex<Visibility>,
     paused: bool,
     failed: HashMap<SourceId, u8>,
     paused_accounts: HashSet<SourceId>,
     undo: HashMap<DownloadId, (Instant, Job)>,
+    moving: Option<FolderMove>,
+    undo_rules: HashMap<i64, (Instant, db::KeepRule)>,
     snapshot: watch::Sender<Arc<DownloadsSnapshot>>,
     last_progress: (Instant, u64),
     closing: bool,
@@ -147,6 +170,16 @@ impl Engine {
             tokio::select! {
                 command = commands.recv() => {
                     let Some((command,reply)) = command else { break };
+                    if let DownloadCommand::MoveFolder(path) = command {
+                        match self.begin_move(path).await {
+                            Ok(()) => { if let Some(moving) = &mut self.moving { moving.reply = reply; } }
+                            Err(e) => {
+                                let result = DownloadReply { error: Some(e.to_string()), ..Default::default() };
+                                if let Some(reply) = reply { let _ = reply.send(result); }
+                            }
+                        }
+                        continue;
+                    }
                     let result = self.command(command).await;
                     let result = result.unwrap_or_else(|_| DownloadReply { error:Some("Downloads could not save that change".into()),..Default::default() });
                     if let Some(error) = &result.error { self.deps.bus.toast(Toast::error(error)); }
@@ -168,14 +201,36 @@ impl Engine {
         db::root(&self.deps.store.reader()?, &current(&self.deps.config).downloads)
     }
 
-    async fn save(&self, job: Job) -> Result<()> {
-        self.deps.store.writer().run(move |c| db::put(c, &job)).await
+    async fn save(&mut self, job: Job) -> Result<()> {
+        if self.saved.get(&job.id) == Some(&job) {
+            return Ok(());
+        }
+        let write = job.clone();
+        self.deps.store.writer().run(move |c| db::put(c, &write)).await?;
+        self.saved.insert(job.id, job);
+        Ok(())
     }
 
     fn visible(&self, job: &Job) -> bool {
-        let Ok(c) = self.deps.store.reader() else { return false };
+        let lib = self.deps.shared.library();
         let cfg = current(&self.deps.config);
-        !planning::concealed(&c, &self.deps.shared.library(), self.deps.shared.parental(&cfg.parental), job)
+        let view = self.deps.shared.parental(&cfg.parental);
+        let Some(item) = job.item() else { return !view.hides_explicit || !job.explicit() };
+        if lib.conceals(&item) {
+            return false;
+        }
+        if !view.hides_explicit {
+            return true;
+        }
+        let mut cache = self.visibility.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.library.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &lib)) {
+            cache.library = Some(lib);
+            cache.explicit.clear();
+        }
+        !*cache
+            .explicit
+            .entry(item.clone())
+            .or_insert_with(|| self.deps.store.reader().ok().and_then(|c| crate::store::live::item_explicit(&c, &item).ok()).unwrap_or(true))
     }
 
     async fn add(&self, targets: Vec<Target>, agent: bool) -> Result<DownloadReply> {
@@ -253,6 +308,10 @@ impl Engine {
     }
 
     async fn command(&mut self, command: DownloadCommand) -> Result<DownloadReply> {
+        self.saved.clear();
+        if let Some(moving) = &mut self.moving {
+            moving.dirty = true;
+        }
         let done = DownloadReply::default();
         match command {
             DownloadCommand::Add { targets, agent } => {
@@ -263,6 +322,24 @@ impl Engine {
             }
             DownloadCommand::Series { item, scope, agent } => {
                 let c = self.deps.store.reader()?;
+                if scope == SeriesScope::Keep(0) {
+                    let cfg = current(&self.deps.config);
+                    let series = crate::store::vod::series(&c, planning::series_id(&c, &item)?)?;
+                    let item = ItemRef { source: series.source_id, kind: ItemKind::Series, key: series.key };
+                    if self.deps.shared.library().conceals(&item)
+                        || (self.deps.shared.parental(&cfg.parental).hides_explicit && crate::store::live::item_explicit(&c, &item)?)
+                    {
+                        return Ok(DownloadReply { error: Some("not_found".into()), ..done });
+                    }
+                    if agent && series.locked && !self.deps.shared.parental(&cfg.parental).unlocked {
+                        return Ok(DownloadReply { error: Some("locked: needs your PIN in Tuner".into()), ..done });
+                    }
+                    let id = db::rules(&c)?.into_iter().find(|r| r.source_id == item.source && r.series_key == item.key).map(|r| r.id);
+                    if let Some(id) = id {
+                        self.delete_rule(id).await?;
+                    }
+                    return Ok(DownloadReply { rule: id, ..done });
+                }
                 let targets = planning::series_targets(&c, &item, scope)?;
                 if let SeriesScope::Keep(n) = scope {
                     // Validate the same concealed/locked reference before persisting a rule.
@@ -368,7 +445,7 @@ impl Engine {
                     {
                         self.stop(id, State::Cancelled, Some("delete pending")).await?;
                         let mut kept = db::job(&self.deps.store.reader()?, id)?.unwrap_or_else(|| job.clone());
-                        if kept.state != State::Finishing {
+                        if kept.state != State::Finishing && !kept.state.playable() {
                             kept.state = job.state;
                         }
                         kept.reason = job.reason;
@@ -392,6 +469,16 @@ impl Engine {
                     }
                 }
             }
+            DownloadCommand::DeleteRule(id) => {
+                self.delete_rule(id).await?;
+            }
+            DownloadCommand::UndoRule(id) => {
+                if let Some((at, rule)) = self.undo_rules.remove(&id)
+                    && at.elapsed() < Duration::from_secs(10)
+                {
+                    self.deps.store.writer().run(move |c| db::restore_rule(c, &rule)).await?;
+                }
+            }
             DownloadCommand::Move { id, to } => {
                 self.deps.store.writer().run(move |c| db::move_to(c, id, to)).await?;
             }
@@ -413,9 +500,21 @@ impl Engine {
                 }
             }
             DownloadCommand::PauseAll(on) => {
+                let mut cfg = (*current(&self.deps.config)).clone();
+                cfg.downloads.paused = on;
+                cfg.save(&self.deps.paths.config_file())?;
+                *self.deps.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
                 self.paused = on;
                 if on {
-                    let ids: Vec<_> = self.running.keys().copied().collect();
+                    let ids: Vec<_> = db::jobs(&self.deps.store.reader()?)?
+                        .into_iter()
+                        .filter(|j| {
+                            j.state == State::Running
+                                && !j.kind.recording()
+                                && self.running.get(&j.id).is_none_or(|r| r.progress.lock().unwrap_or_else(|e| e.into_inner()).finishing.is_none())
+                        })
+                        .map(|j| j.id)
+                        .collect();
                     for id in ids {
                         self.stop(id, State::Paused, Some("all")).await?;
                     }
@@ -441,8 +540,13 @@ impl Engine {
                 if let Some(mut job) = db::job(&self.deps.store.reader()?, id)?
                     && self.visible(&job)
                 {
+                    if !matches!(job.state, State::Scheduled | State::Waiting) {
+                        return Ok(done);
+                    }
                     if !record {
-                        job.reason = Some("watching".into());
+                        job.state = State::Cancelled;
+                        job.reason = Some("skipped".into());
+                        job.fp["download_clash_at"] = serde_json::Value::Null;
                     } else if alternate {
                         if let Some(item) = planning::alternate(&self.deps.store.reader()?, &self.deps.shared.library(), &self.deps.budget, &job)? {
                             planning::change_copy(
@@ -486,9 +590,11 @@ impl Engine {
                 }
             }
             DownloadCommand::MoveFolder(path) => {
-                self.move_folder(path).await?;
+                self.begin_move(path).await?;
             }
-            DownloadCommand::Refresh => {}
+            DownloadCommand::Refresh => {
+                self.maintenance_at = Instant::now() - Duration::from_secs(60);
+            }
             DownloadCommand::Shutdown => {
                 self.closing = true;
                 let ids: Vec<_> = self.running.keys().copied().collect();
@@ -498,6 +604,22 @@ impl Engine {
             }
         }
         Ok(done)
+    }
+
+    async fn delete_rule(&mut self, id: i64) -> Result<()> {
+        let c = self.deps.store.reader()?;
+        if let Some(rule) = db::rules(&c)?.into_iter().find(|r| r.id == id) {
+            let item = ItemRef { source: rule.source_id, kind: ItemKind::Series, key: rule.series_key.clone() };
+            let cfg = current(&self.deps.config);
+            if self.deps.shared.library().conceals(&item)
+                || (self.deps.shared.parental(&cfg.parental).hides_explicit && crate::store::live::item_explicit(&c, &item)?)
+            {
+                return Ok(());
+            }
+            self.deps.store.writer().run(move |c| db::delete_rule(c, id)).await?;
+            self.undo_rules.insert(id, (Instant::now(), rule));
+        }
+        Ok(())
     }
 
     fn failed_job(&mut self, source: SourceId) {
@@ -510,6 +632,13 @@ impl Engine {
     }
 
     async fn tick(&mut self) -> Result<()> {
+        let time = jiff::Zoned::now();
+        self.tick_at(crate::model::now(), time.hour() as u32 * 60 + time.minute() as u32).await
+    }
+
+    async fn tick_at(&mut self, now: i64, minute: u32) -> Result<()> {
+        self.finish_move().await;
+        self.undo_rules.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(10));
         if self.maintenance_at.elapsed() >= Duration::from_secs(5) {
             self.maintenance_at = Instant::now();
             self.maintain().await?;
@@ -518,9 +647,7 @@ impl Engine {
         for id in completed {
             let mut run = self.running.remove(&id).expect("completed worker");
             let (mut job, result) = run.task.await.map_err(Error::other)?;
-            let at_limit = job
-                .source_id
-                .is_some_and(|source| self.deps.budget.usage().iter().any(|u| u.source == source && u.limit.is_some_and(|limit| u.in_use >= limit)));
+            let at_limit = job.source_id.is_some_and(|source| !self.deps.budget.admits(job.id, source));
             if let Some(lease) = run.lease.take() {
                 self.deps.budget.release(id, lease, None);
             }
@@ -574,6 +701,9 @@ impl Engine {
         let expired: Vec<_> = self.undo.iter().filter(|(_, (at, _))| at.elapsed() >= Duration::from_secs(10)).map(|(id, _)| *id).collect();
         for id in expired {
             if let Some((_, mut job)) = self.undo.remove(&id) {
+                if let Some(moving) = &mut self.moving {
+                    moving.dirty = true;
+                }
                 remove_files(&self.root()?, &job)?;
                 job.state = State::Cancelled;
                 job.store_name = None;
@@ -585,6 +715,18 @@ impl Engine {
         }
         let cfg = current(&self.deps.config);
         let mut rows = db::jobs(&self.deps.store.reader()?)?;
+        self.saved = rows.iter().map(|j| (j.id, j.clone())).collect();
+        if !scheduler::window_allows(&cfg.downloads.window, minute) {
+            for job in &rows {
+                if job.state == State::Running
+                    && !job.kind.recording()
+                    && self.running.get(&job.id).is_some_and(|r| r.progress.lock().unwrap_or_else(|e| e.into_inner()).finishing.is_none())
+                {
+                    self.stop(job.id, State::Paused, Some("window")).await?;
+                }
+            }
+            rows = db::jobs(&self.deps.store.reader()?)?;
+        }
         for job in &mut rows {
             if let Some(run) = self.running.get_mut(&job.id) {
                 let p = run.progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -600,125 +742,152 @@ impl Engine {
                 self.save(job.clone()).await?;
             }
         }
-        let now = crate::model::now();
         let actual_used: u64 = rows.iter().map(|j| j.bytes_done).sum();
         let mut used = actual_used;
         let root = self.root()?;
         let free = crate::sources::http::free_bytes(&root).unwrap_or(0);
         let cap = cfg.downloads.cap_gb.saturating_mul(1_000_000_000);
-        let reserve = cfg.downloads.reserve_gb.saturating_mul(1_000_000_000);
         self.resources.configure(cap, cfg.downloads.max_mbps);
         let mut pending = rows.clone();
         pending.sort_by_key(|j| (!j.kind.recording(), j.position));
-        for mut job in pending {
-            if self.running.contains_key(&job.id) || self.undo.contains_key(&job.id) {
-                continue;
-            }
-            if job.state == State::Paused
-                && matches!(job.reason.as_deref(), Some("playback" | "recording"))
-                && job.source_id.is_some_and(|s| self.deps.budget.admits(job.id, s))
-            {
-                job.state = State::Waiting;
-                job.reason = None;
-                self.save(job.clone()).await?;
-            }
-            if self.paused
-                || !matches!(job.state, State::Waiting | State::Scheduled | State::Finishing)
-                || job.source_id.is_some_and(|s| self.paused_accounts.contains(&s))
-            {
-                continue;
-            }
-            if job.fp.get("download_retry_at").and_then(serde_json::Value::as_i64).is_some_and(|at| now < at)
-                || job.fp.get("download_finish_failed").and_then(serde_json::Value::as_bool) == Some(true)
-            {
-                continue;
-            }
-            if job.state != State::Finishing {
-                if !job.kind.recording() {
-                    let time = jiff::Zoned::now();
-                    let minute = time.hour() as u32 * 60 + time.minute() as u32;
-                    if !scheduler::window_allows(&cfg.downloads.window, minute) {
-                        job.reason = Some("window".into());
-                        self.save(job).await?;
-                        continue;
-                    }
+        for job in pending {
+            if self.pending(job.clone(), &cfg, now, minute, &mut used, free).await.is_err() {
+                let mut failed = job;
+                failed.state = State::Failed;
+                failed.reason = Some("not in your playlists".into());
+                if self.save(failed).await.is_err() {
+                    tracing::warn!("downloads: could not save failed job");
                 }
-                let c = self.deps.store.reader()?;
-                let adopt = job.kind == Kind::Live && planning::media(&c, &job).is_ok_and(|m| self.deps.budget.has_live(&m));
-                let busy = !adopt && job.source_id.is_some_and(|s| !self.deps.budget.admits(job.id, s));
-                let catchup = catchup_available(&c, &job, now);
-                match scheduler::due(&job, now, busy, catchup) {
-                    scheduler::Due::Wait => {
-                        if job.fp.get("download_clash_at").and_then(serde_json::Value::as_i64).is_some_and(|at| now >= at + 60) {
-                            job.reason = Some("watching".into());
-                            self.save(job).await?;
-                        }
-                        continue;
-                    }
-                    scheduler::Due::Ask => {
-                        if !self.visible(&job) {
-                            job.reason = Some("watching".into());
-                            self.save(job).await?;
-                            continue;
-                        }
-                        if job.fp.get("download_clash_at").and_then(serde_json::Value::as_i64).is_none() {
-                            job.fp["download_clash_at"] = now.into();
-                            job.reason = Some("clash".into());
-                            job.fp["download_alternate"] =
-                                planning::alternate(&c, &self.deps.shared.library(), &self.deps.budget, &job)?.is_some().into();
-                            self.notify_due(&job);
-                            self.save(job).await?;
-                        }
-                        continue;
-                    }
-                    scheduler::Due::Catchup => {
-                        job.kind = Kind::Catchup;
-                        job.state = State::Waiting;
-                        job.reason = Some("saved from catch-up".into());
-                    }
-                    scheduler::Due::Missed => {
-                        job.state = State::Missed;
-                        if job.reason.as_deref() != Some("watching") {
-                            job.reason = Some("missed".into());
-                        }
-                        self.save(job).await?;
-                        continue;
-                    }
-                    scheduler::Due::Start => {}
-                }
-                let Some(item) = (if adopt { job.item() } else { planning::pick(&c, &self.deps.shared.library(), &cfg, &self.deps.budget, &job)? })
-                else {
-                    job.reason = Some("busy".into());
-                    self.save(job).await?;
-                    continue;
-                };
-                if job.item().as_ref() != Some(&item) {
-                    planning::change_copy(&c, &self.deps.shared.library(), &cfg, &mut job, item)?;
-                }
-                let size = db::estimate(&job).saturating_sub(job.bytes_done);
-                if !scheduler::space_allows(used, free, cap, reserve, size) {
-                    job.reason = Some("space".into());
-                    self.save(job).await?;
-                    continue;
-                }
-                used = used.saturating_add(size);
-            }
-            if self.start(job.clone(), cap.saturating_sub(used), reserve).await.is_err() {
-                job.attempts += 1;
-                job.reason = Some("Could not open this item".into());
-                job.state = if let Some(delay) = scheduler::retry_delay(job.attempts) {
-                    job.fp["download_retry_at"] = (now + delay).into();
-                    State::Waiting
-                } else {
-                    if let Some(source) = job.source_id {
-                        self.failed_job(source);
-                    }
-                    State::Failed
-                };
-                self.save(job).await?;
             }
         }
+        let rows = db::jobs(&self.deps.store.reader()?)?;
         self.publish(&rows, actual_used, free, cap);
+        Ok(())
+    }
+
+    async fn pending(&mut self, mut job: Job, cfg: &crate::config::Config, now: i64, minute: u32, used: &mut u64, free: u64) -> Result<()> {
+        let cap = cfg.downloads.cap_gb.saturating_mul(1_000_000_000);
+        let reserve = cfg.downloads.reserve_gb.saturating_mul(1_000_000_000);
+        if self.running.contains_key(&job.id) || self.undo.contains_key(&job.id) {
+            return Ok(());
+        }
+        if job.state == State::Paused
+            && (matches!(job.reason.as_deref(), Some("playback" | "recording"))
+                || (job.reason.as_deref() == Some("window") && scheduler::window_allows(&cfg.downloads.window, minute)))
+            && job.source_id.is_some_and(|s| self.deps.budget.admits(job.id, s))
+        {
+            job.state = State::Waiting;
+            job.reason = None;
+            self.save(job.clone()).await?;
+        }
+        if ((self.paused || self.moving.is_some()) && !job.kind.recording() && job.state != State::Finishing)
+            || !matches!(job.state, State::Waiting | State::Scheduled | State::Finishing)
+            || job.source_id.is_some_and(|s| self.paused_accounts.contains(&s))
+        {
+            return Ok(());
+        }
+        if job.fp.get("download_retry_at").and_then(serde_json::Value::as_i64).is_some_and(|at| now < at)
+            || job.fp.get("download_finish_failed").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            return Ok(());
+        }
+        if job.state != State::Finishing {
+            if !job.kind.recording() && !scheduler::window_allows(&cfg.downloads.window, minute) {
+                job.reason = Some("window".into());
+                self.save(job).await?;
+                return Ok(());
+            }
+            let c = self.deps.store.reader()?;
+            planning::media(&c, &job)?;
+            let adopt = job.kind == Kind::Live && planning::media(&c, &job).is_ok_and(|m| self.deps.budget.has_live(&m));
+            let busy = !adopt && job.source_id.is_some_and(|s| self.deps.budget.picture_holds(job.id, s));
+            let catchup = catchup_available(&c, &job, now);
+            match scheduler::due(&job, now, busy, catchup) {
+                scheduler::Due::Wait => {
+                    if job.fp.get("download_clash_at").and_then(serde_json::Value::as_i64).is_some_and(|at| now >= at + 60) {
+                        job.reason = Some("watching".into());
+                        self.save(job).await?;
+                    }
+                    return Ok(());
+                }
+                scheduler::Due::Ask => {
+                    if !self.visible(&job) {
+                        job.reason = Some("watching".into());
+                        self.save(job).await?;
+                        return Ok(());
+                    }
+                    if job.fp.get("download_clash_at").and_then(serde_json::Value::as_i64).is_none() {
+                        job.fp["download_clash_at"] = now.into();
+                        job.reason = Some("clash".into());
+                        job.fp["download_alternate"] =
+                            planning::alternate(&c, &self.deps.shared.library(), &self.deps.budget, &job)?.is_some().into();
+                        self.notify_due(&job);
+                        self.save(job).await?;
+                    }
+                    return Ok(());
+                }
+                scheduler::Due::Catchup => {
+                    job.kind = Kind::Catchup;
+                    job.state = State::Waiting;
+                    job.reason = Some("saved from catch-up".into());
+                }
+                scheduler::Due::Missed => {
+                    if db::recover_partial(&self.root()?, &mut job, now)? {
+                        self.save(job).await?;
+                        return Ok(());
+                    }
+                    job.state = State::Missed;
+                    if job.reason.as_deref() != Some("watching") {
+                        job.reason = Some("missed".into());
+                    }
+                    self.save(job).await?;
+                    return Ok(());
+                }
+                scheduler::Due::Start => {}
+            }
+            if job.kind == Kind::Live
+                && !adopt
+                && let Some(source) = job.source_id
+            {
+                let ids: Vec<_> = db::jobs(&c)?
+                    .into_iter()
+                    .filter(|j| j.source_id == Some(source) && !j.kind.recording() && self.running.contains_key(&j.id))
+                    .map(|j| j.id)
+                    .collect();
+                for id in ids {
+                    self.stop(id, State::Paused, Some("recording")).await?;
+                }
+            }
+            let Some(item) = (if adopt { job.item() } else { planning::pick(&c, &self.deps.shared.library(), cfg, &self.deps.budget, &job)? }) else {
+                job.reason = Some("busy".into());
+                self.save(job).await?;
+                return Ok(());
+            };
+            if job.item().as_ref() != Some(&item) {
+                planning::change_copy(&c, &self.deps.shared.library(), cfg, &mut job, item)?;
+            }
+            let size = db::estimate(&job).saturating_sub(job.bytes_done);
+            if !scheduler::space_allows(*used, free, cap, reserve, size) {
+                job.reason = Some("space".into());
+                self.save(job).await?;
+                return Ok(());
+            }
+            *used = used.saturating_add(size);
+        }
+        if self.start(job.clone(), cap.saturating_sub(*used), reserve).await.is_err() {
+            job.attempts += 1;
+            job.reason = Some("Could not open this item".into());
+            job.state = if let Some(delay) = scheduler::retry_delay(job.attempts) {
+                job.fp["download_retry_at"] = (now + delay).into();
+                State::Waiting
+            } else {
+                if let Some(source) = job.source_id {
+                    self.failed_job(source);
+                }
+                State::Failed
+            };
+            self.save(job).await?;
+        }
         Ok(())
     }
 
@@ -738,14 +907,14 @@ impl Engine {
             let (lease, adopted) = if let Some((buffer, lease)) = shared {
                 let from =
                     buffer.snapshot().range.map_or(0.0, |r| r.end - (crate::model::now() - job.start().unwrap_or(crate::model::now())).max(0) as f64);
-                if buffer
-                    .adopt(
-                        &root.join(job.id.to_string()),
-                        from,
-                        crate::player::hls::RecordingLimits { reserve_bytes: reserve, max_bytes: u64::MAX, limits: Some(self.resources.job(job.id)) },
-                    )
-                    .is_err()
-                {
+                let kept = buffer.clone();
+                let dir = root.join(job.id.to_string());
+                let limits = crate::player::hls::RecordingLimits {
+                    reserve_bytes: reserve,
+                    max_bytes: u64::MAX,
+                    limits: Some(self.resources.job(job.id).recording()),
+                };
+                if !matches!(tokio::task::spawn_blocking(move || kept.adopt(&dir, from, limits)).await, Ok(Ok(()))) {
                     self.deps.budget.release(job.id, lease, None);
                     return Err(Error::other("Could not keep the live recording"));
                 }
@@ -761,6 +930,8 @@ impl Engine {
                 job.store_name = Some(format!("{}/", job.id));
             }
             job.state = State::Running;
+            job.reason = None;
+            job.fp["download_clash_at"] = serde_json::Value::Null;
             (Some(p), Some(lease), adopted)
         };
         self.save(job.clone()).await?;
@@ -783,6 +954,9 @@ impl Engine {
             cancel: cancel.clone(),
             stop_recording: stop.clone(),
         };
+        if let Some(moving) = &mut self.moving {
+            moving.dirty = true;
+        }
         let task = tokio::spawn(work.run());
         self.running.insert(job.id, Running { cancel, stop, progress, task, lease });
         tracing::info!("download: #{} running ({}, source {})", job.id, job.kind.as_str(), job.source_id.map_or(0, |s| s.0));
@@ -817,12 +991,36 @@ impl Engine {
         self.last_progress = (Instant::now(), used);
         self.snapshot.send_replace(Arc::new(DownloadsSnapshot {
             jobs,
+            rules: self.rules(),
             used_bytes: used,
             free_bytes: free,
             cap_bytes: cap,
             speed_bps: speed,
             paused: self.paused,
         }));
+    }
+
+    fn rules(&self) -> Vec<super::KeepRule> {
+        let Ok(c) = self.deps.store.reader() else { return vec![] };
+        let lib = self.deps.shared.library();
+        let cfg = current(&self.deps.config);
+        let view = self.deps.shared.parental(&cfg.parental);
+        db::rules(&c)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let item = ItemRef { source: r.source_id, kind: ItemKind::Series, key: r.series_key };
+                if lib.conceals(&item) || (view.hides_explicit && crate::store::live::item_explicit(&c, &item).unwrap_or(true)) {
+                    return None;
+                }
+                let title = planning::series_id(&c, &item)
+                    .ok()
+                    .and_then(|id| crate::store::vod::series(&c, id).ok())
+                    .map(|s| s.display_name().to_owned())
+                    .unwrap_or_else(|| "Series no longer in your playlists".into());
+                Some(super::KeepRule { id: r.id, item, title, keep: r.keep })
+            })
+            .collect()
     }
 
     fn notify_due(&self, job: &Job) {
@@ -873,7 +1071,9 @@ impl Engine {
             let progress =
                 (!job.kind.recording()).then(|| job.item()).flatten().and_then(|i| super::maintenance::progress(&c, &lib, &i).ok().flatten());
             let watched = progress.as_ref().map_or(job.watched_at.is_some(), |p| p.finished);
-            if let Some(p) = progress {
+            if let Some(p) = progress
+                && job.fp.get("download_position_s").and_then(|v| v.as_f64()) != Some(p.position_s)
+            {
                 job.fp["download_position_s"] = p.position_s.into();
                 self.save(job.clone()).await?;
             }
@@ -888,6 +1088,9 @@ impl Engine {
             if cfg.downloads.delete_after_watched_days > 0
                 && job.watched_at.is_some_and(|at| now >= at + i64::from(cfg.downloads.delete_after_watched_days) * 86400)
             {
+                if let Some(moving) = &mut self.moving {
+                    moving.dirty = true;
+                }
                 remove_files(&self.root()?, &job)?;
                 job.state = State::Cancelled;
                 job.store_name = None;
@@ -914,29 +1117,60 @@ impl Engine {
         Ok(())
     }
 
-    async fn move_folder(&mut self, path: PathBuf) -> Result<()> {
+    async fn begin_move(&mut self, path: PathBuf) -> Result<()> {
         if !path.is_absolute() {
             return Err(Error::other("Choose an absolute folder path"));
         }
-        let ids: Vec<_> = self.running.keys().copied().collect();
-        for id in ids {
-            self.stop(id, State::Waiting, None).await?;
+        if self.moving.is_some() {
+            return Err(Error::other("Downloads are already moving"));
         }
-        let old = self.root()?;
-        if std::fs::canonicalize(&old).ok().zip(std::fs::canonicalize(&path).ok()).is_some_and(|(a, b)| a == b) {
-            return Ok(());
+        let rows = db::jobs(&self.deps.store.reader()?)?;
+        for job in rows {
+            if job.state == State::Running && !job.kind.recording() {
+                self.stop(job.id, State::Waiting, None).await?;
+            }
         }
-        let to = path.clone();
-        let from = old.clone();
-        tokio::task::spawn_blocking(move || copy_folder(&from, &to)).await.map_err(Error::other)??;
-        let mut cfg = (*current(&self.deps.config)).clone();
-        cfg.downloads.dir = path.to_string_lossy().into_owned();
-        cfg.save(&self.deps.paths.config_file())?;
-        *self.deps.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
-        if old != path {
-            std::fs::remove_dir_all(&old).map_err(|e| Error::io(&old, e))?;
-        }
+        let from = self.root()?;
+        let path =
+            if std::fs::canonicalize(&from).ok().zip(std::fs::canonicalize(&path).ok()).is_some_and(|(a, b)| a == b) { from.clone() } else { path };
+        let (old, to) = (from.clone(), path.clone());
+        let task = tokio::task::spawn_blocking(move || {
+            check_move(&old, &to)?;
+            copy_folder(&old, &to)
+        });
+        self.moving = Some(FolderMove { from, to: path, task: Some(task), dirty: !self.running.is_empty(), reply: None });
         Ok(())
+    }
+
+    async fn finish_move(&mut self) {
+        let Some(moving) = &mut self.moving else { return };
+        if moving.task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let result = if let Some(task) = moving.task.take() { task.await.map_err(Error::other).and_then(|r| r) } else { Ok(()) };
+        if result.is_ok() && moving.dirty {
+            if self.running.is_empty() {
+                let (from, to) = (moving.from.clone(), moving.to.clone());
+                moving.task = Some(tokio::task::spawn_blocking(move || copy_folder(&from, &to)));
+                moving.dirty = false;
+            }
+            return;
+        }
+        let moving = self.moving.take().expect("folder move");
+        let result = result.and_then(|()| {
+            let mut cfg = (*current(&self.deps.config)).clone();
+            cfg.downloads.dir = moving.to.to_string_lossy().into_owned();
+            cfg.save(&self.deps.paths.config_file())?;
+            *self.deps.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
+            if moving.from != moving.to {
+                tokio::task::spawn_blocking(move || std::fs::remove_dir_all(moving.from));
+            }
+            Ok(())
+        });
+        let reply = DownloadReply { error: result.err().map(|e| e.to_string()), ..Default::default() };
+        if let Some(tx) = moving.reply {
+            let _ = tx.send(reply);
+        }
     }
 }
 
@@ -993,8 +1227,7 @@ fn remove_files(root: &std::path::Path, j: &Job) -> Result<()> {
     Ok(())
 }
 
-fn copy_folder(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn check_move(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     if from == to {
         return Ok(());
     }
@@ -1015,6 +1248,14 @@ fn copy_folder(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     if to.exists() && std::fs::read_dir(to).map_err(|e| Error::io(to, e))?.next().is_some() {
         return Err(Error::other("Choose an empty folder"));
     }
+    Ok(())
+}
+
+fn copy_folder(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if from == to {
+        return Ok(());
+    }
     std::fs::create_dir_all(to).map_err(|e| Error::io(to, e))?;
     std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::io(to, e))?;
     for entry in std::fs::read_dir(from).map_err(|e| Error::io(from, e))? {
@@ -1024,11 +1265,36 @@ fn copy_folder(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
             return Err(Error::other("The downloads folder contains a link"));
         }
         if entry.file_type().map_err(|e| Error::io(entry.path(), e))?.is_dir() {
-            copy_folder(&entry.path(), &path)?;
+            if let Err(e) = copy_folder(&entry.path(), &path)
+                && entry.path().exists()
+            {
+                return Err(e);
+            }
         } else {
-            std::fs::copy(entry.path(), &path).map_err(|e| Error::io(&path, e))?;
+            if let Err(e) = std::fs::copy(entry.path(), &path) {
+                if entry.path().exists() {
+                    return Err(Error::io(&path, e));
+                }
+                continue;
+            }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| Error::io(&path, e))?;
         }
     }
+    for entry in std::fs::read_dir(to).map_err(|e| Error::io(to, e))? {
+        let entry = entry.map_err(|e| Error::io(to, e))?;
+        if !from.join(entry.file_name()).exists() {
+            let path = entry.path();
+            if entry.file_type().map_err(|e| Error::io(&path, e))?.is_dir() {
+                std::fs::remove_dir_all(&path).map_err(|e| Error::io(&path, e))?;
+            } else {
+                std::fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+            }
+        }
+    }
+
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;

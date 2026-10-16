@@ -21,6 +21,9 @@ pub fn due(job: &Job, now: Timestamp, busy: bool, catchup: bool) -> Due {
     if now < start {
         return Due::Wait;
     }
+    if job.state == State::Waiting && job.bytes_done > 0 && job.stop().is_some_and(|end| now < end) {
+        return if busy { Due::Ask } else { Due::Start };
+    }
     if now >= stop {
         return if catchup { Due::Catchup } else { Due::Missed };
     }

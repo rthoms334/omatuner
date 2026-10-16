@@ -206,8 +206,8 @@ impl Buffer {
     /// A recording uses the very same serialized provider reader (DESIGN §43 §3).
     pub fn start_keep(p: &Playable, dir: &Path, user_agent: &str, limits: RecordingLimits, archive: bool) -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(dir)?;
-        let mut store = Store::new(dir.to_owned(), WINDOW);
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let mut store = if dir.join("index.json").is_file() { Store::resume(dir.to_owned(), WINDOW)? } else { Store::new(dir.to_owned(), WINDOW) };
         store.keep = true;
         Self::start_store(p, store, user_agent, Some(limits), archive)
     }
@@ -359,7 +359,31 @@ impl Buffer {
 
     /// Move the retained live history into this job without reopening its provider socket.
     pub fn adopt(&self, dir: &Path, from: f64, limits: RecordingLimits) -> io::Result<()> {
-        self.shared.store().adopt(dir.to_owned(), from)?;
+        // Keep the source stable while copying outside the store lock. New segments may
+        // arrive meanwhile; retry the snapshot until every one is present before switching.
+        {
+            let mut store = self.shared.store();
+            if store.keep || store.memory {
+                return Err(io::Error::other("recording store unavailable"));
+            }
+            store.keep = true;
+        }
+        loop {
+            let mut next = self.shared.store().clone();
+            let (counter, epoch, old) = (next.next, next.epoch, next.dir.clone());
+            if let Err(error) = next.adopt(dir.to_owned(), from) {
+                self.shared.store().keep = false;
+                return Err(error);
+            }
+            let mut current = self.shared.store();
+            if current.next != counter || current.epoch != epoch {
+                continue;
+            }
+            *current = next;
+            drop(current);
+            let _ = std::fs::remove_dir_all(old);
+            break;
+        }
         if let Some(limits) = &limits.limits {
             limits.reset(self.shared.store().blobs.values().map(|b| b.size).sum());
         }
@@ -654,7 +678,7 @@ async fn refresh(state: &Shared, client: &mut Client, source: &mut Source, track
     let media = playlist::parse(&text, &base).map_err(|_| PlayerErrorKind::Unsupported)?;
     // A finished playlist (`#EXT-X-ENDLIST`, the "loop" channels some providers serve) has no
     // live edge to follow: mpv plays it from the start, as before live rewind.
-    if source.last.is_none() && media.ended {
+    if source.last.is_none() && media.ended && !state.archive {
         client.not_playlist = true;
         return Err(PlayerErrorKind::Unsupported);
     }
@@ -732,7 +756,7 @@ async fn refresh(state: &Shared, client: &mut Client, source: &mut Source, track
         t.segments.push_back(store::Segment { id, seq, start: t.edge, end: t.edge + seg.duration, disc, key, map });
         t.edge += seg.duration;
         t.target = media.target;
-        t.ended = media.ended;
+        t.ended = false;
         source.last = Some(seg.seq);
         source.discontinuity = Some(seg.discontinuity);
         source.gap = false;

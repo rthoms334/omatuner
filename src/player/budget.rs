@@ -223,6 +223,12 @@ impl SharedBudget {
         s.limit(source).is_none_or(|limit| s.count(&s.holders(tile, source), source) < limit)
     }
 
+    pub fn picture_holds(&self, owner: impl Into<Holder>, source: SourceId) -> bool {
+        let s = self.state();
+        let holders = s.holders(owner.into(), source);
+        holders.iter().any(|h| matches!(h, Holder::Picture(_))) && s.limit(source).is_some_and(|limit| s.count(&holders, source) >= limit)
+    }
+
     /// Another picture holds any playlist (single view: never — zaps skip the copy lookup).
     pub fn others_active(&self, tile: impl Into<Holder>) -> bool {
         let tile = tile.into();

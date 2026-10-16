@@ -48,13 +48,15 @@ fn part(path: &Path) -> PathBuf {
 
 impl Work {
     fn at_limit(&self) -> bool {
-        self.job
-            .source_id
-            .is_some_and(|source| self.budget.usage().iter().any(|u| u.source == source && u.limit.is_some_and(|limit| u.in_use >= limit)))
+        self.job.source_id.is_some_and(|source| !self.budget.admits(self.job.id, source))
     }
 
     pub async fn run(mut self) -> (Job, Result<()>) {
         let _inhibit = crate::cast::inhibit::SleepInhibitor::for_downloads().await;
+        if self.job.kind.recording() {
+            self.limits = self.limits.clone().recording();
+            self.max_mbps = 0.0;
+        }
         let result = self.run_inner().await;
         (self.job, result)
     }
@@ -109,13 +111,13 @@ impl Work {
         let buffer = if let Some(buffer) = self.adopted.take() {
             buffer
         } else {
-            self.limits.reset(0);
             let buffer = Arc::new(
                 tokio::task::spawn_blocking(move || Buffer::start_keep(&p, &root, &ua, limits, archive))
                     .await
                     .map_err(Error::other)?
                     .map_err(Error::other)?,
             );
+            self.limits.reset(buffer.snapshot().bytes);
             if !archive
                 && let Some(p) = &self.playable
                 && let Some(source) = p.source_id
@@ -125,7 +127,7 @@ impl Work {
             buffer
         };
         self.job.store_name = Some(format!("{}/", self.job.id));
-        let mut partial = false;
+        let mut partial = self.job.fp.get("download_partial").and_then(|v| v.as_bool()) == Some(true);
         let start = crate::model::now();
         let stop = if self.job.kind == Kind::Live {
             self.job.stop()
@@ -157,6 +159,9 @@ impl Work {
                     retry_at = None;
                 }
             } else if s.failed {
+                if s.duration <= 0.0 || s.failure == Some(crate::player::PlayerErrorKind::HttpForbidden) {
+                    break;
+                }
                 if retries >= 3 {
                     partial = true;
                     self.job.reason = Some("connection failed".into());
@@ -176,6 +181,9 @@ impl Work {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        partial |= self.job.kind.recording()
+            && (self.cancel.is_cancelled() || self.stop_recording.is_cancelled())
+            && stop.is_none_or(|end| crate::model::now() < end);
         let tail = buffer.snapshot();
         let duration = tail.duration;
         partial |= tail.failed;
@@ -192,11 +200,18 @@ impl Work {
         .map_err(Error::other)??;
         self.job.fp["download_duration_s"] = duration.into();
         self.job.fp["download_partial"] = partial.into();
-        if empty_busy {
+        if tail.failed && duration > 0.0 && tail.failure == Some(crate::player::PlayerErrorKind::HttpForbidden) {
+            return Err(Error::Http { status: 403, url: String::new() });
+        }
+        if empty_busy || (duration <= 0.0 && tail.failed) {
             let _ = std::fs::remove_dir_all(&dir);
             self.job.store_name = None;
             self.progress.lock().unwrap_or_else(|e| e.into_inner()).store_name = None;
-            return Err(Error::Http { status: 403, url: String::new() });
+            return Err(if tail.failure == Some(crate::player::PlayerErrorKind::HttpForbidden) {
+                Error::Http { status: 403, url: String::new() }
+            } else {
+                Error::other("connection failed")
+            });
         }
         if self.cancel.is_cancelled() {
             self.job.state = State::Finishing;
@@ -235,6 +250,11 @@ impl Work {
         self.job.store_name = Some(name.clone());
         self.progress.lock().unwrap_or_else(|e| e.into_inner()).store_name = self.job.store_name.clone();
         let dest = self.root.join(name);
+        // A recovered recording must never replace bytes kept by an earlier stop.
+        if live && dest.is_file() && !part(&dest).exists() {
+            tokio::fs::rename(&dest, part(&dest)).await.map_err(|e| Error::io(&dest, e))?;
+            self.job.fp["download_partial"] = true.into();
+        }
         let _reader = if self.job.kind == Kind::Live {
             let reader = super::reader::Reader::start(part(&dest)).await.map_err(Error::other)?;
             if let Some(source) = p.source_id {
@@ -307,7 +327,9 @@ impl Work {
                 live = true;
             }
             if live && (self.stop_recording.is_cancelled() || self.cancel.is_cancelled()) {
-                tokio::fs::rename(part(&dest), &dest).await.map_err(|e| Error::io(&dest, e))?;
+                if part(&dest).exists() {
+                    tokio::fs::rename(part(&dest), &dest).await.map_err(|e| Error::io(&dest, e))?;
+                }
                 self.job.bytes_done = tokio::fs::metadata(&dest).await.map_err(|e| Error::io(&dest, e))?.len();
                 break;
             }
@@ -331,7 +353,7 @@ impl Work {
                     self.job.done_at = Some(crate::model::now());
                     return Ok(());
                 }
-                Err(e) if !live || self.cancel.is_cancelled() || (matches!(e, Error::Http { status: 403, .. }) && self.at_limit()) => return Err(e),
+                Err(e) if !live || self.cancel.is_cancelled() || matches!(e, Error::Http { status: 403, .. }) => return Err(e),
                 Err(_) => {
                     let start = crate::model::now();
                     gaps += 1;
@@ -360,7 +382,14 @@ impl Work {
                 }
             }
         }
-        self.job.state = State::Done;
+        self.job.state = if self.job.kind.recording()
+            && ((self.cancel.is_cancelled() || self.stop_recording.is_cancelled()) && stream_stop.is_none_or(|end| crate::model::now() < end)
+                || self.job.fp.get("download_partial").and_then(|v| v.as_bool()) == Some(true))
+        {
+            State::Partial
+        } else {
+            State::Done
+        };
         self.job.done_at = Some(crate::model::now());
         Ok(())
     }

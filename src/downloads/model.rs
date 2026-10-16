@@ -100,6 +100,14 @@ pub struct Job {
     pub orphaned_since: Option<Timestamp>,
 }
 impl Job {
+    pub fn matches(&self, item: &ItemRef) -> bool {
+        self.item().as_ref() == Some(item)
+            || self
+                .fp
+                .get("download_copies")
+                .and_then(|v| serde_json::from_value::<Vec<ItemRef>>(v.clone()).ok())
+                .is_some_and(|items| items.contains(item))
+    }
     pub fn item(&self) -> Option<ItemRef> {
         Some(ItemRef { source: self.source_id?, kind: self.kind.item_kind(), key: self.item_key.clone()? })
     }
@@ -132,11 +140,20 @@ impl Job {
 #[derive(Debug, Clone, Default)]
 pub struct DownloadsSnapshot {
     pub jobs: Vec<Job>,
+    pub rules: Vec<KeepRule>,
     pub used_bytes: u64,
     pub free_bytes: u64,
     pub cap_bytes: u64,
     pub speed_bps: f64,
     pub paused: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeepRule {
+    pub id: i64,
+    pub item: ItemRef,
+    pub title: String,
+    pub keep: u32,
 }
 
 /// The guide and item menus share one add path; a bare channel supplies `minutes` instead.
@@ -173,6 +190,8 @@ pub enum DownloadCommand {
     Cancel(Vec<DownloadId>),
     Delete(Vec<DownloadId>),
     Undo(Vec<DownloadId>),
+    DeleteRule(i64),
+    UndoRule(i64),
     Move {
         id: DownloadId,
         to: usize,

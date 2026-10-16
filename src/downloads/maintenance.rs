@@ -73,6 +73,7 @@ pub fn retime(c: &Connection, now: i64) -> Result<()> {
         if start < now {
             continue;
         }
+        let before = job.clone();
         let shift = i64::from(channel.tvg_shift_min) * 60;
         let programmes = store::epg::window(c, epg, start - shift - 1800, start - shift + 1801)?;
         if let Some(p) = programmes
@@ -88,16 +89,14 @@ pub fn retime(c: &Connection, now: i64) -> Result<()> {
         } else {
             job.reason = Some("guide missing".into());
         }
-        db::put(c, &job)?;
+        if job != before {
+            db::put(c, &job)?;
+        }
     }
     Ok(())
 }
 
-/// Use channel-agnostic S/E or episode-title identity; a title without episode data is
-/// recorded once, rather than treating its next day's repeat as new.
-fn event_identity(key: &str) -> &str {
-    key.split_once('@').map_or(key, |(title, _)| title)
-}
+// Following's event keys keep dates for fixtures and daily programmes (DESIGN §43).
 fn identity(job: &Job) -> String {
     if let Some(key) = job.fp.get("download_event").and_then(|v| v.as_str()) {
         return key.to_owned();
@@ -130,11 +129,17 @@ pub fn following(c: &Connection, lib: &Library, cfg: &Config, now: i64) -> Resul
             continue;
         }
         let Some(item) = airing.channel else { continue };
-        let event = event_identity(&airing.event_key);
-        if let Some(existing) = rows.iter_mut().find(|j| identity(j) == event && j.reason.as_deref() != Some("rule removed")) {
+        let event = airing.event_key.as_str();
+        if let Some(existing) = rows.iter_mut().find(|j| {
+            identity(j) == event
+                && (j.fp.get("download_follow_rule").and_then(|v| v.as_i64()) == Some(rule.id.0)
+                    || (j.kind == Kind::Episode && j.state == State::Done))
+                && !matches!(j.state, State::Missed | State::Failed | State::Cancelled)
+        }) {
             if existing.state == State::Scheduled
                 && existing.fp.get("download_follow_rule").and_then(|v| v.as_i64()) == Some(rule.id.0)
                 && existing.prog_start.is_some_and(|start| (start - airing.start).abs() <= 1800)
+                && (existing.prog_start != Some(airing.start) || existing.prog_stop != Some(airing.stop))
             {
                 existing.prog_start = Some(airing.start);
                 existing.prog_stop = Some(airing.stop);

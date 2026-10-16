@@ -139,7 +139,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("Tuner (or a background refresh) is running; it arms the reminder timers itself");
             return Ok(());
         };
-        tuner::downloads::arming::rearm(&paths)?;
+        if let Err(e) = tuner::downloads::arming::rearm(&paths) {
+            tracing::warn!("recording arming failed: {e}");
+        }
         return match tuner::reminders::arming::rearm_at_login(&paths, &config)? {
             tuner::platform::systemd::ArmStatus::Unavailable(e) => Err(anyhow::anyhow!("reminders won't fire while Tuner is closed: {e}")),
             tuner::platform::systemd::ArmStatus::Armed(n) => {
@@ -478,7 +480,9 @@ fn refresh_headless(paths: AppPaths, config: Config, timeout: Duration) -> anyho
     if !store.close(Duration::from_secs(3)) {
         tracing::warn!("database writer did not finish within 3 s");
     }
-    tuner::downloads::arming::rearm(&arm_paths)?;
+    if let Err(e) = tuner::downloads::arming::rearm(&arm_paths) {
+        tracing::warn!("recording arming failed: {e}");
+    }
     Ok(failed)
 }
 

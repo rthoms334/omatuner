@@ -115,11 +115,6 @@ pub fn set_state(c: &Connection, id: DownloadId, state: State, reason: Option<&s
     Ok(())
 }
 
-pub fn remove(c: &Connection, id: DownloadId) -> Result<()> {
-    c.execute("DELETE FROM download WHERE id=?1", [id])?;
-    Ok(())
-}
-
 pub fn move_to(c: &Connection, id: DownloadId, to: usize) -> Result<()> {
     super::sql::atomic(c, |c| {
         let mut rows = jobs(c)?;
@@ -141,8 +136,8 @@ pub fn root(c: &Connection, cfg: &DownloadsConfig) -> Result<PathBuf> {
     Ok(Path::new(&db).parent().ok_or_else(|| Error::other("Downloads folder unavailable"))?.join("downloads"))
 }
 
-/// Crash recovery never promotes an incomplete file. A kept HLS index is retried through
-/// finishing; no provider request is needed to complete it (DESIGN §43 §4, §8.11).
+/// Crash recovery preserves incomplete captures as Partial. A live kept HLS recording
+/// resumes until its stop time; expired captures go through finishing (DESIGN §43 §4, §8.11).
 pub fn reconcile(c: &Connection, root: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
@@ -178,11 +173,18 @@ pub fn reconcile(c: &Connection, root: &Path) -> Result<()> {
             let kept = root.join(j.id.to_string()).join("index.json").is_file();
             if kept && j.kind.recording() {
                 let mut j = j.clone();
-                j.state = State::Finishing;
+                j.state =
+                    if j.kind == Kind::Live && j.stop().is_some_and(|end| end > crate::model::now()) { State::Waiting } else { State::Finishing };
+                j.fp["download_partial"] = true.into();
                 j.store_name = Some(format!("{}/", j.id));
                 put(c, &j)?;
             } else {
-                set_state(c, j.id, State::Waiting, None)?;
+                let mut recovered = j.clone();
+                recovered.state = State::Waiting;
+                if j.kind.recording() {
+                    recovered.fp["download_partial"] = true.into();
+                }
+                put(c, &recovered)?;
             }
         } else if j.state.playable() && !path.is_some_and(|p| p.is_file()) {
             set_state(c, j.id, State::Failed, Some("file missing"))?;
@@ -196,13 +198,36 @@ pub fn reconcile(c: &Connection, root: &Path) -> Result<()> {
             let id = name.split('.').next().and_then(|s| s.parse::<i64>().ok()).map(DownloadId);
             if let Some(job) = rows.iter().find(|j| Some(j.id) == id) {
                 let bytes = entry.metadata().map_err(|e| Error::io(entry.path(), e))?.len();
-                c.execute("UPDATE download SET bytes_done=?1 WHERE id=?2", params![bytes.min(i64::MAX as u64) as i64, job.id])?;
+                c.execute(
+                    "UPDATE download SET bytes_done=?1,store_name=COALESCE(store_name,?3) WHERE id=?2",
+                    params![bytes.min(i64::MAX as u64) as i64, job.id, name.strip_suffix(".part")],
+                )?;
             } else {
                 std::fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
             }
         }
     }
     Ok(())
+}
+
+/// An expired raw recording still has playable bytes after a crash (DESIGN §43 §3).
+pub fn recover_partial(root: &Path, job: &mut Job, now: Timestamp) -> Result<bool> {
+    if !job.kind.recording() {
+        return Ok(false);
+    }
+    let Some(path) = job.path(root) else { return Ok(false) };
+    let part = path.with_file_name(format!("{}.part", path.file_name().unwrap_or_default().to_string_lossy()));
+    if std::fs::metadata(&part).is_ok_and(|m| m.len() > 0) {
+        std::fs::rename(&part, &path).map_err(|e| Error::io(&path, e))?;
+    }
+    if !path.is_file() {
+        return Ok(false);
+    }
+    job.bytes_done = std::fs::metadata(&path).map_err(|e| Error::io(&path, e))?.len();
+    job.state = State::Partial;
+    job.reason = Some("recording interrupted".into());
+    job.done_at = Some(now);
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +282,19 @@ pub fn keep(c: &Connection, item: &ItemRef, count: u32, now: Timestamp) -> Resul
     })
 }
 
+pub fn delete_rule(c: &Connection, id: i64) -> Result<()> {
+    c.execute("DELETE FROM download_rule WHERE id=?1", [id])?;
+    Ok(())
+}
+
+pub fn restore_rule(c: &Connection, rule: &KeepRule) -> Result<()> {
+    c.execute(
+        "INSERT OR IGNORE INTO download_rule(id,source_id,series_key,keep,added_at,fp,orphaned_since) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![rule.id, rule.source_id, rule.series_key.as_str(), rule.keep, rule.added_at, rule.fp.to_string(), rule.orphaned_since],
+    )?;
+    Ok(())
+}
+
 pub fn finished(c: &Connection, item: &ItemRef) -> Result<Option<Job>> {
     Ok(c.prepare_cached(&format!(
         "SELECT {COLS} FROM download WHERE source_id=?1 AND item_key=?2 AND kind=?3 AND state='done' ORDER BY done_at DESC LIMIT 1"
@@ -281,10 +319,6 @@ pub fn estimate(j: &Job) -> u64 {
             .unwrap_or(3600.0);
         (duration * (2_000_000_000.0 / 3600.0)).ceil() as u64
     })
-}
-
-pub fn is_recording(j: &Job) -> bool {
-    j.kind == Kind::Live
 }
 
 /// Backups carry identities and rules, never media or transport validators.

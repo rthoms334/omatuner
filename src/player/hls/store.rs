@@ -71,6 +71,62 @@ impl Store {
         }
     }
 
+    /// Resume with local counters only; a fresh provider window begins a discontinuity.
+    pub fn resume(dir: PathBuf, window: f64) -> std::io::Result<Self> {
+        let index = super::finish::Recording::load(&dir).map_err(std::io::Error::other)?;
+        let mut store = Self::new(dir, window);
+        store.keep = true;
+        store.tracks.clear();
+        for segments in index.tracks {
+            let mut track = Track::default();
+            for s in segments {
+                let extension = match s.extension.as_str() {
+                    "ts" => "ts",
+                    "m4s" => "m4s",
+                    "mp4" => "mp4",
+                    "aac" => "aac",
+                    "mp3" => "mp3",
+                    "ac3" => "ac3",
+                    "ec3" => "ec3",
+                    _ => unreachable!(),
+                };
+                let mut blobs = vec![(s.id, extension)];
+                if let Some((key, _)) = &s.key {
+                    blobs.push((*key, "key"));
+                }
+                if let Some(map) = s.map {
+                    blobs.push((map, "mp4"));
+                }
+                for (id, ext) in blobs {
+                    let size = fs::metadata(store.dir.join(format!("{id}.{ext}")))?.len();
+                    store.blobs.insert(id, Blob { resource: Resource { uri: format!("kept:{id}"), range: None }, data: None, size, extension: ext });
+                    store.next = store.next.max(id + 1);
+                }
+                track.segments.push_back(Segment {
+                    id: s.id,
+                    seq: track.next_seq,
+                    start: s.start,
+                    end: s.end,
+                    disc: s.discontinuity,
+                    key: s.key,
+                    map: s.map,
+                });
+                track.next_seq += 1;
+                track.edge = s.end;
+                track.discontinuity = s.discontinuity;
+            }
+            store.tracks.push(track);
+        }
+        // A crash may leave an unindexed blob; never reuse its counter.
+        for entry in fs::read_dir(&store.dir)? {
+            let entry = entry?;
+            if let Some(id) = entry.file_name().to_str().and_then(|n| n.split('.').next()).and_then(|s| s.parse::<u64>().ok()) {
+                store.next = store.next.max(id + 1);
+            }
+        }
+        Ok(store)
+    }
+
     pub fn memory(window: f64) -> Self {
         let mut store = Self::new(PathBuf::new(), window);
         store.memory = true;
@@ -189,10 +245,10 @@ impl Store {
     /// segment), then stop pruning. The provider reader and its lease stay where they are.
     pub fn adopt(&mut self, dir: PathBuf, from: f64) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
-        if self.memory || self.keep {
+        if self.memory {
             return Err(std::io::Error::other("recording store unavailable"));
         }
-        fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let mut next = self.clone();
         next.dir = dir;
         next.keep = false;
@@ -207,8 +263,11 @@ impl Store {
         // move leaves both the current reader and its rewind history untouched.
         for (id, blob) in &next.blobs {
             let name = format!("{id}.{}", blob.extension);
-            let bytes = fs::read(self.dir.join(&name))?;
-            super::finish::write_private(&next.dir.join(name), &bytes)?;
+            let to = next.dir.join(&name);
+            if !to.exists() && fs::hard_link(self.dir.join(&name), &to).is_err() {
+                let bytes = fs::read(self.dir.join(&name))?;
+                super::finish::write_private(&to, &bytes)?;
+            }
         }
         next.keep = true;
         if let Err(error) = next.save() {
@@ -396,6 +455,26 @@ mod tests {
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
     #[test]
+    fn kept_store_resumes_after_crash_without_reusing_blob_counters() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new(root.path().to_owned(), 1800.0);
+        store.keep = true;
+        add(&mut store, 2.0);
+        add(&mut store, 2.0);
+        store.save().unwrap();
+        fs::write(root.path().join("9.ts"), b"unindexed crash tail").unwrap();
+        drop(store);
+        let mut resumed = Store::resume(root.path().to_owned(), 1800.0).unwrap();
+        assert_eq!(resumed.next, 10);
+        assert_eq!(resumed.tracks[0].edge, 4.0);
+        add(&mut resumed, 2.0);
+        resumed.save().unwrap();
+        assert_eq!(fs::read(root.path().join("0.ts")).unwrap(), b"segment");
+        assert_eq!(fs::read(root.path().join("9.ts")).unwrap(), b"unindexed crash tail");
+        assert_eq!(super::super::finish::Recording::load(root.path()).unwrap().duration(), 6.0);
+    }
+
+    #[test]
     fn adopt_keeps_history_then_finishes_without_stopping_the_picture() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
@@ -406,8 +485,10 @@ mod tests {
             add(&mut s, 2.0);
         }
         let kept = root.path().join("2");
+        let original_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(rolling.join("300.ts")).unwrap());
         s.adopt(kept.clone(), 600.0).unwrap();
         assert!(!rolling.exists());
+        assert_eq!(std::os::unix::fs::MetadataExt::ino(&fs::metadata(kept.join("300.ts")).unwrap()), original_inode);
         assert_eq!(s.range().unwrap().start, 600.0);
         for _ in 0..900 {
             add(&mut s, 2.0);

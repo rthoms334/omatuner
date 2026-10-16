@@ -29,15 +29,22 @@ impl Resources {
         u.rate = mbps;
     }
     pub fn job(&self, id: DownloadId) -> Limits {
-        Limits { resources: self.clone(), id }
+        Limits { resources: self.clone(), id, rate_limited: true }
     }
 }
 #[derive(Debug, Clone)]
 pub struct Limits {
     resources: Resources,
     id: DownloadId,
+    rate_limited: bool,
 }
 impl Limits {
+    /// Recordings reserve disk space without consuming the downloads' rate budget.
+    pub fn recording(mut self) -> Self {
+        self.rate_limited = false;
+        self
+    }
+
     /// Called only at a transfer boundary, after any prior writer has acknowledged closure.
     pub fn reset(&self, bytes: u64) {
         self.resources.0.lock().unwrap_or_else(|e| e.into_inner()).bytes.insert(self.id, bytes);
@@ -51,6 +58,9 @@ impl Limits {
         Some(Permit { limits: self.clone(), bytes, committed: false })
     }
     pub async fn throttle(&self, bytes: u64) {
+        if !self.rate_limited {
+            return;
+        }
         let at = {
             let mut u = self.resources.0.lock().unwrap_or_else(|e| e.into_inner());
             if !u.rate.is_finite() || u.rate <= 0.0 {
@@ -85,6 +95,18 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn recordings_keep_space_limits_without_spending_the_download_rate_budget() {
+        let resources = Resources::default();
+        resources.configure(100, 0.000001);
+        let recording = resources.job(DownloadId(1)).recording();
+        let before = resources.0.lock().unwrap().next;
+        tokio::time::timeout(Duration::from_millis(100), recording.throttle(1_000_000)).await.unwrap();
+        assert_eq!(resources.0.lock().unwrap().next, before);
+        recording.reserve(100).unwrap().commit();
+        assert!(resources.job(DownloadId(2)).reserve(1).is_none());
+    }
+
     #[tokio::test]
     async fn accounts_share_cap_failed_writes_roll_back_and_rate_is_aggregate() {
         let r = Resources::default();
