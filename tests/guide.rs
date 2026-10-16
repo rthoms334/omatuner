@@ -1746,8 +1746,8 @@ fn numeric_entry_tunes_by_channel_number() {
     player_until(&t, "channel 5", plays(MediaRef::Channel(ids[4])));
 }
 
-/// At 790 pt (a tiled half) every control is drawn — transport controls as glyphs — and
-/// controls focus mode only walks drawn controls.
+/// At 790 pt (a tiled half) the essential row fits, without track names; secondary
+/// controls remain reachable through the cog (DESIGN §13.8).
 #[test]
 fn player_controls_fit_a_tiled_half() {
     let _one = one();
@@ -1775,11 +1775,18 @@ fn player_controls_fit_a_tiled_half() {
     for _ in 0..3 {
         h.step();
     }
-    for label in ["Previous channel", "Play / pause", "Next channel", "Audio", "Subtitles", "Guide", "History", "Info", "Fullscreen"] {
+    for label in ["Play / pause", "Previous channel", "Next channel", "Audio & subtitles", "Fullscreen", "Player settings"] {
         assert!(has(&h, label), "{label} is drawn at 790 pt");
     }
-    // the transport controls are glyphs (no "Previous channel" text painted)
-    assert!(!texts(&shapes(&h)).iter().any(|(x, _, _)| x.contains("Previous channel")));
+    for label in ["Audio", "Subtitles", "Guide", "History", "Info"] {
+        assert!(!has(&h, label), "{label} has left the row");
+    }
+    assert!(!texts(&shapes(&h)).iter().any(|(x, _, _)| x.contains("Previous channel") || x.contains("Dolby Digital")));
+    h.get_by_label("Player settings").click();
+    h.run_steps(3);
+    for label in ["Audio & subtitles", "Delay", "Channels", "Guide", "History", "Info", "Pop out"] {
+        assert!(has(&h, label), "{label} is reachable through the cog");
+    }
 }
 
 #[test]

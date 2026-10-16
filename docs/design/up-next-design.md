@@ -122,7 +122,7 @@ Compact (under 700 pt) is the same list without the ETA column. "Played" collaps
 │                                                                    │  4 more · ~03:12   ││
 │                                                                    └────────────────────┘│
 │ ▕██████████████████████████████████████████████████████████████████▏  1:49:40 / 1:50:02│
-│ 󰒮 󰐊 󰒭  −10 +10  󰗅 English  󰨖 Off  󰐑 Up next  󰒭 Next   󰋽 Info   󰕾 ━━━●─┊─ 80 %         │
+│ ⟲  󰐊  ⟳  󰒮  󰒭  󰕾 ━━━●─┊─ 80 %                   󰒭 Next  󰗅  Cast  󰊓  ⚙             │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 
 After EOF (the card that replaces "Next episode in 10 s", same place, same OSD button style):
@@ -162,7 +162,7 @@ Mini player:  ┌ video ─────────┐   Pop-out strip:  Goldfin
 | | `←` / `Backspace` | Nothing to the left on the screen. In the player panel, close it (pane arrows) |
 | | letters | Filter (launcher idiom) |
 
-- **Esc ladder (inserted step).** clear filter → close overlay / side panel → **cancel an Up next countdown or a drag in progress** → leave OSD controls → hide banner → leave fullscreen → leave player → route back.
+- **Esc ladder (inserted step).** clear filter → close overlay / side panel or cog sub-page → close cog pop-up → **cancel an Up next countdown or a drag in progress** → leave OSD controls → hide banner → leave fullscreen → leave player → route back.
   - The player already checks number entry and the side panel before the card, so the order matches the code.
   - **Pop-out:** "Esc pops in once a side panel, number entry or controls focus has had it" now also lists the countdown.
 - **Card keys:** `Enter` / `i` play now (as today), `n` plays now or skips the locked item, `u` opens the panel, and `Esc` cancels.
@@ -173,7 +173,7 @@ Mini player:  ┌ video ─────────┐   Pop-out strip:  Goldfin
     - Esc or a drop outside the list cancels the drag.
   - One click does what Enter does: it plays the row. A double-click is one click (DESIGN §15.1 "Double-click safety"), and a reorder never comes from a body click.
   - A ✕ on hover removes the row. Right-click opens the row menu.
-  - The OSD row gets `󰐑 Up next` and, when the queue has a next item, `󰒭 Next` (tooltips show the keys).
+  - The cog menu has `󰐑 Up next`; the OSD row keeps `󰒭 Next` when the queue has a next item (tooltips show the keys).
   - Detail pages get a `[󰐑 Up next]` button after Resume / Start over. The guide programme card gets `Up next`.
   - The Movies grid menu has "Add the N shown to Up next, by year" (only when ≤ 50 are shown).
   - Favourites lists have "Queue this list" (in list order).

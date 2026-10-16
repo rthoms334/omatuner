@@ -492,3 +492,39 @@ fn epg_mapping_adjust_keeps_panel_shortcuts() {
     }
     assert_eq!(resolve(&stack, &text("z")), None, "Adjust does not filter");
 }
+
+#[test]
+fn player_settings_keys_keep_the_existing_player_shortcuts() {
+    for base in [K::PlayerLive, K::PlayerVod] {
+        for extra in [vec![], vec![K::PlayerOsd], vec![K::PopOut], vec![K::PopOut, K::MultiView]] {
+            let mut stack = extra;
+            stack.push(base);
+            assert_eq!(resolve(&stack, &text("O")), Some(Action::PlayerSettings), "{stack:?}");
+            assert_eq!(resolve(&stack, &text("o")), Some(Action::TogglePopOut));
+            assert_eq!(resolve(&stack, &text("I")), Some(Action::StreamInfo));
+            stack.insert(0, K::PlayerSettings);
+            for k in [Key::Escape, Key::ArrowLeft, Key::Backspace] {
+                assert_eq!(resolve(&stack, &key(k)), Some(Action::Back), "{stack:?}: {k:?}");
+            }
+            for k in [Key::Enter, Key::Space] {
+                assert_eq!(resolve(&stack, &key(k)), Some(Action::Activate));
+            }
+            assert_eq!(resolve(&stack, &key(Key::ArrowUp)), Some(Action::Up));
+            assert_eq!(resolve(&stack, &key(Key::ArrowDown)), Some(Action::Down));
+            assert_eq!(resolve(&stack, &key(Key::ArrowRight)), Some(Action::Right));
+            for (key, action) in [
+                ("A", Action::AudioMenu),
+                ("S", Action::SubtitleMenu),
+                ("[", Action::LipSyncEarlier),
+                ("]", Action::LipSyncLater),
+                ("z", Action::SubDelayMinus),
+                ("x", Action::SubDelayPlus),
+                ("Z", Action::SubDelayReset),
+            ] {
+                assert_eq!(resolve(&stack, &text(key)), Some(action));
+            }
+        }
+    }
+    assert_eq!(resolve(&[K::PlayerLive], &text("H")), Some(Action::ChannelHistory));
+    assert_eq!(resolve(&[K::PlayerLive], &text("i")), Some(Action::FocusOsdControls));
+}

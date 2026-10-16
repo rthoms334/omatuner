@@ -11,8 +11,9 @@ pub(super) enum Control {
     SkipBack,
     SkipForward,
     BackToLive,
-    Audio,
-    Subtitles,
+    AudioSubtitles,
+    Delay,
+    Settings,
     Channels,
     Guide,
     History,
@@ -28,7 +29,7 @@ pub(super) enum Control {
     PopOut,
 }
 
-/// Which of the optional OSD buttons the controls row has: Up next's (DESIGN §32, up-next-design
+/// Which optional controls the OSD row and cog offer: Up next's (DESIGN §32, up-next-design
 /// §2.5 Mouse) and Cast (DESIGN §40 §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct OptionalButtons {
@@ -65,8 +66,8 @@ impl Control {
             Control::SkipBack => glyphs::SKIP_BACK,
             Control::SkipForward => glyphs::SKIP_FORWARD,
             Control::BackToLive => glyphs::NEXT,
-            Control::Audio => glyphs::AUDIO_TRACK,
-            Control::Subtitles => glyphs::SUBTITLES,
+            Control::AudioSubtitles => glyphs::AUDIO_TRACK,
+            Control::Delay | Control::Settings => glyphs::SETTINGS,
             Control::Channels => glyphs::PLAYLIST,
             Control::Guide => glyphs::GUIDE,
             Control::History => glyphs::HISTORY,
@@ -87,8 +88,9 @@ impl Control {
             Control::SkipBack => "Back",
             Control::SkipForward => "Forward",
             Control::BackToLive => "Back to live",
-            Control::Audio => "Audio",
-            Control::Subtitles => "Subtitles",
+            Control::AudioSubtitles => "Audio & subtitles",
+            Control::Delay => "Delay",
+            Control::Settings => "Player settings",
             Control::Channels => "Channels",
             Control::Guide => "Guide",
             Control::History => "History",
@@ -105,12 +107,23 @@ impl Control {
     pub(super) fn glyph_only(self) -> bool {
         matches!(
             self,
-            Control::Prev | Control::PlayPause | Control::Next | Control::SkipBack | Control::SkipForward | Control::Fullscreen | Control::PopOut
+            Control::Prev
+                | Control::PlayPause
+                | Control::Next
+                | Control::SkipBack
+                | Control::SkipForward
+                | Control::Fullscreen
+                | Control::PopOut
+                | Control::AudioSubtitles
+                | Control::Settings
         )
     }
     /// The hover text of a control that always has one (its key), whether labelled or not.
     pub(super) fn key_tip(self) -> Option<&'static str> {
         match self {
+            Control::Settings => Some("Player settings (O)"),
+            Control::AudioSubtitles => Some("Audio & subtitles (A / S)"),
+            Control::Fullscreen => Some("Fullscreen (f)"),
             Control::UpNext => Some("Up next (u)"),
             Control::QueueNext => Some("Play the next item in Up next (n)"),
             Control::Cast => Some("Cast to a TV (C)"),
@@ -193,11 +206,9 @@ pub(super) fn clock(seconds: f64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
-/// Control label with the live value (track names).
+/// Control label with the live value (the connected TV).
 pub(super) fn control_text(c: Control, snap: &PlayerSnapshot) -> String {
     match c {
-        Control::Audio => snap.tracks.selected_audio().map_or_else(|| "Audio".into(), |a| a.label()),
-        Control::Subtitles => snap.tracks.selected_sub().map_or_else(|| "Off".into(), |a| a.label()),
         Control::QueueNext => "Next".into(),
         // the TV's name while casting, else what the button does
         Control::Cast => snap.cast.as_ref().map_or_else(|| "Cast".into(), |c| c.name.clone()),
@@ -206,7 +217,7 @@ pub(super) fn control_text(c: Control, snap: &PlayerSnapshot) -> String {
 }
 
 impl PlayerScreen {
-    /// The controls focus mode walks: those drawn last frame (a prefix of `controls`).
+    /// The controls focus mode walks those drawn last frame.
     pub(super) fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: OptionalButtons) -> Vec<Control> {
         let all = Self::controls(snap, narrow, video_only, queue);
         let drawn: Vec<Control> = all.iter().copied().filter(|c| self.visible.contains(c)).collect();
@@ -227,16 +238,10 @@ impl PlayerScreen {
         width < 700.0 * theme.rem()
     }
 
-    /// The controls row; narrow keeps zapping (the only mouse path to it), play / tracks /
-    /// info and Up next's `Next`. "Pop out" isn't offered in the popped-out window (its strip
-    /// has the way back). Up next's buttons sit before Info (up-next-design §2.4).
-    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: OptionalButtons) -> Vec<Control> {
+    /// The essentials (DESIGN §13.8); the volume sits between transport and the right group.
+    /// The popped-out window uses the same row. Everything else lives in the cog menu.
+    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, _video_only: bool, queue: OptionalButtons) -> Vec<Control> {
         use Control as C;
-        let live = is_live(snap);
-        // the TV has its own tracks, picture and window: those controls do nothing while casting
-        let casting = snap.cast.is_some();
-        let tracks = [C::Audio, C::Subtitles].into_iter().filter(|_| !casting);
-        let up_next = [queue.panel.then_some(C::UpNext), queue.next.then_some(C::QueueNext)];
         let mut v = Vec::new();
         if snap.seekable {
             v.push(C::SkipBack);
@@ -245,29 +250,21 @@ impl PlayerScreen {
         if snap.seekable {
             v.push(C::SkipForward);
         }
-        if live {
+        if is_live(snap) {
             if snap.live_buffer.is_some_and(|r| r.behind(snap.position.unwrap_or(r.end))) {
                 v.push(C::BackToLive);
             }
             v.extend([C::Prev, C::Next]);
         }
-        if narrow {
-            v.extend(tracks);
-            v.extend(queue.next.then_some(C::QueueNext));
-            v.push(C::Info);
-            return v;
+        v.extend(queue.next.then_some(C::QueueNext));
+        if snap.cast.is_none() {
+            v.push(C::AudioSubtitles);
         }
-        v.extend(tracks);
-        if live {
-            v.extend([C::Channels, C::Guide, C::History]);
+        if !narrow {
+            v.extend(queue.cast.then_some(C::Cast));
+            v.push(C::Fullscreen);
         }
-        v.extend(up_next.into_iter().flatten());
-        v.push(C::Info);
-        v.extend(queue.cast.then_some(C::Cast));
-        v.push(C::Fullscreen);
-        if !video_only && !casting {
-            v.push(C::PopOut);
-        }
+        v.push(C::Settings);
         v
     }
 
@@ -383,8 +380,9 @@ impl PlayerScreen {
             Control::SkipBack => ctx.play(PlayerCommand::SeekBy(-f64::from(cfg.skip_small_s))),
             Control::SkipForward => ctx.play(PlayerCommand::SeekBy(f64::from(cfg.skip_small_s))),
             Control::BackToLive => ctx.play(PlayerCommand::JumpToLive),
-            Control::Audio => ctx.open(OverlayRequest::Tracks { audio: true }),
-            Control::Subtitles => ctx.open(OverlayRequest::Tracks { audio: false }),
+            Control::AudioSubtitles => self.open_settings(ctx, SettingsPage::Tracks),
+            Control::Delay => self.open_settings(ctx, SettingsPage::Delay),
+            Control::Settings => self.open_settings(ctx, SettingsPage::Main),
             Control::Channels => self.open_panel(ctx, PanelKind::Channels),
             Control::Guide => self.open_panel(ctx, PanelKind::MiniGuide),
             Control::History => self.open_panel(ctx, PanelKind::History),
@@ -427,6 +425,9 @@ impl PlayerScreen {
             Action::Up if seekable => self.row = OsdRow::Seek,
             Action::Down => self.row = OsdRow::Buttons,
             Action::Up => {}
+            Action::PlayPause if self.settings.is_none() && controls.get(self.control) == Some(&Control::Settings) && self.row == OsdRow::Buttons => {
+                self.activate_control(ctx, Control::Settings);
+            }
             Action::Activate => {
                 if self.row == OsdRow::Seek {
                     ctx.play(PlayerCommand::TogglePause);
@@ -558,7 +559,6 @@ impl PlayerScreen {
 
         // ---- bottom bar
         let nn = ch.as_ref().filter(|_| live).and_then(|c| live::now_next_of(ctx, c));
-        let controls = Self::controls(snap, narrow, ctx.video_only, OptionalButtons::of(ctx));
         let ctrl_h = (theme.space(SpaceToken::ControlHeight) * s * 1.2).round();
         let line = body_font.size * 1.4;
         let lines = 3.0;
@@ -708,112 +708,72 @@ impl PlayerScreen {
             y += line;
         }
 
-        // volume at the right end of the controls row: its room is reserved first, so the
-        // controls give up space before it does (narrow: the speaker alone)
-        let cy = y + pad / 2.0;
-        let speaker_w = [glyphs::VOLUME, glyphs::MUTED]
-            .iter()
-            .map(|g| p.layout_no_wrap((*g).to_owned(), small_font.clone(), t.osd_text).size().x)
-            .fold(0.0, f32::max)
-            + pad;
-        let speaker_x = |right: f32| Rect::from_min_size(egui::pos2(right - speaker_w, cy), egui::vec2(speaker_w, ctrl_h));
-        let controls_right = if narrow {
-            let speaker = speaker_x(inner.right());
-            self.draw_volume(ui, ctx, &p, speaker, None, small_font.clone(), snap);
-            speaker.left() - pad
-        } else {
-            let label_w =
-                ["130 %", "Muted"].iter().map(|s| p.layout_no_wrap((*s).to_owned(), small_font.clone(), t.osd_text).size().x).fold(0.0, f32::max);
-            let slider_w = (if rect.width() >= 1200.0 * theme.rem() { 112.0 } else { 80.0 }) * s;
-            let label = Rect::from_min_size(egui::pos2(inner.right() - label_w, cy), egui::vec2(label_w, ctrl_h));
-            let slider = Rect::from_min_size(egui::pos2(label.left() - pad / 2.0 - slider_w, cy), egui::vec2(slider_w, ctrl_h));
-            let speaker = speaker_x(slider.left() - pad / 4.0);
-            self.draw_volume(ui, ctx, &p, speaker, Some((slider, Some(label))), small_font.clone(), snap);
-            speaker.left() - pad
-        };
+        let row = Rect::from_min_max(egui::pos2(inner.left(), y + pad / 2.0), inner.max);
+        self.draw_controls(ui, ctx, row, small_font, ctrl_h, snap);
+    }
 
-        // controls row: labelled where the design labels them; all glyphs when that doesn't
-        // fit; whatever still doesn't fit isn't drawn (and focus mode skips it)
-        let centred = !ctx.video_only;
-        let transport = |c: Control| matches!(c, Control::SkipBack | Control::PlayPause | Control::SkipForward);
-        let mut cx = inner.left();
+    /// Both windows share the row, including its right-aligned cog. Collapse labels before
+    /// shrinking the spacing, so even a small live-rewind window keeps every essential.
+    fn draw_controls(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, font: FontId, height: f32, snap: &PlayerSnapshot) {
+        let theme = ctx.theme;
+        let t = &theme.tokens;
+        let s = scale_of(ui);
+        let narrow = Self::narrow(ui.available_rect_before_wrap().width(), theme);
+        self.controls_narrow = narrow;
+        let controls = Self::controls(snap, narrow, ctx.video_only, OptionalButtons::of(ctx));
+        let split = controls
+            .iter()
+            .position(|c| matches!(c, Control::QueueNext | Control::AudioSubtitles | Control::Cast | Control::Fullscreen | Control::Settings))
+            .unwrap();
+        let p = ui.painter_at(rect);
+        let pad = (theme.space(SpaceToken::PanelPadding) * s).round();
+        let mut gap = pad / 2.0;
+        let mut button_pad = pad;
+        let text_of = |c: Control, only: bool| {
+            if only || c.glyph_only() { c.glyph(snap).to_owned() } else { format!("{}  {}", c.glyph(snap), control_text(c, snap)) }
+        };
+        let width_of = |text: String| p.layout_no_wrap(text, font.clone(), t.osd_text).size().x;
+        let slider_w = if narrow { 0.0 } else { (if rect.width() >= 1200.0 * theme.rem() { 112.0 } else { 80.0 }) * s };
+        let label_w = if narrow { 0.0 } else { width_of("130 %".into()).max(width_of("Muted".into())) };
+        let speaker_w = width_of(glyphs::VOLUME.into()).max(width_of(glyphs::MUTED.into()));
+        let volume_w = |gap: f32, padding: f32| speaker_w + padding + slider_w + label_w + if narrow { 0.0 } else { gap * 2.0 };
+        let total = |only: bool| controls.iter().map(|c| width_of(text_of(*c, only)) + button_pad + gap).sum::<f32>() + volume_w(gap, button_pad);
+        let only = narrow || total(false) > rect.width();
+        let fixed = controls.iter().map(|c| width_of(text_of(*c, only))).sum::<f32>() + speaker_w + slider_w + label_w;
+        let spacing = button_pad * (controls.len() + 1) as f32 + gap * (controls.len() + if narrow { 0 } else { 2 }) as f32;
+        let fit = ((rect.width() - fixed) / spacing).clamp(0.0, 1.0);
+        gap *= fit;
+        button_pad *= fit;
+        let right_w = controls[split..].iter().map(|c| width_of(text_of(*c, only)) + button_pad + gap).sum::<f32>() - gap;
+        let right_x = rect.right() - right_w;
+        let mut x = rect.left();
         let mut clicked = None;
-        let text_of = |c: Control, glyphs_only: bool| {
-            if glyphs_only || c.glyph_only() { c.glyph(snap).to_owned() } else { format!("{}  {}", c.glyph(snap), control_text(c, snap)) }
-        };
-        let row_width = |glyphs_only: bool| -> f32 {
-            controls
-                .iter()
-                .filter(|c| !centred || !transport(**c))
-                .map(|c| p.layout_no_wrap(text_of(*c, glyphs_only), small_font.clone(), t.osd_text).size().x + pad * 1.5)
-                .sum()
-        };
-        let glyphs_only = narrow || row_width(false) > controls_right - inner.left();
         self.control = self.focused_index(&controls);
-        let mut drawn = Vec::with_capacity(controls.len());
-        for (i, c) in controls.iter().enumerate() {
-            if centred && transport(*c) {
-                let side = (80.0 * s).min(rect.width() / 5.0).min((bottom.top() - top.bottom()).max(36.0) * 0.65);
-                let offset = match c {
-                    Control::SkipBack => -1.35,
-                    Control::SkipForward => 1.35,
-                    _ => 0.0,
-                };
-                let centre = egui::pos2(
-                    rect.center().x + side * offset,
-                    rect.center().y.clamp(top.bottom() + side / 2.0, (bottom.top() - side / 2.0).max(top.bottom() + side / 2.0)),
-                );
-                let r = Rect::from_center_size(centre, egui::vec2(side, side));
-                p.circle_filled(centre, side / 2.0, t.osd_scrim);
-                let text = match c {
-                    Control::SkipBack => format!("⟲ {}", ctx.config.player.skip_small_s),
-                    Control::SkipForward => format!("{} ⟳", ctx.config.player.skip_small_s),
-                    _ => c.glyph(snap).to_owned(),
-                };
-                let focused = self.osd_focus && self.row == OsdRow::Buttons && i == self.control;
-                if osd_button(
-                    ui,
-                    &p,
-                    theme,
-                    r,
-                    ui.id().with(("osd-control", i)),
-                    &text,
-                    FontId::proportional(side * 0.38),
-                    c.label(),
-                    Some(c.label()),
-                    focused,
-                )
-                .clicked()
-                {
-                    clicked = Some((i, *c));
-                }
-                self.bars.push(r);
-                drawn.push(*c);
-                continue;
+        for (i, c) in controls.iter().copied().enumerate() {
+            if i == split {
+                let speaker = Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(speaker_w + button_pad, height));
+                let slider = (!narrow).then(|| {
+                    let slider = Rect::from_min_size(egui::pos2(speaker.right() + gap, rect.top()), egui::vec2(slider_w, height));
+                    let label = Rect::from_min_size(egui::pos2(slider.right() + gap, rect.top()), egui::vec2(label_w, height));
+                    (slider, Some(label))
+                });
+                self.draw_volume(ui, ctx, &p, speaker, slider, font.clone(), snap);
+                x = right_x;
             }
-            let text = text_of(*c, glyphs_only);
-            let w = p.layout_no_wrap(text.clone(), small_font.clone(), t.osd_text).size().x;
-            let r = Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(w + pad, ctrl_h));
-            if r.right() > controls_right {
-                break;
+            let text = text_of(c, only);
+            let r = Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(width_of(text.clone()) + button_pad, height));
+            if c == Control::Settings {
+                self.settings_anchor = Some(r);
             }
-            drawn.push(*c);
-            let focused = self.osd_focus && self.row == OsdRow::Buttons && i == self.control.min(controls.len() - 1);
-            let tip = match c.key_tip() {
-                Some(k) => Some(k.to_owned()),
-                None => (glyphs_only || c.glyph_only()).then(|| control_text(*c, snap)),
-            };
-            let resp = osd_button(ui, &p, theme, r, ui.id().with(("osd-control", i)), &text, small_font.clone(), c.label(), tip.as_deref(), focused);
-            if resp.clicked() {
-                clicked = Some((i, *c));
+            let focused = self.settings.is_none() && self.osd_focus && self.row == OsdRow::Buttons && i == self.control;
+            let tip = c.key_tip().unwrap_or(c.label());
+            if osd_button(ui, &p, theme, r, ui.id().with(("osd-control", i)), &text, font.clone(), c.label(), Some(tip), focused).clicked() {
+                clicked = Some((i, c));
             }
-            cx = r.right() + pad / 2.0;
+            x = r.right() + gap;
         }
-        self.control = self.control.min(drawn.len().saturating_sub(1));
-        self.visible = drawn;
+        self.visible = controls;
         if let Some((i, c)) = clicked {
-            // a click activates the control but doesn't enter controls focus mode (DESIGN
-            // §13.8): the arrows keep zapping / seeking afterwards
             self.row = OsdRow::Buttons;
             self.control = i;
             self.show_banner(ctx);
@@ -821,143 +781,59 @@ impl PlayerScreen {
         }
     }
 
-    /// The video-only window's banner: one bottom strip — title and volume, then what's on
-    /// (live) or the position (VOD), and the way back when there is room. With the pointer in
-    /// the window (or paused) the right side holds buttons instead of the volume and the hint:
-    /// previous / play / next (live) or skips (VOD), speaker (+ slider from 360 px), pop in,
-    /// stop.
+    /// The popped-out window's compact banner: title / return, programme / position, then
+    /// the same essential controls as the full window (DESIGN §13.8).
     pub(super) fn draw_compact_osd(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let pad = theme.space(SpaceToken::Sm);
-        let title_font = FontId::proportional(theme.font(TypeToken::Body));
-        let small_font = FontId::proportional(theme.font(TypeToken::Caption));
-        let line = title_font.size * 1.35;
-        let strip = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0 * pad - line - small_font.size * 1.35), rect.max);
+        let font = FontId::proportional(theme.font(TypeToken::Body));
+        let small = FontId::proportional(theme.font(TypeToken::Caption));
+        let line = font.size * 1.4;
+        let ctrl_h = theme.space(SpaceToken::ControlHeight);
+        let strip = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 2.0 * pad - line * 2.0 - ctrl_h), rect.max);
         let p = ui.painter_at(rect);
         p.rect_filled(strip, 0.0, t.osd_scrim);
         self.bottom_bar = Some(strip.height());
         self.bars = vec![strip];
         let inner = strip.shrink(pad);
-        let buttons = snap.paused || ui.ctx().pointer_hover_pos().is_some_and(|pos| rect.contains(pos));
-        let text_right = if buttons {
-            self.draw_strip_buttons(ui, ctx, &p, inner, title_font.clone(), snap) - pad
-        } else {
-            let vol = if snap.muted { format!("{} muted", glyphs::MUTED) } else { format!("{} {:.0} %", glyphs::VOLUME, snap.volume) };
-            osd_text(&p, inner.right_top(), Align2::RIGHT_TOP, &vol, small_font.clone(), t.osd_text, f32::INFINITY).left() - pad
-        };
-        let playable = snap.playable.as_ref();
-        let mut title = playable.map(|p| p.title.clone()).unwrap_or_default();
-        if snap.paused {
-            title = format!("{} {title}", glyphs::PAUSE);
+        let back = Rect::from_min_size(egui::pos2(inner.right() - ctrl_h, inner.top()), egui::vec2(ctrl_h, line));
+        if osd_button(
+            ui,
+            &p,
+            theme,
+            back,
+            ui.id().with("strip-back"),
+            glyphs::POP_IN,
+            font.clone(),
+            "Back to the full window",
+            Some("Back to the full window (o · Esc · double-click)"),
+            false,
+        )
+        .clicked()
+        {
+            ctx.navigate(NavRequest::TogglePopOut);
         }
-        osd_text(&p, inner.left_top(), Align2::LEFT_TOP, &title, title_font, t.osd_text, (text_right - inner.left()).max(0.0));
+        let playable = snap.playable.as_ref();
+        let title = playable.map(|p| p.title.clone()).unwrap_or_default();
+        let title = if snap.paused { format!("{} {title}", glyphs::PAUSE) } else { title };
+        osd_text(&p, inner.left_top(), Align2::LEFT_TOP, &title, font.clone(), t.osd_text, (back.left() - pad - inner.left()).max(0.0));
         let second = if is_live(snap) {
-            let ch = playable.and_then(|p| match p.media {
-                MediaRef::Channel(id) | MediaRef::Catchup { channel: id, .. } => ctx.lib.live.get(id).cloned(),
-                _ => None,
-            });
+            let ch = playing_channel(snap).and_then(|id| ctx.lib.live.get(id)).cloned();
             let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
-            ch.and_then(|c| live::now_next_of(ctx, &c))
+            let programme = ch
+                .and_then(|c| live::now_next_of(ctx, &c))
                 .and_then(|n| n.now)
                 .map(|now| self.banner_cats.shown(ctx, &now).title(&spoilers))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            format!("{} · {programme}", live_label(snap))
         } else {
             let dur = snap.duration.or_else(|| playable.and_then(|p| p.duration_hint)).unwrap_or(0.0);
             format!("{} / {}", clock(snap.position.unwrap_or(0.0)), clock(dur))
         };
-        let second = if is_live(snap) { format!("{} · {second}", live_label(snap)) } else { second };
-        let second_pos = egui::pos2(inner.left(), inner.top() + line);
-        let mut second_w = inner.width();
-        if buttons {
-            second_w = (text_right - inner.left()).max(0.0);
-        } else if strip.width() >= 360.0 {
-            let hint = osd_text(
-                &p,
-                egui::pos2(inner.right(), second_pos.y),
-                Align2::RIGHT_TOP,
-                "o · Esc  back",
-                small_font.clone(),
-                with_alpha(t.osd_text, 0.5),
-                f32::INFINITY,
-            );
-            second_w = (hint.left() - pad - inner.left()).max(0.0);
-        }
-        osd_text(&p, second_pos, Align2::LEFT_TOP, &second, small_font, with_alpha(t.osd_text, 0.8), second_w);
-    }
-
-    /// The pop-out strip's buttons, right-aligned in `inner` (the strip's two text lines high);
-    /// returns their left edge. The text keeps room: the slider only from 560 pt, previous /
-    /// next only from 420 pt (the wheel over the speaker still steps the volume).
-    pub(super) fn draw_strip_buttons(
-        &mut self,
-        ui: &egui::Ui,
-        ctx: &mut UiCtx<'_>,
-        p: &egui::Painter,
-        inner: Rect,
-        font: FontId,
-        snap: &PlayerSnapshot,
-    ) -> f32 {
-        #[derive(Clone, Copy)]
-        enum B {
-            Prev,
-            PlayPause,
-            Next,
-            PopIn,
-            Stop,
-        }
-        let theme = ctx.theme;
-        let live = is_live(snap);
-        let side = inner.height();
-        let gap = theme.space(SpaceToken::Xxs);
-        let square = |right: f32| Rect::from_min_size(egui::pos2(right - side, inner.top()), egui::vec2(side, side));
-        let rem = theme.rem();
-        let wide = inner.width() >= 560.0 * rem;
-        let skips = inner.width() >= 420.0 * rem && (live || snap.seekable);
-        // right to left: stop, pop in, volume, next, play, previous
-        let stop = square(inner.right());
-        let pop_in = square(stop.left() - gap);
-        let slider_w = 64.0 * rem;
-        let slider = wide.then(|| Rect::from_min_size(egui::pos2(pop_in.left() - gap - slider_w, inner.top()), egui::vec2(slider_w, side)));
-        let speaker = square(slider.map_or(pop_in.left(), |s| s.left()) - gap);
-        let next = square(speaker.left() - gap);
-        let play = if skips { square(next.left() - gap) } else { next };
-        let prev = square(play.left() - gap);
-        self.draw_volume(ui, ctx, p, speaker, slider.map(|s| (s, None)), font.clone(), snap);
-        let (prev_label, next_label) =
-            if live { ("Previous channel", "Next channel") } else { (Control::SkipBack.label(), Control::SkipForward.label()) };
-        let (prev_glyph, next_glyph) = if live { (glyphs::PREVIOUS, glyphs::NEXT) } else { (glyphs::SKIP_BACK, glyphs::SKIP_FORWARD) };
-        let buttons = [
-            (B::Prev, prev, prev_glyph, prev_label, prev_label),
-            (B::PlayPause, play, if snap.paused { glyphs::PLAY } else { glyphs::PAUSE }, "Play / pause", "Play / pause (Space)"),
-            (B::Next, next, next_glyph, next_label, next_label),
-            (B::PopIn, pop_in, glyphs::POP_IN, "Back to the full window", "Back to the full window (o · Esc · double-click)"),
-            (B::Stop, stop, glyphs::CLOSE, "Stop and close", "Stop and close (q)"),
-        ];
-        let mut clicked = None;
-        for (i, (b, r, glyph, label, tip)) in buttons.into_iter().enumerate() {
-            if !skips && matches!(b, B::Prev | B::Next) {
-                continue;
-            }
-            if osd_button(ui, p, theme, r, ui.id().with(("strip-button", i)), glyph, font.clone(), label, Some(tip), false).clicked() {
-                clicked = Some(b);
-            }
-        }
-        let skip = f64::from(ctx.config.player.skip_small_s);
-        match clicked {
-            Some(B::Prev) if live => self.zap(ctx, false),
-            Some(B::Next) if live => self.zap(ctx, true),
-            Some(B::Prev) => ctx.play(PlayerCommand::SeekBy(-skip)),
-            Some(B::Next) => ctx.play(PlayerCommand::SeekBy(skip)),
-            Some(B::PlayPause) => ctx.play(PlayerCommand::TogglePause),
-            Some(B::PopIn) => ctx.navigate(NavRequest::TogglePopOut),
-            Some(B::Stop) => Self::stop_and_leave(ctx),
-            None => {}
-        }
-        if clicked.is_some() {
-            self.show_banner(ctx);
-        }
-        if skips { prev.left() } else { play.left() }
+        osd_text(&p, inner.left_top() + egui::vec2(0.0, line), Align2::LEFT_TOP, &second, small, with_alpha(t.osd_text, 0.8), inner.width());
+        let row = Rect::from_min_max(inner.left_top() + egui::vec2(0.0, line * 2.0), inner.max);
+        self.draw_controls(ui, ctx, row, font, ctrl_h, snap);
     }
 
     /// `[HD] [5.1] [CC] [⟲]` right-aligned at `right_center`; returns their extent.

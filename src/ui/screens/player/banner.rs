@@ -122,7 +122,7 @@ impl PlayerScreen {
     }
 
     pub(super) fn banner_visible(&self, snap: &PlayerSnapshot) -> bool {
-        self.osd_focus || self.panel.is_some() || self.banner_shown(snap)
+        self.osd_focus || self.settings.is_some() || self.panel.is_some() || self.banner_shown(snap)
     }
 
     pub(super) fn toggle_info(&mut self, ctx: &UiCtx<'_>) {
