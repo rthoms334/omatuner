@@ -2285,7 +2285,7 @@ fn watchlist_play_and_stop_echo_the_list_and_the_title_being_stopped() {
     assert_eq!(w.err("watchlist", json!({"action": "stop"})), ErrorCode::Unavailable);
 }
 
-/// DESIGN §43 §8.10: the downloads tool never returns a title/address, cannot add a locked
+/// DESIGN §43 §8.10: the downloads tool guards titles, omits addresses, cannot add a locked
 /// ref, and omits concealed jobs while retaining their bytes in the anonymous used total.
 #[test]
 fn downloads_tool_refuses_locked_refs_and_keeps_concealed_jobs_private() {
@@ -2314,6 +2314,15 @@ fn downloads_tool_refuses_locked_refs_and_keeps_concealed_jobs_private() {
     assert!(locked["refused"].as_array().unwrap().iter().any(|r| r["error"].as_str().unwrap_or("").starts_with("locked")));
     let added = w.ok("downloads", json!({"action":"add","refs":["movie:1:m3u:airplane"]}));
     assert_eq!(added["added"].as_array().unwrap().len(), 1);
+    let series = first_ref(&w.ok("search", json!({"query":"the show","kinds":["series"]})), "results");
+    let episodes = w.ok("episodes", json!({"series_ref":series}));
+    let plain = episodes["episodes"][0]["ref"].as_str().unwrap().to_owned();
+    let guarded = episodes["episodes"][2]["ref"].as_str().unwrap().to_owned();
+    assert_eq!(w.ok("downloads", json!({"action":"add","refs":[plain,guarded]}))["added"].as_array().unwrap().len(), 2);
+    w.ok("spoiler_guard", json!({"action":"add_series","series_ref":series}));
+    let services = w.ui.services();
+    let guard = tuner::spoiler::snapshot::build(&services.store.reader().unwrap(), &services.config(), &services.agent.library(), w.now).unwrap();
+    services.agent.set_guard(tuner::guard::Guard::with_snapshot(guard));
     let s = w.ui.services();
     let now = w.now;
     s.store
@@ -2344,16 +2353,52 @@ fn downloads_tool_refuses_locked_refs_and_keeps_concealed_jobs_private() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let list = loop {
         let list = w.ok("downloads", json!({"action":"list"}));
-        if list["items"].as_array().unwrap().len() == 1 && list["used_gb"].as_f64().unwrap() > 0.0 {
+        if list["items"].as_array().unwrap().len() == 3 && list["used_gb"].as_f64().unwrap() > 0.0 {
             break list;
         }
         assert!(Instant::now() < deadline, "snapshot published");
         std::thread::sleep(Duration::from_millis(50));
     };
     let wire = list.to_string();
-    for secret in ["Airplane", "Adult", "Locked Film", "http", "://"] {
+    for secret in ["Episode 3", "Adult", "Locked Film", "http", "://"] {
         assert!(!wire.contains(secret), "{wire}");
     }
-    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().any(|j| j["title"] == "Airplane!"));
+    assert_eq!(items.iter().find(|j| j["ref"] == plain).unwrap()["title"], "Episode 1");
+    let hidden = items.iter().find(|j| j["ref"] == guarded).unwrap();
+    assert!(hidden.get("title").is_none(), "{hidden}");
+    assert_eq!((hidden["season"].as_i64(), hidden["episode"].as_i64()), (Some(1), Some(3)));
+    let busy_id = tuner::model::DownloadId(hidden["id"].as_i64().unwrap());
+    let budget = w.ui.services().tiles.budget().clone();
+    budget.set_limit(SourceId(1), Some(1));
+    let lease = budget.acquire(busy_id, SourceId(1)).unwrap();
+    let busy = w.ok("play", json!({"ref":"movie:1:m3u:airplane"}));
+    assert_eq!(busy["busy"]["series"], "The Show");
+    assert!(busy["busy"].get("title").is_none(), "{busy}");
+    assert!(!mentions(&busy, "Episode 3"));
+    budget.release(busy_id, lease, None);
+    let kept = w.ok("downloads", json!({"action":"series","ref":series,"scope":"keep","n":2}));
+    assert!(kept["rule"].is_i64());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let list = w.ok("downloads", json!({"action":"list"}));
+        if list["rules"].as_array().is_some_and(|r| !r.is_empty()) {
+            assert_eq!(list["rules"][0]["title"], "The Show");
+            assert_eq!(list["rules"][0]["ref"], series);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let rule = kept["rule"].as_i64().unwrap();
+    let s = w.ui.services();
+    s.rt.block_on(handle.request(tuner::downloads::DownloadCommand::DeleteRule(rule)));
+    assert!(tuner::store::downloads::rules(&s.store.reader().unwrap()).unwrap().is_empty());
+    s.rt.block_on(handle.request(tuner::downloads::DownloadCommand::UndoRule(rule)));
+    assert_eq!(tuner::store::downloads::rules(&s.store.reader().unwrap()).unwrap()[0].id, rule);
+    w.ok("downloads", json!({"action":"series","ref":series,"scope":"keep","n":0}));
+    assert!(tuner::store::downloads::rules(&w.ui.services().store.reader().unwrap()).unwrap().is_empty());
     w.ui.services().rt.block_on(handle.request(tuner::downloads::DownloadCommand::Shutdown));
 }

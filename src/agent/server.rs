@@ -567,9 +567,11 @@ impl Inner {
                     let snapshot = handle.snapshot();
                     let job = snapshot.jobs.iter().find(|j| j.id == id);
                     if again.pause_downloads != Some(true) {
-                        return Ok(
-                            serde_json::json!({"busy":{"id":id.0,"what":if job.is_some_and(|j|j.kind.recording()){"recording"}else{"download"},"progress":job.and_then(|j|j.progress())}}),
-                        );
+                        let mut busy = job.map(super::downloads::label).unwrap_or_else(|| serde_json::json!({}));
+                        busy["id"] = id.0.into();
+                        busy["what"] = if job.is_some_and(|j| j.kind.recording()) { "recording" } else { "download" }.into();
+                        busy["progress"] = job.and_then(|j| j.progress()).into();
+                        return Ok(serde_json::json!({"busy":busy}));
                     }
                     if out.outcome == super::proto::PlayOutcome::PinRequired {
                         if let super::AgentCommand::Play(play) = &mut command {

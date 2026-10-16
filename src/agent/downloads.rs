@@ -28,20 +28,36 @@ fn target(q: &Q, reference: &str, minutes: Option<u32>, any_copy: bool) -> Out<T
     Ok(Target { item, programme, minutes, any_copy })
 }
 
+pub(super) fn label(j: &crate::downloads::Job) -> Value {
+    if j.kind == crate::downloads::Kind::Episode {
+        let title = j.subtitle.as_deref().and_then(|s| s.split_once(" · ")).map(|(_, title)| title).unwrap_or("");
+        json!({"kind":"episode", "series":super::query::clean(&j.title),
+            "season":j.fp.get("download_season"), "episode":j.fp.get("download_episode"),
+            "title":super::query::clean(title)})
+    } else {
+        json!({"kind":j.kind.as_str(), "title":super::query::clean(&j.title), "subtitle":j.subtitle.as_deref().map(super::query::clean)})
+    }
+}
+
 pub(super) async fn handle(h: &Arc<Inner>, p: Downloads) -> Out<Value> {
     let handle = h.shared.downloads().ok_or_else(|| Fail::new(ErrorCode::Unavailable, "Downloads are unavailable"))?;
     if p.action == DownloadsAction::List {
         let snapshot = handle.snapshot();
         return h.run(false, move |q| {
             let items: Vec<_> = snapshot.jobs.iter().filter(|j| !crate::downloads::planning::concealed(q.conn, q.lib, q.view, j))
-                .filter(|j| p.state.as_deref().is_none_or(|s| s == j.state.as_str())).map(|j| json!({
-                    "id":j.id.0, "ref":j.item().as_ref().map(item_ref), "kind":j.kind.as_str(),
-                    "title":super::query::clean(&j.title), "subtitle":j.subtitle.as_deref().map(super::query::clean), "state":j.state.as_str(),
-                    "progress":j.progress(), "eta_s":j.bytes_total.zip(j.fp.get("download_speed_bps").and_then(|v|v.as_f64()).filter(|n|*n>0.0)).map(|(n,rate)|(n.saturating_sub(j.bytes_done) as f64/rate).ceil() as u64), "account":j.source_id.map(|s| s.0), "reason":j.reason,
-                    "when":j.prog_start, "stop":j.prog_stop, "bytes":j.bytes_done,
-                    "s":j.fp.get("download_season"), "e":j.fp.get("download_episode")
-                })).collect();
-            Ok(json!({"used_gb":snapshot.used_bytes as f64 / 1e9,"cap_gb":snapshot.cap_bytes as f64 / 1e9,"free_gb":snapshot.free_bytes as f64 / 1e9,"items":items}))
+                .filter(|j| p.state.as_deref().is_none_or(|s| s == j.state.as_str())).map(|j| {
+                    let mut out = label(j);
+                    out.as_object_mut().unwrap().extend(json!({
+                        "id":j.id.0, "ref":j.item().as_ref().map(item_ref), "state":j.state.as_str(),
+                        "progress":j.progress(), "eta_s":j.bytes_total.zip(j.fp.get("download_speed_bps").and_then(|v|v.as_f64()).filter(|n|*n>0.0)).map(|(n,rate)|(n.saturating_sub(j.bytes_done) as f64/rate).ceil() as u64),
+                        "account":j.source_id.map(|s| s.0), "reason":j.reason,
+                        "when":j.prog_start, "stop":j.prog_stop, "bytes":j.bytes_done
+                    }).as_object().unwrap().clone());
+                    out
+                }).collect();
+            let rules: Vec<_> = snapshot.rules.iter().filter(|r| !q.conceals(&r.item)).map(|r|
+                json!({"id":r.id,"ref":item_ref(&r.item),"kind":"series","title":super::query::clean(&r.title),"keep":r.keep})).collect();
+            Ok(json!({"used_gb":snapshot.used_bytes as f64 / 1e9,"cap_gb":snapshot.cap_bytes as f64 / 1e9,"free_gb":snapshot.free_bytes as f64 / 1e9,"items":items,"rules":rules}))
         }).await;
     }
     let requested_ids = p.ids.clone();
@@ -85,7 +101,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Downloads) -> Out<Value> {
                     crate::store::copies::unloaded_series(q.conn, &[sid]).map_err(Fail::from)
                 })
                 .await?;
-            if !unloaded.is_empty() {
+            if !unloaded.is_empty() && !(p.scope.as_deref() == Some("keep") && p.n == Some(0)) {
                 for id in unloaded {
                     h.jobs.submit(crate::jobs::JobKind::LoadSeriesDetails(id));
                 }
@@ -96,7 +112,9 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Downloads) -> Out<Value> {
                 Some("next_n") => SeriesScope::Next(p.n.filter(|n| *n > 0 && *n <= 50).ok_or_else(|| Fail::bad("n must be 1 to 50"))?),
                 Some("season") => SeriesScope::Season(p.season.ok_or_else(|| Fail::bad("give season"))?),
                 Some("all") => SeriesScope::All,
-                Some("keep") => SeriesScope::Keep(p.n.filter(|n| (1..=10).contains(n)).ok_or_else(|| Fail::bad("n must be 1 to 10"))?),
+                Some("keep") => {
+                    SeriesScope::Keep(p.n.filter(|n| (0..=10).contains(n)).ok_or_else(|| Fail::bad("n must be 0 to 10 (0 removes the rule)"))?)
+                }
                 _ => return Err(Fail::bad("scope is next, next_n, season, all or keep")),
             };
             DownloadCommand::Series { item, scope, agent: true }

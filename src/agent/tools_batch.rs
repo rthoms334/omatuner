@@ -31,14 +31,14 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "downloads",
             title: "Downloads and recordings",
-            description: "Save films, episodes, series or programmes. List returns opaque ids, state, progress and space; it never exposes titles, files or stream addresses. Confirm more than 3 items, every recording, Keep N rule, file deletion and pause for playback with the user first. Locked refs need the PIN in Tuner. Recordings keep the current picture on an unanswered clash and try catch-up afterwards.",
+            description: "Save films, episodes, series or programmes. List returns opaque ids, guarded titles, state, progress, space and Keep N rules; never files or stream addresses. Series scope=keep with n=0 removes its rule. Confirm more than 3 items, every recording, Keep N rule, file deletion and pause for playback with the user first. Locked refs need the PIN in Tuner. Recordings keep the current picture on an unanswered clash and try catch-up afterwards.",
             input_schema: object(
                 json!({
                     "action": action_schema::<super::params::DownloadsAction>("What to do."),
                     "state": {"type":"string"}, "refs":{"type":"array","items":{"type":"string"},"maxItems":50},
                     "ref":{"type":"string"}, "channel":{"type":"string"}, "minutes":{"type":"integer","minimum":1,"maximum":1440},
                     "copy":{"enum":["best","this"]}, "scope":{"enum":["next","next_n","season","all","keep"]},
-                    "n":{"type":"integer","minimum":1,"maximum":50}, "season":{"type":"integer","minimum":0},
+                    "n":{"type":"integer","minimum":0,"maximum":50}, "season":{"type":"integer","minimum":0},
                     "ids":{"type":"array","items":{"type":"integer"},"maxItems":50}
                 }),
                 &["action"],
