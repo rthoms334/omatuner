@@ -49,7 +49,10 @@ use super::mpv_log::{self, MpvLog};
 use super::remote::{RemoteAdapter, RemoteCmd, RemoteEvent, RemoteOutput, TvClock};
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, StreamInfo, parse_track_list, query_stream_info};
-use super::{CopyPlay, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState, RenderClock};
+use super::{
+    CopyPlay, LiveBufferRange, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState,
+    RenderClock,
+};
 use crate::config::{Config, SubtitleAuto};
 use crate::model::{
     CastErrorKind, CastHints, CastPhase, CastView, ChannelId, DeviceId, HistoryEntry, ItemRef, MediaRef, PlayOrigin, Playable, PlayableKind,
@@ -107,6 +110,7 @@ pub struct TileSetup {
     pub budget: SharedBudget,
     /// Starts audible (picture A) or muted until the app moves the sound (picture B).
     pub audible: bool,
+    pub hls_window: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -136,9 +140,18 @@ fn create(
     setup: TileSetup,
 ) -> Controller {
     let snap = (**snap_tx.borrow()).clone();
-    let TileSetup { tile, budget, audible } = setup;
+    let TileSetup { tile, budget, audible, hls_window } = setup;
     Controller {
         live_cache: super::timeshift::LiveCache::new(deps.cache_dir.as_deref(), tile),
+        hls: None,
+        hls_media: None,
+        hls_origin: 0.0,
+        hls_epoch: 0,
+        hls_resume: None,
+        hls_paused: false,
+        hls_waiting: false,
+        hls_fallback: None,
+        hls_window,
         cache_ready: false,
         pending_seek: None,
         machine: PlayerMachine::new(MachineConfig::from_config(cfg)),
@@ -236,6 +249,15 @@ struct LocalView {
 
 struct Controller {
     live_cache: super::timeshift::LiveCache,
+    hls: Option<super::hls::Buffer>,
+    hls_media: Option<MediaRef>,
+    hls_origin: f64,
+    hls_epoch: u64,
+    hls_resume: Option<f64>,
+    hls_paused: bool,
+    hls_waiting: bool,
+    hls_fallback: Option<MediaRef>,
+    hls_window: f64,
     cache_ready: bool,
     pending_seek: Option<(f64, Instant)>,
     mpv: Arc<Mpv>,
@@ -347,7 +369,11 @@ impl Controller {
                 Output::Remote(r) if r.alive => r.out.events.clone(),
                 _ => crossbeam_channel::never(),
             };
+            let hls_errors = self.hls.as_ref().map_or_else(crossbeam_channel::never, |h| h.errors.clone());
             select! {
+                recv(hls_errors) -> error => {
+                    if let Ok(kind) = error { state_changed |= self.hls_error(kind); }
+                },
                 recv(cmd_rx) -> cmd => match cmd {
                     Ok(PlayerCommand::Shutdown) | Err(_) => {
                         // the TV gets the session's fast stop (≤ 300 ms, nobody waits for it)
@@ -355,6 +381,7 @@ impl Controller {
                         // the final progress save reaches the store before its writer closes
                         self.feed(Input::Stop, Instant::now());
                         self.publish(true);
+                        self.close_hls();
                         self.budget.forget(self.tile);
                         return;
                     }
@@ -566,6 +593,11 @@ impl Controller {
                         self.snap.seekable = false;
                         self.snap.playable = Some(p.clone());
                     }
+                    // A consumer woken by StateChanged must see that state and its
+                    // controls in the snapshot, including the first reconnect frame.
+                    if matches!(ev, PlayerEvent::StateChanged(_)) {
+                        self.publish(true);
+                    }
                     self.emit(ev);
                 }
                 Effect::SaveProgress { .. } => self.save_progress(pos.or(self.machine.last_position())),
@@ -597,6 +629,14 @@ impl Controller {
     /// `Effect::StopMpv` on mpv: stop; the lease is released when the stopped entry's END_FILE
     /// arrives (now, when no entry is open).
     fn stop_local(&mut self) {
+        if !matches!(self.machine.state(), PlayerState::Reconnecting { .. }) {
+            self.close_hls();
+        } else if self.hls.is_some()
+            && let Some(range) = self.snap.live_buffer
+        {
+            self.hls_paused = self.snap.paused;
+            self.hls_resume = self.snap.position.filter(|p| self.snap.paused || range.behind(*p));
+        }
         self.live_cache.clear();
         self.cache_ready = false;
         self.snap.live_buffer = None;
@@ -605,7 +645,7 @@ impl Controller {
         self.pending = None;
         self.waiting = None;
         let _ = self.mpv.command("stop", &[]);
-        if self.lease_entry.is_none() {
+        if self.lease_entry.is_none() && self.hls.is_none() {
             self.release_lease();
         }
     }
@@ -628,11 +668,80 @@ impl Controller {
         }
     }
 
+    /// The recorder reports every failed attempt; the same state machine as direct play
+    /// owns backoff, refusal classification, failure records and the final stop.
+    fn hls_error(&mut self, event: super::hls::Event) -> bool {
+        let (kind, text) = match event {
+            super::hls::Event::Published => {
+                if self.hls_waiting
+                    && matches!(self.machine.state(), PlayerState::Loading { .. })
+                    && let Some(p) = self.machine.target().cloned()
+                {
+                    self.hls_waiting = false;
+                    self.load_now(p);
+                    return true;
+                }
+                return false;
+            }
+            super::hls::Event::NotPlaylist => {
+                if let Some(p) = self.machine.target().cloned() {
+                    self.hls_fallback = Some(p.media.clone());
+                    self.close_hls();
+                    self.machine.replace_local_reader(None);
+                    self.load(p);
+                    return true;
+                }
+                return false;
+            }
+            super::hls::Event::Failed(kind, text) => (kind, text),
+        };
+        let code = match kind {
+            PlayerErrorKind::HttpForbidden => Some(403),
+            PlayerErrorKind::HttpNotFound => Some(404),
+            PlayerErrorKind::HttpOther(code) => Some(code),
+            _ => None,
+        };
+        if let Some(code) = code {
+            self.log_http(code, Instant::now());
+            self.observe_refusal(code);
+        }
+        self.hls_waiting = false;
+        self.feed(Input::RecorderFailed { kind, text }, Instant::now())
+    }
+
+    fn close_hls(&mut self) {
+        if let Some(hls) = self.hls.take() {
+            // Buffer::drop joins its fetcher after the actual provider socket closes.
+            drop(hls);
+            self.release_lease();
+        }
+        self.hls_media = None;
+        self.hls_origin = 0.0;
+        self.hls_resume = None;
+        self.hls_paused = false;
+        self.hls_waiting = false;
+    }
+
     /// Stop-before-start (see [`must_stop_first`]): `stop`, wait for the old entry's END_FILE
     /// (or 1.5 s), then load. Casting: the relay stops its previous generation itself before it
     /// opens the next (§8.5), so only the local stream a cast just stopped is waited for: the
     /// TV's upstream never runs alongside it.
     fn load(&mut self, p: Arc<Playable>) {
+        if self.hls_fallback.as_ref().is_some_and(|m| *m != p.media) {
+            self.hls_fallback = None;
+        }
+        if !self.casting()
+            && let Some(hls) = &self.hls
+            && self.hls_media.as_ref() == Some(&p.media)
+            && hls.snapshot().failed
+        {
+            self.hls_waiting = true;
+            hls.retry();
+            return;
+        }
+        if self.casting() || self.hls_media.as_ref() != Some(&p.media) {
+            self.close_hls();
+        }
         self.waiting = None;
         if self.casting() {
             if let Some(old) = self.lease_entry {
@@ -677,8 +786,19 @@ impl Controller {
     /// Load `p` now. Refused by the budget only because another picture's stream is still
     /// closing (its claim moved on): wait for it until `deadline`, then the refusal stands.
     fn load_now_by(&mut self, p: Arc<Playable>, deadline: Instant) {
-        self.release_lease();
-        if let Some(src) = p.source_id {
+        if let Some(hls) = &self.hls {
+            let status = hls.snapshot();
+            if status.failed
+                || (self.lease_played && self.hls_resume.is_none() && status.range.zip(self.snap.position).is_some_and(|(r, pos)| pos > r.end + 0.5))
+            {
+                self.hls_waiting = true;
+                return;
+            }
+        }
+        if self.hls.is_none() {
+            self.release_lease();
+        }
+        if let Some(src) = p.source_id.filter(|_| self.hls.is_none()) {
             match self.budget.acquire(self.tile, src) {
                 Ok(l) => {
                     self.lease = Some(l);
@@ -713,7 +833,7 @@ impl Controller {
             self.snap.video_suspended = false;
         }
         self.apply_lip_sync();
-        if self.snap.paused {
+        if self.snap.paused && !self.hls_paused {
             // a new play always plays (mpv's `pause` survives loadfile)
             let _ = self.mpv.set_property("pause", false);
         }
@@ -732,7 +852,45 @@ impl Controller {
         self.snap.live_buffer = None;
         self.snap.seekable = false;
         self.pending_seek = None;
-        self.live_cache.prepare(p.kind.is_live(), &mut args);
+        if super::hls::eligible(&p) && self.hls_fallback.as_ref() != Some(&p.media) {
+            if self.hls.is_none() {
+                let root = self
+                    .deps
+                    .cache_dir
+                    .clone()
+                    .or_else(|| crate::paths::AppPaths::from_env().ok().map(|p| p.cache_dir))
+                    .unwrap_or_else(std::env::temp_dir);
+                match super::hls::Buffer::start(&p, &root, self.tile, &self.applied.player.user_agent, self.hls_window) {
+                    Ok(buffer) => {
+                        self.hls = Some(buffer);
+                        self.hls_media = Some(p.media.clone());
+                    }
+                    Err(_) => {
+                        self.release_lease();
+                        self.feed(
+                            Input::Fail(PlayerError { kind: PlayerErrorKind::Mpv, message: "Couldn't start local live playback".into() }),
+                            Instant::now(),
+                        );
+                        return;
+                    }
+                }
+            }
+            if let Some(hls) = &self.hls {
+                let status = hls.snapshot();
+                self.hls_origin = status.range.map_or(0.0, |r| r.end);
+                self.hls_epoch = status.epoch;
+                let (url, offset) = hls.view(self.hls_resume.take().or_else(|| hls.live_target()));
+                args[0] = url;
+                args[3] = format!("{},start={offset:.6}", self.hls_options());
+                if self.hls_paused {
+                    let _ = self.mpv.set_property("pause", true);
+                }
+                self.hls_paused = false;
+                self.live_cache.clear();
+            }
+        } else {
+            self.live_cache.prepare(p.kind.is_live(), &mut args);
+        }
         if self.light_decode {
             super::mpv::add_light_decode(&mut args);
         }
@@ -740,6 +898,7 @@ impl Controller {
             Ok(entry) => entry,
             Err(e) => {
                 tracing::warn!("loadfile failed: {e}");
+                self.close_hls();
                 self.release_lease();
                 let err = PlayerError { kind: PlayerErrorKind::Mpv, message: format!("Playback failed ({e})") };
                 self.feed(Input::Fail(err), Instant::now());
@@ -1011,7 +1170,7 @@ impl Controller {
                 }
             }
             PlayerCommand::JumpToLive => {
-                if self.live_cache.active {
+                if self.live_cache.active || self.hls.is_some() {
                     self.read_seekable();
                     if let Some(range) = self.snap.live_buffer {
                         self.seek(range.end, "absolute");
@@ -1761,9 +1920,15 @@ impl Controller {
 
     /// Hidden-window safety net (module docs of `player`).
     fn video_watchdog(&mut self, now: Instant) {
-        // vid=no deselects the video stream in the demuxer, throwing away the pictures
-        // we need for live rewind. Keep it selected while timeshifting, even when hidden.
-        if self.live_cache.active {
+        // The HLS recorder is independent of decoding. A hidden picture at live may
+        // suspend, but a paused or rewound picture must keep video selected.
+        let timeshifting = self.snap.paused || self.snap.live_buffer.zip(self.snap.position).is_some_and(|(r, p)| r.behind(p));
+        if timeshifting {
+            if self.snap.video_suspended {
+                let _ = self.mpv.set_property("vid", "auto");
+                self.snap.video_suspended = false;
+                self.force_publish = true;
+            }
             return;
         }
         let last = self.render_clock.load(Ordering::Relaxed);
@@ -1790,6 +1955,14 @@ impl Controller {
         if self.machine.owns_entry(entry_id) {
             self.file_loaded = false;
         }
+        if !self.casting()
+            && reason == EndReason::Eof
+            && self.machine.owns_entry(entry_id)
+            && let Some(next) = self.hls.as_ref().and_then(|h| h.snapshot().next_view)
+            && self.open_hls_view(next)
+        {
+            return true;
+        }
         let line = format!("END_FILE entry {entry_id}: {reason:?} ({error}) in {}", state_label(self.machine.state()));
         if self.machine.owns_entry(entry_id) && matches!(reason, EndReason::Eof | EndReason::Error | EndReason::Unknown) {
             tracing::info!("{line}");
@@ -1810,8 +1983,12 @@ impl Controller {
                 self.lease_redirected = next.is_none();
             }
             LeaseOnEnd::Release => {
-                // the leased stream is really closed now
-                self.release_lease();
+                // mpv closed only its localhost reader; the recorder still owns the lease.
+                if self.hls.is_some() {
+                    self.lease_entry = None;
+                } else {
+                    self.release_lease();
+                }
                 if let Some(pl) = self.pending.take() {
                     self.load_now(pl.playable);
                 }
@@ -1989,8 +2166,11 @@ impl Controller {
                 }
             }
             PropId::TimePos => {
-                self.snap.position = f(&v);
-                if let Some(t) = f(&v) {
+                if let Some(hls) = &self.hls {
+                    self.hls_origin = hls.snapshot().origin;
+                }
+                self.snap.position = f(&v).map(|p| p + self.hls_origin);
+                if let Some(t) = self.snap.position {
                     self.feed(Input::TimePos(t), now);
                     let sec = t.floor() as i64;
                     if self.last_second != Some(sec) {
@@ -1999,7 +2179,8 @@ impl Controller {
                     }
                 }
             }
-            PropId::Duration => self.snap.duration = f(&v).or(self.snap.duration),
+            PropId::Duration if self.hls.is_none() => self.snap.duration = f(&v).or(self.snap.duration),
+            PropId::Duration => {}
             PropId::DemuxerCacheDuration => self.snap.cache_secs = f(&v),
             PropId::Volume => {
                 self.snap.volume = f(&v).unwrap_or(self.snap.volume);
@@ -2098,9 +2279,26 @@ impl Controller {
     fn read_seekable(&mut self) {
         let live = self.machine.target().is_some_and(|p| p.kind.is_live());
         let playing = matches!(self.machine.state(), PlayerState::Playing | PlayerState::Paused | PlayerState::Buffering { .. });
-        let range = (live && playing && self.cache_ready && self.live_cache.active)
-            .then(|| super::timeshift::CacheState::read(&self.mpv).range(self.live_cache.window()))
-            .flatten();
+        let range = if live && playing && (self.cache_ready || self.hls.as_ref().is_some_and(|h| !h.snapshot().memory)) {
+            if let Some(hls) = &self.hls {
+                let status = hls.snapshot();
+                if status.memory {
+                    super::timeshift::CacheState::read(&self.mpv).range(120.0).map(|r| {
+                        let start = r.start + self.hls_origin;
+                        let end = r.end + self.hls_origin;
+                        LiveBufferRange { start, end: status.range.map_or(end, |live| live.end.min(end)).max(start) }
+                    })
+                } else {
+                    status.range
+                }
+            } else if self.live_cache.active {
+                super::timeshift::CacheState::read(&self.mpv).range(self.live_cache.window())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if self.snap.live_buffer != range {
             self.snap.live_buffer = range;
             self.dirty = true;
@@ -2117,22 +2315,70 @@ impl Controller {
     /// point; it remains paused there. The extra readahead margin prevents a full window
     /// from stopping the network reader. Byte-limited memory caches need the idle case too.
     fn live_tick(&mut self) {
-        if self.casting() || !self.live_cache.active || !self.cache_ready {
+        if self.casting() || (self.hls.is_none() && !self.live_cache.active) || !self.cache_ready {
+            return;
+        }
+        if self.hls.as_ref().is_some_and(|h| h.snapshot().epoch != self.hls_epoch) {
+            if let Some(hls) = &self.hls {
+                let status = hls.snapshot();
+                if let Some(range) = status.range {
+                    self.hls_epoch = status.epoch;
+                    self.open_hls_view(range.end);
+                }
+            }
             return;
         }
         let state = super::timeshift::CacheState::read(&self.mpv);
         self.live_cache.maintain(&self.mpv, &state);
         self.read_seekable();
         let Some(range) = self.snap.live_buffer else { return };
-        let Some(pos) = self.mpv.get_property::<f64>("time-pos").ok() else { return };
-        let expired = pos < range.start;
-        let full = self.snap.paused && state.idle && !state.eof && range.end - pos > 10.0;
+        let Some(pos) = self.mpv.get_property::<f64>("time-pos").ok().map(|p| p + self.hls_origin) else { return };
+        if !self.snap.paused
+            && let Some(next) = self.hls.as_ref().and_then(|h| h.snapshot().next_view)
+            && pos >= next - 0.25
+            && self.open_hls_view(next)
+        {
+            self.pending_seek = Some((next, Instant::now()));
+            return;
+        }
+        let expired = self.snap.paused && pos < range.start;
+        let full = self.hls.as_ref().is_none_or(|h| h.snapshot().memory) && self.snap.paused && state.idle && !state.eof && range.end - pos > 10.0;
         if (expired || full) && self.pending_seek.is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(1)) {
             let target = if expired { range.start } else { (pos + 2.0).min(range.end) };
-            if self.mpv.command("seek", &[&target.to_string(), "absolute+exact"]).is_ok() {
+            if self.local_seek(target) {
                 self.pending_seek = Some((target, Instant::now()));
             }
         }
+    }
+
+    fn hls_options(&self) -> String {
+        let hls = self.hls.as_ref().expect("local HLS reader");
+        super::mpv::hls_options(&self.applied, self.tile, hls.snapshot().memory, hls.options())
+    }
+
+    fn open_hls_view(&mut self, target: f64) -> bool {
+        let Some(hls) = &self.hls else { return false };
+        let (url, offset) = hls.view(Some(target));
+        let opts = format!("{},start={offset:.6}", self.hls_options());
+        let mut args = [url, "replace".into(), "-1".into(), opts];
+        if self.light_decode {
+            super::mpv::add_light_decode(&mut args);
+        }
+        if let Ok(entry) = super::mpv::loadfile(&self.mpv, &args) {
+            tracing::debug!("live rewind: replacing local reader at {target:.3}");
+            self.machine.replace_local_reader(entry);
+            self.lease_entry = entry;
+            self.cache_ready = false;
+            return true;
+        }
+        false
+    }
+
+    fn local_seek(&mut self, target: f64) -> bool {
+        if self.hls.as_ref().is_some_and(|h| !h.snapshot().memory) {
+            return self.open_hls_view(target);
+        }
+        self.mpv.command("seek", &[&(target - self.hls_origin).to_string(), "absolute+exact"]).is_ok()
     }
 
     fn seek(&mut self, seconds: f64, mode: &str) {
@@ -2141,22 +2387,25 @@ impl Controller {
         }
         self.read_seekable();
         let refused = !self.snap.seekable;
-        let current = self.mpv.get_property::<f64>("time-pos").ok().or(self.snap.position).unwrap_or(0.0);
+        let current = self.mpv.get_property::<f64>("time-pos").ok().map(|p| p + self.hls_origin).or(self.snap.position).unwrap_or(0.0);
         let from = self
             .pending_seek
             .filter(|(_, at)| {
                 at.elapsed() < Duration::from_secs(1)
-                    && (at.elapsed() < Duration::from_millis(100) || self.mpv.get_property::<bool>("seeking").unwrap_or(false))
+                    && (!self.cache_ready || at.elapsed() < Duration::from_millis(100) || self.mpv.get_property::<bool>("seeking").unwrap_or(false))
             })
             .map_or(current, |(t, _)| t);
         let requested = if mode == "relative" { from + seconds } else { seconds };
-        let target = self
-            .snap
-            .live_buffer
-            .map_or_else(|| self.snap.duration.map_or(requested.max(0.0), |d| requested.clamp(0.0, d.max(0.0))), |r| requested.clamp(r.start, r.end));
-        // Live requests must stay inside the demuxer's cache, even for non-seekable HTTP.
-        // Absolute exact also makes rapid repeated commands add up before mpv echoes time-pos.
-        let failed = !refused && self.mpv.command("seek", &[&target.to_string(), "absolute+exact"]).is_err();
+        let target = self.snap.live_buffer.map_or_else(
+            || self.snap.duration.map_or(requested.max(0.0), |d| requested.clamp(0.0, d.max(0.0))),
+            |r| {
+                let end = self.hls.as_ref().and_then(|h| h.live_target()).unwrap_or(r.end).clamp(r.start, r.end);
+                requested.clamp(r.start, end)
+            },
+        );
+        // Clamp against the recorder or packet cache. Pending targets make rapid repeated
+        // commands add up before mpv echoes the new position.
+        let failed = !refused && !self.local_seek(target);
         // one line per skip, so a stream that won't seek says why in the log (formats and
         // numbers only: no URL, no title)
         let num = |p: &str| self.mpv.get_property::<f64>(p).ok().map_or("-".to_owned(), |v| format!("{v:.1}"));
@@ -2220,6 +2469,11 @@ impl Controller {
             return;
         }
         self.snap.state = self.machine.state().clone();
+        // PlaybackRestart changes Loading to Playing. Read the range after that
+        // transition so the first Playing snapshot already has its live controls.
+        if !self.casting() {
+            self.read_seekable();
+        }
         self.snap.last_position = self.machine.last_position();
         if let PlayerState::Error(e) = &self.snap.state {
             self.snap.last_error = Some(e.clone());
@@ -2412,10 +2666,51 @@ mod tests {
             snap_tx,
             Arc::new(AtomicU64::new(0)),
             Instant::now(),
-            TileSetup { tile: TileId::A, budget: SharedBudget::default(), audible: true },
+            TileSetup { tile: TileId::A, budget: SharedBudget::default(), audible: true, hls_window: super::super::hls::WINDOW },
         );
         c.audio_lookup = super::super::audio_output::Lookup::new(query);
         (c, events)
+    }
+
+    #[test]
+    fn hidden_live_suspends_but_pause_and_rewind_restore_video() {
+        let (mut c, _) = audio_controller(&Config::default(), Arc::new(|_| None));
+        let p = Arc::new(Playable {
+            media: MediaRef::Channel(ChannelId(1)),
+            kind: PlayableKind::Live,
+            source_id: None,
+            item: None,
+            title: String::new(),
+            subtitle: None,
+            logo: None,
+            number: None,
+            url: crate::redact::Secret::new("https://example.test/live.ts".into()),
+            headers: Default::default(),
+            start_at: None,
+            duration_hint: None,
+        });
+        let now = Instant::now();
+        c.machine.handle(Input::Play { target: p, immediate: true }, now);
+        c.machine.handle(Input::Loaded { entry: Some(1) }, now);
+        c.machine.handle(Input::StartFile { entry: 1 }, now);
+        c.machine.handle(Input::PlaybackRestart, now);
+        c.epoch = now - Duration::from_secs(20);
+        c.render_clock.store(1, Ordering::Relaxed);
+        c.snap.video_size = Some((160, 90));
+        c.snap.position = Some(99.0);
+        c.snap.live_buffer = Some(LiveBufferRange { start: 0.0, end: 100.0 });
+        c.live_cache.active = true;
+        c.video_watchdog(now);
+        assert!(c.snap.video_suspended);
+        assert_eq!(c.mpv.get_property::<String>("vid").unwrap(), "no");
+        c.snap.paused = true;
+        c.video_watchdog(now);
+        assert!(!c.snap.video_suspended);
+        assert_ne!(c.mpv.get_property::<String>("vid").unwrap(), "no");
+        c.snap.paused = false;
+        c.snap.position = Some(60.0);
+        c.video_watchdog(now);
+        assert!(!c.snap.video_suspended);
     }
 
     fn identify(c: &mut Controller, now: Instant) {

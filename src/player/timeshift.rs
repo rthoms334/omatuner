@@ -1,4 +1,5 @@
-//! Local live timeshift, using the existing demuxer and connection.
+//! Cache rewind for raw TS and other non-HLS live inputs, using the existing demuxer.
+//! Provider HLS uses the independent rolling recorder in `player/hls/`.
 //!
 //! mpv 0.41's disk cache is append-only; max-back-bytes limits METADATA when on disk.
 //! Therefore we also inspect file-cache-bytes, stop disk writes near 2 GiB, and continue
@@ -101,8 +102,10 @@ impl LiveCache {
         }
         let opts = &mut args[3];
         opts.push_str(",cache=yes,demuxer-seekable-cache=yes,force-seekable=yes,demuxer-donate-buffer=no,demuxer-cache-unlink-files=immediate");
-        // Let the controller handle reconnects: every new load gets an empty cache.
-        opts.push_str(",stream-lavf-o=reconnect=0");
+        // Rewind is confined to the packet cache. FFmpeg's HTTP seek opens its new
+        // connection before closing the old one, including seeks made while probing
+        // a finite TS response. Disable upstream seeks and let the controller reconnect.
+        opts.push_str(&format!(",stream-lavf-o={}", super::mpv::quote("reconnect=0,seekable=0")));
         if self.disk {
             let dir = self.dir.as_ref().expect("disk has directory");
             opts.push_str(&format!(",demuxer-cache-dir={},cache-on-disk=yes", super::mpv::quote(&dir.to_string_lossy())));
@@ -189,7 +192,7 @@ fn clear_contents(dir: &Path) {
     }
 }
 
-fn make_dir(cache: &Path, tile: TileId) -> std::io::Result<PathBuf> {
+pub(super) fn make_dir(cache: &Path, tile: TileId) -> std::io::Result<PathBuf> {
     let root = cache.join("live-rewind");
     fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
     if fs::symlink_metadata(&root)?.file_type().is_symlink() {

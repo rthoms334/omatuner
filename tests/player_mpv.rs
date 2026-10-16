@@ -6,6 +6,7 @@
 mod support;
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -107,9 +108,10 @@ fn movie(id: i64, url: String) -> Playable {
 // ---------------------------------------------------------------------------------------------
 // harness
 
-/// A sliding HLS playlist without ENDLIST. All seeks use its existing demuxer; no load or
-/// provider byte-range request is needed. Pausing must keep fetching new live segments.
+/// The local HLS recorder keeps fetching while paused; seeks reopen only localhost.
+/// Requires real HTTP sockets: run outside the sandbox.
 #[test]
+#[ignore = "requires localhost sockets; run outside the sandbox"]
 fn live_rewind_cache_seek_pause_clamp_and_channel_change() {
     let Some((media, _serial)) = setup() else { return };
     let srv = TestServer::start(media, Faults::default());
@@ -131,10 +133,9 @@ fn live_rewind_behaviour(first: String, second: String) {
     let mut h = Harness::start_in(headless_config(), vec![live(1, first), live(2, second)], Some(cache.path().into()));
     h.play(MediaRef::Channel(ChannelId(1)), true);
     h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.video_size.is_some());
-    h.player.mark_rendered_for_tests();
     let s = h.wait_snapshot(Duration::from_secs(25), |s| s.state == PlayerState::Playing && s.live_buffer.is_some_and(|r| r.end - r.start > 12.0));
     let generation = s.load_generation;
-    assert!(!s.video_suspended, "a hidden live picture must keep caching video");
+    assert!(!s.video_suspended, "no render clock yet");
     h.handle.send(PlayerCommand::SetPause(true));
     let paused = h.wait_snapshot(LONG, |s| s.paused);
     let before = paused.position.unwrap();
@@ -162,7 +163,7 @@ fn live_rewind_behaviour(first: String, second: String) {
     h.handle.send(PlayerCommand::SeekBy(-3600.0));
     assert!(h.wait_event_from(mark, LONG, |e| matches!(e, PlayerEvent::LiveSeekBoundary { oldest: true })).is_some());
     h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| (s.position.unwrap_or(-100.0) - r.start).abs() < 1.0));
-    assert_eq!(h.snapshot().load_generation, generation, "cached seeks never reload");
+    assert_eq!(h.snapshot().load_generation, generation, "seeks keep the same channel generation");
 
     let root = cache.path().join("live-rewind");
     let dir = std::fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
@@ -198,6 +199,10 @@ impl Harness {
     }
 
     fn start_in(cfg: Config, table: Vec<Playable>, cache_dir: Option<PathBuf>) -> Self {
+        Self::start_in_window(cfg, table, cache_dir, tuner::player::hls::WINDOW)
+    }
+
+    fn start_in_window(cfg: Config, table: Vec<Playable>, cache_dir: Option<PathBuf>, window: f64) -> Self {
         let (bus, events) = EventBus::new(None);
         let rec = Recorded::default();
         let deps = PlayerDeps {
@@ -207,7 +212,7 @@ impl Harness {
             resolver: Box::new(TableResolver(table.into_iter().map(|p| (p.media.clone(), p)).collect())),
             cast: None,
         };
-        let player = Player::start(&cfg, deps).expect("headless mpv");
+        let player = Player::start_with_hls_window_for_tests(&cfg, deps, window).expect("headless mpv");
         let handle = player.handle();
         Self { player, handle, events, seen: Vec::new(), rec }
     }
@@ -2144,4 +2149,316 @@ mod casting {
         let saved = h.rec.progress.lock().unwrap().clone();
         assert!(saved.iter().any(|p| p.position_s == 31.0 && !p.finished), "the TV's last position was saved: {saved:?}");
     }
+}
+
+#[test]
+#[ignore = "live HLS hidden-window decoder policy: real HTTP; run outside the sandbox"]
+fn live_hls_hidden_playing_suspends_but_paused_keeps_decoding() {
+    let media = support::media::ensure_rolling_media();
+    let srv = TestServer::start(media, Faults::default());
+    let cache = tempfile::tempdir().unwrap();
+    let h = Harness::start_in(headless_config(), vec![live(1, srv.url("rolling/index.m3u8"))], Some(cache.path().into()));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.live_buffer.is_some_and(|r| !r.behind(s.position.unwrap_or(0.0))));
+    h.player.mark_rendered_for_tests();
+    let hidden = h.wait_snapshot(Duration::from_secs(20), |s| s.video_suspended);
+    let edge = hidden.live_buffer.unwrap().end;
+    h.wait_snapshot(Duration::from_secs(6), |s| s.live_buffer.is_some_and(|r| r.end > edge + 2.0));
+    h.handle.send(PlayerCommand::SetPause(true));
+    let paused = h.wait_snapshot(LONG, |s| s.paused && !s.video_suspended);
+    let edge = paused.live_buffer.unwrap().end;
+    h.wait_snapshot(Duration::from_secs(6), |s| s.live_buffer.is_some_and(|r| r.end > edge + 2.0));
+    assert!(!h.snapshot().video_suspended, "paused and hidden keeps video selected");
+    h.handle.send(PlayerCommand::SeekBy(-10.0));
+    h.handle.send(PlayerCommand::SetPause(false));
+    h.wait_snapshot(LONG, |s| !s.paused && s.live_buffer.is_some_and(|r| r.behind(s.position.unwrap_or(r.end))));
+    assert!(!h.snapshot().video_suspended, "rewound and hidden keeps video selected");
+}
+
+#[test]
+#[ignore = "64 second HLS controller run plus pause expiry; real HTTP, run outside the sandbox"]
+fn live_hls_rolling_controller_pause_expiry_and_zap() {
+    let media = support::media::ensure_rolling_media();
+    let srv = TestServer::start(media, Faults::default());
+    let cache = tempfile::tempdir().unwrap();
+    let url = srv.url("rolling/index.m3u8");
+    let h = Harness::start_in_window(headless_config(), vec![live(1, url.clone()), live(2, url)], Some(cache.path().into()), 20.0);
+    h.player.budget().set_limit(SourceId(1), Some(1));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    let initial = h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.live_buffer.is_some());
+    let generation = initial.load_generation;
+    let played =
+        h.wait_snapshot(Duration::from_secs(75), |s| s.position.is_some_and(|p| p >= 64.0) && s.live_buffer.is_some_and(|r| r.start >= 44.0));
+    let before = played.position.unwrap();
+    h.handle.send(PlayerCommand::SeekBy(-15.0));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| p < before - 13.0 && p >= before - 15.5));
+    h.handle.send(PlayerCommand::JumpToLive);
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| !r.behind(s.position.unwrap_or(0.0))));
+    h.handle.send(PlayerCommand::SetPause(true));
+    let paused = h.wait_snapshot(LONG, |s| s.paused);
+    let point = paused.position.unwrap();
+    h.wait_snapshot(Duration::from_secs(30), |s| {
+        s.live_buffer.is_some_and(|r| r.start > point + 2.0) && s.position.zip(s.live_buffer).is_some_and(|(p, r)| (p - r.start).abs() < 0.6)
+    });
+    assert!(h.snapshot().paused, "expiry clamps automatically while remaining paused");
+    assert_eq!(h.snapshot().load_generation, generation, "local view replacements are not channel changes");
+    h.handle.send(PlayerCommand::JumpToLive);
+    h.wait_snapshot(LONG, |s| !s.paused && s.live_buffer.is_some_and(|r| !r.behind(s.position.unwrap_or(0.0))));
+    h.handle.send(PlayerCommand::SetPause(true));
+    let live = h.wait_snapshot(LONG, |s| s.paused).position.unwrap();
+    h.handle.send(PlayerCommand::SeekBy(-10.0));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| p < live - 8.5));
+    h.handle.send(PlayerCommand::SeekBy(10.0));
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| !r.behind(s.position.unwrap_or(0.0))));
+    let root = cache.path().join("live-rewind");
+    let recorded: Vec<_> = fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).filter(|p| fs::read_dir(p).unwrap().count() > 0).collect();
+    assert_eq!(recorded.len(), 1);
+    assert!(fs::read_dir(&recorded[0]).unwrap().count() <= 11);
+    h.play(MediaRef::Channel(ChannelId(2)), true);
+    h.wait_snapshot(LONG, |s| s.load_generation > generation && s.state == PlayerState::Playing && s.live_buffer.is_some());
+    assert!(!recorded[0].exists(), "zap deletes the old recording");
+    assert!(srv.max_concurrent() <= 1, "no provider overlap, including the zap: {:?}", srv.overlaps());
+}
+
+#[test]
+#[ignore = "HLS timestamp reset with continuing sequence: real HTTP; run outside the sandbox"]
+fn live_hls_discontinuity_keeps_the_recording_and_timeline() {
+    let media = support::media::ensure_rolling_media();
+    let srv = TestServer::start(media, Faults::default());
+    srv.set_body(
+        "/rolling/custom.m3u8",
+        Some("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2,\nseg000.ts\n#EXTINF:2,\nseg001.ts\n#EXTINF:2,\nseg002.ts\n"),
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let h = Harness::start_in_window(headless_config(), vec![live(1, srv.url("rolling/custom.m3u8"))], Some(cache.path().into()), 20.0);
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    let first = h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.position.is_some());
+    srv.set_body("/rolling/custom.m3u8", Some("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:2,\nseg002.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\nseg000.ts\n#EXTINF:2,\nseg001.ts\n#EXTINF:2,\nseg002.ts\n"));
+    let after = h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| p > 3.0) && s.live_buffer.is_some_and(|r| r.start == 0.0 && r.end > 5.0));
+    assert_eq!(after.load_generation, first.load_generation);
+    h.handle.send(PlayerCommand::SeekTo(0.5));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| (p - 0.5).abs() < 0.3));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| p > 3.0));
+    assert_eq!(h.snapshot().load_generation, first.load_generation, "rewind crosses the local boundary again without a reconnect");
+    srv.set_body(
+        "/rolling/custom.m3u8",
+        Some("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2,\nseg005.ts\n#EXTINF:2,\nseg006.ts\n#EXTINF:2,\nseg007.ts\n"),
+    );
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| r.start == 0.0 && r.end >= 8.0) && s.position.is_some_and(|p| p >= 8.0));
+    assert!(srv.max_concurrent() <= 1);
+}
+
+/// Sample the actual decoded clock throughout several provider publications. The fixture
+/// has no timestamp resets here; neither a repeated segment nor a long stall can pass.
+fn assert_hls_advances(h: &Harness, duration: Duration) {
+    let began = Instant::now();
+    let mut last = h.snapshot().position.unwrap();
+    let mut moved = Instant::now();
+    while began.elapsed() < duration {
+        std::thread::sleep(Duration::from_millis(50));
+        let s = h.snapshot();
+        let pos = s.position.unwrap_or(last);
+        assert!(pos >= last - 0.1, "recorded content repeated: {last} -> {pos}");
+        if pos > last + 0.01 {
+            last = pos;
+            moved = Instant::now();
+        }
+        assert!(moved.elapsed() < Duration::from_millis(550), "playback stalled: {:?} at {pos}", s.state);
+        assert!(s.video_size.is_some(), "video remains selected");
+    }
+}
+
+#[test]
+#[ignore = "six-second provider segments; real HTTP and mpv, run outside the sandbox"]
+fn live_hls_six_second_back_to_live_and_forward_edge_keep_playing() {
+    let Some((_, _guard)) = setup() else { return };
+    let srv = TestServer::start(support::media::ensure_provider_segment_media(), Faults::default());
+    let cache = tempfile::tempdir().unwrap();
+    let h = Harness::start_in(headless_config(), vec![live(1, srv.url("six/index.m3u8"))], Some(cache.path().into()));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.live_buffer.is_some_and(|r| r.end >= 18.0));
+    for (command, rewind) in [(PlayerCommand::JumpToLive, -12.0), (PlayerCommand::SeekBy(10.0), -6.0)] {
+        h.handle.send(PlayerCommand::SetPause(true));
+        h.wait_snapshot(LONG, |s| s.paused);
+        h.handle.send(PlayerCommand::SeekBy(rewind));
+        h.wait_snapshot(LONG, |s| s.live_buffer.zip(s.position).is_some_and(|(r, p)| r.behind(p)));
+        h.handle.send(command);
+        h.handle.send(PlayerCommand::SetPause(false));
+        h.wait_snapshot(LONG, |s| !s.paused && s.live_buffer.zip(s.position).is_some_and(|(r, p)| !r.behind(p)));
+        assert_hls_advances(&h, Duration::from_secs(19));
+    }
+}
+
+#[test]
+#[ignore = "ten-second provider cadence and hidden decoder; real HTTP, run outside the sandbox"]
+fn live_hls_ten_second_live_badge_and_hidden_decoder_are_stable() {
+    let Some((_, _guard)) = setup() else { return };
+    let srv = TestServer::start(support::media::ensure_provider_segment_media(), Faults::default());
+    let cache = tempfile::tempdir().unwrap();
+    let h = Harness::start_in(headless_config(), vec![live(1, srv.url("ten/index.m3u8"))], Some(cache.path().into()));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.live_buffer.is_some());
+    h.player.mark_rendered_for_tests();
+    h.wait_snapshot(Duration::from_secs(20), |s| s.video_suspended);
+    let began = Instant::now();
+    while began.elapsed() < Duration::from_secs(32) {
+        let s = h.snapshot();
+        let range = s.live_buffer.unwrap();
+        assert_eq!(range.label(s.position.unwrap()), "Live");
+        assert!(s.video_suspended, "a new ten-second segment must not resume the decoder");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+#[ignore = "ten-second oldest-point clamp and playback; real HTTP, run outside the sandbox"]
+fn live_hls_ten_second_oldest_clamp_plays_without_reloading() {
+    let Some((_, _guard)) = setup() else { return };
+    let srv = TestServer::start(support::media::ensure_provider_segment_media(), Faults::default());
+    let cache = tempfile::tempdir().unwrap();
+    let h = Harness::start_in_window(headless_config(), vec![live(1, srv.url("ten/index.m3u8"))], Some(cache.path().into()), 30.0);
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.position.is_some());
+    h.handle.send(PlayerCommand::SetPause(true));
+    let point = h.wait_snapshot(LONG, |s| s.paused).position.unwrap();
+    h.wait_snapshot(Duration::from_secs(50), |s| s.live_buffer.zip(s.position).is_some_and(|(r, p)| r.start > point && (p - r.start).abs() < 0.5));
+    h.handle.send(PlayerCommand::SetPause(false));
+    h.wait_snapshot(LONG, |s| !s.paused && s.state == PlayerState::Playing);
+    controller_log();
+    assert_hls_advances(&h, Duration::from_secs(32));
+    assert!(
+        !controller_log().iter().any(|l| l.starts_with("live rewind: replacing local reader")),
+        "playing at the oldest point must not reload each segment"
+    );
+}
+
+#[test]
+#[ignore = "30-second provider outage; real HTTP, run outside the sandbox"]
+fn live_hls_outage_shows_reconnecting_never_replays_and_recovers() {
+    let Some((_, _guard)) = setup() else { return };
+    let srv = TestServer::start(support::media::ensure_provider_segment_media(), Faults::default());
+    let cache = tempfile::tempdir().unwrap();
+    let mut h = Harness::start_in(headless_config(), vec![live(1, srv.url("six/index.m3u8"))], Some(cache.path().into()));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    let initial = h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.position.is_some());
+    let mark = h.mark();
+    srv.set_status("/six/index.m3u8", 503);
+    h.wait_state_from(mark, Duration::from_secs(8), |s| matches!(s, PlayerState::Reconnecting { .. }));
+    let began = Instant::now();
+    while began.elapsed() < Duration::from_secs(30) {
+        let s = h.snapshot();
+        assert!(matches!(s.state, PlayerState::Reconnecting { .. } | PlayerState::Loading { .. }), "outage state: {:?}", s.state);
+        assert_eq!(s.load_generation, initial.load_generation, "never open stale media during the outage");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mark = h.mark();
+    srv.set_status("/six/index.m3u8", 0);
+    h.wait_state_from(mark, LONG, |s| *s == PlayerState::Playing);
+    let recovered = h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| p > initial.position.unwrap() + 20.0));
+    assert!(recovered.live_buffer.unwrap().label(recovered.position.unwrap()) == "Live");
+    assert!(h.rec.failures.lock().unwrap().iter().all(|(_, kind)| kind.is_none()));
+    assert_hls_advances(&h, Duration::from_secs(13));
+}
+
+#[test]
+#[ignore = "HLS 403 classification and recorder shutdown; real HTTP, run outside the sandbox"]
+fn live_hls_forbidden_fails_fast_and_stops_the_recorder() {
+    let Some((media, _guard)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    srv.set_status("/refused.m3u8", 403);
+    let mut h = Harness::start(headless_config(), vec![live(1, srv.url("refused.m3u8"))]);
+    let began = Instant::now();
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    let state = h.wait_state(Duration::from_secs(5), |s| matches!(s, PlayerState::Error(_)));
+    let PlayerState::Error(error) = state else { unreachable!() };
+    assert!(began.elapsed() < Duration::from_secs(5));
+    assert_eq!(error.kind, PlayerErrorKind::HttpForbidden);
+    assert!(error.message.contains("provider refused"), "{}", error.message);
+    assert!(h.rec.failures.lock().unwrap().iter().any(|(_, kind)| *kind == Some(PlayerErrorKind::HttpForbidden)));
+    let requests = srv.requests_for("/refused.m3u8").len();
+    assert_eq!(requests, 2, "the normal single retry");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(srv.requests_for("/refused.m3u8").len(), requests, "give-up stops provider polling");
+    assert!(srv.max_concurrent() <= 1);
+}
+
+#[test]
+#[ignore = "HLS provider prose and retry budget; real HTTP, run outside the sandbox"]
+fn live_hls_provider_text_keeps_message_and_three_retries() {
+    let Some((media, _guard)) = setup() else { return };
+    let srv = TestServer::start(media, Faults::default());
+    tuner::redact::register_secret("provider-text-secret");
+    srv.set_body("/message.m3u8", Some("<html>Max connections reached provider-text-secret</html>"));
+    let mut h = Harness::start(headless_config(), vec![live(1, srv.url("message.m3u8"))]);
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    let PlayerState::Error(error) = h.wait_state(Duration::from_secs(13), |s| matches!(s, PlayerState::Error(_))) else { unreachable!() };
+    assert_eq!(error.kind, PlayerErrorKind::ProviderError);
+    assert!(error.message.contains("The provider said:") && error.message.contains("Max connections reached"));
+    assert!(!error.message.contains("provider-text-secret"));
+    assert_eq!(srv.requests_for("/message.m3u8").len(), 4);
+    assert!(h.rec.failures.lock().unwrap().iter().any(|(_, kind)| *kind == Some(PlayerErrorKind::ProviderError)));
+}
+
+#[test]
+#[ignore = "mislabeled HLS URL serves TS; real HTTP, run outside the sandbox"]
+fn live_hls_binary_response_falls_back_to_mpv_cache() {
+    let Some((media, _guard)) = setup() else { return };
+    let root = tempfile::tempdir().unwrap();
+    fs::copy(media.join("bars.ts"), root.path().join("actually-ts.m3u8")).unwrap();
+    let srv = TestServer::start(root.path().into(), Faults::default());
+    let cache = tempfile::tempdir().unwrap();
+    let h = Harness::start_in(headless_config(), vec![live(1, srv.url("actually-ts.m3u8"))], Some(cache.path().into()));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.video_size.is_some() && s.live_buffer.is_some());
+    assert!(h.rec.failures.lock().unwrap().iter().all(|(_, kind)| kind.is_none()));
+    assert!(srv.requests_for("/actually-ts.m3u8").len() >= 2, "sniff closes before mpv opens its direct reader");
+    assert!(srv.max_concurrent() <= 1, "fallback retains stop-before-start ownership: {:?}; requests: {:?}", srv.overlaps(), srv.requests());
+    // Disabling HTTP seeks must still allow forward/backward seeks in the packet cache.
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| r.end > 7.0));
+    let requests = srv.requests().len();
+    h.handle.send(PlayerCommand::SetPause(true));
+    h.wait_snapshot(LONG, |s| s.paused);
+    h.handle.send(PlayerCommand::SeekTo(5.0));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| (p - 5.0).abs() < 0.3));
+    h.handle.send(PlayerCommand::SeekBy(-2.0));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| (p - 3.0).abs() < 0.3));
+    h.handle.send(PlayerCommand::SetPause(false));
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.position.is_some_and(|p| p > 4.0));
+    assert_eq!(srv.requests().len(), requests, "cached seeks must not reopen the provider");
+}
+
+#[test]
+#[ignore = "paused rewind survives provider restart and reconnect; real HTTP, run outside the sandbox"]
+fn live_hls_paused_rewind_survives_confirmed_reset_and_reconnect() {
+    let Some((_, _guard)) = setup() else { return };
+    let srv = TestServer::start(support::media::ensure_provider_segment_media(), Faults::default());
+    let playlist = |first, last| {
+        let mut text = format!("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:{first}\n");
+        for seq in first..=last {
+            text.push_str(&format!("#EXTINF:6,\nseg{:03}.ts\n", seq % 40));
+        }
+        text
+    };
+    srv.set_body("/six/custom.m3u8", Some(&playlist(10, 13)));
+    let cache = tempfile::tempdir().unwrap();
+    let mut h = Harness::start_in(headless_config(), vec![live(1, srv.url("six/custom.m3u8"))], Some(cache.path().into()));
+    h.play(MediaRef::Channel(ChannelId(1)), true);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Playing && s.position.is_some());
+    srv.set_body("/six/custom.m3u8", Some(&playlist(11, 16)));
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| r.end >= 18.0));
+    h.handle.send(PlayerCommand::SetPause(true));
+    h.wait_snapshot(LONG, |s| s.paused);
+    h.handle.send(PlayerCommand::SeekTo(2.0));
+    h.wait_snapshot(LONG, |s| s.position.is_some_and(|p| (p - 2.0).abs() < 0.3));
+    // A large reset must append a new local epoch and preserve the paused old recording.
+    srv.set_body("/six/custom.m3u8", Some(&playlist(0, 3)));
+    h.wait_snapshot(LONG, |s| s.live_buffer.is_some_and(|r| r.end >= 24.0));
+    assert!(h.snapshot().paused && (h.snapshot().position.unwrap() - 2.0).abs() < 0.3);
+    let mark = h.mark();
+    srv.set_status("/six/custom.m3u8", 503);
+    h.wait_state_from(mark, Duration::from_secs(8), |s| matches!(s, PlayerState::Reconnecting { .. }));
+    srv.set_body("/six/custom.m3u8", Some(&playlist(1, 4)));
+    srv.set_status("/six/custom.m3u8", 0);
+    h.wait_snapshot(LONG, |s| s.state == PlayerState::Paused && s.paused && s.position.is_some_and(|p| (p - 2.0).abs() < 0.3));
+    assert!(srv.max_concurrent() <= 1);
 }

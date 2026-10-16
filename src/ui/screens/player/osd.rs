@@ -219,7 +219,7 @@ impl PlayerScreen {
         self.visible
             .get(self.control)
             .and_then(|c| controls.iter().position(|x| x == c))
-            .unwrap_or_else(|| self.control.min(controls.len().saturating_sub(1)))
+            .unwrap_or_else(|| controls.iter().position(|c| *c == Control::PlayPause).unwrap_or(0))
     }
 
     /// Below 700 pt (× rem) the controls row collapses (DESIGN §13.8).
