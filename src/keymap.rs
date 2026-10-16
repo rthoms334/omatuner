@@ -98,7 +98,7 @@ pub enum KeyContext {
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 23] = [
+    pub const ALL: [KeyContext; 24] = [
         KeyContext::Global,
         KeyContext::Watchlists,
         KeyContext::Downloads,
