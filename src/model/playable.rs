@@ -13,6 +13,8 @@ use crate::redact::Secret;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MediaRef {
     Channel(ChannelId),
+    /// A private finished or partial recording, including an orphaned playlist.
+    Download(super::DownloadId),
     /// Catch-up of a past programme on `channel` (times are programme start/stop, UTC).
     Catchup {
         channel: ChannelId,
@@ -48,6 +50,8 @@ impl PlayableKind {
 /// Fully resolved playback request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Playable {
+    /// Local media uses no provider lease (DESIGN §43 §4).
+    pub from_download: bool,
     pub media: MediaRef,
     pub kind: PlayableKind,
     /// Durable identity for progress/history/favourites (None for ad-hoc URLs).

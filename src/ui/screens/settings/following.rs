@@ -274,7 +274,7 @@ fn upcoming_id(i: usize) -> i64 {
 /// Its `Act::Feature(Feature::Following, n)` buttons.
 pub(super) fn act(_s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, n: u16) {
     if n == ACT_NEW {
-        ctx.open(OverlayRequest::FollowSheet(crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule: None }));
+        ctx.open(OverlayRequest::FollowSheet(crate::ui::overlays::follow_sheet::FollowSheetSpec { record: false, programme: None, rule: None }));
     }
 }
 
@@ -283,7 +283,7 @@ pub(super) fn act(_s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, n: u16) {
 pub(super) fn item(s: &mut SettingsScreen, ctx: &mut UiCtx<'_>, id: i64) {
     if id > 0 {
         let rule = Some(FollowRuleId(id));
-        ctx.open(OverlayRequest::FollowSheet(crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule }));
+        ctx.open(OverlayRequest::FollowSheet(crate::ui::overlays::follow_sheet::FollowSheetSpec { record: false, programme: None, rule }));
         return;
     }
     let i = (-id - 1) as usize;
@@ -492,7 +492,7 @@ mod tests {
             h.run_steps(2);
             h.state_mut().nav()
         };
-        let sheet = crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule: Some(id) };
+        let sheet = crate::ui::overlays::follow_sheet::FollowSheetSpec { record: false, programme: None, rule: Some(id) };
         assert!(open(&mut h, Item::Feature(Feature::Following, id.0)).contains(&NavRequest::Open(OverlayRequest::FollowSheet(sheet))));
         let popover = OverlayRequest::Programme { programme: pid, channel: ch, zap: None };
         assert!(open(&mut h, Item::Feature(Feature::Following, upcoming_id(0))).contains(&NavRequest::Open(popover)));
@@ -626,7 +626,7 @@ mod tests {
         );
         // Edit… opens the rule in the sheet
         h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_EDIT)));
-        let sheet = crate::ui::overlays::follow_sheet::FollowSheetSpec { programme: None, rule: Some(arsenal) };
+        let sheet = crate::ui::overlays::follow_sheet::FollowSheetSpec { record: false, programme: None, rule: Some(arsenal) };
         assert_eq!(h.state_mut().nav(), [NavRequest::Open(OverlayRequest::FollowSheet(sheet))]);
 
         // Test against the guide: a toast of what it finds, by the rule's name only

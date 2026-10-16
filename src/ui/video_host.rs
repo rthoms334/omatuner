@@ -1081,6 +1081,7 @@ mod tests {
     /// A live channel (the casting tests only read its title).
     pub(super) fn playable() -> crate::model::Playable {
         crate::model::Playable {
+            from_download: false,
             media: crate::model::MediaRef::Channel(crate::model::ChannelId(1)),
             kind: PlayableKind::Live,
             item: None,

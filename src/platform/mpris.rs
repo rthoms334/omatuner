@@ -747,6 +747,7 @@ mod tests {
 
     fn live(programme: Option<&str>) -> PlayerSnapshot {
         let p = Playable {
+            from_download: false,
             media: MediaRef::Channel(ChannelId(7)),
             kind: PlayableKind::Live,
             item: Some(ItemRef { source: SourceId(2), kind: ItemKind::Channel, key: ItemKey("xt:live:1234".into()) }),

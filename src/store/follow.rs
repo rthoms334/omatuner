@@ -297,6 +297,9 @@ pub fn apply_plan(conn: &Connection, plan: &Plan, rules: &[FollowRule], now: Tim
             }
             if matches!(step.reminder, ReminderOp::Create | ReminderOp::Replace(_)) {
                 match by_id.get(&to.rule) {
+                    Some(rule) if rule.mode == FollowMode::Record => {
+                        reminder = Some(None);
+                    }
                     Some(rule) => {
                         let (id, adopted) = make_reminder(c, rule, &to)?;
                         if adopted {

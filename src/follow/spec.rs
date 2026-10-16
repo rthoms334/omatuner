@@ -24,6 +24,8 @@ pub enum FollowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FollowMode {
+    /// Save each new match in Downloads (DESIGN §43 §3).
+    Record,
     #[default]
     Notify,
     Switch,

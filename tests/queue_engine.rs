@@ -235,6 +235,7 @@ impl Rig {
 
     fn player_kind(&self, item: &ItemRef, media: MediaRef, kind: PlayableKind, origin: PlayOrigin, state: PlayerState, generation: u64) {
         let playable = Playable {
+            from_download: false,
             media,
             kind,
             item: Some(item.clone()),

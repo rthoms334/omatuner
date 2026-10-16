@@ -55,6 +55,7 @@ pub mod spoiler;
 pub mod textmatch;
 
 // Tuner's own updates (DESIGN §41)
+pub mod downloads;
 pub mod update;
 pub mod watchlist;
 

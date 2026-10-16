@@ -94,6 +94,12 @@ pub async fn evaluate(ctx: &JobContext, reason: FollowReason, progress: &Progres
     let o = opts.clone();
     let (rules_n, stats) = (ev.rules.len(), ev.stats);
     let out = super::write(ctx, move |c| commit(c, &ev, &o)).await?;
+    let download_cfg = cfg.clone();
+    super::write(ctx, move |c| {
+        let lib = crate::store::library::load_visible(c, crate::store::library::Visibility::NO_EXPLICIT)?;
+        crate::downloads::maintenance::following(c, &lib, &download_cfg, crate::model::now())
+    })
+    .await?;
     notify(ctx, DataScope::Reminders);
     notify(ctx, DataScope::Follow);
     tracing::info!(

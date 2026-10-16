@@ -355,7 +355,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
     let r = parse_ref(&p.item)?;
     let log_ref = r.to_string();
     let ready = |target: PlayTarget, out: PlayOut| PlayStep::Ready {
-        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true), device: None }),
+        command: AgentCommand::Play(AgentPlay { pause_after_pin: None, target, from_start, show: AgentShow::window(true), device: None }),
         out: clean_play(out),
         log_ref: log_ref.clone(),
     };
@@ -518,7 +518,7 @@ fn episode_step(q: &Q, ep: &crate::model::Episode, series: &str, from_start: boo
         None => format!("Playing {title}."),
     };
     Ok(PlayStep::Ready {
-        command: AgentCommand::Play(AgentPlay { target, from_start, show: AgentShow::window(true), device: None }),
+        command: AgentCommand::Play(AgentPlay { pause_after_pin: None, target, from_start, show: AgentShow::window(true), device: None }),
         out: clean_play(PlayOut {
             outcome: PlayOutcome::Playing,
             item: out.item,
@@ -1044,6 +1044,7 @@ mod tests {
                 device: None,
             };
             let command = AgentCommand::Play(AgentPlay {
+                pause_after_pin: None,
                 target: PlayTarget::Media(MediaRef::Movie(crate::model::MovieId(1))),
                 from_start: false,
                 show: AgentShow::window(true),

@@ -898,6 +898,7 @@ impl TunerApp {
             AppEvent::Job(crate::jobs::JobEvent::Updated(_)) => {} // the status bar polls `jobs.active()`
             AppEvent::Data(scope) => self.on_data_changed(*scope),
             AppEvent::Toast(t) => self.toast(t.clone()),
+            AppEvent::DownloadBusy(busy) => self.open_overlay(OverlayRequest::DownloadBusy(busy.clone()), None, None),
             // The IPC server already raised the window (`hypr::focus_self`).
             AppEvent::Ipc(req) => self.handle_ipc(req),
             // the handler validated the target, resolved where it shows and raised the window
@@ -1266,6 +1267,12 @@ impl TunerApp {
     /// card at Details; other files/URLs play fullscreen). `main` made file paths absolute in
     /// the invoking process (its working directory may differ from ours).
     fn handle_ipc(&mut self, req: &IpcRequest) {
+        if req.record.is_some() {
+            if let Some(handle) = self.services().agent.downloads() {
+                handle.send(crate::downloads::DownloadCommand::Refresh);
+            }
+            return;
+        }
         // a reminder timer fired while Tuner was closed or running (B6): the scheduler re-reads
         // its reminders and fires the due one (routed by `reminders::fire_policy`; a switch
         // opens where the reminder says, see `on_switch_now`)
@@ -1582,11 +1589,29 @@ impl TunerApp {
     }
 
     /// [`Self::agent_play`]'s body.
-    fn agent_play_here(&mut self, p: crate::agent::AgentPlay) -> AgentPlayed {
+    fn agent_play_here(&mut self, mut p: crate::agent::AgentPlay) -> AgentPlayed {
         use crate::agent::PlayTarget;
         use crate::model::VodKind;
         let cfg = self.services().config();
         let unlocked = self.parental.is_unlocked(&cfg.parental);
+        if unlocked
+            && let Some(source) = p.pause_after_pin.take()
+            && let Some(handle) = self.services().agent.downloads()
+        {
+            let bus = self.services().bus.clone();
+            let budget = handle.budget().clone();
+            let previous = budget.claim_of(crate::model::TileId::A);
+            budget.claim(crate::model::TileId::A, Some(source));
+            self.services().rt.spawn(async move {
+                let reply = handle.request(crate::downloads::DownloadCommand::PauseForPlay(source)).await;
+                if reply.error.is_none() {
+                    bus.send(AppEvent::Agent(crate::agent::AgentCommand::Play(p)));
+                } else {
+                    budget.claim(crate::model::TileId::A, previous);
+                }
+            });
+            return AgentPlayed::Sent;
+        }
         let now = crate::model::now();
         let gone = |app: &mut Self| {
             app.toast(Toast::info("That is no longer in your playlists"));
@@ -1600,6 +1625,9 @@ impl TunerApp {
         let resume = !p.from_start;
         let cmd = match &p.target {
             PlayTarget::Media(MediaRef::Channel(id)) => {
+                if p.pause_after_pin.is_some() && self.lib.live.get(*id).is_some_and(|ch| ch.locked) && !unlocked {
+                    return self.ask_pin_for(p, "This channel is locked");
+                }
                 self.pending_agent = None;
                 self.play_channel(*id, PlayOrigin::Cli);
                 // the prompt this play opened (a stale `pending_locked` from a prompt dismissed
@@ -1669,7 +1697,7 @@ impl TunerApp {
                     }
                 }
             }
-            PlayTarget::Media(MediaRef::Url(_)) => return AgentPlayed::Nothing,
+            PlayTarget::Media(MediaRef::Url(_) | MediaRef::Download(_)) => return AgentPlayed::Nothing,
         };
         self.pending_agent = None;
         self.pending_zap = None;
@@ -2198,6 +2226,18 @@ impl TunerApp {
             Action::GoSeries => self.nav.push(NavRequest::Switch(Route::Series { group: None })),
             Action::GoSettings => self.nav.push(NavRequest::Switch(Route::Settings(Default::default()))),
             // the batch features' global keys (each a no-op while its feature is off)
+            Action::GoDownloads => self.nav.push(NavRequest::Switch(Route::Downloads)),
+            Action::PlayDownload(id) => self.with_ctx(|ctx, _, _| crate::ui::downloads::play(ctx, id)),
+            Action::UndoDownloadRule(id) => {
+                if let Some(h) = self.services().agent.downloads() {
+                    h.send(crate::downloads::DownloadCommand::UndoRule(id));
+                }
+            }
+            Action::UndoDownload(id) => {
+                if let Some(h) = self.services().agent.downloads() {
+                    h.send(crate::downloads::DownloadCommand::Undo(vec![id]));
+                }
+            }
             Action::GoWatchlists => self.nav.push(NavRequest::Switch(Route::Watchlists { list: None })),
             Action::GoQueue if crate::queue::ENABLED => self.nav.push(NavRequest::Switch(Route::Queue)),
             Action::SpoilerMenu if crate::spoiler::ENABLED => self.nav.push(NavRequest::Open(OverlayRequest::SpoilerMenu)),
@@ -2850,6 +2890,19 @@ impl TunerApp {
         let has_vod = self.lib.has_vod() || self.lib.has_series() || self.lib.built_at == 0;
         // Up next's entry shows only while it has pending items (DESIGN §32)
         let up_next = crate::queue::ENABLED.then(|| self.services().agent.queue().pending()).filter(|n| *n > 0);
+        let hides = self.parental.hides_explicit(&self.services().config().parental);
+        let downloads = self
+            .services()
+            .agent
+            .downloads()
+            .map(|h| {
+                h.snapshot()
+                    .jobs
+                    .iter()
+                    .filter(|j| j.state.active() && (!hides || !j.explicit()) && j.item().is_none_or(|i| !self.lib.conceals(&i)))
+                    .count()
+            })
+            .filter(|n| *n > 0);
         let frame = egui::Frame::NONE.fill(theme.palette.dark_background);
         let clicked = if side_w > 0.0 {
             egui::Panel::left("sidebar")
@@ -2865,6 +2918,7 @@ impl TunerApp {
                         side_w > 100.0,
                         has_vod,
                         up_next,
+                        downloads,
                         play_on,
                         &mut search_clicked,
                         &mut play_on_clicked,
@@ -2887,6 +2941,7 @@ impl TunerApp {
                             false,
                             has_vod,
                             up_next,
+                            downloads,
                             play_on,
                             &mut search_clicked,
                             &mut play_on_clicked,
@@ -3055,6 +3110,10 @@ impl eframe::App for TunerApp {
         self.update_frame(&egui_ctx);
         self.apply_nav(&egui_ctx);
 
+        self.with_ctx(|ctx, _, _| {
+            crate::ui::downloads::publish_badges(&egui_ctx, ctx);
+            crate::ui::downloads::due_toasts(&egui_ctx, ctx);
+        });
         let title = self.title_now();
         if title != self.window_title {
             egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -3083,6 +3142,7 @@ impl eframe::App for TunerApp {
                 .into_iter()
                 .chain(play_on)
                 .chain(crate::spoiler::ui::status_chip(&self.services().agent, crate::model::now()))
+                .chain(crate::ui::downloads::status_chip(&self.services().agent, &cfg.parental))
                 .chain(self.sleep_chip())
                 .chain(self.update_chip())
                 .collect();
@@ -3271,6 +3331,7 @@ fn route_for_screen(id: ScreenId) -> Route {
         ScreenId::Logs => Route::Logs,
         ScreenId::EpgMapping => Route::EpgMapping { channel: None },
         ScreenId::Queue => Route::Queue,
+        ScreenId::Downloads => Route::Downloads,
         ScreenId::Watchlists => Route::Watchlists { list: None },
         ScreenId::MovieDetail | ScreenId::SeriesDetail => Route::Home,
     }
@@ -3314,7 +3375,7 @@ fn view_name(screen: ScreenId) -> Option<&'static str> {
         ScreenId::Movies | ScreenId::MovieDetail => "movies",
         ScreenId::Series | ScreenId::SeriesDetail => "series",
         ScreenId::Settings | ScreenId::Logs | ScreenId::EpgMapping => "settings",
-        ScreenId::Player | ScreenId::Onboarding | ScreenId::Queue | ScreenId::Watchlists => return None,
+        ScreenId::Player | ScreenId::Onboarding | ScreenId::Queue | ScreenId::Watchlists | ScreenId::Downloads => return None,
     })
 }
 
@@ -3840,7 +3901,13 @@ mod tests {
 
     fn wait_watchlist_episode(rig: &mut Rig, list: crate::model::WatchlistId, episode: (u32, u32)) {
         rig.until("watchlist current episode", |r| {
-            r.app.with_ctx(|ctx, _, _| crate::ui::watchlists::snapshot(ctx).list(list).is_some_and(|l| l.entries[1].episode == Some(episode)))
+            r.app.with_ctx(|ctx, _, _| {
+                crate::ui::watchlists::snapshot(ctx)
+                    .list(list)
+                    // A completed range also points at its first episode. Wait for the
+                    // unwatched write, rather than accepting that previous snapshot.
+                    .is_some_and(|l| !l.entries[1].done() && l.entries[1].episode == Some(episode))
+            })
         });
         rig.frame_with(vec![]);
     }
@@ -5148,6 +5215,7 @@ mod tests {
         rig.event(AppEvent::Agent(crate::agent::AgentCommand::LockSession));
         assert!(!rig.app.parental.is_unlocked(&rig.app.services().config().parental));
         let playable = crate::model::Playable {
+            from_download: false,
             media: MediaRef::Channel(id),
             kind: crate::model::PlayableKind::Live,
             item: Some(explicit_ref()),
@@ -5355,14 +5423,16 @@ mod tests {
         let mut rig = Rig::with(pin_config(), live(), 1.0, |c| seed_agent(c, 3600));
         rig.settle();
         let ch1 = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
-        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch1".into(), from_start: None, open_in: None, device: None }));
+        let out =
+            ask(&rig, Call::Play(Play { pause_downloads: None, item: "channel:1:m3u:ch1".into(), from_start: None, open_in: None, device: None }));
         assert_eq!(out["outcome"], "playing");
         rig.until("the play", |r| !played(&r.log()).is_empty());
         assert_eq!(played(&rig.log()), [(MediaRef::Channel(ch1), PlayOrigin::Cli)]);
         assert_eq!(rig.route(), &Route::Player);
         assert!(rig.log().commands.iter().any(|c| matches!(c, PlayerCommand::Play(r) if r.zap.is_some())), "zaps through its group");
 
-        let out = ask(&rig, Call::Play(Play { item: "channel:1:m3u:ch0".into(), from_start: None, open_in: None, device: None }));
+        let out =
+            ask(&rig, Call::Play(Play { pause_downloads: None, item: "channel:1:m3u:ch0".into(), from_start: None, open_in: None, device: None }));
         assert_eq!(out["outcome"], "pin_required");
         rig.until("the PIN prompt", |r| r.overlay_kinds() == [pin_prompt()]);
         assert_eq!(played(&rig.log()).len(), 1, "nothing plays before the PIN");
@@ -5390,6 +5460,7 @@ mod tests {
         rig.settle();
         let id = crate::model::MovieId(1);
         let play = crate::agent::AgentPlay {
+            pause_after_pin: None,
             target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)),
             from_start: false,
             show: crate::agent::act::AgentShow::window(true),
@@ -5436,7 +5507,13 @@ mod tests {
         rig.frame_with(vec![]);
         assert_eq!(rig.app.overlays.len(), 1);
         let ch = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
-        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::window(false), device: None };
+        let play = AgentPlay {
+            pause_after_pin: None,
+            target: PlayTarget::Media(MediaRef::Channel(ch)),
+            from_start: false,
+            show: AgentShow::window(false),
+            device: None,
+        };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         rig.frame_with(vec![]);
         assert_eq!(rig.route(), &Route::Player, "from Live TV: the player screen");
@@ -5444,7 +5521,13 @@ mod tests {
         assert!(rig.app.overlays.is_empty(), "the menu closed with Live TV");
         rig.press(Key::Escape, NONE);
 
-        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::POP_OUT, device: None };
+        let play = AgentPlay {
+            pause_after_pin: None,
+            target: PlayTarget::Media(MediaRef::Channel(ch)),
+            from_start: false,
+            show: AgentShow::POP_OUT,
+            device: None,
+        };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         assert!(rig.app.reminder_ui.pop_out_pending, "before the worker: asked for");
         assert!(!rig.log().toasts.iter().any(|t| t.text.contains("needs Hyprland")), "{:?}", rig.log().toasts);
@@ -5478,7 +5561,13 @@ mod tests {
         rig.settle();
         rig.app.reminder_ui.pop_out_pending = true;
         let ch0 = rig.app.lib.live.by_ref(&channel_ref(0)).unwrap();
-        let play = AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch0)), from_start: false, show: AgentShow::window(true), device: None };
+        let play = AgentPlay {
+            pause_after_pin: None,
+            target: PlayTarget::Media(MediaRef::Channel(ch0)),
+            from_start: false,
+            show: AgentShow::window(true),
+            device: None,
+        };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         rig.frame_with(vec![]);
         assert_eq!(rig.overlay_kinds(), [pin_prompt()]);
@@ -5752,6 +5841,7 @@ mod tests {
         let (ch1, ch2) = (rig.app.lib.live.by_ref(&channel_ref(1)).unwrap(), rig.app.lib.live.by_ref(&channel_ref(2)).unwrap());
         let playing = |ch: ChannelId| {
             let p = crate::model::Playable {
+                from_download: false,
                 media: MediaRef::Channel(ch),
                 kind: crate::model::PlayableKind::Live,
                 item: None,
@@ -5842,6 +5932,7 @@ mod tests {
         assert!(played(&rig.log()).is_empty(), "{:?}", played(&rig.log()));
         assert!(rig.log().toasts[before..].iter().all(|t| !t.text.contains("Channel 1") && !t.text.contains("Switching")));
         bus.send(AppEvent::Agent(AgentCommand::Play(AgentPlay {
+            pause_after_pin: None,
             target: PlayTarget::Media(MediaRef::Channel(ch1)),
             from_start: false,
             show: crate::agent::act::AgentShow::window(true),
@@ -5881,6 +5972,7 @@ mod tests {
         assert!(rig.overlay_kinds().is_empty() && rig.app.pending_locked.is_some(), "a dismissed prompt leaves its channel");
         let id = crate::model::MovieId(1);
         let play = crate::agent::AgentPlay {
+            pause_after_pin: None,
             target: crate::agent::PlayTarget::Media(MediaRef::Movie(id)),
             from_start: false,
             show: crate::agent::act::AgentShow::window(true),
@@ -5903,6 +5995,7 @@ mod tests {
         rig.settle();
         let id = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
         let playable = crate::model::Playable {
+            from_download: false,
             media: MediaRef::Channel(id),
             kind: crate::model::PlayableKind::Live,
             item: Some(channel_ref(1)),
@@ -7398,8 +7491,13 @@ mod tests {
         rig.app.popout_backend = Some(Box::new(PopRecorder(sent.clone())));
         let start = rig.route().clone();
         let ch = rig.app.lib.live.by_ref(&channel_ref(1)).unwrap();
-        let play =
-            AgentPlay { target: PlayTarget::Media(MediaRef::Channel(ch)), from_start: false, show: AgentShow::POP_OUT, device: Some(living_room()) };
+        let play = AgentPlay {
+            pause_after_pin: None,
+            target: PlayTarget::Media(MediaRef::Channel(ch)),
+            from_start: false,
+            show: AgentShow::POP_OUT,
+            device: Some(living_room()),
+        };
         rig.event(AppEvent::Agent(AgentCommand::Play(play)));
         rig.frame_with(vec![]);
         let cmd = rig.log().commands.last().cloned();
@@ -7412,6 +7510,7 @@ mod tests {
         // already casting there: the next play simply lands on the TV
         casting(&mut rig);
         let play = AgentPlay {
+            pause_after_pin: None,
             target: PlayTarget::Media(MediaRef::Channel(ch)),
             from_start: false,
             show: AgentShow::window(true),

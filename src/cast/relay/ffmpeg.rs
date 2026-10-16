@@ -184,6 +184,8 @@ pub fn command(program: &Path) -> tokio::process::Command {
     // and `getppid`.
     unsafe {
         cmd.pre_exec(move || {
+            // Relay and download outputs contain private media (DESIGN §43 §4).
+            libc::umask(0o077);
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -690,7 +692,15 @@ pub struct Progress {
 
 /// Start ffmpeg with `argv` (see [`command`]); `label` names the session in logs.
 pub fn spawn(program: &Path, argv: &[String], label: Arc<str>, progress: Progress) -> std::io::Result<Child> {
+    spawn_in(program, argv, label, progress, None)
+}
+
+/// The same supervisor for private, local recording inputs (DESIGN §43 §3).
+pub fn spawn_in(program: &Path, argv: &[String], label: Arc<str>, progress: Progress, directory: Option<&Path>) -> std::io::Result<Child> {
     let mut cmd = command(program);
+    if let Some(directory) = directory {
+        cmd.current_dir(directory);
+    }
     cmd.args(argv).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let pid = child.id();

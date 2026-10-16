@@ -128,6 +128,7 @@ fn rolling_playlist_real_mpv() {
 fn raw_ts_and_non_live_hls_do_not_enter_the_recorder() {
     use crate::model::*;
     let mut p = Playable {
+        from_download: false,
         media: MediaRef::Channel(ChannelId(1)),
         kind: PlayableKind::Live,
         item: None,
@@ -152,13 +153,19 @@ fn raw_ts_and_non_live_hls_do_not_enter_the_recorder() {
 fn low_disk_is_a_one_way_switch_and_unlinks_recording() {
     let dir = tempfile::tempdir().unwrap();
     let state = Shared {
+        archive: false,
+        partial: Mutex::new(false),
+        recording: Mutex::new(None),
         store: Mutex::new(Store::new(dir.path().to_owned(), 20.0)),
         changed: Notify::new(),
         token: Token::mint(),
         audio: Mutex::new(false),
         view: Mutex::new(View::default()),
+        readers: Mutex::new(Default::default()),
+        next_reader: std::sync::atomic::AtomicU64::new(1),
         errors: crossbeam_channel::unbounded().0,
         failed: Mutex::new(false),
+        failure: Mutex::new(None),
         retry: Notify::new(),
     };
     {
@@ -264,13 +271,19 @@ fn local_view_real_mpv() {
 #[tokio::test]
 async fn recorded_view_reload_does_not_wait_for_publication() {
     let state = Arc::new(Shared {
+        archive: false,
+        partial: Mutex::new(false),
+        recording: Mutex::new(None),
         store: Mutex::new(Store::memory(20.0)),
         changed: Notify::new(),
         token: Token::mint(),
         audio: Mutex::new(false),
         view: Mutex::new(View { from: Some(0.0), targeted: true, ..View::default() }),
+        readers: Mutex::new(Default::default()),
+        next_reader: std::sync::atomic::AtomicU64::new(1),
         errors: crossbeam_channel::unbounded().0,
         failed: Mutex::new(false),
+        failure: Mutex::new(None),
         retry: Notify::new(),
     });
     {
@@ -304,13 +317,19 @@ async fn recorded_view_reload_does_not_wait_for_publication() {
 #[tokio::test]
 async fn live_reload_waits_for_publication_and_releases_replaced_reader() {
     let state = Arc::new(Shared {
+        archive: false,
+        partial: Mutex::new(false),
+        recording: Mutex::new(None),
         store: Mutex::new(Store::memory(20.0)),
         changed: Notify::new(),
         token: Token::mint(),
         audio: Mutex::new(false),
         view: Mutex::new(View::default()),
+        readers: Mutex::new(Default::default()),
+        next_reader: std::sync::atomic::AtomicU64::new(1),
         errors: crossbeam_channel::unbounded().0,
         failed: Mutex::new(false),
+        failure: Mutex::new(None),
         retry: Notify::new(),
     });
     {
@@ -336,6 +355,7 @@ async fn live_reload_waits_for_publication_and_releases_replaced_reader() {
     let mut waiting = tokio::spawn(serve(State(state.clone()), request()));
     assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiting).await.is_err());
     let buffer = Buffer {
+        budget_group: Mutex::new(None),
         shared: state.clone(),
         url: Secret::new("http://127.0.0.1/unused/0.m3u8".into()),
         stop: CancellationToken::new(),
@@ -348,14 +368,21 @@ async fn live_reload_waits_for_publication_and_releases_replaced_reader() {
 
 fn test_buffer(store: Store) -> Buffer {
     Buffer {
+        budget_group: Mutex::new(None),
         shared: Arc::new(Shared {
+            archive: false,
+            partial: Mutex::new(false),
+            recording: Mutex::new(None),
             store: Mutex::new(store),
             changed: Notify::new(),
             token: Token::mint(),
             audio: Mutex::new(false),
             view: Mutex::new(View::default()),
+            readers: Mutex::new(Default::default()),
+            next_reader: std::sync::atomic::AtomicU64::new(1),
             errors: crossbeam_channel::unbounded().0,
             failed: Mutex::new(false),
+            failure: Mutex::new(None),
             retry: Notify::new(),
         }),
         url: Secret::new("http://127.0.0.1/unused/0.m3u8".into()),
@@ -504,4 +531,62 @@ fn playlist_sniff_preserves_provider_messages_and_rejects_binary_immediately() {
     ts[0] = 0x47;
     ts[188] = 0x47;
     assert_eq!(playlist_head(&ts), Err(None), "binary takes the mpv cache path after just 512 bytes");
+}
+
+#[test]
+fn recording_reserve_stops_partial_without_discarding_retained_segments() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::new(root.path().to_owned(), 1800.0);
+    store.keep = true;
+    let id = store.insert(Resource { uri: "https://fixture/segment".into(), range: None }, Bytes::from_static(b"retained"), "ts").unwrap();
+    store.tracks[0].segments.push_back(store::Segment { id, seq: 0, start: 0.0, end: 2.0, disc: 0, key: None, map: None });
+    let shared = Shared {
+        changed: Notify::new(),
+        token: Token::mint(),
+        audio: Mutex::new(false),
+        view: Mutex::new(View::default()),
+        readers: Mutex::new(Default::default()),
+        next_reader: std::sync::atomic::AtomicU64::new(1),
+        errors: crossbeam_channel::unbounded().0,
+        retry: Notify::new(),
+        store: Mutex::new(store),
+        failed: Mutex::new(false),
+        failure: Mutex::new(None),
+        archive: false,
+        partial: Mutex::new(false),
+        recording: Mutex::new(Some(RecordingLimits { reserve_bytes: 100, max_bytes: 1000, limits: None })),
+    };
+    check_space(&shared, Some(99));
+    assert!(*shared.partial.lock().unwrap());
+    assert!(!shared.store().memory, "recording must not degrade into an evicting memory buffer");
+    assert!(root.path().join(format!("{id}.ts")).exists());
+}
+
+/// Two pictures share one recording without replacing one another's rewind reader.
+#[tokio::test]
+async fn shared_recording_readers_seek_independently_and_receive_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::new(dir.path().into(), 1800.0);
+    for i in 0..8 {
+        append_segment(&mut store, 2.0, u64::from(i >= 4));
+    }
+    let buffer = Arc::new(test_buffer(store));
+    let a = buffer.reader();
+    let b = buffer.reader();
+    a.view(Some(2.0));
+    b.view(Some(12.0));
+    let state = buffer.shared.clone();
+    let request = |reader: u64, epoch: u64| {
+        Request::builder().uri(format!("/{}/r{reader}/0.m3u8?view={epoch}", state.token.expose())).body(Body::empty()).unwrap()
+    };
+    assert_eq!(serve(State(state.clone()), request(a.id, 1)).await.status(), StatusCode::OK);
+    assert_eq!(serve(State(state.clone()), request(b.id, 1)).await.status(), StatusCode::OK);
+    assert_eq!(a.snapshot().origin, 2.0);
+    assert_eq!(b.snapshot().origin, 12.0);
+    a.view(Some(0.0));
+    assert_eq!(serve(State(state.clone()), request(a.id, 1)).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(serve(State(state.clone()), request(b.id, 1)).await.status(), StatusCode::OK);
+    state.emit(Event::Failed(PlayerErrorKind::Stalled, None));
+    assert!(matches!(a.errors.try_recv(), Ok(Event::Failed(PlayerErrorKind::Stalled, _))));
+    assert!(matches!(b.errors.try_recv(), Ok(Event::Failed(PlayerErrorKind::Stalled, _))));
 }

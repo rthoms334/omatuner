@@ -37,10 +37,12 @@ use crate::ui::ParentalSession;
 
 #[derive(Debug)]
 pub struct AppShared {
+    downloads: Mutex<Option<crate::downloads::DownloadsHandle>>,
     lib: RwLock<Arc<Library>>,
     /// The published snapshot's generation, for services that follow the library (Up next).
     lib_generation: watch::Sender<u64>,
     unlocked_at: Mutex<Option<Instant>>,
+    recording_headless: std::sync::atomic::AtomicBool,
     /// The reminder scheduler's waker (`Services::start_reminders`): a switch the handler
     /// wrote is picked up at once, UI frame or not.
     reminders: Mutex<Option<ReminderWaker>>,
@@ -88,9 +90,11 @@ impl AppShared {
     /// Shared state around the jobs' explicit gate.
     pub fn new(explicit: ExplicitGate) -> Self {
         Self {
+            downloads: Mutex::default(),
             lib: RwLock::default(),
             lib_generation: watch::Sender::new(0),
             unlocked_at: Mutex::default(),
+            recording_headless: std::sync::atomic::AtomicBool::new(false),
             reminders: Mutex::default(),
             explicit,
             guard: RwLock::default(),
@@ -257,8 +261,22 @@ impl AppShared {
         self.queue.send_replace(q);
     }
 
+    pub fn downloads(&self) -> Option<crate::downloads::DownloadsHandle> {
+        self.downloads.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_downloads(&self, handle: Option<crate::downloads::DownloadsHandle>) {
+        *self.downloads.lock().unwrap_or_else(|e| e.into_inner()) = handle;
+    }
+
     /// The parental state now, under `cfg` (the live config).
+    pub fn set_recording_headless(&self, on: bool) {
+        self.recording_headless.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
     pub fn parental(&self, cfg: &ParentalConfig) -> ParentalView {
+        if self.recording_headless.load(std::sync::atomic::Ordering::Relaxed) {
+            return ParentalView { unlocked: false, hides_explicit: true, pin_active: cfg.pin_active() };
+        }
         let at = *self.unlocked_at.lock().unwrap_or_else(|e| e.into_inner());
         let session = ParentalSession::with_unlocked_at(at);
         ParentalView { unlocked: session.is_unlocked(cfg), hides_explicit: session.hides_explicit(cfg), pin_active: cfg.pin_active() }

@@ -30,6 +30,7 @@
 pub mod backup;
 pub mod cast;
 pub mod copies;
+pub mod downloads;
 pub mod epg;
 pub mod follow;
 pub mod guide_fix;

@@ -24,6 +24,8 @@ macro_rules! row_id {
     };
 }
 
+row_id!(/// `download.id` (DESIGN §43).
+    DownloadId);
 row_id!(/// `source.id`
     SourceId);
 row_id!(/// `grp.id` (channel, movie or series category)

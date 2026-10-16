@@ -18,6 +18,7 @@ pub mod casting;
 pub mod click_guard;
 pub mod copies;
 pub mod data;
+pub mod downloads;
 pub mod epg_grid;
 pub mod item_menu;
 pub mod layout;
@@ -67,10 +68,12 @@ pub enum ScreenId {
     /// Up next (Alt+6, DESIGN §32).
     Queue,
     Watchlists,
+    Downloads,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SettingsPage {
+    Downloads,
     #[default]
     Playlists,
     Epg,
@@ -154,6 +157,7 @@ pub enum Route {
     Logs,
     /// Up next (Alt+6, DESIGN §32).
     Queue,
+    Downloads,
     Watchlists {
         list: Option<crate::model::WatchlistId>,
     },
@@ -175,6 +179,7 @@ impl Route {
             Route::EpgMapping { .. } => ScreenId::EpgMapping,
             Route::Logs => ScreenId::Logs,
             Route::Queue => ScreenId::Queue,
+            Route::Downloads => ScreenId::Downloads,
             Route::Watchlists { .. } => ScreenId::Watchlists,
         }
     }
@@ -183,6 +188,13 @@ impl Route {
 /// Overlays (modal layers). Owners in `overlays/mod.rs`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayRequest {
+    Download(item_menu::Target),
+    DeleteDownloads(Vec<crate::model::DownloadId>),
+    DownloadBusy(downloads::Busy),
+    DownloadRecording {
+        channel: ChannelId,
+        target: crate::downloads::Target,
+    },
     /// Global search (WP-12).
     Search {
         initial: String,
@@ -330,6 +342,7 @@ impl BackTarget {
             ScreenId::EpgMapping => "Guide fixes",
             ScreenId::Logs => "Logs",
             ScreenId::Queue => "Up next",
+            ScreenId::Downloads => "Downloads",
             ScreenId::Watchlists => "Watchlists",
         };
         Self { label }

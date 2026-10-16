@@ -1300,6 +1300,7 @@ mod tests {
             load_generation: generation,
             origin: Some(origin),
             playable: Some(Arc::new(crate::model::Playable {
+                from_download: false,
                 media,
                 kind,
                 item: Some(it.clone()),

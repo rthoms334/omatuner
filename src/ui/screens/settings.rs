@@ -74,6 +74,7 @@ use crate::ui::{LayoutClass, OnboardingStart, OverlayRequest, Route, Screen, Scr
 // The batch features' parts of Settings (base-B): each file is its track's, with the same
 // hooks — `rows` (its rows on the pages it adds to), `act` (its `Act::Feature` buttons), `item`
 // (Enter on its `Item::Feature` rows) and, for a page of its own, `enter` (load on entering).
+mod downloads;
 mod search;
 pub(crate) use search::IndexedRow;
 pub use search::SettingTarget;
@@ -91,6 +92,7 @@ mod updates; // About & logs ▸ Updates (DESIGN §41)
 #[allow(dead_code)] // base-B: each feature file constructs its own once its track fills it
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Feature {
+    Downloads,
     Agents,
     Cast,
     Following,
@@ -103,7 +105,7 @@ enum Feature {
 }
 
 /// Every page in list order (`pages` leaves out the features that are off).
-const PAGES_ALL: [(SettingsPage, &str, &str); 15] = [
+const PAGES_ALL: [(SettingsPage, &str, &str); 16] = [
     (SettingsPage::Playlists, glyphs::PLAYLIST, "Playlists"),
     (SettingsPage::Epg, glyphs::GUIDE, "EPG"),
     (SettingsPage::Player, glyphs::PLAY, "Player"),
@@ -115,6 +117,7 @@ const PAGES_ALL: [(SettingsPage, &str, &str); 15] = [
     (SettingsPage::Parental, glyphs::LOCK, "Parental"),
     (SettingsPage::Agents, glyphs::AGENT, "AI agents"),
     (SettingsPage::Cast, glyphs::CAST, "Cast"),
+    (SettingsPage::Downloads, "⤓", "Downloads"),
     (SettingsPage::Backup, glyphs::BACKUP, "Backup"),
     (SettingsPage::Hidden, glyphs::HIDDEN, "Hidden items"),
     (SettingsPage::Orphans, glyphs::WARNING, "Orphans"),
@@ -953,6 +956,7 @@ impl SettingsScreen {
     /// A feature file's button.
     fn feature_act(&mut self, ctx: &mut UiCtx<'_>, f: Feature, n: u16) {
         match f {
+            Feature::Downloads => downloads::act(self, ctx, n),
             Feature::Agents => agents::act(self, ctx, n),
             Feature::Cast => cast::act(self, ctx, n),
             Feature::Following => following::act(self, ctx, n),
@@ -968,6 +972,7 @@ impl SettingsScreen {
     /// Enter on a feature file's row.
     fn feature_item(&mut self, ctx: &mut UiCtx<'_>, f: Feature, id: i64) {
         match f {
+            Feature::Downloads => {}
             Feature::Agents => agents::item(self, ctx, id),
             Feature::Cast => cast::item(self, ctx, id),
             Feature::Following => following::item(self, ctx, id),
@@ -1344,6 +1349,7 @@ impl SettingsScreen {
                 }
                 reminders::rows(self, ctx, &mut v);
             }
+            SettingsPage::Downloads => downloads::rows(self, ctx, &mut v),
             SettingsPage::Following => following::rows(self, ctx, &mut v),
             SettingsPage::SpoilerGuard => spoiler::rows(self, ctx, &mut v),
             SettingsPage::Agents => agents::rows(self, ctx, &mut v),
@@ -1376,6 +1382,7 @@ impl SettingsScreen {
             }
             SettingsPage::Backup => {
                 v.push(Row::Section("Export".into()));
+                v.push(Row::Note("Downloads: backs up jobs and rules, not the media files.".into(), false));
                 v.push(Row::Local { field: Local::BackupPasswords, label: "Include passwords" });
                 v.push(Row::Local { field: Local::BackupHistory, label: "Include watch history" });
                 v.push(Row::Act { act: Act::ExportBackup, icon: glyphs::BACKUP, label: "Export backup…".into(), danger: false });

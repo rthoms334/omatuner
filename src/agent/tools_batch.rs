@@ -29,6 +29,26 @@ fn read_only<A: ToolAction>() -> bool {
 pub fn tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
+            name: "downloads",
+            title: "Downloads and recordings",
+            description: "Save films, episodes, series or programmes. List returns opaque ids, guarded titles, state, progress, space and Keep N rules; never files or stream addresses. Series scope=keep with n=0 removes its rule. Confirm more than 3 items, every recording, Keep N rule, file deletion and pause for playback with the user first. Locked refs need the PIN in Tuner. Recordings keep the current picture on an unanswered clash and try catch-up afterwards.",
+            input_schema: object(
+                json!({
+                    "action": action_schema::<super::params::DownloadsAction>("What to do."),
+                    "state": {"type":"string"}, "refs":{"type":"array","items":{"type":"string"},"maxItems":50},
+                    "ref":{"type":"string"}, "channel":{"type":"string"}, "minutes":{"type":"integer","minimum":1,"maximum":1440},
+                    "copy":{"enum":["best","this"]}, "scope":{"enum":["next","next_n","season","all","keep"]},
+                    "n":{"type":"integer","minimum":0,"maximum":50}, "season":{"type":"integer","minimum":0},
+                    "ids":{"type":"array","items":{"type":"integer"},"maxItems":50}
+                }),
+                &["action"],
+            ),
+            read_only: false,
+            launches: true,
+            example: json!({"action":"list"}),
+            mixed: true,
+        },
+        ToolDef {
             name: "queue",
             title: "Up next",
             description: "Tuner's play queue (Up next): list it, add movies, episodes, catch-up or programme refs (end, next or an \
@@ -111,14 +131,14 @@ Favourites are for channels; save films and series here. No plot text is returne
         ToolDef {
             name: "follow",
             title: "Following",
-            description: "Standing guide searches: Tuner re-reads the guide after every refresh and sets reminders (or switches, or \
+            description: "Standing guide searches: Tuner re-reads the guide after every refresh and sets reminders (or switches, recordings, or \
 lists) for every match — a team's matches, new episodes of a show, an event's sessions, or a daily news flash in the pop-out. Always \
 preview first and show the matches and what was left out, then add only after the user confirms (switch mode explicitly). One rule per \
 add. Never create a rule from an inferred interest. Spoiler-safe results show only rule, time and channel.",
             input_schema: object(
                 json!({
                     "action": action_schema::<FollowAction>("What to do."),
-                    "rule": { "type": "object", "description": "preview / add: the rule.", "properties": {
+                    "rule": { "type": "object", "description": "preview / add / record: the rule.", "properties": {
                         "name": text("Rule name (\"Arsenal\")."),
                         "kind": { "type": "string", "enum": ["team", "show", "event", "custom", "news_flash"] },
                         "terms": strings("Names and aliases, any of."),
@@ -127,7 +147,7 @@ add. Never create a rule from an inferred interest. Spoiler-safe results show on
                         "categories": strings("Guide categories (sports), any of."),
                         "airings": { "type": "string", "enum": ["live_only", "live_or_new", "new_only", "any"] },
                         "channels": { "description": "any, favourites, {list}, {playlist} or {channels: [refs]}." },
-                        "mode": { "type": "string", "enum": ["notify", "switch", "list", "flash"] },
+                        "mode": { "type": "string", "enum": ["notify", "switch", "list", "flash", "record"] },
                         "lead_min": { "type": "integer", "minimum": 0, "maximum": 120 },
                         "offset_min": { "type": "integer", "minimum": -60, "maximum": 120 },
                         "spoiler_safe": { "type": "boolean" },

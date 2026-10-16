@@ -91,13 +91,15 @@ pub enum KeyContext {
     MultiView,
     /// Watchlist entries and list controls (DESIGN §42 §2.4).
     Watchlists,
+    Downloads,
 }
 
 impl KeyContext {
     /// Every context, in help-overlay / documentation order.
-    pub const ALL: [KeyContext; 22] = [
+    pub const ALL: [KeyContext; 23] = [
         KeyContext::Global,
         KeyContext::Watchlists,
+        KeyContext::Downloads,
         KeyContext::List,
         KeyContext::ListFiltering,
         KeyContext::Checklist,
@@ -124,6 +126,7 @@ impl KeyContext {
         match self {
             KeyContext::Global => "Everywhere",
             KeyContext::Watchlists => "Watchlists",
+            KeyContext::Downloads => "Downloads",
             KeyContext::List => "Lists",
             KeyContext::ListFiltering => "Lists while filtering",
             KeyContext::PosterGrid => "Movies & series grid",
@@ -310,6 +313,11 @@ pub enum Action {
     /// Alt+6: the Up next screen.
     GoQueue,
     GoWatchlists,
+    GoDownloads,
+    Download,
+    PlayDownload(crate::model::DownloadId),
+    UndoDownload(crate::model::DownloadId),
+    UndoDownloadRule(i64),
     WatchlistOne,
     WatchlistSkip,
     WatchlistOrder,
@@ -497,6 +505,7 @@ pub static GLOBAL: &[Binding] = &[
     b(C::alt(Key::Num5), A::GoSeries, "Series"),
     b(C::alt(Key::Num6), A::GoQueue, "Up next"),
     b(C::alt(Key::Num7), A::GoWatchlists, "Watchlists"),
+    b(C::alt(Key::Num8), A::GoDownloads, "Downloads"),
     b(C::ctrl(Key::Comma), A::GoSettings, "Settings"),
     b(C::alt(Key::Num0), A::GoSettings, "Settings"),
     b(C::alt(Key::ArrowLeft), A::Back, "Back"),
@@ -525,6 +534,7 @@ pub static GLOBAL: &[Binding] = &[
 /// Shared by List / ListFiltering / PosterGrid(Filtering) / Detail: item actions on Ctrl
 /// chords and Delete (Search has its own subset, [`SEARCH_ITEM_ACTIONS`]).
 pub static ITEM_ACTIONS: &[Binding] = &[
+    b(C::ctrl(Key::D), A::Download, "Download / record…"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Save to / remove from My list (channels: Favourites)"),
     b(C::ctrl_shift(Key::F), A::AddToList, "Watchlists… (channels: Favourites lists…)"),
     b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide"),
@@ -664,6 +674,7 @@ pub static DETAIL: &[Binding] = &[
 ];
 
 pub static GUIDE: &[Binding] = &[
+    b(C::ctrl(Key::D), A::Download, "Download / record…"),
     b(C::key(Key::ArrowUp), A::Up, "Previous / next channel"),
     b(C::ch('k'), A::Up, "Previous / next channel"),
     b(C::key(Key::ArrowDown), A::Down, "Previous / next channel"),
@@ -725,6 +736,7 @@ pub static GUIDE: &[Binding] = &[
 /// Bindings shared by both player contexts. The passive info banner (shown on zap, any key,
 /// mouse move) never changes the context — only `FocusOsdControls` pushes `PlayerOsd`.
 pub static PLAYER_COMMON: &[Binding] = &[
+    b(C::ctrl(Key::D), A::Download, "Download / record…"),
     b(C::key(Key::Space), A::PlayPause, "Play / pause"),
     b(C::ch('m'), A::Mute, "Mute"),
     b(C::ch('+'), A::VolumeUp, "Volume up / down"),
@@ -891,6 +903,7 @@ pub static SEARCH: &[Binding] = &[
 /// The item shortcuts the search overlay acts on (no reorder, sort or remove there: a hit
 /// list has no order of its own and nothing to remove from).
 pub static SEARCH_ITEM_ACTIONS: &[Binding] = &[
+    b(C::ctrl(Key::D), A::Download, "Download / record…"),
     b(C::ctrl(Key::F), A::ToggleFavourite, "Save to / remove from My list (channels: Favourites)"),
     b(C::ctrl_shift(Key::F), A::AddToList, "Watchlists… (channels: Favourites lists…)"),
     b(C::ctrl(Key::H), A::ToggleHidden, "Hide / unhide"),
@@ -1003,6 +1016,19 @@ pub static SETTINGS: &[Binding] = &[
 ];
 
 /// Watchlist play order and entry actions (DESIGN §42 §2.4).
+/// Downloads list (DESIGN §43 §2.5).
+pub static DOWNLOADS: &[Binding] = &[
+    b(C::key(Key::ArrowUp), A::Up, "Previous download"),
+    b(C::key(Key::ArrowDown), A::Down, "Next download"),
+    b(C::key(Key::Enter), A::Activate, "Play"),
+    b(C::key(Key::Space), A::PlayPause, "Pause / resume"),
+    b(C::alt(Key::ArrowUp), A::MoveUp, "Move up"),
+    b(C::alt(Key::ArrowDown), A::MoveDown, "Move down"),
+    b(C::key(Key::Delete), A::Remove, "Cancel or delete…"),
+    b(C::ctrl(Key::Enter), A::ContextMenu, "Download menu"),
+    b(C::shift(Key::F10), A::ContextMenu, "Download menu"),
+];
+
 pub static WATCHLISTS: &[Binding] = &[
     b(C::key(Key::ArrowRight), A::Right, "Open entries / move right"),
     b(C::ctrl(Key::I), A::ShowDetails, "Episodes… / film details"),
@@ -1036,6 +1062,7 @@ pub fn tables(ctx: KeyContext) -> Vec<&'static [Binding]> {
     match ctx {
         KeyContext::Global => vec![GLOBAL],
         KeyContext::Watchlists => vec![WATCHLISTS],
+        KeyContext::Downloads => vec![DOWNLOADS],
         KeyContext::List => vec![LIST, ITEM_ACTIONS],
         KeyContext::ListFiltering => vec![LIST_FILTERING, ITEM_ACTIONS],
         KeyContext::PosterGrid => vec![POSTER_GRID, ITEM_ACTIONS],
@@ -1145,6 +1172,7 @@ fn resolve_inner(stack: &[KeyContext], ev: &egui::Event) -> Option<Action> {
 /// their feature's `ENABLED` flips (base-B; each track flips only its flag).
 pub fn feature_on(a: Action) -> bool {
     match a {
+        A::GoDownloads | A::Download => crate::downloads::ENABLED,
         A::QueueAdd | A::QueuePlayNext | A::GoQueue | A::QueuePanel | A::QueueNext | A::QueuePrev => crate::queue::ENABLED,
         A::FollowProgramme | A::UndoFollow(_) | A::OpenFollowing => crate::follow::ENABLED,
         A::RevealSpoilers | A::SpoilerMenu => crate::spoiler::ENABLED,

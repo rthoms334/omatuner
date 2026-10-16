@@ -2573,6 +2573,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Alt+5` | Series |
 | `Alt+6` | Up next |
 | `Alt+7` | Watchlists |
+| `Alt+8` | Downloads |
 | `Ctrl+Comma` / `Alt+0` | Settings |
 | `Alt+←` | Back |
 | `F11` | Toggle window fullscreen |
@@ -2602,6 +2603,19 @@ no Ctrl+Shift+C (the terminal's copy).
 | `o` | In order / Any order |
 | `+` | New list… |
 
+#### Downloads (`Downloads`)
+
+| Keys | Action |
+|---|---|
+| `↑` | Previous download |
+| `↓` | Next download |
+| `Enter` | Play |
+| `Space` | Pause / resume |
+| `Alt+↑` | Move up |
+| `Alt+↓` | Move down |
+| `Delete` | Cancel or delete… |
+| `Ctrl+Enter` / `Shift+F10` | Download menu |
+
 #### Lists (`List`)
 
 | Keys | Action |
@@ -2618,6 +2632,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `?` | Keyboard help |
 | `Space` / `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+O` | Play from another playlist (Also on)… |
+| `Ctrl+D` | Download / record… |
 | `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
 | `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
@@ -2654,6 +2669,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Insert` | Mark (groups: Ctrl+H then hides all marked) |
 | `Ctrl+Shift+H` | Hide the groups with the words typed |
 | `Ctrl+O` | Play from another playlist (Also on)… |
+| `Ctrl+D` | Download / record… |
 | `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
 | `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
@@ -2707,6 +2723,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `?` | Keyboard help |
 | `Space` | Show each copy / fold them (stack card) |
 | `Ctrl+O` | Play from another copy… |
+| `Ctrl+D` | Download / record… |
 | `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
 | `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
@@ -2740,6 +2757,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Ctrl+U` / `Esc` | Clear filter |
 | `Tab` / `Shift+Tab` | Next / previous pane |
 | `Ctrl+O` | Play from another copy… |
+| `Ctrl+D` | Download / record… |
 | `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
 | `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
@@ -2775,6 +2793,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `?` | Keyboard help |
 | `Ctrl+O` | Play from another copy… |
 | `C` / `Alt+C` | Cast to a TV… |
+| `Ctrl+D` | Download / record… |
 | `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
 | `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
@@ -2797,6 +2816,7 @@ no Ctrl+Shift+C (the terminal's copy).
 
 | Keys | Action |
 |---|---|
+| `Ctrl+D` | Download / record… |
 | `↑` / `k` / `↓` / `j` | Previous / next channel |
 | `←` / `h` / `→` / `l` | Previous / next programme |
 | `PgUp` / `PgDn` | Page channels |
@@ -2841,6 +2861,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `c` | Channel list |
 | `g` | Mini guide (now / next) |
 | `0` / `1` / `2` / `3` / `4` / `5` / `6` / `7` / `8` / `9` | Type a channel number |
+| `Ctrl+D` | Download / record… |
 | `Space` | Play / pause |
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
@@ -2880,6 +2901,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `L` | Jump to live (from catch-up) |
 | `Home` | Go to start |
 | `Ctrl+O` | Play from another copy… |
+| `Ctrl+D` | Download / record… |
 | `Space` | Play / pause |
 | `m` | Mute |
 | `+` / `=` / `-` | Volume up / down |
@@ -2973,6 +2995,7 @@ no Ctrl+Shift+C (the terminal's copy).
 | `Ctrl+Backspace` | Delete word |
 | `Ctrl+U` | Clear |
 | `Esc` | Clear, then close |
+| `Ctrl+D` | Download / record… |
 | `Ctrl+F` | Save to / remove from My list (channels: Favourites) |
 | `Ctrl+Shift+F` | Watchlists… (channels: Favourites lists…) |
 | `Ctrl+H` | Hide / unhide |
@@ -7081,3 +7104,53 @@ The `watchlist` MCP tool reads and edits lists and starts or stops their playbac
 `status.watchlist` identifies the active list. Locked entries are never played or added over
 MCP, concealed entries are absent from all views and counts, and episode labels use the
 existing spoiler guard. Plugin skills and RULES.md describe watchlists and their confirmations.
+
+## 43. Downloads and recordings
+
+Design: `docs/design/downloads-design.md`; its §11 records the approved decisions.
+
+### 43.1 Saving and playing
+Alt+8 opens Downloads; Ctrl+D opens the download menu on films, episodes, series, guide
+programmes and the player. Film and episode files resume with validated HTTP ranges.
+Series choices include seasons, all episodes and Keep N unwatched. Finished copies resolve
+locally before credentials or a provider lease; partial recordings play only when selected
+in Downloads. Private counter names, parental locks, concealment and the spoiler guard apply.
+The screen groups running, waiting, scheduled, downloaded and failed jobs; Settings controls
+the cap, reserve, watched-file retention, padding, folder, speed and optional overnight window.
+“Pause downloads” persists across restarts; recordings and finishing continue. Downloads pause
+when the window closes and resume when it opens. Recordings consume none of the shared rate
+budget. Downloads and Settings list Keep N rules under “Kept topped up”, with Delete and Undo.
+Forgetting a downloaded film or episode offers to delete its file too, after Confirm.
+
+### 43.2 Recording and account clashes
+Live HLS adopts the existing rewind store when possible and keeps its segments, keys and
+maps. At stop, the cast relay's ffmpeg remuxes each discontinuity run with `-c copy`, joins
+the runs with the concat demuxer and verifies the resulting Matroska file before deleting
+the kept folder. “Finishing…” reports progress; an interrupted finish is recoverable.
+Raw TS records one GET with reconnect gaps. Scheduled recordings follow guide changes,
+use transient `tuner-record-<id>` timers while Tuner is closed, and re-arm at login. Sleep is
+inhibited during a job. Missed recordings use catch-up when available.
+
+Pictures, casting and downloads share the connection budget. Playing on an account held by
+a download asks before pausing or stopping it; an available copy on another account is offered.
+The lease is released only after transport closure. Playing the channel being recorded shares
+its recorder. An unanswered recording clash keeps the picture and falls back to catch-up,
+otherwise Missed. Skip cancels the recording. A due recording automatically pauses a download
+holding its account; only a picture gets the clash prompt. Following identities are scoped to
+each rule; fixtures and daily events retain their dates, and Missed, Failed and Cancelled jobs
+do not count as recorded. A recording stopped early is Partial. After a crash, live HLS resumes
+its kept folder if its stop is still ahead; expired TS parts become playable Partial files.
+
+### 43.3 Storage and agents
+Migration 0016 adds `download` and `download_rule` and Following's record action. Fingerprints,
+HOLDERS and backups preserve identities; deleting a playlist keeps downloaded media as orphans.
+Backups contain metadata, never media. Startup reconciles interrupted jobs, stray parts and
+missing files. The actor publishes at most 500 rows and four progress updates a second.
+
+The `downloads` MCP tool lists, queues, records and manages jobs; `play.pause_downloads`
+requires consent, and `status.downloads` reports aggregate activity and space. Locked refs
+are refused and concealed jobs are omitted. Results use opaque references and numeric ids,
+with visible titles passed through the spoiler guard, but no filenames or stream addresses.
+Episode results carry series, season, episode and episode title. List includes Keep N rules;
+`series` with `scope=keep,n=0` removes one. Plugin rules and skills cover confirmations,
+recording plans, Keep N and failure recovery.

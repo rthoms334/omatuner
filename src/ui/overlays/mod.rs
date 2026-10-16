@@ -15,6 +15,7 @@ pub mod cast_picker;
 pub mod categories;
 pub mod delete_playlist;
 pub mod dialogs;
+pub mod downloads;
 pub mod edit_item;
 pub mod follow_sheet;
 pub mod help;
@@ -179,6 +180,10 @@ pub trait Overlay {
 /// Build an overlay for a request (every variant wired; frozen).
 pub fn build(req: OverlayRequest, ctx: &mut UiCtx<'_>) -> Box<dyn Overlay> {
     match req {
+        OverlayRequest::DeleteDownloads(ids) => Box::new(downloads::DeleteFiles::new(ids)),
+        OverlayRequest::Download(target) => Box::new(downloads::Picker::new(target)),
+        OverlayRequest::DownloadRecording { channel, target } => Box::new(downloads::Picker::for_recording(channel, target)),
+        OverlayRequest::DownloadBusy(busy) => Box::new(downloads::Ask::new(busy)),
         OverlayRequest::WatchlistFind { entry, kind, title } => Box::new(watchlists::Find::new(entry, kind, title)),
         OverlayRequest::WatchlistPicker(spec) => Box::new(watchlists::Picker::new(spec)),
         OverlayRequest::WatchlistsMoved(names) => Box::new(watchlists::Moved::new(names)),

@@ -793,6 +793,7 @@ mod tests {
 
     fn playable(kind: PlayableKind, media: MediaRef) -> Arc<Playable> {
         Arc::new(Playable {
+            from_download: false,
             media,
             kind,
             item: Some(ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("k".into()) }),

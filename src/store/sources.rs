@@ -283,6 +283,7 @@ pub(crate) fn delete_chunked(conn: &Connection, table: &str, cond: &str, arg: i6
 /// Body of [`delete_source`] on a shared connection (also used by backup restore).
 pub(crate) fn purge_source(conn: &Connection, id: SourceId) -> Result<()> {
     crate::store::watchlist::before_source_delete(conn, id)?;
+    conn.execute("UPDATE download SET orphaned_since=COALESCE(orphaned_since,?2) WHERE source_id=?1", params![id, crate::model::now()])?;
     let scope = crate::store::epg::ProgrammeScope::PlaylistSource(id);
     while crate::store::epg::delete_programmes_in(conn, &scope, PROGRAMME_CHUNK)? > 0 {}
     // big catalogues go in chunks so user writes interleave; the final delete cascades the rest
