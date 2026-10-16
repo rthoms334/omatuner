@@ -1,5 +1,5 @@
-//! Downloads tool: opaque ids and guarded state, never filenames, URLs or titles
-//! (DESIGN §43 §6–§7). Confirmations live in the plugin's RULES.md.
+//! Downloads tool: opaque ids, titles and guarded state, never filenames or URLs
+//! (DESIGN §43 §6–§7). Titles leave like Up next's, through the reply's spoiler guard. Confirmations live in the plugin's RULES.md.
 use super::params::{Downloads, DownloadsAction};
 use super::proto::{AgentRef, ErrorCode, item_ref};
 use super::query::{Fail, Out, Q, parse_ref};
@@ -35,7 +35,8 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Downloads) -> Out<Value> {
         return h.run(false, move |q| {
             let items: Vec<_> = snapshot.jobs.iter().filter(|j| !crate::downloads::planning::concealed(q.conn, q.lib, q.view, j))
                 .filter(|j| p.state.as_deref().is_none_or(|s| s == j.state.as_str())).map(|j| json!({
-                    "id":j.id.0, "ref":j.item().as_ref().map(item_ref), "kind":j.kind.as_str(), "state":j.state.as_str(),
+                    "id":j.id.0, "ref":j.item().as_ref().map(item_ref), "kind":j.kind.as_str(),
+                    "title":super::query::clean(&j.title), "subtitle":j.subtitle.as_deref().map(super::query::clean), "state":j.state.as_str(),
                     "progress":j.progress(), "eta_s":j.bytes_total.zip(j.fp.get("download_speed_bps").and_then(|v|v.as_f64()).filter(|n|*n>0.0)).map(|(n,rate)|(n.saturating_sub(j.bytes_done) as f64/rate).ceil() as u64), "account":j.source_id.map(|s| s.0), "reason":j.reason,
                     "when":j.prog_start, "stop":j.prog_stop, "bytes":j.bytes_done,
                     "s":j.fp.get("download_season"), "e":j.fp.get("download_episode")
