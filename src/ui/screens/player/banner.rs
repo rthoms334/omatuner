@@ -12,7 +12,6 @@ pub(super) fn live_label(snap: &PlayerSnapshot) -> String {
 pub(super) struct SkipFeedback {
     seconds: f64,
     target: f64,
-    presses: u32,
     live_edge: Option<f64>,
     pub(super) at: Instant,
 }
@@ -24,8 +23,7 @@ impl PlayerScreen {
         }
         let previous = self.skip_feedback.as_ref().filter(|f| f.at.elapsed() < Duration::from_secs(1) && f.seconds.signum() == seconds.signum());
         let total = previous.map_or(seconds, |f| f.seconds + seconds);
-        let presses = previous.map_or(1, |f| f.presses.saturating_add(1));
-        self.skip_feedback = Some(SkipFeedback { seconds: total, target, presses, live_edge, at: Instant::now() });
+        self.skip_feedback = Some(SkipFeedback { seconds: total, target, live_edge, at: Instant::now() });
     }
 
     pub(super) fn draw_skip_feedback(&mut self, ui: &egui::Ui, ctx: &UiCtx<'_>, rect: Rect) {
@@ -36,27 +34,28 @@ impl PlayerScreen {
             return;
         }
         let t = &ctx.theme.tokens;
-        let centre = egui::pos2(rect.left() + rect.width() * if f.seconds < 0.0 { 0.25 } else { 0.75 }, rect.center().y);
-        // egui's animation setting also lets reduced-motion users suppress the expansion.
-        let motion = ui.style().animation_time > 0.0;
-        let radius = (48.0 * scale_of(ui)).min(rect.height() * 0.15);
-        let p = ui.painter_at(rect);
-        p.circle_filled(centre, radius, t.osd_scrim);
-        p.circle_stroke(
-            centre,
-            radius * (1.0 + if motion { elapsed * 0.3 } else { 0.0 }),
-            egui::Stroke::new(2.0, with_alpha(t.osd_text, if motion { 1.0 - elapsed } else { 1.0 })),
+        let s = scale_of(ui);
+        let layout = osd::CentreTransport::new(
+            rect,
+            if ctx.video_only { rect.top() } else { self.bars.first().map_or(rect.top(), |bar| bar.bottom()) },
+            rect.bottom() - self.bottom_bar.unwrap_or(0.0),
+            s,
         );
-        let text = if f.seconds < 0.0 {
-            format!("⟲ {:.0}", f.seconds.abs())
-        } else if f.presses > 1 {
-            format!("⟳ {:.0}", f.seconds)
+        let centre = if ctx.video_only {
+            egui::pos2(rect.left() + rect.width() * if f.seconds < 0.0 { 0.25 } else { 0.75 }, rect.center().y)
         } else {
-            format!("{:.0} ⟳", f.seconds)
+            layout.at(if f.seconds < 0.0 { Control::SkipBack } else { Control::SkipForward }) + egui::vec2(0.0, layout.skip * 1.3)
         };
+        // Reduced motion keeps the feedback steady until it expires.
+        let motion = ui.style().animation_time > 0.0;
+        let p = ui.painter_at(rect);
+        let color = with_alpha(t.osd_text, if motion { ((1.0 - elapsed) / 0.35).min(1.0) } else { 1.0 });
+        let text = format!("{:+.0} s", f.seconds);
         let target = f.live_edge.map_or_else(|| clock(f.target), |end| crate::player::LiveBufferRange { start: 0.0, end }.label(f.target));
-        p.text(centre - egui::vec2(0.0, radius * 0.2), Align2::CENTER_CENTER, text, FontId::proportional(radius * 0.55), t.osd_text);
-        p.text(centre + egui::vec2(0.0, radius * 0.4), Align2::CENTER_CENTER, target, FontId::proportional(radius * 0.3), t.osd_text);
+        let total = p.layout_no_wrap(text, FontId::proportional(layout.skip * 0.4), color);
+        let target = p.layout_no_wrap(target, FontId::proportional(layout.skip * 0.3), color);
+        osd::shadowed_galley(&p, centre, total, color, s);
+        osd::shadowed_galley(&p, centre + egui::vec2(0.0, layout.skip * 0.45), target, color, s);
         // Paint only: the feedback never captures a click or changes focus.
         ui.ctx().request_repaint_after(Duration::from_millis(if motion { 16 } else { 1000 }));
     }

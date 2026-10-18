@@ -728,7 +728,7 @@ fn skips_from_screen(url: String, seekable: bool) {
                 let moved = handle.snapshot().position.is_some_and(|p| (p - before - 30.0).abs() < 0.6);
                 let ripple = ui.output().shapes.iter().any(|s| {
                     matches!(&s.shape,
-                    egui::Shape::Text(t) if t.galley.job.text == "⟳ 30")
+                    egui::Shape::Text(t) if t.galley.job.text == "+30 s")
                 });
                 if moved && ripple {
                     break;

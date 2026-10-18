@@ -2042,6 +2042,14 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
 ```
+The full window also mirrors skip back / play-pause / skip forward in the picture: thin
+OSD-white icons with soft dark shadows and no backgrounds, 56 pt play/pause and 40 pt
+circular arrows with the configured skip seconds inside (× OSD scale, fitted to the available
+height), spaced about two skip widths either side of centre, with 80 pt hit targets. Hover
+brightens, keyboard focus adds a thin translucent theme ring, and pressing shrinks the icon;
+accumulating signed skip feedback sits below its arrow without a circle. They share the row's
+focus order and banner timeout; the popped-out window has no centre controls.
+
 The bottom row keeps the essentials, in order:
 
 * Left: skip back · play/pause · skip forward (skips only while seekable, including a live
@@ -2071,9 +2079,10 @@ pop-up, ↑/↓ (or Tab/Shift+Tab) move, Enter/→ open or choose, ←/Backspace
 then close. Enter resets a focused delay value; → increases it. A click outside closes the
 pop-up without activating the covered control. The OSD stays visible while it is open.
 
-A successful skip paints a non-interactive circle on its side of the picture for one second.
+A successful skip paints non-interactive shadowed text below its centre arrow for one second
+(on its side of the picture in the popped-out window).
 Same-direction skips within one second add up; the target is a VOD clock or live offset.
-The circle expands/fades with egui animations enabled and stays static with animations off.
+The text fades with egui animations enabled and stays static with animations off.
 Live badges show **Live** within three seconds of the cached edge, otherwise **−MM:SS**;
 **Back to live** appears among the controls when behind. `L` resumes at that edge.
 
@@ -2096,7 +2105,7 @@ The OSD has two layers (UX review B1):
   700 pt × rem the row retains transport, live zapping, the speaker (no slider), Next in Up
   next, Audio & subtitles and the cog. Cast and Fullscreen move into the cog menu. Labels
   collapse to glyphs before spacing shrinks; the cog stays at the right edge.
-* **Mouse** (every control is an OSD button: hover fill, pointing hand, tooltip with its key):
+* **Mouse** (row controls have a hover fill; all controls have a pointing hand and tooltip):
   ← at the left of the top bar leaves the player like `p`; the cog offers Channels
   (live) and Pop out (not in the popped-out window); volume follows transport — the
   speaker (glyph by level; click = mute, tooltip "Mute (m)"), a slider 0–130 % with a mark

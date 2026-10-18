@@ -29,6 +29,7 @@
 //!   Fullscreen · settings cog on the right. Narrow keeps the speaker and moves Cast /
 //!   Fullscreen into the cog. The cog opens a pop-up with tracks and Delay sub-pages;
 //!   `O` opens it, arrows navigate, Esc goes back a page then closes it before OSD focus.
+//!   The full window mirrors transport in the picture, with shadowed icons and large targets.
 //! * Numeric entry: any key that isn't part of it commits the number, then acts (like the
 //!   guide).
 //!
@@ -1416,6 +1417,169 @@ mod tests {
     }
 
     #[test]
+    fn centre_controls_visibility_focus_and_keyboard_activation() {
+        let mut h = player(WIDE);
+        assert!(has_label(&h, "Centre play / pause"));
+        assert!(!has_label(&h, "Skip back") && !has_label(&h, "Skip forward"));
+        let mut snap = (*shown(&h)).clone();
+        snap.seekable = true;
+        snap.live_buffer = Some(crate::player::LiveBufferRange { start: 0.0, end: 100.0 });
+        snap.position = Some(60.0);
+        h.state_mut().t.snapshot = Arc::new(snap);
+        h.run_steps(3);
+        let play = h.get_by_label("Centre play / pause").rect();
+        let back = h.get_by_label("Skip back").rect();
+        let forward = h.get_by_label("Skip forward").rect();
+        assert!((play.center().x - WIDE.x / 2.0).abs() < 10.0 && (play.center().y - WIDE.y / 2.0).abs() < 10.0);
+        assert!(back.right() < play.left() && play.right() < forward.left(), "large targets must not overlap");
+        for rect in [back, play, forward] {
+            assert!(rect.width() >= 80.0 && rect.height() >= 80.0);
+        }
+        h.state_mut().act(Action::FocusOsdControls);
+        h.run_steps(2);
+        assert_eq!(h.state().s.visible[h.state().s.control], Control::PlayPause);
+        h.state_mut().act(Action::Left);
+        assert_eq!(h.state().s.visible[h.state().s.control], Control::SkipBack);
+        h.state_mut().act(Action::Right);
+        h.state_mut().act(Action::Right);
+        assert_eq!(h.state().s.visible[h.state().s.control], Control::SkipForward);
+        h.state_mut().act(Action::Left);
+        let paused = real(&h).paused;
+        h.state_mut().act(Action::Activate);
+        until(&mut h, "centre keyboard paused", |h| real(h).paused != paused);
+        h.state_mut().act(Action::Back);
+        h.get_by_label("Centre play / pause").click();
+        until(&mut h, "centre click unpaused", |h| real(h).paused == paused);
+        assert!(!h.state().s.osd_focus);
+        h.hover_at(egui::pos2(1.0, 1.0));
+        h.run_steps(2);
+        h.state_mut().act(Action::Back);
+        h.run_steps(2);
+        assert!(!has_label(&h, "Centre play / pause"));
+        h.state_mut().t.video_only = true;
+        h.state_mut().act(Action::FocusOsdControls);
+        h.run_steps(2);
+        assert!(has_label(&h, "Play / pause") && !has_label(&h, "Centre play / pause"), "pop-out has no centre transport, even in focus mode");
+    }
+
+    fn paint_shapes(h: &H) -> Vec<&egui::Shape> {
+        fn flat<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|shape| flat(shape, out)),
+                _ => out.push(shape),
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &h.output().shapes {
+            flat(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn centre_text(h: &H, label: &str, text: &str) -> egui::epaint::TextShape {
+        let rect = h.get_by_label(label).rect();
+        paint_shapes(h)
+            .into_iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Text(t)
+                    if t.galley.job.text == text
+                        && t.override_text_color.is_some_and(|c| c.a() > 128)
+                        && rect.contains(t.visual_bounding_rect().center()) =>
+                {
+                    Some(t.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{label}: missing foreground {text}"))
+    }
+
+    #[test]
+    fn centre_controls_have_no_background_and_play_pause_is_larger() {
+        let mut h = player(WIDE);
+        let mut snap = (*shown(&h)).clone();
+        snap.seekable = true;
+        snap.paused = false;
+        h.state_mut().t.snapshot = Arc::new(snap.clone());
+        Arc::make_mut(&mut h.state_mut().t.config).player.skip_small_s = 15;
+        h.run_steps(2);
+        let labels = ["Skip back", "Centre play / pause", "Skip forward"];
+        let targets = labels.map(|label| h.get_by_label(label).rect());
+        let scale = osd_scale(WIDE.x);
+        let pause = centre_text(&h, labels[1], glyphs::PAUSE);
+        let back = centre_text(&h, labels[0], glyphs::SKIP_BACK_CIRCULAR);
+        let forward = centre_text(&h, labels[2], glyphs::SKIP_FORWARD_CIRCULAR);
+        let height = |t: &egui::epaint::TextShape| t.visual_bounding_rect().height();
+        assert!((height(&pause) - 56.0 * scale).abs() < 3.0);
+        for skip in [&back, &forward] {
+            assert!((height(skip) - 40.0 * scale).abs() < 3.0);
+            assert!(height(&pause) > height(skip) * 1.25);
+        }
+        for label in [labels[0], labels[2]] {
+            let number = centre_text(&h, label, "15");
+            assert!(number.visual_bounding_rect().width() < height(&back) * 0.5);
+            assert_eq!(number.galley.job.sections[0].format.font_id.family, egui::FontFamily::Name(crate::theme::egui_style::FAMILY_MEDIUM.into()));
+        }
+        // Test actual paint in idle, hover, keyboard focus and pointer-down states. No opaque
+        // disc or osd_button rectangle may sneak back in; focus is a stroke with no fill.
+        for state in 0..4 {
+            if state == 1 {
+                h.hover_at(targets[1].center());
+            } else if state == 2 {
+                h.state_mut().act(Action::FocusOsdControls);
+            } else if state == 3 {
+                h.event(egui::Event::PointerButton {
+                    pos: targets[1].center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            h.run_steps(2);
+            let shapes = paint_shapes(&h);
+            for shape in &shapes {
+                match shape {
+                    egui::Shape::Circle(c) if targets.iter().any(|r| r.contains(c.center)) => assert_eq!(c.fill, Color32::TRANSPARENT),
+                    egui::Shape::Rect(r) if targets.iter().any(|target| target.contains_rect(r.rect)) => assert_eq!(r.fill, Color32::TRANSPARENT),
+                    _ => {}
+                }
+            }
+            let now = centre_text(&h, labels[1], glyphs::PAUSE);
+            if state == 1 {
+                assert!(now.override_text_color.unwrap().a() > pause.override_text_color.unwrap().a());
+            } else if state == 2 {
+                assert!(
+                    shapes.iter().any(
+                        |s| matches!(s, egui::Shape::Circle(c) if targets[1].contains(c.center) && c.stroke.width > 0.0 && c.stroke.color.a() > 0)
+                    )
+                );
+            } else if state == 3 {
+                assert!(height(&now) < height(&pause) * 0.96, "press shrinks only the glyph");
+                assert_eq!(h.get_by_label(labels[1]).rect(), targets[1]);
+            }
+            let shadows = shapes
+                .iter()
+                .filter(|s| {
+                    matches!(s, egui::Shape::Text(t) if t.galley.job.text == glyphs::PAUSE
+                && targets[1].contains(t.visual_bounding_rect().center())
+                && t.override_text_color.is_some_and(|c| c.a() > 0 && c.a() < 64))
+                })
+                .count();
+            assert_eq!(shadows, 4, "soft shadow is made from faint glyph copies");
+        }
+        h.event(egui::Event::PointerButton {
+            pos: targets[1].center(),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        snap.paused = true;
+        h.state_mut().t.snapshot = Arc::new(snap);
+        h.run_steps(2);
+        let play = centre_text(&h, labels[1], glyphs::PLAY_OUTLINE);
+        assert!((height(&play) - 56.0 * scale).abs() < 3.0 && height(&play) > height(&back) * 1.25);
+    }
+
+    #[test]
     fn disappearing_back_to_live_focus_falls_back_to_play_pause() {
         let mut h = player(WIDE);
         let mut snap = (*shown(&h)).clone();
@@ -1448,10 +1612,18 @@ mod tests {
         }
         h.run_steps(2);
         let text = painted(&h);
-        assert!(text.iter().any(|t| t == "⟳ 30") && text.iter().any(|t| t == "−00:40"), "{text:?}");
+        assert!(text.iter().any(|t| t == "+30 s") && text.iter().any(|t| t == "−00:40"), "{text:?}");
+        let feedback = paint_shapes(&h)
+            .into_iter()
+            .find_map(|s| match s {
+                egui::Shape::Text(t) if t.galley.job.text == "+30 s" => Some(t.visual_bounding_rect()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!paint_shapes(&h).iter().any(|s| matches!(s, egui::Shape::Circle(c) if feedback.expand(50.0).contains(c.center))));
         // Feedback is paint-only: a click through its picture still dismisses focus mode.
         h.state_mut().act(Action::FocusOsdControls);
-        press(&h, egui::pos2(WIDE.x * 0.75, WIDE.y / 2.0), egui::PointerButton::Primary);
+        press(&h, feedback.center(), egui::PointerButton::Primary);
         h.run_steps(2);
         assert!(!h.state().s.osd_focus);
         let app = h.state_mut();
@@ -1460,7 +1632,7 @@ mod tests {
         assert!(painted(&h).iter().any(|t| t.contains("That's as far back as Tuner has")));
         h.state_mut().s.skip_feedback.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
         h.run_steps(2);
-        assert!(!painted(&h).iter().any(|t| t == "⟳ 30"));
+        assert!(!painted(&h).iter().any(|t| t == "+30 s"));
     }
 
     #[test]

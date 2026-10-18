@@ -1,5 +1,7 @@
 //! The OSD: controls, bars, volume, badges (split from the player screen; owner WP-11).
 
+use std::sync::Arc;
+
 use super::*;
 
 /// OSD controls (controls focus mode moves between them).
@@ -172,6 +174,54 @@ pub(super) fn osd_button(
     let g = p.layout_no_wrap(text.to_owned(), font, color);
     p.galley(rect.center() - g.size() / 2.0, g, color);
     resp
+}
+
+/// Soft glyph shadow on the picture: a few faint copies, with no button background.
+pub(super) fn shadowed_galley(p: &egui::Painter, centre: egui::Pos2, galley: Arc<egui::Galley>, color: Color32, s: f32) {
+    let pos = centre - galley.mesh_bounds.center().to_vec2();
+    let shadow = Color32::from_black_alpha((38.0 * f32::from(color.a()) / 255.0).round() as u8);
+    for offset in [egui::vec2(-1.0, 1.0), egui::vec2(1.0, 1.0), egui::vec2(0.0, -0.5), egui::vec2(0.0, 2.0)] {
+        p.galley_with_override_text_color(pos + offset * s, galley.clone(), shadow);
+    }
+    p.galley_with_override_text_color(pos, galley, color);
+}
+
+/// Size the ink, not the font's line box: Nerd glyphs have different side bearings/heights.
+fn centre_glyph(p: &egui::Painter, text: &str, height: f32, color: Color32) -> Arc<egui::Galley> {
+    let galley = p.layout_no_wrap(text.to_owned(), FontId::proportional(height), color);
+    let size = height * height / galley.mesh_bounds.height().max(1.0);
+    p.layout_no_wrap(text.to_owned(), FontId::proportional(size), color)
+}
+
+/// The three picture controls keep large targets independently of their smaller glyphs.
+pub(super) struct CentreTransport {
+    pub(super) centre: egui::Pos2,
+    pub(super) skip: f32,
+    hit: f32,
+    spacing: f32,
+}
+
+impl CentreTransport {
+    pub(super) fn new(rect: Rect, top: f32, bottom: f32, s: f32) -> Self {
+        let hit = (80.0 * s).min(rect.width() / 5.0).min((bottom - top).max(36.0) * 0.65);
+        let skip = hit * 0.5;
+        let centre = egui::pos2(rect.center().x, rect.center().y.clamp(top + hit / 2.0, (bottom - hit / 2.0).max(top + hit / 2.0)));
+        // About 1.9 skip widths, with enough room that the invisible hit targets never overlap.
+        Self { centre, skip, hit, spacing: (skip * 1.9).max(hit + 4.0 * hit / 80.0) }
+    }
+
+    pub(super) fn at(&self, c: Control) -> egui::Pos2 {
+        let offset = match c {
+            Control::SkipBack => -self.spacing,
+            Control::SkipForward => self.spacing,
+            _ => 0.0,
+        };
+        self.centre + egui::vec2(offset, 0.0)
+    }
+
+    fn rect(&self, c: Control) -> Rect {
+        Rect::from_center_size(self.at(c), egui::vec2(self.hit, self.hit))
+    }
 }
 
 /// The speaker glyph for a level (0–130 %).
@@ -710,6 +760,61 @@ impl PlayerScreen {
 
         let row = Rect::from_min_max(egui::pos2(inner.left(), y + pad / 2.0), inner.max);
         self.draw_controls(ui, ctx, row, small_font, ctrl_h, snap);
+        if !ctx.video_only {
+            self.draw_centre_controls(ui, ctx, rect, top.bottom(), bottom.top(), snap);
+        }
+    }
+
+    /// Picture transport mirrors the row's actions and focus order; the pop-out keeps its row.
+    fn draw_centre_controls(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, top: f32, bottom: f32, snap: &PlayerSnapshot) {
+        let t = &ctx.theme.tokens;
+        let layout = CentreTransport::new(rect, top, bottom, scale_of(ui));
+        let p = ui.painter_at(rect);
+        for c in [Control::SkipBack, Control::PlayPause, Control::SkipForward] {
+            let Some(i) = self.visible.iter().position(|control| *control == c) else { continue };
+            let r = layout.rect(c);
+            let label = match c {
+                Control::SkipBack => "Skip back",
+                Control::SkipForward => "Skip forward",
+                _ => "Centre play / pause",
+            };
+            let resp = ui.interact(r, ui.id().with(("centre-control", i)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+            let resp = resp.on_hover_text(c.label());
+            let focused = self.settings.is_none() && ((self.osd_focus && self.row == OsdRow::Buttons && i == self.control) || resp.has_focus());
+            let color = with_alpha(t.osd_text, if resp.hovered() || focused { 1.0 } else { 0.88 });
+            let pressed = if resp.is_pointer_button_down_on() { 0.92 } else { 1.0 };
+            let size = layout.skip * if c == Control::PlayPause { 1.4 } else { 1.0 } * pressed;
+            let glyph = match c {
+                Control::SkipBack => glyphs::SKIP_BACK_CIRCULAR,
+                Control::SkipForward => glyphs::SKIP_FORWARD_CIRCULAR,
+                _ if snap.paused => glyphs::PLAY_OUTLINE,
+                _ => glyphs::PAUSE,
+            };
+            if focused {
+                p.circle_stroke(r.center(), layout.hit * 0.48, egui::Stroke::new(1.25, with_alpha(t.osd_accent, 0.6)));
+            }
+            shadowed_galley(&p, r.center(), centre_glyph(&p, glyph, size, color), color, layout.skip / 40.0);
+            if c != Control::PlayPause {
+                let text = ctx.config.player.skip_small_s.to_string();
+                let font = FontId::new(size * 0.32, egui::FontFamily::Name(crate::theme::egui_style::FAMILY_MEDIUM.into()));
+                let mut number = p.layout_no_wrap(text.clone(), font.clone(), color);
+                let fit = (size * 0.46 / number.mesh_bounds.width().max(1.0)).min(1.0);
+                if fit < 1.0 {
+                    number = p.layout_no_wrap(text, FontId::new(font.size * fit, font.family), color);
+                }
+                // The arrowhead projects beyond the ring: centre the number within the ring.
+                let offset = if c == Control::SkipBack { 0.06 } else { -0.06 };
+                shadowed_galley(&p, r.center() + egui::vec2(size * offset, 0.0), number, color, layout.skip / 40.0);
+            }
+            self.bars.push(r);
+            if resp.clicked() {
+                self.row = OsdRow::Buttons;
+                self.control = i;
+                self.show_banner(ctx);
+                self.activate_control(ctx, c);
+            }
+        }
     }
 
     /// Both windows share the row, including its right-aligned cog. Collapse labels before
