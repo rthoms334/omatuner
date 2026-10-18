@@ -27,6 +27,13 @@ pub struct DownloadsHandle {
     budget: SharedBudget,
 }
 impl DownloadsHandle {
+    #[cfg(test)]
+    pub(crate) fn with_snapshot(snapshot: DownloadsSnapshot) -> Self {
+        let (tx, _) = mpsc::unbounded_channel();
+        let (_, snapshot) = watch::channel(Arc::new(snapshot));
+        Self { tx, snapshot, budget: SharedBudget::default() }
+    }
+
     pub fn budget(&self) -> &SharedBudget {
         &self.budget
     }
@@ -429,6 +436,7 @@ impl Engine {
                         job.reason = None;
                         job.fp["download_capture_failed"] = false.into();
                         job.fp["download_retry_at"] = serde_json::Value::Null;
+                        job.fp["download_tried"] = serde_json::Value::Null;
                         job.fp["download_finish_failed"] = false.into();
                         if let Some(source) = job.source_id {
                             self.paused_accounts.remove(&source);
@@ -495,6 +503,14 @@ impl Engine {
                     job.bytes_total = None;
                     job.store_name = None;
                     job.fp["download_validators"] = serde_json::Value::Null;
+                    job.fp["download_switched_to"] = serde_json::Value::Null;
+                    job.fp["download_tried"] = serde_json::Value::Null;
+                    job.fp["download_retry_at"] = serde_json::Value::Null;
+                    job.etag = None;
+                    job.last_modified = None;
+                    job.attempts = 0;
+                    job.done_at = None;
+                    job.reason = None;
                     job.state = State::Waiting;
                     self.save(job).await?;
                 }
@@ -631,6 +647,38 @@ impl Engine {
         }
     }
 
+    fn recover(&mut self, job: &mut Job) -> Result<bool> {
+        let c = self.deps.store.reader()?;
+        let cfg = current(&self.deps.config);
+        let lib = self.deps.shared.library();
+        let Some(item) = planning::recovery(&c, &lib, &cfg, job, |s| self.paused_accounts.contains(&s))? else { return Ok(false) };
+        let previous = job.clone();
+        planning::change_copy(&c, &lib, &cfg, job, item)?;
+        if previous.done_at.is_some() || previous.fp["download_hls"].as_bool() == Some(true) || !planning::same_file(&c, &cfg, &previous, job) {
+            remove_files(&self.root()?, &previous)?;
+            job.bytes_done = 0;
+            job.bytes_total = None;
+            job.store_name = None;
+            job.etag = None;
+            job.last_modified = None;
+            job.fp["download_validators"] = serde_json::Value::Null;
+            for key in ["download_hls", "download_partial", "download_capture_failed", "download_finishing", "download_finish_failed"] {
+                job.fp[key] = serde_json::Value::Null;
+            }
+            self.resources.job(job.id).reset(0);
+        }
+        let mut tried: Vec<ItemRef> = previous.fp.get("download_tried").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+        tried.extend(previous.item());
+        job.fp["download_tried"] = serde_json::to_value(tried).map_err(Error::other)?;
+        job.fp["download_switched_to"] = lib.source(job.source_id.expect("copy source")).map_or("another playlist", |s| s.name.as_str()).into();
+        job.fp["download_retry_at"] = serde_json::Value::Null;
+        job.attempts = 0;
+        job.done_at = None;
+        job.state = State::Waiting;
+        job.reason = None;
+        Ok(true)
+    }
+
     async fn tick(&mut self) -> Result<()> {
         let time = jiff::Zoned::now();
         self.tick_at(crate::model::now(), time.hour() as u32 * 60 + time.minute() as u32).await
@@ -690,6 +738,9 @@ impl Engine {
                         }
                     }
                 }
+            }
+            if job.state == State::Failed {
+                self.recover(&mut job)?;
             }
             self.resources.job(id).reset(job.bytes_done);
             let complete = job.done_at.is_some();
@@ -782,9 +833,14 @@ impl Engine {
         }
         if ((self.paused || self.moving.is_some()) && !job.kind.recording() && job.state != State::Finishing)
             || !matches!(job.state, State::Waiting | State::Scheduled | State::Finishing)
-            || job.source_id.is_some_and(|s| self.paused_accounts.contains(&s))
         {
             return Ok(());
+        }
+        if job.source_id.is_some_and(|s| self.paused_accounts.contains(&s)) {
+            if job.state != State::Waiting || !self.recover(&mut job)? {
+                return Ok(());
+            }
+            self.save(job.clone()).await?;
         }
         if job.fp.get("download_retry_at").and_then(serde_json::Value::as_i64).is_some_and(|at| now < at)
             || job.fp.get("download_finish_failed").and_then(serde_json::Value::as_bool) == Some(true)
@@ -858,7 +914,11 @@ impl Engine {
                     self.stop(id, State::Paused, Some("recording")).await?;
                 }
             }
-            let Some(item) = (if adopt { job.item() } else { planning::pick(&c, &self.deps.shared.library(), cfg, &self.deps.budget, &job)? }) else {
+            let Some(item) = (if adopt {
+                job.item()
+            } else {
+                planning::pick(&c, &self.deps.shared.library(), cfg, &self.deps.budget, &job, |s| self.paused_accounts.contains(&s))?
+            }) else {
                 job.reason = Some("busy".into());
                 self.save(job).await?;
                 return Ok(());
@@ -886,6 +946,9 @@ impl Engine {
                 }
                 State::Failed
             };
+            if job.state == State::Failed {
+                self.recover(&mut job)?;
+            }
             self.save(job).await?;
         }
         Ok(())

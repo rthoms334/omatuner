@@ -9,6 +9,8 @@ use crate::player::{PlayRequest, PlayerCommand};
 use crate::ui::{OverlayRequest, Route, UiCtx, item_menu};
 use std::sync::Arc;
 
+pub(crate) mod grouping;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Busy {
     pub id: DownloadId,
@@ -22,10 +24,8 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<DownloadsSnapshot> {
     let raw = handle.snapshot();
     let mut shown = (*raw).clone();
     let hide = ctx.parental.hides_explicit(&ctx.config.parental);
-    shown.jobs.retain(|j| {
-        j.item().is_none_or(|item| !ctx.lib.conceals(&item))
-            && (!hide || (!j.explicit() && j.item().is_none_or(|item| !ctx.lib.explicit.contains(&item))))
-    });
+    shown.jobs.retain(|j| visible(ctx.lib, hide, j));
+    shown.used_bytes = shown.jobs.iter().map(|j| j.bytes_done).sum();
     shown.rules.retain(|r| !ctx.lib.conceals(&r.item) && (!hide || !ctx.lib.explicit.contains(&r.item)));
     let guard = crate::ui::widgets::spoiler::Spoilers::of(ctx);
     for job in &mut shown.jobs {
@@ -49,6 +49,11 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<DownloadsSnapshot> {
         }
     }
     Arc::new(shown)
+}
+
+fn visible(lib: &crate::store::library::Library, hide: bool, job: &Job) -> bool {
+    let mut items = job.item().into_iter().chain(grouping::title_item(job));
+    (!hide || !job.explicit()) && items.all(|item| !lib.conceals(&item) && (!hide || !lib.explicit.contains(&item)))
 }
 
 pub fn send(ctx: &UiCtx<'_>, command: DownloadCommand) {
@@ -136,6 +141,14 @@ pub fn deleted(ctx: &mut UiCtx<'_>, id: DownloadId) {
 }
 
 pub fn state_text(job: &Job) -> String {
+    let mut text = state_label(job);
+    if let Some(playlist) = job.fp.get("download_switched_to").and_then(|v| v.as_str()) {
+        text.push_str(&format!(" · Switched to {playlist}"));
+    }
+    text
+}
+
+fn state_label(job: &Job) -> String {
     if job.state == State::Finishing && job.reason.as_deref() == Some("finishing failed") {
         return "Finishing failed; the recording is kept".into();
     }
@@ -189,7 +202,13 @@ pub fn state_text(job: &Job) -> String {
         State::Cancelled => "Cancelled",
         State::Finishing => unreachable!(),
     };
-    if job.state == State::Running { job.progress().map_or_else(|| name.into(), |p| format!("{name} {:.0} %", p * 100.0)) } else { name.into() }
+    if job.state == State::Running {
+        job.progress().map_or_else(|| name.into(), |p| format!("{name} {:.0} %", p * 100.0))
+    } else if let Some(reason) = job.reason.as_deref().filter(|_| matches!(job.state, State::Failed | State::Waiting | State::Missed)) {
+        format!("{name} · {reason}")
+    } else {
+        name.into()
+    }
 }
 
 /// Frame-local lookup for leaf widgets that do not hold a UiCtx. Built once from the watch
@@ -258,11 +277,7 @@ pub fn status_chip(shared: &crate::shared::AppShared, cfg: &crate::config::Paren
     let snap = shared.downloads()?.snapshot();
     let hide = shared.parental(cfg).hides_explicit;
     let lib = shared.library();
-    let n = snap
-        .jobs
-        .iter()
-        .filter(|j| j.state.active() && (!hide || (!j.explicit() && j.item().is_none_or(|i| !lib.conceals(&i) && !lib.explicit.contains(&i)))))
-        .count();
+    let n = snap.jobs.iter().filter(|j| j.state.active() && visible(&lib, hide, j)).count();
     if n == 0 {
         return None;
     }

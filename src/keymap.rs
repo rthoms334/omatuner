@@ -1020,7 +1020,9 @@ pub static SETTINGS: &[Binding] = &[
 pub static DOWNLOADS: &[Binding] = &[
     b(C::key(Key::ArrowUp), A::Up, "Previous download"),
     b(C::key(Key::ArrowDown), A::Down, "Next download"),
-    b(C::key(Key::Enter), A::Activate, "Play"),
+    b(C::key(Key::Enter), A::Activate, "Open series / play"),
+    b(C::key(Key::Escape), A::Back, "Back to Downloads"),
+    b(C::key(Key::ArrowLeft), A::Parent, "Back to Downloads"),
     b(C::key(Key::Space), A::PlayPause, "Pause / resume"),
     b(C::alt(Key::ArrowUp), A::MoveUp, "Move up"),
     b(C::alt(Key::ArrowDown), A::MoveDown, "Move down"),
