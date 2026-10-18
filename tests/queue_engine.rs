@@ -597,7 +597,11 @@ fn play_time_copy_selection_refreshes_the_stored_row() {
     for src in [a, b] {
         w(&s, move |c| seed::seed_movies(c, src, 1));
         w(&s, move |c| seed::seed_series_with_episodes(c, src, 1, 2, 2));
-        w(&s, move |c| tuner::store::titles::refresh_source(c, src));
+        w(&s, move |c| {
+            // The series seeder omits the year, which key-based stacking requires.
+            c.execute("UPDATE series SET year=2024 WHERE source_id=?1", [src])?;
+            tuner::store::titles::refresh_source(c, src)
+        });
     }
     let (movie, episode) = w(&s, move |c| {
         c.execute("UPDATE movie SET key='other-film',clean_name='Other film copy',duration_s=5400 WHERE source_id=?1", [b])?;
@@ -608,6 +612,9 @@ fn play_time_copy_selection_refreshes_the_stored_row() {
         )?;
         let movie = ItemRef { source: b, kind: ItemKind::Movie, key: ItemKey("other-film".into()) };
         let episode = ItemRef { source: b, kind: ItemKind::Episode, key: ItemKey("other-episode".into()) };
+        let lib = tuner::store::library::load(c)?;
+        assert_eq!(lib.vod.stacks(true).copies(0), [0, 1], "film fixture must stack both playlists");
+        assert_eq!(lib.vod.stacks(false).copies(0), [0, 1], "series fixture must stack both playlists");
         Ok((tuner::store::vod::resolve_movie(c, &movie)?.unwrap(), tuner::store::vod::resolve_episode(c, &episode)?.unwrap()))
     });
     let rig = Rig::new(&rt, s.clone(), Config::default());
@@ -630,7 +637,7 @@ fn play_time_copy_selection_refreshes_the_stored_row() {
             )?;
             Ok(())
         });
-        let reply = rt.block_on(rig.queue.request(QueueCommand::Play { id, resume: None }));
+        let reply = rt.block_on(rig.queue.request(QueueCommand::PlayAt(id)));
         assert_eq!(reply, QueueReply::Play(PlayReply::Playing(id)));
         assert_eq!(rig.player.plays().last(), Some(&(media, PlayOrigin::Queue)));
         let snap = rig.queue.snapshot();
