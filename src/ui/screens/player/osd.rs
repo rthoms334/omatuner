@@ -808,7 +808,11 @@ impl PlayerScreen {
             shadowed_galley(&p, r.center(), centre_glyph(&p, glyph, size, color), color, layout.skip / 40.0);
             if c != Control::PlayPause {
                 let text = ctx.config.player.skip_small_s.to_string();
-                let font = FontId::new(size * 0.32, egui::FontFamily::Name(crate::theme::egui_style::FAMILY_MEDIUM.into()));
+                // Medium once `fonts::install` has bound it; egui panics on an unknown family
+                // (the first frames and headless harnesses have none), so Regular until then.
+                let medium = egui::FontFamily::Name(crate::theme::egui_style::FAMILY_MEDIUM.into());
+                let bound = ui.ctx().fonts(|f| f.definitions().families.contains_key(&medium));
+                let font = FontId::new(size * 0.32, if bound { medium } else { egui::FontFamily::Proportional });
                 let mut number = p.layout_no_wrap(text.clone(), font.clone(), color);
                 let fit = (size * 0.46 / number.mesh_bounds.width().max(1.0)).min(1.0);
                 if fit < 1.0 {
