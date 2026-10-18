@@ -240,6 +240,18 @@ pub fn set_state(conn: &Connection, id: QueueId, state: RowState, now: Timestamp
     })
 }
 
+/// Persist the resolved item and its display fields atomically with the current state.
+pub(crate) fn set_current(conn: &Connection, row: &QueueEntry, now: Timestamp) -> Result<()> {
+    atomic(conn, |c| {
+        let fp = crate::store::user::fingerprint_of(c, &row.item)?;
+        c.execute(
+            "UPDATE queue_item SET source_id=?2,kind=?3,item_key=?4,title=?5,subtitle=?6,duration_s=?7,fp=?8,orphaned_since=NULL WHERE id=?1",
+            params![row.id, row.item.source, row.item.kind.as_str(), row.item.key.as_str(), row.title, row.subtitle, row.duration_s, fp_to_json(&fp)],
+        )?;
+        set_state(c, row.id, RowState::Current, now)
+    })
+}
+
 /// "Play from the start" on a row.
 pub fn set_from_start(conn: &Connection, id: QueueId, on: bool) -> Result<()> {
     conn.execute("UPDATE queue_item SET from_start = ?2 WHERE id = ?1", params![id, on])?;

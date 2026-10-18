@@ -682,7 +682,7 @@ impl Engine {
                 }
                 Vec::new()
             }
-            Effect::Play { id, how, resume } => vec![self.play(id, how, resume).await],
+            Effect::Play { id, how, resume } => self.play(id, how, resume).await,
             Effect::PlayEpisode { id, origin } => {
                 // the PIN window may have closed during the episode before: re-read it now
                 let may = self.read(move |c, lib, view, _| episode_may_play(c, lib, view, id)).await.unwrap_or_else(|e| {
@@ -745,15 +745,32 @@ impl Engine {
         matches!(crate::playback::route(&intent, &st, &self.shared.guard(), now()), Route::Tile { tile: crate::model::TileId::A, .. })
     }
 
-    async fn play(&mut self, id: crate::model::QueueId, how: How, resume: bool) -> Input {
+    async fn play(&mut self, id: crate::model::QueueId, how: How, resume: bool) -> Vec<Input> {
         let Some(row) = self.machine.rows().iter().find(|r| r.id == id).cloned() else {
-            return Input::Resolved { id, outcome: Resolved::Gone };
+            return vec![Input::Resolved { id, outcome: Resolved::Gone }];
         };
         let (kind, source) = (row.item.kind, row.item.source);
-        let r = self.read(move |c, lib, view, cfg| resolve(c, lib, view, cfg, &row, how, resume, now())).await;
+        let r = self
+            .read(move |c, lib, view, cfg| {
+                let plan = resolve(c, lib, view, cfg, &row, how, resume, now())?;
+                let row = match &plan {
+                    Plan::Play { cmd, .. } => playing_row(c, lib, view, cfg, row, &cmd.req.media)?,
+                    Plan::Not(_) => row,
+                };
+                Ok((plan, row))
+            })
+            .await;
+        let mut inputs = Vec::new();
         let outcome = match r {
-            Ok(Plan::Play { cmd, items, kind: k, channel }) => {
+            Ok((Plan::Play { cmd, items, kind: k, channel }, row)) => {
                 if self.routes(k, channel) {
+                    let mut rows = self.machine.rows().to_vec();
+                    if let Some(stored) = rows.iter_mut().find(|r| r.id == id) {
+                        *stored = row;
+                    }
+                    // Resolved makes this row current; its state write persists these fields
+                    // in the same transaction before the engine publishes the snapshot.
+                    inputs.push(Input::Rows(rows));
                     let from = self.machine.snapshot().current;
                     tracing::info!("queue: #{} → #{id} ({}, source {source})", from.map_or("-".into(), |f| f.to_string()), kind.as_str());
                     self.deps.player.send(PlayerCommand::PlayCopy(*cmd));
@@ -763,30 +780,41 @@ impl Engine {
                     Resolved::Waits
                 }
             }
-            Ok(Plan::Not(outcome)) => outcome,
+            Ok((Plan::Not(outcome), _)) => outcome,
             Err(e) => {
                 tracing::warn!("queue: #{id}: {e}");
                 Resolved::Failed(e.to_string())
             }
         };
-        Input::Resolved { id, outcome }
+        inputs.push(Input::Resolved { id, outcome });
+        inputs
     }
 
-    /// Run a write, then re-read the list (a state change needs no re-read: the machine made it).
-    /// Facts are per row and only a pinned copy changes a row's item; a move or a removal keeps
-    /// every other row's facts.
+    /// Run a write, then re-read the list. A current row also persists its resolved display
+    /// fields and refreshes its facts; other state changes were already made by the machine.
     async fn write(&mut self, w: Write) -> Vec<Input> {
         let at = now();
-        let reload = !matches!(w, Write::State(..));
+        let playing = match &w {
+            Write::State(id, crate::queue::RowState::Current) => self.machine.rows().iter().find(|r| r.id == *id).cloned(),
+            _ => None,
+        };
+        let reload = playing.is_some() || !matches!(w, Write::State(..));
         let counts = matches!(w, Write::Remove(_));
-        let new_facts = matches!(w, Write::PinCopy(..));
+        let new_facts = playing.is_some() || matches!(w, Write::PinCopy(..));
         let r = self
             .deps
             .store
             .writer()
             .run(move |c| {
                 let n = match &w {
-                    Write::State(id, s) => crate::store::queue::set_state(c, *id, *s, at).map(|_| 0)?,
+                    Write::State(id, s) => {
+                        if let Some(row) = &playing {
+                            crate::store::queue::set_current(c, row, at)?;
+                        } else {
+                            crate::store::queue::set_state(c, *id, *s, at)?;
+                        }
+                        0
+                    }
                     Write::Move { ids, to } => crate::store::queue::move_rows(c, ids, *to).map(|_| 0)?,
                     Write::Order(ids) => crate::store::queue::reorder(c, ids).map(|_| 0)?,
                     Write::Remove(ids) => crate::store::queue::remove(c, ids)?,
@@ -1168,6 +1196,39 @@ fn episode_may_play(conn: &Connection, lib: &Library, view: ParentalView, id: cr
 enum Plan {
     Play { cmd: Box<CopyPlay>, items: Vec<ItemRef>, kind: Kind, channel: Option<ChannelId> },
     Not(Resolved),
+}
+
+/// Keep the stored episode/film labels in sync with the copy selected at play time. Use the
+/// same display fields as an add so every consumer can still guard the episode title.
+fn playing_row(
+    conn: &Connection,
+    lib: &Library,
+    view: ParentalView,
+    cfg: &Config,
+    mut row: QueueEntry,
+    media: &MediaRef,
+) -> crate::error::Result<QueueEntry> {
+    let item = match media {
+        MediaRef::Movie(id) => {
+            let movie = crate::store::vod::movie(conn, *id)?;
+            ItemRef { source: movie.source_id, kind: ItemKind::Movie, key: movie.key }
+        }
+        MediaRef::Episode(id) => {
+            let episode = crate::store::vod::episode(conn, *id)?;
+            ItemRef { source: episode.source_id, kind: ItemKind::Episode, key: episode.key }
+        }
+        _ => return Ok(row), // live slots retain the programme the user queued
+    };
+    let target = AddTarget { item, programme: None, any_copy: row.any_copy, from_start: row.from_start };
+    let by = if row.by_agent { AddedBy::Agent } else { AddedBy::App };
+    let display = new_row(conn, lib, view, target, by, cfg.interface.clock_24h, now())?
+        .map_err(|why| crate::error::Error::other(format!("Couldn't read the playing queue item: {why:?}")))?;
+    row.item = display.item;
+    row.title = display.title;
+    row.subtitle = display.subtitle;
+    row.duration_s = display.duration_s;
+    row.orphaned = false;
+    Ok(row)
 }
 
 /// Play-time resolution of a row: the copy plan (pin → latest progress → trouble last →
