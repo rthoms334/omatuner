@@ -5377,16 +5377,18 @@ every copy ("Removed from Favourites in TV and TV 2", "Marked unwatched in …",
 "… every copy". A page
 opened for one copy on purpose keeps acting on that copy, like the card that led there.
 
-**Series: episodes matched across copies.** A combined series page reads, with its own
-episodes, the progress of the other copies' episodes by (season, episode)
-(`copies::episode_progress`: a watched mark wins, else the latest progress) and shows it merged:
+**Series: episodes matched across copies.** A combined series lists the union of its copies'
+seasons and episodes by (season, episode): the page copy first, then play order, retaining each
+row's own reference for playback and actions. Progress is merged across those coordinates
+(`copies::episode_progress`: a watched mark wins, else the latest progress):
 an episode watched in TV 2's copy shows ✓ here, "Mark season watched" says *Season watched*.
-The page opens at the next episode of **the copy with the newest progress**
-(`copies::next_episode`, the same rule Play and Shift+Enter on a card use — verified), as this
-copy's episode. ✓ on an episode and "Mark season watched / unwatched" write the same episodes
+The page opens at the next episode of the union using merged progress (`copies::next_episode`,
+the same rule Play and Shift+Enter on a card use), including seasons absent from the page copy.
+✓ on an episode and "Mark season watched / unwatched" write the same episodes
 of **every copy** in one write with Undo (`copies::mark_episodes`; a copy without that episode
 is skipped; "Marked S01 watched in TV and TV 2"). Xtream series load episodes lazily: when
-another copy's aren't loaded (`copies::unloaded_series`) the page writes this copy and the
+another copy's aren't loaded (`copies::unloaded_series`) the page requests them and updates
+the union when they arrive. A pending ✓ writes this copy and the
 loaded ones **at once** (nothing is lost if the user leaves or quits) and submits
 `LoadSeriesDetails` for the others (`ui::copies::EpisodeFetch`: polls the job list and the
 database at most four times a second), shows "Loading the other copy's episodes to mark them

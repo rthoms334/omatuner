@@ -92,8 +92,8 @@ pub fn play_title(ctx: &mut UiCtx<'_>, movies: bool, item: u32, pick: Option<u32
         }
         return true;
     }
-    // a series: the episode of the copy with the newest progress (else of the copy that
-    // plays); a picked copy plays its own next episode
+    // A series continues through the union using merged progress; a picked copy plays
+    // its own next episode.
     let ids: Vec<SeriesId> = match pick {
         Some(p) => vec![p],
         None => plan.order.clone(),
@@ -207,7 +207,7 @@ fn elsewhere(plan: &CopyPlan, first: u32, next: Option<u32>, source: impl Fn(u32
     plan.order.iter().copied().find(|c| *c != first && source(*c) != own)
 }
 
-/// The command that plays an episode of the series copy `series` (the page's copy), with the
+/// The command that plays an episode of its own series copy `series`, with the
 /// same episode of the next series copy in `plan` as the fallback when its episodes are loaded.
 pub fn episode_command(
     conn: &rusqlite::Connection,
@@ -223,7 +223,7 @@ pub fn episode_command(
         VodKind::Series(id) => copies::same_episode(conn, id, episode.season, episode.episode).ok().flatten().map(MediaRef::Episode),
         VodKind::Movie(_) => None,
     };
-    let next = plan.order.iter().copied().find(|c| Some(*c) != this);
+    let next = plan.order.iter().copied().find(|c| Some(*c) != this && same(*c).is_some());
     let other = this.and_then(|t| elsewhere(plan, t, next, |c| vod.series.get(c as usize).map(|v| v.source_id)));
     let req = PlayRequest { media: MediaRef::Episode(episode.id), zap: None, origin, resume, immediate: true };
     PlayerCommand::PlayCopy(CopyPlay { req, fallback: next.and_then(same), elsewhere: other.and_then(same), start_at: None })
@@ -585,6 +585,21 @@ pub fn mark_episodes(ctx: &UiCtx<'_>, copies: Vec<SeriesId>, eps: Vec<(u32, u32)
     let text = format!("Marked {} {} in {}", episodes_label(&eps), if on { "watched" } else { "unwatched" }, series_playlists(ctx.lib, &copies));
     let now = ctx.now;
     write_with_undo(ctx, DataScope::Progress, text, move |c| copies::mark_episodes(c, &copies, &eps, on, now).map(|(u, _)| u));
+}
+
+/// Mark every row in a season, including rows learned while a combined mark waited for
+/// lazy copies to load (DESIGN §29.16). Read the coordinates on the writer, then use the same
+/// per-copy writes and Undo as an episode mark.
+pub fn mark_season(ctx: &UiCtx<'_>, ids: Vec<SeriesId>, season: u32, on: bool) {
+    if ids.is_empty() {
+        return;
+    }
+    let text = format!("Marked S{season:02} {} in {}", if on { "watched" } else { "unwatched" }, series_playlists(ctx.lib, &ids));
+    let now = ctx.now;
+    write_with_undo(ctx, DataScope::Progress, text, move |c| {
+        let eps = copies::episodes(c, &ids, Some(season))?.into_iter().map(|e| (e.season, e.episode)).collect::<Vec<_>>();
+        copies::mark_episodes(c, &ids, &eps, on, now).map(|(u, _)| u)
+    });
 }
 
 /// "S01E03", "S01" (a season's episodes), or "3 episodes".

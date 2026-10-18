@@ -475,7 +475,7 @@ pub fn plan_play(q: &Q, p: &Play) -> Out<PlayStep> {
                         },
                     ));
                 }
-                let Some((_, ep)) = crate::store::copies::next_episode(q.conn, &q.series_copies(idx))? else {
+                let Some((_, ep)) = crate::store::copies::next_episode(q.conn, &q.series_copies(idx)?)? else {
                     let lazy = q.lib.source(v.source_id).is_some_and(|s| s.kind == crate::model::SourceKind::Xtream)
                         && crate::store::vod::series(q.conn, id)?.details_loaded_at.is_none();
                     if lazy {

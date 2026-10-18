@@ -24,7 +24,7 @@ use super::home::kit::{self, Loader};
 use super::movie_detail::{DetailHeader, NO_DESCRIPTION, detail_bar, fraction, resumable, resume_or_play, sparse_meta};
 use crate::jobs::{JobEvent, JobKind};
 use crate::keymap::{Action, KeyContext};
-use crate::model::{Episode, EpisodeId, ItemKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Series, SeriesId, SourceKind, VodKind, WatchProgress};
+use crate::model::{Episode, EpisodeId, ItemKind, ItemRef, MediaRef, PlayOrigin, Series, SeriesId, SourceKind, VodKind, WatchProgress};
 use crate::msg::{AppEvent, DataScope};
 use crate::player::PlayerEvent;
 use crate::theme::{SpaceToken, TypeToken};
@@ -70,17 +70,17 @@ struct Data {
     /// Season numbers in order (from the season rows and the episodes).
     seasons: Vec<u32>,
     episodes: Vec<Episode>,
-    /// This copy's own progress, by episode.
-    progress: HashMap<ItemKey, WatchProgress>,
+    /// Each row's own progress, by episode id (keys can repeat across playlists).
+    progress: HashMap<EpisodeId, WatchProgress>,
     next: Option<EpisodeId>,
     /// The other copies of the series (a stack while copies combine, DESIGN §29.14).
     others: Vec<SeriesId>,
-    /// Of those, the ones whose episodes aren't loaded yet (Xtream loads them lazily).
+    /// Combined copies whose episodes are not loaded yet (including the page copy).
     unloaded: Vec<SeriesId>,
     /// Progress matched across the copies by season and episode (P3): a copy's watched mark
     /// wins, else the latest progress — what a combined page shows.
-    across: HashMap<ItemKey, WatchProgress>,
-    /// The next episode from the copy with the newest progress, as this copy's episode.
+    across: HashMap<EpisodeId, WatchProgress>,
+    /// The next episode in the union, with progress matched across copies.
     next_across: Option<EpisodeId>,
     /// An unfinished episode in another copy, including episodes absent from this copy.
     continuing_others: bool,
@@ -93,47 +93,26 @@ impl Data {
 }
 
 fn load(c: &rusqlite::Connection, id: SeriesId, others: Vec<SeriesId>) -> crate::error::Result<Data> {
-    use crate::store::{user, vod};
+    use crate::store::{copies, user, vod};
     let series = vod::series(c, id)?;
-    let mut seasons: Vec<u32> = vod::seasons(c, id)?.into_iter().map(|s| s.number).collect();
-    let episodes = vod::episodes(c, id, None)?;
-    for e in &episodes {
-        if !seasons.contains(&e.season) {
-            seasons.push(e.season);
-        }
-    }
+    let all: Vec<SeriesId> = std::iter::once(id).chain(others.iter().copied()).collect();
+    let episodes = copies::episodes(c, &all, None)?;
+    let mut seasons: Vec<u32> = copies::seasons(c, &all)?.into_iter().map(|s| s.number).collect();
+    seasons.extend(episodes.iter().map(|e| e.season));
     seasons.sort_unstable();
     seasons.dedup();
     let mut progress = HashMap::new();
     for e in &episodes {
         if let Some(p) = user::progress(c, &episode_ref(e))? {
-            progress.insert(e.key.clone(), p);
+            progress.insert(e.id, p);
         }
     }
     let next = vod::next_episode(c, id)?.map(|e| e.id);
-    let continuing_others = crate::store::copies::series_in_continue_watching(c, &others)?;
-    let mut across = progress.clone();
-    let (mut next_across, mut unloaded) = (next, Vec::new());
-    if !others.is_empty() {
-        use crate::store::copies;
-        unloaded = copies::unloaded_series(c, &others)?;
-        let theirs = copies::episode_progress(c, &others)?;
-        for e in &episodes {
-            let Some(p) = theirs.get(&(e.season, e.episode)) else { continue };
-            match across.get(&e.key) {
-                Some(own) if (own.finished, own.updated_at) >= (p.finished, p.updated_at) => {}
-                _ => {
-                    across.insert(e.key.clone(), p.clone());
-                }
-            }
-        }
-        // the copy with the newest progress decides; its episode as this copy's
-        let all: Vec<SeriesId> = std::iter::once(id).chain(others.iter().copied()).collect();
-        if let Some((s, ep)) = copies::next_episode(c, &all)? {
-            next_across =
-                if s == id { Some(ep.id) } else { episodes.iter().find(|x| (x.season, x.episode) == (ep.season, ep.episode)).map(|x| x.id).or(next) };
-        }
-    }
+    let continuing_others = copies::series_in_continue_watching(c, &others)?;
+    let unloaded = if others.is_empty() { Vec::new() } else { copies::unloaded_series(c, &all)? };
+    let merged = copies::episode_progress(c, &all)?;
+    let across = episodes.iter().filter_map(|e| merged.get(&(e.season, e.episode)).map(|p| (e.id, p.clone()))).collect();
+    let next_across = copies::next_episode(c, &all)?.map(|(_, e)| e.id);
     Ok(Data { series, seasons, episodes, progress, next, others, unloaded, across, next_across, continuing_others })
 }
 
@@ -151,6 +130,7 @@ pub struct SeriesDetailScreen {
     id: Option<SeriesId>,
     data: Option<Data>,
     loader: Option<Loader<Data>>,
+    loading_others: Vec<SeriesId>,
     missing: bool,
     details_requested: Option<SeriesId>,
     section: Section,
@@ -168,6 +148,8 @@ pub struct SeriesDetailScreen {
     /// The ✓ marks waiting for them, each with the copies it still has to write (so leaving
     /// for another series never redirects them).
     pending_marks: Vec<PendingMark>,
+    /// Copies already requested for this page; failed loads are not retried on every refresh.
+    details_copies_requested: Vec<SeriesId>,
 }
 
 /// A combined ✓ whose copies `copies` (episodes not loaded when it was made) are written once
@@ -177,34 +159,37 @@ pub struct SeriesDetailScreen {
 struct PendingMark {
     copies: Vec<SeriesId>,
     eps: Vec<(u32, u32)>,
+    season: Option<u32>,
     on: bool,
 }
 
 impl SeriesDetailScreen {
-    fn reload(&mut self, ctx: &UiCtx<'_>) {
+    fn reload(&mut self, ctx: &mut UiCtx<'_>) {
         let Some(id) = self.id else { return };
-        // the other copies of the series while copies combine (their episodes match by
-        // season and number)
-        let others: Vec<SeriesId> = crate::ui::stacks::index_of(ctx.lib, VodKind::Series(id))
-            .map(|i| crate::ui::stacks::copies_of(ctx.lib, ctx.config, false, i))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|c| match ctx.lib.vod.series.get(c as usize)?.kind {
-                VodKind::Series(s) if s != id => Some(s),
-                _ => None,
-            })
-            .collect();
+        self.copies.reload(ctx);
+        self.copies.sync(ctx, VodKind::Series(id));
+        let others = self.other_series(ctx);
+        self.loading_others = others.clone();
         self.loader = Some(Loader::start(ctx, move |c| load(c, id, others)));
     }
 
+    fn other_series(&self, ctx: &UiCtx<'_>) -> Vec<SeriesId> {
+        let page = self.copies.page().filter(|p| ctx.lib.vod.series.get(*p as usize).map(|v| v.kind) == self.id.map(VodKind::Series));
+        if self.copies.combined() {
+            page.map(|p| self.copies.plan().series_ids(&ctx.lib.vod, p)).unwrap_or_default().into_iter().filter(|s| Some(*s) != self.id).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The progress the page shows by episode: matched across the copies on a combined page.
-    fn shown_progress(&self) -> Option<&HashMap<ItemKey, WatchProgress>> {
+    fn shown_progress(&self) -> Option<&HashMap<EpisodeId, WatchProgress>> {
         let d = self.data.as_ref()?;
         Some(if self.copies.combined() { &d.across } else { &d.progress })
     }
 
     fn finished(&self, e: &Episode) -> bool {
-        self.shown_progress().and_then(|p| p.get(&e.key)).is_some_and(|p| p.finished)
+        self.shown_progress().and_then(|p| p.get(&e.id)).is_some_and(|p| p.finished)
     }
 
     fn season_number(&self) -> Option<u32> {
@@ -223,7 +208,7 @@ impl SeriesDetailScreen {
         use crate::ui::item_menu::Target;
         let series = self.id?;
         Some(match self.focused_episode() {
-            Some(e) => Target::Episode { series, episode: e.id },
+            Some(e) => Target::Episode { series: e.series_id, episode: e.id },
             None => Target::Series(series),
         })
     }
@@ -278,14 +263,14 @@ impl SeriesDetailScreen {
     }
 
     fn play(&mut self, ctx: &mut UiCtx<'_>, e: &Episode, from_start: bool, alt: bool) {
-        if self.locked(ctx) {
+        if self.locked(ctx) || ctx.lib.vod.find(VodKind::Series(e.series_id)).is_some_and(|v| v.locked) && !kit::unlocked(ctx) {
             kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This series is locked");
             return;
         }
         // several copies: the same episode of the next copy is the fallback (DESIGN §29.15)
-        if let Some(id) = self.id.filter(|_| self.copies.is_stacked()) {
+        if self.copies.is_stacked() {
             let plan = self.copies.plan().clone();
-            crate::ui::copies::play_episode(ctx, &plan, id, e, from_start, true);
+            crate::ui::copies::play_episode(ctx, &plan, e.series_id, e, from_start, true);
             return;
         }
         if from_start {
@@ -332,7 +317,7 @@ impl SeriesDetailScreen {
 
     /// The copy Play uses when it isn't this page's (DESIGN §29.14).
     fn other_copy(&self) -> Option<u32> {
-        self.copies.plays().filter(|c| Some(*c) != self.copies.page())
+        self.copies.chosen().filter(|c| Some(*c) != self.copies.page())
     }
 
     /// Play another copy: the episode its page would open at.
@@ -364,7 +349,7 @@ impl SeriesDetailScreen {
         !eps.is_empty() && eps.iter().all(|e| self.finished(e))
     }
 
-    fn mark(&mut self, ctx: &mut UiCtx<'_>, eps: Vec<Episode>, on: bool) {
+    fn mark(&mut self, ctx: &mut UiCtx<'_>, eps: Vec<Episode>, season: Option<u32>, on: bool) {
         if !on {
             crate::ui::downloads::offer_cleanup(ctx, &eps.iter().map(episode_ref).collect::<Vec<_>>());
         }
@@ -377,7 +362,7 @@ impl SeriesDetailScreen {
             for e in &eps {
                 for map in [&mut d.progress, &mut d.across] {
                     if on {
-                        let p = map.entry(e.key.clone()).or_insert_with(|| WatchProgress {
+                        let p = map.entry(e.id).or_insert_with(|| WatchProgress {
                             item: episode_ref(e),
                             position_s: 0.0,
                             duration_s: None,
@@ -388,7 +373,7 @@ impl SeriesDetailScreen {
                         });
                         p.finished = true;
                     } else {
-                        map.remove(&e.key);
+                        map.remove(&e.id);
                     }
                 }
             }
@@ -402,10 +387,14 @@ impl SeriesDetailScreen {
             // this copy and the loaded ones now; the unloaded ones once their episodes are in
             let (later, now): (Vec<SeriesId>, Vec<SeriesId>) =
                 std::iter::once(d.series.id).chain(d.others.iter().copied()).partition(|s| d.unloaded.contains(s));
-            crate::ui::copies::mark_episodes(ctx, now, keys.clone(), on);
+            if let Some(season) = season {
+                crate::ui::copies::mark_season(ctx, now, season, on);
+            } else {
+                crate::ui::copies::mark_episodes(ctx, now, keys.clone(), on);
+            }
             if !later.is_empty() {
                 self.fetch.start(ctx, &later);
-                self.pending_marks.push(PendingMark { copies: later, eps: keys, on });
+                self.pending_marks.push(PendingMark { copies: later, eps: keys, season, on });
             }
             return;
         }
@@ -419,7 +408,11 @@ impl SeriesDetailScreen {
         let mut missing: Vec<SeriesId> = Vec::new();
         for m in std::mem::take(&mut self.pending_marks) {
             let (lost, ok): (Vec<SeriesId>, Vec<SeriesId>) = m.copies.into_iter().partition(|s| failed.contains(s));
-            crate::ui::copies::mark_episodes(ctx, ok, m.eps, m.on);
+            if let Some(season) = m.season {
+                crate::ui::copies::mark_season(ctx, ok, season, m.on);
+            } else {
+                crate::ui::copies::mark_episodes(ctx, ok, m.eps, m.on);
+            }
             for s in lost {
                 if !missing.contains(&s) {
                     missing.push(s);
@@ -461,7 +454,7 @@ impl SeriesDetailScreen {
             Btn::SeasonWatched => {
                 let on = !self.season_watched();
                 let eps = self.current_episodes().into_iter().cloned().collect();
-                self.mark(ctx, eps, on);
+                self.mark(ctx, eps, self.season_number(), on);
             }
             Btn::RemoveContinue => self.remove_continue(ctx),
         }
@@ -483,10 +476,10 @@ impl SeriesDetailScreen {
         self.scroll_target = Some(ScrollTarget::Cursor);
     }
 
-    /// After an episode ended: the episode after `key` (next in season order), if any.
-    fn after(&self, key: &ItemKey) -> Option<Episode> {
+    /// After an episode ended: the episode after `id` (next in season order), if any.
+    fn after(&self, id: EpisodeId) -> Option<Episode> {
         let d = self.data.as_ref()?;
-        let i = d.episodes.iter().position(|e| &e.key == key)?;
+        let i = d.episodes.iter().position(|e| e.id == id)?;
         d.episodes.get(i + 1).cloned()
     }
 }
@@ -513,6 +506,7 @@ impl Screen for SeriesDetailScreen {
         };
         if self.id != Some(*id) {
             self.data = None;
+            self.details_copies_requested.clear();
             self.section = Section::Episodes;
             self.season = 0;
             self.ep = 0;
@@ -541,7 +535,6 @@ impl Screen for SeriesDetailScreen {
         match ev {
             AppEvent::Data(DataScope::VodDetails | DataScope::Progress | DataScope::Overrides | DataScope::Vod | DataScope::All) => {
                 self.reload(ctx);
-                self.copies.reload(ctx);
             }
             AppEvent::Job(JobEvent::Finished { kind: JobKind::LoadSeriesDetails(s), outcome: Err(msg), .. }) if Some(*s) == self.id => {
                 ctx.toast(crate::msg::Toast::error(format!("Couldn't load the episodes: {}", crate::redact::redact(msg))));
@@ -552,7 +545,7 @@ impl Screen for SeriesDetailScreen {
                 // (the "Next episode in 10 s" card is the fullscreen player's, DESIGN §13.6)
                 if let Some(ended) = &shown {
                     self.reload(ctx);
-                    if let Some(n) = self.after(&ended.key) {
+                    if let Some(n) = self.after(ended.id) {
                         self.select_episode(n.id);
                     }
                 }
@@ -634,7 +627,7 @@ impl Screen for SeriesDetailScreen {
             Action::MarkWatched => {
                 if let Some(e) = self.focused_episode() {
                     let on = !self.finished(&e);
-                    self.mark(ctx, vec![e], on);
+                    self.mark(ctx, vec![e], None, on);
                 }
             }
             Action::Remove if self.section == Section::Buttons => self.remove_continue(ctx),
@@ -747,11 +740,11 @@ impl Screen for SeriesDetailScreen {
             }
             OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)) => {
                 let eps = self.current_episodes().into_iter().cloned().collect();
-                self.mark(ctx, eps, true);
+                self.mark(ctx, eps, self.season_number(), true);
             }
             OverlayResult::Chosen(Action::Digit(MENU_SEASON_UNWATCHED)) => {
                 let eps = self.current_episodes().into_iter().cloned().collect();
-                self.mark(ctx, eps, false);
+                self.mark(ctx, eps, self.season_number(), false);
             }
             OverlayResult::Chosen(
                 a @ (Action::MarkWatched | Action::ToggleFavourite | Action::AddToList | Action::Rename | Action::ToggleLock | Action::ToggleHidden),
@@ -774,22 +767,36 @@ impl Screen for SeriesDetailScreen {
     fn ui(&mut self, ui: &mut egui::Ui, ctx: &mut UiCtx<'_>) {
         if let Some(id) = self.id.filter(|_| !self.missing) {
             self.copies.sync(ctx, VodKind::Series(id));
+            // A copy-plan read can be deferred by the UI budget, or a setting can change
+            // without a data event. Refresh once its new membership/order is available.
+            if self.other_series(ctx) != self.loading_others {
+                self.reload(ctx);
+            }
         }
         if let Some(failed) = self.fetch.poll(ctx, ui.ctx()) {
             self.finish_pending_marks(ctx, failed);
+            self.reload(ctx);
         }
         match kit::poll(&mut self.loader) {
             Some(Ok(d)) => {
                 let lazy = d.series.details_loaded_at.is_none() && ctx.lib.source(d.series.source_id).is_some_and(|s| s.kind == SourceKind::Xtream);
                 if lazy && self.details_requested != Some(d.series.id) {
                     self.details_requested = Some(d.series.id);
-                    ctx.services.jobs.submit(JobKind::LoadSeriesDetails(d.series.id));
+                    if !d.unloaded.contains(&d.series.id) {
+                        ctx.services.jobs.submit(JobKind::LoadSeriesDetails(d.series.id));
+                    }
+                }
+                let unloaded: Vec<_> = d.unloaded.iter().copied().filter(|s| !self.details_copies_requested.contains(s)).collect();
+                if !unloaded.is_empty() {
+                    self.fetch.start(ctx, &unloaded);
+                    self.details_copies_requested.extend(unloaded);
                 }
                 let target = self.episode_pending.and_then(|(s, n)| d.episodes.iter().find(|e| (e.season, e.episode) == (s, n)).map(|e| e.id));
                 let next = target.or(if self.copies.combined() { d.next_across } else { d.next });
                 let had_episodes = !d.episodes.is_empty();
+                let copies_loaded = d.unloaded.is_empty();
                 self.data = Some(d);
-                if self.position_pending && had_episodes && (self.episode_pending.is_none() || target.is_some() || !lazy) {
+                if self.position_pending && had_episodes && (self.episode_pending.is_none() || target.is_some() || !lazy && copies_loaded) {
                     self.position_pending = false;
                     self.episode_pending = None;
                     if let Some(n) = next {
@@ -876,7 +883,7 @@ impl Screen for SeriesDetailScreen {
         let shown = self.shown_progress().cloned().unwrap_or_default();
         let fetching = self.fetch.busy().then(|| self.fetch.progress());
         // a combined page resumes from whichever copy is furthest along (`shown`)
-        let resume_at = next.as_ref().and_then(|e| shown.get(&e.key)).filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s);
+        let resume_at = next.as_ref().and_then(|e| shown.get(&e.id)).filter(|p| resumable(p, ctx.config.player.resume_min_s)).map(|p| p.position_s);
         let season_watched = self.season_watched();
         let loading = data.episodes.is_empty() && (self.loader.is_some() || !sparse && s.details_loaded_at.is_none());
         let (section, btn_focus, season_idx, ep_idx) = (self.section, self.btn, self.season, self.ep);
@@ -886,7 +893,10 @@ impl Screen for SeriesDetailScreen {
         // several copies: Play names the playlist it plays from; another copy opens at its own
         // next episode
         let other = self.other_copy();
-        let plays_from = self.copies.plays().and_then(|c| self.copies.playlist(ctx, c)).map(str::to_owned);
+        let plays_from = other
+            .and_then(|c| self.copies.playlist(ctx, c))
+            .map(str::to_owned)
+            .or_else(|| next.as_ref().and_then(|e| ctx.lib.source(e.source_id)).map(|s| s.name.clone()).filter(|_| self.copies.is_stacked()));
         let mut copy_click = None;
         let mut clicked_btn = None;
         let mut clicked_season = None;
@@ -982,9 +992,13 @@ impl Screen for SeriesDetailScreen {
                     let what =
                         if n == 1 { "the other copy's episodes".to_owned() } else { format!("the episodes of {n} other copies ({done} done)") };
                     ui.label(
-                        egui::RichText::new(format!("Loading {what} to mark them too…"))
-                            .size(theme.font(TypeToken::BodySmall))
-                            .color(t.text_secondary),
+                        egui::RichText::new(if self.pending_marks.is_empty() {
+                            format!("Loading {what}…")
+                        } else {
+                            format!("Loading {what} to mark them too…")
+                        })
+                        .size(theme.font(TypeToken::BodySmall))
+                        .color(t.text_secondary),
                     );
                 });
             }
@@ -1076,7 +1090,7 @@ impl Screen for SeriesDetailScreen {
             for (i, e) in data.season_episodes(season).into_iter().enumerate() {
                 // the spoiler guard's view of the episode (title and plot after next-up)
                 let e = &*spoilers.episode(&series_norm, e);
-                let p = shown.get(&e.key);
+                let p = shown.get(&e.id);
                 let watched = p.is_some_and(|p| p.finished);
                 let cursor = section == Section::Episodes && i == ep_idx;
                 let selected = section != Section::Episodes && i == ep_idx;
@@ -1133,7 +1147,7 @@ impl Screen for SeriesDetailScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SourceId, StreamLocator};
+    use crate::model::{ItemKey, SourceId, StreamLocator};
 
     fn ep(id: i64, season: u32, n: u32) -> Episode {
         Episode {
@@ -1205,6 +1219,145 @@ mod tests {
     fn ep_progress(t: &crate::ui::testing::TestUi, key: &str) -> Option<WatchProgress> {
         let item = ItemRef { source: SourceId(1), kind: ItemKind::Episode, key: ItemKey(key.into()) };
         crate::store::user::progress(&t.services().store.reader().unwrap(), &item).unwrap()
+    }
+
+    /// DESIGN §29.16: the page copy keeps S1; S2 comes from the next available copy.
+    #[test]
+    fn combined_landman_lists_and_plays_the_union() {
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, testkit::landman);
+        let own = crate::store::vod::episodes(&t.db, ids[0], None).unwrap();
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::SeriesDetail(ids[0]));
+        until(&mut h, "both seasons", |h| has_label(h, "Season 2"));
+        let d = h.state().s.data.as_ref().unwrap();
+        assert_eq!(d.seasons, [1, 2]);
+        assert_eq!(d.season_episodes(1), own.iter().collect::<Vec<_>>(), "page rows stay identical");
+        assert_eq!(d.season_episodes(2).len(), 10);
+        let next = h.state().s.next_episode().unwrap();
+        assert_eq!((next.series_id, next.season, next.episode), (ids[1], 2, 1));
+        assert_eq!(h.state().s.focused_episode(), Some(next.clone()));
+        assert!(h.state().s.finished(&own[0]));
+        assert!(!h.state().s.finished(&next));
+        assert!(
+            matches!(h.state().s.feature_target(), Some(crate::ui::item_menu::Target::Episode { series, episode }) if series == next.series_id && episode == next.id)
+        );
+        // Inspect the real playback command through the resume prompt, including fallback:
+        // the first plan copy (4K) lacks S2, so the other full copy must be tried.
+        seed(&mut h.state_mut().t, move |c| {
+            let e = crate::store::vod::episodes(c, ids[2], Some(2))?.remove(0);
+            crate::store::user::save_progress(
+                c,
+                &WatchProgress {
+                    item: episode_ref(&e),
+                    position_s: 600.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 50,
+                    finished: false,
+                    title: e.title,
+                    fingerprint: Default::default(),
+                },
+            )
+        });
+        for button in [false, true] {
+            h.state_mut().nav();
+            h.state_mut().s.section = if button { Section::Buttons } else { Section::Episodes };
+            h.state_mut().act(Action::Activate);
+            let nav = h.state_mut().nav();
+            let Some(NavRequest::Open(OverlayRequest::Resume(spec))) = nav.last() else { panic!("{nav:?}") };
+            let copy = spec.copy.as_ref().unwrap();
+            assert_eq!(spec.position_s, 600.0);
+            assert_eq!(copy.req.media, MediaRef::Episode(next.id));
+            assert_eq!(copy.start_at, Some(600.0));
+            let fallback = crate::store::copies::same_episode(&h.state().t.db, ids[2], 2, 1).unwrap().unwrap();
+            assert_eq!(copy.fallback, Some(MediaRef::Episode(fallback)));
+        }
+        // The season action covers both full copies, while the page copy has no S2 rows.
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_SEASON_WATCHED)));
+        h.state_mut().undo_toast().expect("season mark completed");
+        for id in ids {
+            for e in crate::store::vod::episodes(&h.state().t.db, id, Some(2)).unwrap() {
+                assert!(crate::store::user::progress(&h.state().t.db, &episode_ref(&e)).unwrap().unwrap().finished);
+            }
+        }
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_SEASON_UNWATCHED)));
+        h.state_mut().undo_toast().expect("season unmark completed");
+        for id in ids {
+            for e in crate::store::vod::episodes(&h.state().t.db, id, Some(2)).unwrap() {
+                assert!(crate::store::user::progress(&h.state().t.db, &episode_ref(&e)).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn landman_page_rows_win_over_a_pin_and_progress_keys_do_not_collide() {
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let ids = testkit::landman(c)?;
+            let page = crate::store::vod::series(c, ids[0])?;
+            let pinned = crate::store::vod::series(c, ids[2])?;
+            let r = |s: &Series| ItemRef { source: s.source_id, kind: ItemKind::Series, key: s.key.clone() };
+            crate::store::copies::pin(c, &r(&pinned), &[r(&page), r(&pinned)], true, 1)?;
+            // Provider keys are unique only within a playlist. S2E1's key can be the
+            // same as the page copy's S1E1 without sharing its watched mark.
+            c.execute("UPDATE episode SET key='other-' || key WHERE series_id=?1", [ids[2]])?;
+            let key = crate::store::vod::episodes(c, ids[0], Some(1))?.remove(0).key;
+            c.execute("UPDATE episode SET key=?1 WHERE series_id=?2 AND season=2 AND episode=1", rusqlite::params![key.as_str(), ids[2]])?;
+            Ok(ids)
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::SeriesDetail(ids[0]));
+        until(&mut h, "pinned copy's extra season", |h| has_label(h, "Season 2"));
+        let d = h.state().s.data.as_ref().unwrap();
+        assert!(d.season_episodes(1).iter().all(|e| e.series_id == ids[0]));
+        assert!(d.season_episodes(2).iter().all(|e| e.series_id == ids[2]));
+        let (first, next) = (&d.episodes[0], &d.episodes[10]);
+        assert_eq!(first.key, next.key);
+        assert!(h.state().s.finished(first));
+        assert!(!h.state().s.finished(next));
+        assert_eq!(h.state().s.next_episode().unwrap().id, next.id);
+    }
+
+    #[test]
+    fn uncombined_landman_keeps_only_its_own_episodes() {
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, testkit::landman);
+        std::sync::Arc::make_mut(&mut t.config).interface.same_title = crate::config::SameTitle::ShowEach;
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::SeriesDetail(ids[0]));
+        until(&mut h, "own season", |h| has_label(h, "Season 1"));
+        let d = h.state().s.data.as_ref().unwrap();
+        assert_eq!(d.seasons, [1]);
+        assert_eq!(d.episodes.len(), 10);
+        assert!(d.episodes.iter().all(|e| e.series_id == ids[0]));
+    }
+
+    #[test]
+    fn combined_landman_loads_missing_copies_and_refreshes_the_union() {
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let ids = testkit::landman(c)?;
+            c.execute_batch("CREATE TEMP TABLE later_episodes AS SELECT * FROM episode WHERE season=2; DELETE FROM episode WHERE season=2;")?;
+            for id in &ids[1..] {
+                c.execute("DELETE FROM episode WHERE series_id=?1", [id])?;
+                c.execute("UPDATE series SET details_at=NULL WHERE id=?1", [id])?;
+            }
+            c.execute("UPDATE source SET kind='xtream'", [])?;
+            Ok(ids)
+        });
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::SeriesDetailAt { series: ids[0], season: 2, episode: 3 });
+        until(&mut h, "other copies requested", |h| h.state().s.details_copies_requested.len() == 2);
+        assert!(h.state().s.position_pending);
+        seed(&mut h.state_mut().t, |c| {
+            c.execute_batch("INSERT INTO episode SELECT * FROM later_episodes; UPDATE series SET details_at=1;")?;
+            Ok(())
+        });
+        h.state().t.services().bus.send(AppEvent::Data(DataScope::VodDetails));
+        until(&mut h, "arriving season", |h| {
+            has_label(h, "Season 2") && h.state().s.focused_episode().is_some_and(|e| (e.season, e.episode) == (2, 3))
+        });
+        assert_eq!(h.state().s.current_episodes().len(), 10);
     }
 
     #[test]
@@ -1391,8 +1544,8 @@ mod tests {
         assert_eq!((s.season, s.ep), (0, 0));
         s.set_season(9);
         assert_eq!(s.season, 1, "clamped to the last season");
-        assert_eq!(s.after(&ItemKey("e2".into())).map(|e| e.id), Some(EpisodeId(3)), "the next episode crosses seasons");
-        assert!(s.after(&ItemKey("e5".into())).is_none());
+        assert_eq!(s.after(EpisodeId(2)).map(|e| e.id), Some(EpisodeId(3)), "the next episode crosses seasons");
+        assert!(s.after(EpisodeId(5)).is_none());
     }
 
     /// A series in two playlists (DESIGN §29.14): its page has the Copies section between the
@@ -1591,7 +1744,8 @@ mod tests {
             Ok((a, b, ids[0], ids[1], bravo))
         });
         let bravo_episodes = move |c: &mut rusqlite::Connection| {
-            for e in 1..=2 {
+            // This copy has an extra row the page could not know before loading it.
+            for e in 1..=3 {
                 c.execute(
                     "INSERT INTO episode(series_id, source_id, key, season, episode, title, duration_s, stream) VALUES (?1, ?2, ?3, 1, ?4, 'E', 2700, '{\"t\":\"url\",\"url\":\"http://127.0.0.1:9/x.mp4\"}')",
                     rusqlite::params![bravo, b, format!("m3u:named-ep0-{e}"), e],
@@ -1643,7 +1797,7 @@ mod tests {
         assert!(h.state().s.fetch.busy());
         h.state_mut().enter(Route::SeriesDetail(heat));
         seed(&mut h.state_mut().t, bravo_episodes);
-        until(&mut h, "Bravo's season marked", |h| !h.state().s.fetch.busy() && (1..=2).all(|n| named_ep(h, b, n).is_some_and(|p| p.finished)));
+        until(&mut h, "Bravo's season marked", |h| !h.state().s.fetch.busy() && (1..=3).all(|n| named_ep(h, b, n).is_some_and(|p| p.finished)));
         let heat_rows: i64 = h
             .state()
             .t
@@ -1698,7 +1852,7 @@ mod tests {
         let d = s.data.as_mut().unwrap();
         for e in d.episodes.clone().iter().filter(|e| e.season == 1) {
             d.progress.insert(
-                e.key.clone(),
+                e.id,
                 WatchProgress {
                     item: episode_ref(e),
                     position_s: 0.0,

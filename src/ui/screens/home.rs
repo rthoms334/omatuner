@@ -1669,7 +1669,7 @@ pub(crate) mod testkit {
     use crate::error::Result;
     use crate::jobs::{JobEvent, JobOutcome};
     use crate::keymap::Action;
-    use crate::model::{ChannelId, MovieId, SeriesId, SourceId, Timestamp};
+    use crate::model::{ChannelId, ItemKind, ItemRef, MovieId, SeriesId, SourceId, Timestamp};
     use crate::msg::AppEvent;
     use crate::ui::testing::TestUi;
     use crate::ui::{NavRequest, Route, Screen};
@@ -1684,6 +1684,11 @@ pub(crate) mod testkit {
     }
 
     impl<S: Screen> App<S> {
+        /// Continue the same profile on another screen, retaining the rig's guard.
+        pub fn into_parts(self) -> (TestUi, MutexGuard<'static, ()>) {
+            (self.t, self._one)
+        }
+
         pub fn act(&mut self, a: Action) -> bool {
             // a toast's Undo is the app's, whatever screen shows (`ui::copies::undo`)
             if let Action::Undo(n) = a {
@@ -2065,6 +2070,46 @@ pub(crate) mod testkit {
         crate::store::titles::refresh_source(&tx, src)?;
         tx.commit()?;
         Ok(ids)
+    }
+
+    /// Landman's three English copies: the 4K page has S1; the other two also have S2.
+    pub(crate) fn landman(c: &mut Connection) -> Result<[SeriesId; 3]> {
+        let tv = source(c, "TV")?;
+        let tv2 = source(c, "TV 2")?;
+        let a = named_series(c, tv, &[("EN Landman [4k]", "Landman"), ("EN Landman", "Landman")], 10)?;
+        let b = named_series(c, tv2, &[("Landman (US)", "Landman")], 10)?[0];
+        for (id, src) in [(a[1], tv), (b, tv2)] {
+            // No season row: an episode-only season must also contribute its header.
+            for n in 1..=10 {
+                c.execute(
+                    "INSERT INTO episode(series_id, source_id, key, season, episode, title, duration_s, stream)
+                     VALUES (?1, ?2, ?3, 2, ?4, ?5, 2700, '{\"t\":\"url\",\"url\":\"http://127.0.0.1:9/s2.mp4\"}')",
+                    params![id, src, format!("s2-{n}"), n, format!("Copy {} S2E{n}", id.0)],
+                )?;
+            }
+        }
+        for &id in &[a[0], a[1], b] {
+            c.execute("UPDATE series SET year=2024, tmdb_id=157741 WHERE id=?1", [id])?;
+        }
+        for src in [tv, tv2] {
+            crate::store::titles::refresh_source(c, src)?;
+        }
+        let eps = crate::store::vod::episodes(c, a[0], None)?;
+        for e in eps {
+            crate::store::user::save_progress(
+                c,
+                &crate::model::WatchProgress {
+                    item: ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key },
+                    position_s: 2700.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 100 + i64::from(e.episode),
+                    finished: true,
+                    title: e.title,
+                    fingerprint: Default::default(),
+                },
+            )?;
+        }
+        Ok([a[0], a[1], b])
     }
 
     /// `n` series "Series {i}" with `seasons` × `episodes` episodes (details loaded).

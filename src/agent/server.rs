@@ -497,9 +497,11 @@ impl Inner {
 
     async fn details(self: &Arc<Self>, p: super::proto::Details) -> Out<serde_json::Value> {
         let again = p.clone();
-        let (mut out, job) = self.run(true, move |q| query::details(q, &p)).await?;
-        if let Some(job) = job {
-            self.jobs.submit(job);
+        let (mut out, jobs) = self.run(true, move |q| query::details(q, &p)).await?;
+        if !jobs.is_empty() {
+            for job in jobs {
+                self.jobs.submit(job);
+            }
             let deadline = Instant::now() + DETAILS_WAIT;
             while out.details_pending && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -548,8 +550,13 @@ impl Inner {
                     let media = match play.target {
                         super::PlayTarget::Media(m) => m,
                         super::PlayTarget::Series(id) => {
-                            let copies =
-                                q.lib.vod.index_of(crate::model::VodKind::Series(id)).map(|i| q.series_copies(i)).unwrap_or_else(|| vec![id]);
+                            let copies = q
+                                .lib
+                                .vod
+                                .index_of(crate::model::VodKind::Series(id))
+                                .map(|i| q.series_copies(i))
+                                .transpose()?
+                                .unwrap_or_else(|| vec![id]);
                             let Some((_, ep)) = crate::store::copies::next_episode(q.conn, &copies)? else { return Ok(None) };
                             crate::model::MediaRef::Episode(ep.id)
                         }

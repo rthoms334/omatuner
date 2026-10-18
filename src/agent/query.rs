@@ -495,17 +495,26 @@ impl<'a> Q<'a> {
         Ok(self.lib.vod.index_of(VodKind::Series(ep.series_id)).map(|idx| (ep, idx)))
     }
 
-    /// The series ids of a title's copies, the copy that plays first first.
-    pub fn series_copies(&self, idx: u32) -> Vec<SeriesId> {
-        let items = self.items(false);
-        let mut ids: Vec<u32> = self.lib.vod.stacks(false).copies(idx);
-        ids.sort_by_key(|c| *c != idx);
-        ids.into_iter()
-            .filter_map(|c| match items.get(c as usize)?.kind {
-                VodKind::Series(id) => Some(id),
-                VodKind::Movie(_) => None,
-            })
-            .collect()
+    /// Series copies in play order with the asked copy first, as on its combined page.
+    pub fn series_copies(&self, idx: u32) -> Out<Vec<SeriesId>> {
+        let Some(VodKind::Series(id)) = self.items(false).get(idx as usize).map(|v| v.kind) else { return Ok(Vec::new()) };
+        if self.cfg.interface.same_title != crate::config::SameTitle::Combine {
+            return Ok(vec![id]);
+        }
+        let plan = crate::store::copies::plan(self.conn, &self.lib.vod, false, idx, !self.needs_pin(true), self.cfg.interface.copy_order, self.now)?;
+        Ok(plan.series_ids(&self.lib.vod, idx))
+    }
+
+    /// The next displayed row carries the same merged progress as the episodes tool.
+    fn next_episode(&self, ids: &[SeriesId]) -> Out<Option<EpisodeOut>> {
+        let Some((_, ep)) = crate::store::copies::next_episode(self.conn, ids)? else { return Ok(None) };
+        let mut out = self.episode_out(&ep);
+        if ids.len() > 1 {
+            out.progress = crate::store::copies::episode_progress(self.conn, ids)?
+                .get(&(ep.season, ep.episode))
+                .map(|p| progress_out(p.position_s, p.duration_s, p.finished, p.updated_at));
+        }
+        Ok(Some(out))
     }
 
     pub fn episode_out(&self, ep: &Episode) -> EpisodeOut {
@@ -1261,7 +1270,7 @@ pub fn continue_watching(q: &Q, p: &proto::ContinueWatching) -> Out<ContinueOut>
                 if !seen.insert((false, key)) {
                     continue;
                 }
-                let next = crate::store::copies::next_episode(q.conn, &q.series_copies(key))?.map(|(_, e)| q.episode_out(&e));
+                let next = q.next_episode(&q.series_copies(key)?)?;
                 // minutes left of the episode in progress, when that is the one play starts
                 let left = next.as_ref().filter(|n| n.item == item_ref(&row.item)).and_then(|_| remaining(&row));
                 items.push(ContinueItem { title: q.title_out(false, key), next_episode: next, remaining_min: left });
@@ -1306,9 +1315,9 @@ pub fn favourites(q: &Q, p: &Favourites) -> Out<FavouritesOut> {
 /// Upcoming programmes a channel's details list after now / next.
 const CHANNEL_UPCOMING: usize = 5;
 
-/// `details`, and the job that would fetch a title's missing details (the handler submits it
+/// `details`, and the jobs that would fetch a title's missing details (the handler submits them
 /// and asks again for up to 3 s; `details_pending` says it is still loading).
-pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
+pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Vec<JobKind>)> {
     match parse_ref(&p.item)? {
         AgentRef::Programme { channel, start } => {
             let c = q.channel_by_ref(&channel).ok_or_else(|| Fail::not_found("programme"))?;
@@ -1321,7 +1330,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 ..Default::default()
             };
             if out.locked {
-                return Ok((out, None));
+                return Ok((out, Vec::new()));
             }
             let full = crate::store::epg::programme(q.conn, prog.id)?;
             out.description = clean_opt(full.description.as_deref());
@@ -1334,7 +1343,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
             let x = q.extras(&[prog.id])?.remove(&prog.id);
             out.schedule = vec![q.programme_out_x(c, &prog, Vec::new(), x.as_ref())];
             out.copies = channel_copies_out(q, c)?;
-            Ok((out, None))
+            Ok((out, Vec::new()))
         }
         AgentRef::Item(r) => match r.kind {
             ItemKind::Channel => {
@@ -1347,7 +1356,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                     ..Default::default()
                 };
                 if out.locked {
-                    return Ok((out, None));
+                    return Ok((out, Vec::new()));
                 }
                 out.channel = Some(q.channel_out(c));
                 if let Some(epg) = c.epg_channel_id {
@@ -1360,7 +1369,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                     out.schedule = sched.iter().take(CHANNEL_UPCOMING + 1).map(|p| q.programme_out(c, p, Vec::new())).collect();
                 }
                 out.copies = channel_copies_out(q, c)?;
-                Ok((out, None))
+                Ok((out, Vec::new()))
             }
             ItemKind::Movie => {
                 let idx = q.vod_index(&r)?.ok_or_else(|| Fail::not_found("movie"))?;
@@ -1369,7 +1378,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 let mut out =
                     DetailsOut { item: item_ref(&r), kind: "movie".into(), name: clean(&v.name), locked: title.locked, ..Default::default() };
                 if out.locked {
-                    return Ok((out, None));
+                    return Ok((out, Vec::new()));
                 }
                 let VodKind::Movie(id) = v.kind else { return Err(Fail::not_found("movie")) };
                 let m = crate::store::vod::movie(q.conn, id)?;
@@ -1385,7 +1394,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 out.progress = title.progress;
                 out.copies = title_copies_out(q, true, idx);
                 out.details_pending = lazy;
-                Ok((out, lazy.then_some(JobKind::LoadMovieDetails(id))))
+                Ok((out, lazy.then_some(JobKind::LoadMovieDetails(id)).into_iter().collect()))
             }
             ItemKind::Series => {
                 let idx = q.vod_index(&r)?.ok_or_else(|| Fail::not_found("series"))?;
@@ -1394,7 +1403,7 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 let mut out =
                     DetailsOut { item: item_ref(&r), kind: "series".into(), name: clean(&v.name), locked: title.locked, ..Default::default() };
                 if out.locked {
-                    return Ok((out, None));
+                    return Ok((out, Vec::new()));
                 }
                 let VodKind::Series(id) = v.kind else { return Err(Fail::not_found("series")) };
                 let s = crate::store::vod::series(q.conn, id)?;
@@ -1406,13 +1415,20 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 out.cast = clean_opt(s.cast.as_deref());
                 out.director = clean_opt(s.director.as_deref());
                 out.release_date = clean_opt(s.release_date.as_deref());
-                out.seasons =
-                    crate::store::vod::seasons(q.conn, id)?.into_iter().map(|s| SeasonOut { number: s.number, episodes: s.episode_count }).collect();
-                out.next_episode = crate::store::copies::next_episode(q.conn, &q.series_copies(idx))?.map(|(_, e)| q.episode_out(&e));
+                let ids = q.series_copies(idx)?;
+                out.seasons = crate::store::copies::seasons(q.conn, &ids)?
+                    .into_iter()
+                    .map(|s| SeasonOut { number: s.number, episodes: s.episode_count })
+                    .collect();
+                out.next_episode = q.next_episode(&ids)?;
                 out.progress = title.progress;
                 out.copies = title_copies_out(q, false, idx);
-                out.details_pending = lazy;
-                Ok((out, lazy.then_some(JobKind::LoadSeriesDetails(id))))
+                let mut unloaded = crate::store::copies::unloaded_series(q.conn, &ids)?;
+                if lazy && !unloaded.contains(&id) {
+                    unloaded.push(id);
+                }
+                out.details_pending = !unloaded.is_empty();
+                Ok((out, unloaded.into_iter().map(JobKind::LoadSeriesDetails).collect()))
             }
             ItemKind::Episode => {
                 let (ep, idx) = q.episode(&r)?.ok_or_else(|| Fail::not_found("episode"))?;
@@ -1421,14 +1437,14 @@ pub fn details(q: &Q, p: &Details) -> Out<(DetailsOut, Option<JobKind>)> {
                 let name = clean(&format!("{} — S{:02}E{:02} · {}", series.name, ep.season, ep.episode, ep.title));
                 let mut out = DetailsOut { item: item_ref(&r), kind: "episode".into(), name, locked, ..Default::default() };
                 if locked {
-                    return Ok((out, None));
+                    return Ok((out, Vec::new()));
                 }
                 out.plot = clean_opt(ep.plot.as_deref());
                 out.runtime_min = ep.duration_s.filter(|d| *d > 0).map(|d| (f64::from(d) / 60.0).round() as u32);
                 out.rating = ep.rating.filter(|r| *r > 0.0);
                 out.release_date = clean_opt(ep.air_date.as_deref());
                 out.progress = q.episode_out(&ep).progress;
-                Ok((out, None))
+                Ok((out, Vec::new()))
             }
         },
     }

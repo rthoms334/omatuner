@@ -948,6 +948,56 @@ mod tests {
 
     type H = egui_kittest::Harness<'static, testkit::App<WatchlistsScreen>>;
 
+    #[test]
+    fn landman_series_entry_counts_the_union_and_opens_both_seasons() {
+        let (mut t, one) = rig();
+        let (ids, list) = seed(&mut t, |c| {
+            let ids = testkit::landman(c)?;
+            let s = crate::store::vod::series(c, ids[0])?;
+            let item = ItemRef { source: s.source_id, kind: ItemKind::Series, key: s.key };
+            let list = store::create(c, "Landman", None, PlayOrder::Ordered, "app", 1)?;
+            let lib = crate::store::library::load(c)?;
+            store::add(c, &lib, list, &[store::new_entry(c, &item)?], crate::watchlist::Insert::End, 1)?;
+            Ok((ids, list))
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::Watchlists { list: Some(list) });
+        until(&mut h, "series progress", |h| testkit::painted(h).iter().any(|s| s.contains("next S2E1 · 10 of 20 watched")));
+        let e = h.state().s.entry().unwrap();
+        assert_eq!((e.done_episodes, e.total_episodes, e.episode), (10, 20, Some((2, 1))));
+        // Resuming on the short 4K copy must still open a page containing S2.
+        seed(&mut h.state_mut().t, move |c| {
+            let e = crate::store::vod::episodes(c, ids[0], Some(1))?.pop().unwrap();
+            crate::store::user::save_progress(
+                c,
+                &crate::model::WatchProgress {
+                    item: ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key },
+                    position_s: 600.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 200,
+                    finished: false,
+                    title: e.title,
+                    fingerprint: Default::default(),
+                },
+            )
+        });
+        h.state().t.services().bus.send(AppEvent::Data(crate::msg::DataScope::Progress));
+        until(&mut h, "resume on the 4K copy", |h| testkit::painted(h).iter().any(|s| s.contains("next S1E10 · 9 of 20 watched")));
+        h.state_mut().nav();
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(DETAILS)));
+        let nav = h.state_mut().nav();
+        assert!(
+            matches!(nav.as_slice(), [crate::ui::NavRequest::Push(Route::SeriesDetailAt { series, season: 1, episode: 10 })] if *series == ids[0]),
+            "{nav:?}"
+        );
+        let [crate::ui::NavRequest::Push(route)] = nav.as_slice() else { unreachable!() };
+        let route = route.clone();
+        let (t, one) = h.into_state().into_parts();
+        let mut detail = harness(t, one, super::super::series_detail::SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        detail.state_mut().enter(route);
+        until(&mut detail, "watchlist episode page", |h| testkit::has_label(h, "Season 1") && testkit::has_label(h, "Season 2"));
+    }
+
     fn unloaded_series() -> H {
         let (mut t, one) = rig();
         let list = seed(&mut t, |c| {
