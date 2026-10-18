@@ -1219,7 +1219,7 @@ pub fn help_rows(ctx: KeyContext) -> Vec<(String, &'static str)> {
 /// Curated short verbs per context for the status-bar hint line; the KEYS are looked up in the
 /// tables, so the line can never disagree with the keymap.
 const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
-    (KeyContext::Watchlists, &[(A::Activate, "open"), (A::ActivateAlt, "play from here"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")]),
+    (KeyContext::Watchlists, &[(A::Activate, "open"), (A::ActivateAlt, "play from here"), (A::ToggleHelp, "help")]),
     (
         KeyContext::List,
         &[(A::Activate, "play"), (A::ActivateAlt, "fullscreen"), (A::ToggleFavourite, "fav"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")],
