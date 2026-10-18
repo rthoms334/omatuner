@@ -334,8 +334,10 @@ pub enum QueueCommand {
         from: Option<WatchlistItemId>,
         just_one: bool,
     },
-    /// The app's Resume prompt answer, applying only to this first entry.
+    /// A details-page pick or Resume answer, applying only to this first entry.
     PlayListFrom {
+        /// The episode/film selected on a page opened from this entry, if any.
+        item: Option<ItemRef>,
         list: WatchlistId,
         from: Option<WatchlistItemId>,
         just_one: bool,

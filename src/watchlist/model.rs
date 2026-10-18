@@ -118,21 +118,56 @@ pub struct ListView {
     pub list: List,
     pub entries: Vec<EntryState>,
     pub next: Option<WatchlistItemId>,
+    /// Watched media units, including every known episode of skipped series/ranges.
     pub done: usize,
+    /// Media units, not entry positions; see `progress_unit` and `place`.
     pub total: usize,
     pub remaining_s: Option<f64>,
     pub passed_over: Vec<PassedOver>,
     pub show_watched: bool,
 }
 impl ListView {
+    /// Known episodes in each series/range; a film or standalone episode is one unit.
+    /// Copies share coordinates, so the store has already deduplicated their episodes.
+    pub fn recount(&mut self) {
+        self.total = 0;
+        self.done = 0;
+        for e in &self.entries {
+            let total = if e.entry.kind == ItemKind::Series { e.total_episodes } else { 1 };
+            self.total += total;
+            self.done += if e.done() {
+                total
+            } else if e.entry.kind == ItemKind::Series {
+                e.done_episodes
+            } else {
+                0
+            };
+        }
+    }
+    pub fn progress_unit(&self) -> &'static str {
+        let films = self.entries.iter().any(|e| e.entry.kind == ItemKind::Movie);
+        let episodes = self.entries.iter().any(|e| matches!(e.entry.kind, ItemKind::Series | ItemKind::Episode));
+        match (films, episodes) {
+            (true, true) => "items",
+            (_, true) => "episodes",
+            _ => "titles",
+        }
+    }
+    pub fn progress_label(&self) -> String {
+        let unit = match self.progress_unit() {
+            "items" => "watched",
+            unit => unit,
+        };
+        format!("{} of {} {unit}", self.done, self.total)
+    }
     pub fn finished(&self) -> bool {
-        self.total > 0 && self.done == self.total
+        !self.entries.is_empty() && self.entries.iter().all(EntryState::done)
     }
     pub fn next_entry(&self) -> Option<&EntryState> {
         self.next.and_then(|id| self.entries.iter().find(|e| e.entry.id == id))
     }
     pub fn place(&self, id: WatchlistItemId) -> Option<(usize, usize)> {
-        self.entries.iter().position(|e| e.entry.id == id).map(|n| (n + 1, self.total))
+        self.entries.iter().position(|e| e.entry.id == id).map(|n| (n + 1, self.entries.len()))
     }
 }
 

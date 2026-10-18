@@ -2025,6 +2025,34 @@ fn watchlist_episode_placeholders_use_series_identity_and_require_coordinates() 
 /// DESIGN §42 §7: real list reads and writes, initials, ambiguity, missing titles, ranges,
 /// duplicate refusals and My list's protected name all use the running handler and its store.
 #[test]
+fn watchlist_agent_lists_and_show_count_the_same_episode_units() {
+    let mut w = World::new(Config::default());
+    w.publish(Visibility::ALL);
+    let movie = first_ref(&w.ok("search", json!({"query": "dune", "kinds": ["movie"]})), "results");
+    let series = first_ref(&w.ok("search", json!({"query": "the show", "kinds": ["series"]})), "results");
+    for (name, refs, unit, total) in [
+        ("Shows", vec![series.clone()], "episodes", 3),
+        ("Mixed", vec![series.clone(), movie.clone()], "items", 4),
+        ("Films", vec![movie], "titles", 1),
+    ] {
+        let created = w.ok("watchlist", json!({"action": "create", "name": name, "refs": refs}));
+        let list = created["list"]["id"].clone();
+        let id = created["added"][0].clone();
+        w.ok("watchlist", json!({"action": "skip", "list": list, "ids": [id]}));
+        let shown = w.ok("watchlist", json!({"action": "show", "list": list}));
+        let done = if name == "Films" { 1 } else { 3 };
+        assert_eq!(shown["list"]["done"], done);
+        assert_eq!(shown["list"]["total"], total);
+        assert_eq!(shown["list"]["progress_unit"], unit);
+        let lists = w.ok("watchlist", json!({"action": "lists"}));
+        let row = lists.as_array().unwrap().iter().find(|v| v["id"] == list).unwrap();
+        assert_eq!(row["done"], done);
+        assert_eq!(row["total"], total);
+        assert_eq!(row["progress_unit"], unit);
+    }
+}
+
+#[test]
 fn watchlists_agent_edits_and_reads_the_same_derived_lists_as_the_app() {
     let mut w = World::new(Config::default());
     w.publish(Visibility::ALL);

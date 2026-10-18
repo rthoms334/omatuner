@@ -507,6 +507,90 @@ fn watchlist_reads_fresh_order_and_progress_after_the_users_queue() {
     assert!(s.reader().unwrap().query_row("SELECT count(*)=0 FROM meta WHERE key='queue:context'", [], |r| r.get::<_, bool>(0)).unwrap());
 }
 
+/// A details page can pick an episode other than the list's next episode. Its EOF still
+/// advances inside the range, then to the following film, never to the series' next season.
+#[test]
+fn watchlist_page_pick_plays_that_episode_then_continues_through_the_list() {
+    use tuner::store::watchlist as wl;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let s = store();
+    let src = w(&s, |c| seed::seed_source(c, "TV"));
+    w(&s, move |c| seed::seed_series_with_episodes(c, src, 1, 3, 2));
+    let films = w(&s, move |c| seed::seed_movies(c, src, 2));
+    let ep_ref = move |n| ItemRef { source: src, kind: ItemKind::Episode, key: ItemKey(format!("m3u:ep0-2-{n}")) };
+    let (list, entries, eps) = w(&s, move |c| {
+        let lib = tuner::store::library::load(c)?;
+        let list = wl::create(c, "Season then films", None, tuner::watchlist::PlayOrder::Ordered, "app", NOW)?;
+        let series = ItemRef { source: src, kind: ItemKind::Series, key: ItemKey("m3u:series000000000".into()) };
+        let mut range = wl::new_entry(c, &series)?;
+        range.season_from = Some(2);
+        range.season_to = Some(2);
+        let entries = wl::add(
+            c,
+            &lib,
+            list,
+            &[range, wl::new_entry(c, &movie_ref(src, 0))?, wl::new_entry(c, &movie_ref(src, 1))?],
+            tuner::watchlist::Insert::End,
+            NOW,
+        )?
+        .added;
+        wl::pin(c, entries[0], &series)?;
+        tuner::store::user::mark_watched(c, &[(ep_ref(1), "First".into())], true, NOW)?;
+        let eps = [tuner::store::vod::resolve_episode(c, &ep_ref(1))?.unwrap(), tuner::store::vod::resolve_episode(c, &ep_ref(2))?.unwrap()];
+        Ok((list, entries, eps))
+    });
+    let mut cfg = Config::default();
+    cfg.queue.countdown_s = 0;
+    let rig = Rig::new(&rt, s.clone(), cfg);
+    let reply = rt.block_on(rig.queue.request(QueueCommand::PlayListFrom {
+        list,
+        from: Some(entries[0]),
+        item: Some(ep_ref(1)),
+        just_one: false,
+        resume: false,
+    }));
+    assert!(matches!(reply, QueueReply::Play(PlayReply::Playing(_))), "{reply:?}");
+    assert_eq!(rig.player.plays(), [(MediaRef::Episode(eps[0]), PlayOrigin::Queue)]);
+    assert_eq!(rig.queue.snapshot().context, Some(list));
+    for n in 1..=2 {
+        rig.player_kind(
+            &ep_ref(n),
+            MediaRef::Episode(eps[n as usize - 1]),
+            PlayableKind::Episode { season: 2, episode: n },
+            PlayOrigin::Queue,
+            PlayerState::Playing,
+            n as u64,
+        );
+        until("episode owns playback", || rig.queue.snapshot().driving);
+        w(&s, move |c| tuner::store::user::mark_watched(c, &[(ep_ref(n), "Watched".into())], true, NOW));
+        rig.player_kind(
+            &ep_ref(n),
+            MediaRef::Episode(eps[n as usize - 1]),
+            PlayableKind::Episode { season: 2, episode: n },
+            PlayOrigin::Queue,
+            PlayerState::Ended,
+            n as u64,
+        );
+        until("next list item", || rig.player.plays().len() == n as usize + 1);
+    }
+    assert_eq!(rig.player.plays()[1], (MediaRef::Episode(eps[1]), PlayOrigin::Queue));
+    assert_eq!(rig.player.plays()[2], (MediaRef::Movie(films[0]), PlayOrigin::Queue));
+    assert_eq!(rig.queue.snapshot().watchlist.as_ref().unwrap().total, 3, "position chips still count entries");
+    // A film's own details-page Play uses the same context and continues to the next film.
+    rt.block_on(rig.queue.request(QueueCommand::PlayListFrom {
+        list,
+        from: Some(entries[1]),
+        item: Some(movie_ref(src, 0)),
+        just_one: false,
+        resume: true,
+    }));
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(films[0]), PlayOrigin::Queue, PlayerState::Playing, 3);
+    until("film owns playback", || rig.queue.snapshot().driving);
+    w(&s, move |c| tuner::store::user::mark_watched(c, &[(movie_ref(src, 0), "Film".into())], true, NOW));
+    rig.player(&movie_ref(src, 0), MediaRef::Movie(films[0]), PlayOrigin::Queue, PlayerState::Ended, 3);
+    until("film after page play", || rig.player.plays().last() == Some(&(MediaRef::Movie(films[1]), PlayOrigin::Queue)));
+}
+
 #[test]
 fn watchlist_context_survives_restart_without_a_play_and_deletion_removes_chips() {
     use tuner::store::watchlist as wl;

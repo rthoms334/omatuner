@@ -164,6 +164,7 @@ pub enum Effect {
         at: Insert,
     },
     LookupList {
+        item: Option<ItemRef>,
         list: WatchlistId,
         from: Option<WatchlistItemId>,
         by: AddedBy,
@@ -815,9 +816,9 @@ impl QueueMachine {
             QueueCommand::RefreshLists => {}
             QueueCommand::EndAfterQueue(on) => self.sleep_end_of_queue = on,
             QueueCommand::AddListEntry { list, entry, at } => fx.push(Effect::AddListEntry { list, entry, at }),
-            QueueCommand::PlayList { list, from, just_one } => self.play_list(list, from, just_one, None, false, fx),
-            QueueCommand::PlayListAgent { list, from, just_one } => self.play_list(list, from, just_one, None, true, fx),
-            QueueCommand::PlayListFrom { list, from, just_one, resume } => self.play_list(list, from, just_one, Some(resume), false, fx),
+            QueueCommand::PlayList { list, from, just_one } => self.play_list(list, from, just_one, None, false, None, fx),
+            QueueCommand::PlayListAgent { list, from, just_one } => self.play_list(list, from, just_one, None, true, None, fx),
+            QueueCommand::PlayListFrom { list, from, just_one, resume, item } => self.play_list(list, from, just_one, Some(resume), false, item, fx),
             QueueCommand::StopList => self.end_context(fx),
             QueueCommand::Add { targets, at, by } => fx.push(Effect::Add { targets, at, by }),
             QueueCommand::Move { ids, to } => fx.push(Effect::Write(Write::Move { ids, to })),
@@ -1072,6 +1073,7 @@ impl QueueMachine {
         if self.list_lookup.is_none() {
             self.list_lookup = Some((list, start));
             fx.push(Effect::LookupList {
+                item: None,
                 list,
                 from: None,
                 by: if self.context_agent { AddedBy::Agent } else { AddedBy::App },
@@ -1082,6 +1084,7 @@ impl QueueMachine {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn play_list(
         &mut self,
         list: WatchlistId,
@@ -1089,6 +1092,7 @@ impl QueueMachine {
         just_one: bool,
         resume: Option<bool>,
         agent: bool,
+        item: Option<ItemRef>,
         fx: &mut Vec<Effect>,
     ) {
         // Keep a pending automatic row until the fresh pick can reuse or retire it.
@@ -1109,7 +1113,7 @@ impl QueueMachine {
             fx.push(Effect::Context(Some((list, by))));
         }
         self.list_lookup = Some((list, ListStart::Play { resume, just_one }));
-        fx.push(Effect::LookupList { list, from, by, excluded: Vec::new(), ended: Vec::new() });
+        fx.push(Effect::LookupList { item, list, from, by, excluded: Vec::new(), ended: Vec::new() });
     }
 }
 

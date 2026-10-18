@@ -95,6 +95,7 @@ enum Btn {
 #[derive(Default)]
 pub struct MovieDetailScreen {
     id: Option<MovieId>,
+    watchlist: Option<crate::ui::watchlists::Origin>,
     movie: Option<Movie>,
     progress: Option<WatchProgress>,
     loader: Option<Loader<(Movie, Option<WatchProgress>)>>,
@@ -196,6 +197,13 @@ impl MovieDetailScreen {
         if self.missing {
             return;
         }
+        if let Some(origin) = self.watchlist {
+            if let Some(movie) = &self.movie {
+                let item = ItemRef { source: movie.source_id, kind: ItemKind::Movie, key: movie.key.clone() };
+                crate::ui::watchlists::play_from_page(ctx, origin, item, MediaRef::Movie(id), movie.name.clone(), None, resume, false);
+            }
+            return;
+        }
         if self.copies.is_stacked() {
             // the copy picked on the page, else the title's first; the next one as fallback
             let pick = self.copies.chosen();
@@ -212,6 +220,10 @@ impl MovieDetailScreen {
     /// Play the title's copies (`pick`: this copy first; the caller checked its PIN), with the
     /// fallback once before the first frame (DESIGN §29.15).
     fn play_copies(&mut self, ctx: &mut UiCtx<'_>, pick: Option<u32>, resume: bool) {
+        if self.watchlist.is_some() {
+            self.play(ctx, resume);
+            return;
+        }
         match crate::ui::copies::movie_command(&ctx.lib.vod, self.copies.plan(), pick, resume, PlayOrigin::Fullscreen) {
             Some(PlayerCommand::PlayCopy(copy)) => crate::ui::copies::start(ctx, copy),
             Some(cmd) => {
@@ -423,7 +435,12 @@ impl Screen for MovieDetailScreen {
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
-        let Route::MovieDetail(id) = route else { return };
+        let (id, watchlist) = match route {
+            Route::MovieDetail(id) => (id, None),
+            Route::MovieDetailFromList { movie, origin } => (movie, Some(*origin)),
+            _ => return,
+        };
+        self.watchlist = watchlist;
         if self.id != Some(*id) {
             self.movie = None;
             self.progress = None;
@@ -554,7 +571,10 @@ impl Screen for MovieDetailScreen {
             super::copies::Outcome::NotMine => {}
             super::copies::Outcome::Done => return,
             super::copies::Outcome::Act(super::copies::CopyAct::Play(c)) => return self.play_copies(ctx, Some(c), true),
-            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Movie(id))) => return ctx.push(Route::MovieDetail(id)),
+            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Movie(id))) => {
+                let route = self.watchlist.map_or(Route::MovieDetail(id), |origin| Route::MovieDetailFromList { movie: id, origin });
+                return ctx.push(route);
+            }
             super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Series(id))) => return ctx.push(Route::SeriesDetail(id)),
         }
         match result {

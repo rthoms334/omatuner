@@ -237,14 +237,15 @@ impl Engine {
                         name: list.list.name.clone(),
                         any_order: list.list.play_order == crate::watchlist::PlayOrder::Any,
                         position: position + 1,
-                        total: list.total,
+                        total: list.entries.len(),
                     },
                 );
             }
         }
         snap.watchlist = snap.context.and_then(|id| self.lists.get(&id)).map(|list| {
             let current_entry = snap.current.and_then(|id| snap.row(id)).and_then(|r| r.entry.watchlist_item_id);
-            let position = current_entry.or(list.next).and_then(|id| list.place(id)).map_or(list.done, |p| p.0);
+            let position =
+                current_entry.or(list.next).and_then(|id| list.place(id)).map_or_else(|| list.entries.iter().filter(|e| e.done()).count(), |p| p.0);
             let then = list
                 .entries
                 .iter()
@@ -265,7 +266,7 @@ impl Engine {
                 name: list.list.name.clone(),
                 any_order: list.list.play_order == crate::watchlist::model::PlayOrder::Any,
                 position,
-                total: list.total,
+                total: list.entries.len(),
                 playing_through: snap.driving || snap.between_items(),
                 then,
             }
@@ -366,6 +367,7 @@ impl Engine {
         mut excluded: Vec<WatchlistItemId>,
         ended: Vec<ItemRef>,
         queue_at: Option<Insert>,
+        item: Option<ItemRef>,
     ) -> Vec<Input> {
         // The player submits its final progress before publishing Ended. Drain those writes
         // before deriving the next entry, including the same series entry's next episode.
@@ -374,6 +376,7 @@ impl Engine {
         }
         let mut from = from;
         loop {
+            let item = item.clone();
             let excluded_pick = excluded.clone();
             let ended = ended.clone();
             let guard = self.shared.guard();
@@ -420,7 +423,36 @@ impl Engine {
                         }
                         return Ok((None, passed));
                     };
-                    let Some(item) = entry.playable.clone() else { return Ok((None, passed)) };
+                    let item = match item {
+                        Some(item) if !entry.entry.any_copy => {
+                            // A page can show a combined row from another copy; the entry's
+                            // explicit pin still selects the copy for these coordinates.
+                            match entry.entry.item.as_ref() {
+                                Some(pinned) if pinned.kind == ItemKind::Series && item.kind == ItemKind::Episode => {
+                                    let ep = crate::store::vod::resolve_episode(c, &item)?.map(|id| crate::store::vod::episode(c, id)).transpose()?;
+                                    let series = c
+                                        .query_row(
+                                            "SELECT id FROM series WHERE source_id=?1 AND key=?2",
+                                            params![pinned.source, pinned.key.as_str()],
+                                            |r| r.get::<_, SeriesId>(0),
+                                        )
+                                        .optional()?;
+                                    match ep.zip(series) {
+                                        Some((ep, series)) => crate::store::copies::same_episode(c, series, ep.season, ep.episode)?
+                                            .map(|id| crate::store::vod::episode(c, id))
+                                            .transpose()?
+                                            .map(|ep| ItemRef { source: ep.source_id, kind: ItemKind::Episode, key: ep.key }),
+                                        None => None,
+                                    }
+                                }
+                                Some(pinned) if pinned.kind == ItemKind::Movie => Some(pinned.clone()),
+                                _ => Some(item),
+                            }
+                        }
+                        Some(item) => Some(item),
+                        None => entry.playable.clone(),
+                    };
+                    let Some(item) = item else { return Err(crate::error::Error::other("This episode is not available in the entry's pinned copy")) };
                     if item.kind == ItemKind::Series {
                         let id = c
                             .prepare_cached("SELECT id FROM series WHERE source_id=?1 AND key=?2")?
@@ -624,8 +656,8 @@ impl Engine {
 
     async fn effect(&mut self, e: Effect) -> Vec<Input> {
         match e {
-            Effect::LookupList { list, from, by, excluded, ended } => self.list_row(list, from, by, excluded, ended, None).await,
-            Effect::AddListEntry { list, entry, at } => self.list_row(list, Some(entry), AddedBy::App, Vec::new(), Vec::new(), Some(at)).await,
+            Effect::LookupList { item, list, from, by, excluded, ended } => self.list_row(list, from, by, excluded, ended, None, item).await,
+            Effect::AddListEntry { list, entry, at } => self.list_row(list, Some(entry), AddedBy::App, Vec::new(), Vec::new(), Some(at), None).await,
             Effect::Context(context) => {
                 self.reported.clear();
                 let r = self

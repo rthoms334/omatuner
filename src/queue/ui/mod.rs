@@ -71,7 +71,7 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
             let places: std::collections::HashMap<_, _> = visible
                 .lists
                 .iter()
-                .flat_map(|l| l.entries.iter().enumerate().map(move |(i, e)| (e.entry.id, (l.list.name.clone(), i + 1, l.total))))
+                .flat_map(|l| l.entries.iter().enumerate().map(move |(i, e)| (e.entry.id, (l.list.name.clone(), i + 1, l.entries.len()))))
                 .collect();
             filtered.rows = filtered
                 .rows
@@ -103,7 +103,7 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<QueueSnapshot> {
             if let Some(l) = &mut filtered.watchlist {
                 l.then.retain(|e| places.contains_key(&e.id));
                 if let Some(v) = visible.list(l.id) {
-                    l.total = v.total;
+                    l.total = v.entries.len();
                     let current = filtered.rows.iter().find(|r| Some(r.entry.id) == filtered.current).and_then(|r| r.entry.watchlist_item_id);
                     l.position = current.or(v.next).and_then(|id| v.place(id)).map_or(0, |p| p.0);
                 }

@@ -52,8 +52,11 @@ impl ResumeOverlay {
 
     /// [`Self::start`] as the answer plays (here, or on the TV inside `cast_with`).
     fn start_here(&self, ctx: &mut UiCtx<'_>, resume: bool) -> OverlayOutcome {
-        if let Some(w) = self.spec.watchlist {
-            crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayListFrom { list: w.list, from: w.from, just_one: w.just_one, resume });
+        if let Some(w) = &self.spec.watchlist {
+            crate::queue::ui::send(
+                ctx,
+                crate::queue::QueueCommand::PlayListFrom { item: w.item.clone(), list: w.list, from: w.from, just_one: w.just_one, resume },
+            );
             return OverlayOutcome::Close;
         }
         if let Some(q) = self.spec.queue {

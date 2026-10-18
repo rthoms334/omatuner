@@ -128,6 +128,7 @@ fn episode_label(e: &Episode) -> String {
 #[derive(Default)]
 pub struct SeriesDetailScreen {
     id: Option<SeriesId>,
+    watchlist: Option<crate::ui::watchlists::Origin>,
     data: Option<Data>,
     loader: Option<Loader<Data>>,
     loading_others: Vec<SeriesId>,
@@ -219,6 +220,9 @@ impl SeriesDetailScreen {
 
     /// The next episode to watch (button "Play S01E03"): the stored one, else the first.
     fn next_episode(&self) -> Option<Episode> {
+        if self.watchlist.is_some() {
+            return self.focused_episode();
+        }
         let d = self.data.as_ref()?;
         let next = if self.copies.combined() { d.next_across } else { d.next };
         next.and_then(|id| d.episodes.iter().find(|e| e.id == id)).or(d.episodes.first()).cloned()
@@ -265,6 +269,20 @@ impl SeriesDetailScreen {
     fn play(&mut self, ctx: &mut UiCtx<'_>, e: &Episode, from_start: bool, alt: bool) {
         if self.locked(ctx) || ctx.lib.vod.find(VodKind::Series(e.series_id)).is_some_and(|v| v.locked) && !kit::unlocked(ctx) {
             kit::ask_pin(ctx, if alt { Action::ActivateAlt } else { Action::Activate }, "This series is locked");
+            return;
+        }
+        if let Some(origin) = self.watchlist {
+            let progress = self.data.as_ref().and_then(|d| d.across.get(&e.id).or_else(|| d.progress.get(&e.id)));
+            crate::ui::watchlists::play_from_page(
+                ctx,
+                origin,
+                episode_ref(e),
+                MediaRef::Episode(e.id),
+                episode_label(e),
+                progress,
+                !from_start,
+                true,
+            );
             return;
         }
         // several copies: the same episode of the next copy is the fallback (DESIGN §29.15)
@@ -327,6 +345,12 @@ impl SeriesDetailScreen {
         // a locked copy: the PIN first (its answer comes back through the Copies section)
         if v.locked && !kit::unlocked(ctx) {
             self.copies.request_play(ctx, c);
+            return;
+        }
+        if self.watchlist.is_some() {
+            if let Some(e) = self.focused_episode() {
+                self.play(ctx, &e, false, false);
+            }
             return;
         }
         // its own next episode, with the next copy's as the fallback
@@ -499,8 +523,13 @@ impl Screen for SeriesDetailScreen {
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
+        self.watchlist = match route {
+            Route::SeriesDetailFromList { origin, .. } => Some(*origin),
+            _ => None,
+        };
         let (id, episode) = match route {
             Route::SeriesDetail(id) => (id, None),
+            Route::SeriesDetailFromList { series, episode, .. } => (series, *episode),
             Route::SeriesDetailAt { series, season, episode } => (series, Some((*season, *episode))),
             _ => return,
         };
@@ -726,7 +755,11 @@ impl Screen for SeriesDetailScreen {
             super::copies::Outcome::NotMine => {}
             super::copies::Outcome::Done => return,
             super::copies::Outcome::Act(super::copies::CopyAct::Play(c)) => return self.play_copy(ctx, c),
-            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Series(id))) => return ctx.push(Route::SeriesDetail(id)),
+            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Series(id))) => {
+                let route =
+                    self.watchlist.map_or(Route::SeriesDetail(id), |origin| Route::SeriesDetailFromList { series: id, episode: None, origin });
+                return ctx.push(route);
+            }
             super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Movie(id))) => return ctx.push(Route::MovieDetail(id)),
         }
         match result {

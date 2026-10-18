@@ -620,10 +620,9 @@ impl HomeScreen {
                 id: v.list.id,
                 name: v.list.name.clone(),
                 detail: format!(
-                    "next: {} · {} of {}",
+                    "next: {} · {}",
                     v.next_entry().map(|e| crate::ui::watchlists::label(ctx, e)).unwrap_or_default(),
-                    v.next.and_then(|id| v.place(id)).map_or(0, |x| x.0),
-                    v.total
+                    v.progress_label()
                 ),
             })
             .collect::<Vec<_>>();
