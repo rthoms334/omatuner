@@ -18,18 +18,19 @@
 //!   driven by the always-alive movie detail screen, so it is done once.
 //! * Mouse: double-click toggles window fullscreen; wheel = volume (only here); right-click =
 //!   the player menu; a click on the video closes a side panel / leaves focus mode; the top
-//!   bar's ← leaves the player (like `p`); volume follows transport (speaker = mute,
+//!   bar's ← leaves the player (like `p`); volume follows the left-hand buttons (speaker = mute,
 //!   slider 0–130 % with a mark at 100 %, wheel ±5); panels have a ✕ and tune on one click;
 //!   a failed stream offers Retry / Last channel buttons; the banner stays while the pointer
 //!   is over a bar and the pointer hides with the banner.
 //! * Video-only (`ctx.video_only`, DESIGN §12.3): a compact banner with title / return,
-//!   programme / position, and the same controls row. The full OSD comes back in controls
+//!   programme / position, and the controls row including transport. The full OSD comes back in controls
 //!   focus mode or with a side panel. Double-click pops in, dragging the video moves it.
-//! * Controls row: transport · volume on the left; QueueNext · Audio & subtitles · Cast ·
+//! * Controls row: Back to live · previous/next channel · volume on the left; QueueNext · Audio & subtitles · Cast ·
 //!   Fullscreen · settings cog on the right. Narrow keeps the speaker and moves Cast /
 //!   Fullscreen into the cog. The cog opens a pop-up with tracks and Delay sub-pages;
 //!   `O` opens it, arrows navigate, Esc goes back a page then closes it before OSD focus.
-//!   The full window mirrors transport in the picture, with shadowed icons and large targets.
+//!   The full window keeps transport only in the picture, with shadowed icons and large targets.
+//!   Its focus walk reaches the centre trio before the row; Enter or Space activates.
 //! * Numeric entry: any key that isn't part of it commits the number, then acts (like the
 //!   guide).
 //!
@@ -1111,7 +1112,7 @@ mod tests {
             }
         };
         // on the bottom bar, beside the controls
-        let at = h.get_by_label("Play / pause").rect().center() + egui::vec2(0.0, -40.0);
+        let at = h.get_by_label("Previous channel").rect().center() + egui::vec2(0.0, -40.0);
         h.hover_at(at);
         h.run_steps(1);
         assert!(h.state_mut().act(Action::ZapNext));
@@ -1370,7 +1371,7 @@ mod tests {
     fn a_click_on_a_control_acts_without_entering_controls_focus_mode() {
         let mut h = player(WIDE);
         let paused = real(&h).paused;
-        h.get_by_label("Play / pause").click();
+        h.get_by_label("Centre play / pause").click();
         until(&mut h, "pause toggled", |h| {
             sync(h);
             shown(h).paused != paused
@@ -1379,9 +1380,12 @@ mod tests {
     }
 
     #[test]
-    fn row_transport_visibility_focus_and_keyboard_activation() {
+    fn pop_out_row_transport_visibility_focus_and_keyboard_activation() {
         let mut h = player(WIDE);
+        h.state_mut().t.video_only = true;
+        h.run_steps(2);
         assert!(has_label(&h, "Play / pause"));
+        assert!(!has_label(&h, "Centre play / pause"));
         assert!(!has_label(&h, "Back") && !has_label(&h, "Forward"), "no live range yet");
         let mut snap = (*shown(&h)).clone();
         snap.seekable = true;
@@ -1418,48 +1422,99 @@ mod tests {
 
     #[test]
     fn centre_controls_visibility_focus_and_keyboard_activation() {
-        let mut h = player(WIDE);
-        assert!(has_label(&h, "Centre play / pause"));
-        assert!(!has_label(&h, "Skip back") && !has_label(&h, "Skip forward"));
-        let mut snap = (*shown(&h)).clone();
-        snap.seekable = true;
-        snap.live_buffer = Some(crate::player::LiveBufferRange { start: 0.0, end: 100.0 });
-        snap.position = Some(60.0);
-        h.state_mut().t.snapshot = Arc::new(snap);
-        h.run_steps(3);
-        let play = h.get_by_label("Centre play / pause").rect();
-        let back = h.get_by_label("Skip back").rect();
-        let forward = h.get_by_label("Skip forward").rect();
-        assert!((play.center().x - WIDE.x / 2.0).abs() < 10.0 && (play.center().y - WIDE.y / 2.0).abs() < 10.0);
-        assert!(back.right() < play.left() && play.right() < forward.left(), "large targets must not overlap");
-        for rect in [back, play, forward] {
-            assert!(rect.width() >= 80.0 && rect.height() >= 80.0);
+        let key = |h: &mut H, key| {
+            let event = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+            let action = crate::keymap::resolve(&h.state().s.key_contexts(), &event).unwrap();
+            assert!(h.state_mut().act(action));
+            h.run_steps(2);
+        };
+        for size in [WIDE, egui::vec2(600.0, 400.0)] {
+            let mut h = player(size);
+            h.state_mut().t.video.begin_frame();
+            assert!(has_label(&h, "Centre play / pause"));
+            assert!(!has_label(&h, "Skip back") && !has_label(&h, "Skip forward"));
+            let mut snap = (*shown(&h)).clone();
+            snap.seekable = true;
+            snap.live_buffer = Some(crate::player::LiveBufferRange { start: 0.0, end: 100.0 });
+            snap.position = Some(60.0);
+            h.state_mut().t.snapshot = Arc::new(snap);
+            h.run_steps(3);
+            let play = h.get_by_label("Centre play / pause").rect();
+            let back = h.get_by_label("Skip back").rect();
+            let forward = h.get_by_label("Skip forward").rect();
+            assert!((play.center().x - size.x / 2.0).abs() < 10.0 && (play.center().y - size.y / 2.0).abs() < 10.0);
+            assert!(back.right() < play.left() && play.right() < forward.left(), "large targets must not overlap");
+            for rect in [back, play, forward] {
+                assert!(rect.bottom() < h.get_by_label("Back to live").rect().top());
+                if size == WIDE {
+                    assert!(rect.width() >= 80.0 && rect.height() >= 80.0);
+                }
+            }
+            for label in ["Back", "Play / pause", "Forward"] {
+                assert!(!has_label(&h, label), "{label} must not duplicate the centre transport in the row");
+            }
+            key(&mut h, egui::Key::Enter);
+            assert_eq!(h.state().s.visible[h.state().s.control], Control::PlayPause);
+            key(&mut h, egui::Key::ArrowLeft);
+            let mut order = vec![
+                Control::SkipBack,
+                Control::PlayPause,
+                Control::SkipForward,
+                Control::BackToLive,
+                Control::Prev,
+                Control::Next,
+                Control::AudioSubtitles,
+            ];
+            if size == WIDE {
+                if crate::cast::ENABLED {
+                    order.push(Control::Cast);
+                }
+                order.push(Control::Fullscreen);
+            }
+            order.push(Control::Settings);
+            assert_eq!(h.state().s.visible, order);
+            // Repaint after every step: row layout must preserve the centre focus indices.
+            for control in order {
+                assert_eq!(h.state().s.visible[h.state().s.control], control);
+                key(&mut h, egui::Key::Tab);
+            }
+            assert_eq!(h.state().s.visible[h.state().s.control], Control::SkipBack);
+            key(&mut h, egui::Key::ArrowLeft);
+            assert_eq!(h.state().s.visible[h.state().s.control], Control::Settings);
+            key(&mut h, egui::Key::ArrowRight);
+            for control in [Control::SkipBack, Control::PlayPause, Control::SkipForward] {
+                assert_eq!(h.state().s.visible[h.state().s.control], control);
+                for activate in [egui::Key::Enter, egui::Key::Space] {
+                    let paused = real(&h).paused;
+                    h.state_mut().s.flash_text = None;
+                    key(&mut h, activate);
+                    if control == Control::PlayPause {
+                        until(&mut h, "centre keyboard toggled pause", |h| real(h).paused != paused);
+                    } else {
+                        // The real, empty mpv rejects the seek: activation reached the controller.
+                        until(&mut h, "centre keyboard skip", |h| {
+                            h.state_mut().pump();
+                            h.state().s.flash_text.as_ref().is_some_and(|(text, _)| text == "Can't skip in this stream")
+                        });
+                        assert_eq!(real(&h).paused, paused, "Space on a skip must not pause");
+                    }
+                }
+                key(&mut h, egui::Key::ArrowRight);
+            }
+            key(&mut h, egui::Key::Escape);
+            assert!(!h.state().s.osd_focus);
+            let paused = real(&h).paused;
+            h.get_by_label("Centre play / pause").click();
+            until(&mut h, "centre click toggled pause", |h| real(h).paused != paused);
+            assert!(!h.state().s.osd_focus);
+            h.hover_at(egui::pos2(1.0, 1.0));
+            h.run_steps(2);
+            key(&mut h, egui::Key::Escape);
+            assert!(!has_label(&h, "Centre play / pause"));
+            h.state_mut().t.video_only = true;
+            key(&mut h, egui::Key::Enter);
+            assert!(has_label(&h, "Play / pause") && !has_label(&h, "Centre play / pause"), "pop-out has no centre transport, even in focus mode");
         }
-        h.state_mut().act(Action::FocusOsdControls);
-        h.run_steps(2);
-        assert_eq!(h.state().s.visible[h.state().s.control], Control::PlayPause);
-        h.state_mut().act(Action::Left);
-        assert_eq!(h.state().s.visible[h.state().s.control], Control::SkipBack);
-        h.state_mut().act(Action::Right);
-        h.state_mut().act(Action::Right);
-        assert_eq!(h.state().s.visible[h.state().s.control], Control::SkipForward);
-        h.state_mut().act(Action::Left);
-        let paused = real(&h).paused;
-        h.state_mut().act(Action::Activate);
-        until(&mut h, "centre keyboard paused", |h| real(h).paused != paused);
-        h.state_mut().act(Action::Back);
-        h.get_by_label("Centre play / pause").click();
-        until(&mut h, "centre click unpaused", |h| real(h).paused == paused);
-        assert!(!h.state().s.osd_focus);
-        h.hover_at(egui::pos2(1.0, 1.0));
-        h.run_steps(2);
-        h.state_mut().act(Action::Back);
-        h.run_steps(2);
-        assert!(!has_label(&h, "Centre play / pause"));
-        h.state_mut().t.video_only = true;
-        h.state_mut().act(Action::FocusOsdControls);
-        h.run_steps(2);
-        assert!(has_label(&h, "Play / pause") && !has_label(&h, "Centre play / pause"), "pop-out has no centre transport, even in focus mode");
     }
 
     fn paint_shapes(h: &H) -> Vec<&egui::Shape> {
@@ -1900,6 +1955,7 @@ mod tests {
             assert!(!has_label(&h, gone), "{gone} stays hidden while casting");
         }
         assert!(has_label(&h, "Volume: use the TV remote") && has_label(&h, "Player settings") && has_label(&h, "Fullscreen"));
+        assert!(has_label(&h, "Centre play / pause") && !has_label(&h, "Play / pause"));
     }
 
     /// Without a cast the control is only there while casting is on — built in and not

@@ -465,8 +465,9 @@ mod tests {
         use Control as C;
         let mut snap = PlayerSnapshot { playable: Some(playable()), ..Default::default() };
         let none = OptionalButtons::default();
+        assert_eq!(PlayerScreen::controls(&snap, false, false, none), vec![C::Prev, C::Next, C::AudioSubtitles, C::Fullscreen, C::Settings]);
         assert_eq!(
-            PlayerScreen::controls(&snap, false, false, none),
+            PlayerScreen::controls(&snap, false, true, none),
             vec![C::PlayPause, C::Prev, C::Next, C::AudioSubtitles, C::Fullscreen, C::Settings]
         );
         assert_eq!(
@@ -478,34 +479,26 @@ mod tests {
         snap.position = Some(50.0);
         let optional = OptionalButtons { panel: true, next: true, cast: true };
         for popped in [false, true] {
+            let transport = if popped { vec![C::SkipBack, C::PlayPause, C::SkipForward] } else { vec![] };
             assert_eq!(
                 PlayerScreen::controls(&snap, false, popped, optional),
-                vec![
-                    C::SkipBack,
-                    C::PlayPause,
-                    C::SkipForward,
-                    C::BackToLive,
-                    C::Prev,
-                    C::Next,
-                    C::QueueNext,
-                    C::AudioSubtitles,
-                    C::Cast,
-                    C::Fullscreen,
-                    C::Settings
-                ]
+                [transport.clone(), vec![C::BackToLive, C::Prev, C::Next, C::QueueNext, C::AudioSubtitles, C::Cast, C::Fullscreen, C::Settings]]
+                    .concat()
             );
             assert_eq!(
                 PlayerScreen::controls(&snap, true, popped, optional),
-                vec![C::SkipBack, C::PlayPause, C::SkipForward, C::BackToLive, C::Prev, C::Next, C::QueueNext, C::AudioSubtitles, C::Settings]
+                [transport, vec![C::BackToLive, C::Prev, C::Next, C::QueueNext, C::AudioSubtitles, C::Settings]].concat()
             );
             let menu = PlayerScreen::settings_controls(&snap, true, popped, optional);
             assert!(menu.contains(&C::UpNext) && menu.contains(&C::Cast) && menu.contains(&C::Fullscreen));
             assert_eq!(menu.contains(&C::PopOut), !popped);
         }
         snap.playable = Some(Arc::new(crate::model::Playable { kind: PlayableKind::Movie, ..(*playable()).clone() }));
+        assert_eq!(PlayerScreen::controls(&snap, false, false, optional), vec![C::QueueNext, C::AudioSubtitles, C::Cast, C::Fullscreen, C::Settings]);
+        assert_eq!(PlayerScreen::controls(&snap, true, false, optional), vec![C::QueueNext, C::AudioSubtitles, C::Settings]);
         assert_eq!(
-            PlayerScreen::controls(&snap, false, false, optional),
-            vec![C::SkipBack, C::PlayPause, C::SkipForward, C::QueueNext, C::AudioSubtitles, C::Cast, C::Fullscreen, C::Settings]
+            PlayerScreen::controls(&snap, true, true, optional),
+            vec![C::SkipBack, C::PlayPause, C::SkipForward, C::QueueNext, C::AudioSubtitles, C::Settings]
         );
         assert_eq!(PlayerScreen::settings_controls(&snap, false, false, optional), vec![C::AudioSubtitles, C::Delay, C::UpNext, C::Info, C::PopOut]);
         snap.cast = Some(crate::model::CastView {
@@ -519,10 +512,8 @@ mod tests {
             can_seek: true,
             volume: false,
         });
-        assert_eq!(
-            PlayerScreen::controls(&snap, false, false, optional),
-            vec![C::SkipBack, C::PlayPause, C::SkipForward, C::QueueNext, C::Cast, C::Fullscreen, C::Settings]
-        );
+        assert_eq!(PlayerScreen::controls(&snap, false, false, optional), vec![C::QueueNext, C::Cast, C::Fullscreen, C::Settings]);
+        assert_eq!(PlayerScreen::controls(&snap, true, false, optional), vec![C::QueueNext, C::Settings]);
         assert_eq!(PlayerScreen::settings_controls(&snap, true, false, optional), vec![C::UpNext, C::Info, C::Cast, C::Fullscreen]);
     }
 
@@ -683,12 +674,12 @@ mod tests {
         h.state_mut().s.banner_dismissed = true;
         assert!(h.state().s.banner_visible(&shown(&h)));
         let paused = real(&h).paused;
-        let point = h.get_by_label("Play / pause").rect().center();
+        let point = h.get_by_label("Centre play / pause").rect().center();
         h.hover_at(point);
         press(&h, point, egui::PointerButton::Primary);
         h.run_steps(3);
         assert!(h.state().s.settings.is_none() && h.state().s.osd_focus);
-        assert_eq!(real(&h).paused, paused, "the outside click cannot activate the covered row");
+        assert_eq!(real(&h).paused, paused, "the outside click cannot activate the covered control");
     }
 
     #[test]
@@ -717,20 +708,20 @@ mod tests {
             snap.position = Some(50.0);
             h.state_mut().t.snapshot = Arc::new(snap);
             h.run_steps(3);
-            let labels = [
-                "Back",
-                "Play / pause",
-                "Forward",
-                "Back to live",
-                "Previous channel",
-                "Next channel",
-                "Mute",
-                "Audio & subtitles",
-                "Player settings",
-            ];
+            let mut labels = if popped { vec!["Back", "Play / pause", "Forward"] } else { vec![] };
+            labels.extend(["Back to live", "Previous channel", "Next channel", "Mute", "Audio & subtitles", "Player settings"]);
             let rects: Vec<_> = labels.iter().map(|s| h.get_by_label(s).rect()).collect();
             assert!(rects.windows(2).all(|pair| pair[0].right() <= pair[1].left()), "{rects:?}");
             assert!(rects.last().unwrap().right() <= 480.0);
+            for label in ["Back", "Play / pause", "Forward"] {
+                assert_eq!(has_label(&h, label), popped, "{label} belongs only to the pop-out row");
+            }
+            for label in ["Skip back", "Centre play / pause", "Skip forward"] {
+                assert_eq!(has_label(&h, label), !popped, "{label} belongs only to the full window's picture");
+                if !popped {
+                    assert!(h.get_by_label(label).rect().bottom() < rects[0].top());
+                }
+            }
             assert!(!has_label(&h, "Volume") && !has_label(&h, "Fullscreen") && !has_label(&h, "Cast to a TV"));
             h.state_mut().t.multiview.view.on = true;
             let optional = h.state_mut().t.with_ctx(|ctx| OptionalButtons::of(ctx));

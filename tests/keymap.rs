@@ -171,14 +171,15 @@ fn info_banner_never_changes_the_keys_only_controls_focus_does() {
         assert_eq!(resolve(&live, &ev), Some(Action::FocusOsdControls), "{ev:?}");
         assert_eq!(resolve(&vod, &ev), Some(Action::FocusOsdControls), "{ev:?}");
     }
-    // in controls focus mode arrows move between controls; Esc leaves; the rest falls through
+    // in controls focus mode arrows move, Enter / Space activate, Esc leaves; the rest falls through
     for base in [K::PlayerLive, K::PlayerVod] {
         let osd = [K::PlayerOsd, base];
         assert_eq!(resolve(&osd, &key(Key::ArrowLeft)), Some(Action::Left));
         assert_eq!(resolve(&osd, &key(Key::ArrowDown)), Some(Action::Down));
         assert_eq!(resolve(&osd, &key(Key::Enter)), Some(Action::Activate));
         assert_eq!(resolve(&osd, &key(Key::Escape)), Some(Action::LeaveOsdControls));
-        assert_eq!(resolve(&osd, &key(Key::Space)), Some(Action::PlayPause));
+        assert_eq!(resolve(&osd, &key(Key::Space)), Some(Action::Activate));
+        assert_eq!(resolve(&[base], &key(Key::Space)), Some(Action::PlayPause));
         assert_eq!(resolve(&osd, &text("m")), Some(Action::Mute));
     }
     // Esc on the plain player is Back (the app's Esc ladder hides the banner first)

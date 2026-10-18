@@ -1768,17 +1768,30 @@ fn player_controls_fit_a_tiled_half() {
     }];
     let p = player_with(&mut t, Arc::new(snap));
     let mut h = screen_harness(t, p, 790.0);
+    // The centre skip numbers use the app's named medium font.
+    tuner::fonts::LoadedFonts::default().install(&h.ctx);
     {
         let ScreenApp { t, s } = h.state_mut();
+        let snap = Arc::make_mut(&mut t.snapshot);
+        snap.seekable = true;
+        snap.live_buffer = Some(tuner::player::LiveBufferRange { start: 0.0, end: 100.0 });
+        snap.position = Some(50.0);
         t.with_ctx(|ctx| s.on_action(ctx, Action::FocusOsdControls));
     }
     for _ in 0..3 {
         h.step();
     }
-    for label in ["Play / pause", "Previous channel", "Next channel", "Audio & subtitles", "Fullscreen", "Player settings"] {
+    let row = ["Back to live", "Previous channel", "Next channel", "Mute", "Volume", "Audio & subtitles", "Fullscreen", "Player settings"];
+    for label in row {
         assert!(has(&h, label), "{label} is drawn at 790 pt");
     }
-    for label in ["Audio", "Subtitles", "Guide", "History", "Info"] {
+    let rects: Vec<_> = row.iter().map(|label| h.get_by_label(label).rect()).collect();
+    assert!(rects.windows(2).all(|pair| pair[0].right() <= pair[1].left()), "{rects:?}");
+    assert!(rects.last().unwrap().right() <= 790.0);
+    for label in ["Skip back", "Centre play / pause", "Skip forward"] {
+        assert!(h.get_by_label(label).rect().bottom() < rects[0].top(), "{label} stays in the picture");
+    }
+    for label in ["Back", "Play / pause", "Forward", "Audio", "Subtitles", "Guide", "History", "Info"] {
         assert!(!has(&h, label), "{label} has left the row");
     }
     assert!(!texts(&shapes(&h)).iter().any(|(x, _, _)| x.contains("Previous channel") || x.contains("Dolby Digital")));

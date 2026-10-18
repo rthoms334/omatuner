@@ -269,9 +269,17 @@ pub(super) fn control_text(c: Control, snap: &PlayerSnapshot) -> String {
 impl PlayerScreen {
     /// The controls focus mode walks those drawn last frame.
     pub(super) fn active_controls(&self, snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: OptionalButtons) -> Vec<Control> {
-        let all = Self::controls(snap, narrow, video_only, queue);
+        let all = Self::focus_controls(snap, narrow, video_only, queue);
         let drawn: Vec<Control> = all.iter().copied().filter(|c| self.visible.contains(c)).collect();
         if drawn.is_empty() { all } else { drawn }
+    }
+
+    /// Picture controls first, then the bottom row from left to right. In the pop-out the
+    /// transport is already at the start of the row.
+    fn focus_controls(snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: OptionalButtons) -> Vec<Control> {
+        let mut controls = if video_only { Vec::new() } else { Self::transport_controls(snap) };
+        controls.extend(Self::controls(snap, narrow, video_only, queue));
+        controls
     }
 
     /// `controls`' index of the control focused last frame: a button that came or went since
@@ -288,9 +296,7 @@ impl PlayerScreen {
         width < 700.0 * theme.rem()
     }
 
-    /// The essentials (DESIGN §13.8); the volume sits between transport and the right group.
-    /// The popped-out window uses the same row. Everything else lives in the cog menu.
-    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, _video_only: bool, queue: OptionalButtons) -> Vec<Control> {
+    fn transport_controls(snap: &PlayerSnapshot) -> Vec<Control> {
         use Control as C;
         let mut v = Vec::new();
         if snap.seekable {
@@ -300,6 +306,14 @@ impl PlayerScreen {
         if snap.seekable {
             v.push(C::SkipForward);
         }
+        v
+    }
+
+    /// The bottom row's essentials (DESIGN §13.8), with volume before the right group.
+    /// Only the popped-out window keeps transport here; the full window has it in the picture.
+    pub(super) fn controls(snap: &PlayerSnapshot, narrow: bool, video_only: bool, queue: OptionalButtons) -> Vec<Control> {
+        use Control as C;
+        let mut v = if video_only { Self::transport_controls(snap) } else { Vec::new() };
         if is_live(snap) {
             if snap.live_buffer.is_some_and(|r| r.behind(snap.position.unwrap_or(r.end))) {
                 v.push(C::BackToLive);
@@ -475,9 +489,6 @@ impl PlayerScreen {
             Action::Up if seekable => self.row = OsdRow::Seek,
             Action::Down => self.row = OsdRow::Buttons,
             Action::Up => {}
-            Action::PlayPause if self.settings.is_none() && controls.get(self.control) == Some(&Control::Settings) && self.row == OsdRow::Buttons => {
-                self.activate_control(ctx, Control::Settings);
-            }
             Action::Activate => {
                 if self.row == OsdRow::Seek {
                     ctx.play(PlayerCommand::TogglePause);
@@ -765,7 +776,7 @@ impl PlayerScreen {
         }
     }
 
-    /// Picture transport mirrors the row's actions and focus order; the pop-out keeps its row.
+    /// Picture transport starts the focus walk; the pop-out keeps transport in its row.
     fn draw_centre_controls(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, top: f32, bottom: f32, snap: &PlayerSnapshot) {
         let t = &ctx.theme.tokens;
         let layout = CentreTransport::new(rect, top, bottom, scale_of(ui));
@@ -817,15 +828,18 @@ impl PlayerScreen {
         }
     }
 
-    /// Both windows share the row, including its right-aligned cog. Collapse labels before
-    /// shrinking the spacing, so even a small live-rewind window keeps every essential.
+    /// The row keeps its right-aligned cog. Collapse labels before shrinking the spacing,
+    /// so even a small live-rewind pop-out with transport keeps every essential.
     fn draw_controls(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, font: FontId, height: f32, snap: &PlayerSnapshot) {
         let theme = ctx.theme;
         let t = &theme.tokens;
         let s = scale_of(ui);
         let narrow = Self::narrow(ui.available_rect_before_wrap().width(), theme);
         self.controls_narrow = narrow;
-        let controls = Self::controls(snap, narrow, ctx.video_only, OptionalButtons::of(ctx));
+        let optional = OptionalButtons::of(ctx);
+        let controls = Self::controls(snap, narrow, ctx.video_only, optional);
+        let focus_controls = Self::focus_controls(snap, narrow, ctx.video_only, optional);
+        let focus_offset = focus_controls.len() - controls.len();
         let split = controls
             .iter()
             .position(|c| matches!(c, Control::QueueNext | Control::AudioSubtitles | Control::Cast | Control::Fullscreen | Control::Settings))
@@ -853,9 +867,10 @@ impl PlayerScreen {
         let right_x = rect.right() - right_w;
         let mut x = rect.left();
         let mut clicked = None;
-        self.control = self.focused_index(&controls);
-        for (i, c) in controls.iter().copied().enumerate() {
-            if i == split {
+        self.control = self.focused_index(&focus_controls);
+        for (row_index, c) in controls.iter().copied().enumerate() {
+            let i = row_index + focus_offset;
+            if row_index == split {
                 let speaker = Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(speaker_w + button_pad, height));
                 let slider = (!narrow).then(|| {
                     let slider = Rect::from_min_size(egui::pos2(speaker.right() + gap, rect.top()), egui::vec2(slider_w, height));
@@ -877,7 +892,7 @@ impl PlayerScreen {
             }
             x = r.right() + gap;
         }
-        self.visible = controls;
+        self.visible = focus_controls;
         if let Some((i, c)) = clicked {
             self.row = OsdRow::Buttons;
             self.control = i;
@@ -887,7 +902,7 @@ impl PlayerScreen {
     }
 
     /// The popped-out window's compact banner: title / return, programme / position, then
-    /// the same essential controls as the full window (DESIGN §13.8).
+    /// the essential controls including transport (DESIGN §13.8).
     pub(super) fn draw_compact_osd(&mut self, ui: &egui::Ui, ctx: &mut UiCtx<'_>, rect: Rect, snap: &PlayerSnapshot) {
         let theme = ctx.theme;
         let t = &theme.tokens;

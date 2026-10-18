@@ -2031,30 +2031,32 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
 │ 󰁍 ▣ 101  BBC One HD                                                              20:26  │ ← top OSD
 │                                                                                          │
-│                                                                                          │
+│                                ⟲     ▶ / ❚❚     ⟳                                       │
 │                                                                    ┌ CHANNELS (c) ─────┐ │
 │                                                                    │ 100 BBC Parliament │ │
 │                                                                    │▸101 BBC One        │ │
 │ News at Eight                                     20:00 – 21:00    │ 102 BBC Two        │ │
 │ ▕██████████████████░░░░░░░░░░░░░░░▏                34 min left     └────────────────────┘ │
 │ Next  21:00 Drama                                    [HD] [5.1] [CC] [⟲]                  │
-│ ⟲  ▶ / ❚❚  ⟳  Live  󰒮  󰒭  󰕾 ━━━●─┊─ 80 %              Next  󰗅  Cast  󰊓  ⚙             │
+│ Live  󰒮  󰒭  󰕾 ━━━●─┊─ 80 %                              Next  󰗅  Cast  󰊓  ⚙             │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
 ```
-The full window also mirrors skip back / play-pause / skip forward in the picture: thin
+The full window shows skip back / play-pause / skip forward only in the picture: thin
 OSD-white icons with soft dark shadows and no backgrounds, 56 pt play/pause and 40 pt
 circular arrows with the configured skip seconds inside (× OSD scale, fitted to the available
 height), spaced about two skip widths either side of centre, with 80 pt hit targets. Hover
 brightens, keyboard focus adds a thin translucent theme ring, and pressing shrinks the icon;
-accumulating signed skip feedback sits below its arrow without a circle. They share the row's
-focus order and banner timeout; the popped-out window has no centre controls.
+accumulating signed skip feedback sits below its arrow without a circle. Skips appear only
+while seekable, including a live cache range. The focus walk starts with the centre trio
+(skip back, play/pause, skip forward), then the bottom row from left to right; entering focus
+still selects play/pause. The centre and row share the banner timeout. The popped-out window
+has no centre controls, so its bottom row keeps the transport trio at the start.
 
 The bottom row keeps the essentials, in order:
 
-* Left: skip back · play/pause · skip forward (skips only while seekable, including a live
-  cache range) · Back to live (only behind the live edge) · previous/next channel (live) ·
-  speaker and volume slider.
+* Left: Back to live (only behind the live edge) · previous/next channel (live) · speaker
+  and volume slider.
 * Right: Next in Up next (only with a next item, outside multi-view) · Audio & subtitles
   (one glyph, no track names, tooltip) · Cast (while casting is on or a cast is running,
   outside multi-view) · Fullscreen · **⚙ Player settings**.
@@ -2074,7 +2076,7 @@ local output lip sync (50 ms steps, reset) and subtitle delay (100 ms steps, cli
 `A` and `S` still open their existing pickers, including subtitle size controls.
 
 `O` (Shift+O) opens the cog; lowercase `o` keeps its existing pop-out binding. The OSD focus
-walk includes Audio & subtitles and the cog; Enter or Space on the cog opens it. In the
+walk includes Audio & subtitles and the cog; Enter or Space activates the focused control. In the
 pop-up, ↑/↓ (or Tab/Shift+Tab) move, Enter/→ open or choose, ←/Backspace/Esc go back a page,
 then close. Enter resets a focused delay value; → increases it. A click outside closes the
 pop-up without activating the covered control. The OSD stays visible while it is open.
@@ -2093,21 +2095,22 @@ The OSD has two layers (UX review B1):
   however often they are pressed.
 * **Controls focus mode**: entered only with Enter, `i` or Tab (`FocusOsdControls`) — a mouse
   click on a control just activates it, so the arrows keep zapping / seeking; pushes
-  `PlayerOsd` (arrows move between controls / scrub, Enter activates); Esc
+  `PlayerOsd` (arrows move between controls / scrub, Enter or Space activates); Esc
   (`LeaveOsdControls`) or Back (Alt+←, the mouse back button) leaves focus mode and the banner
-  times out normally. Unbound keys fall through (Space pauses, except on the cog).
+  times out normally. Unbound keys fall through; outside focus mode, Space pauses.
 * **Esc ladder in the player**: clear filter / number entry → close overlay / side panel or
   settings sub-page → close settings pop-up → cancel Up next countdown → leave controls focus
   → hide the banner → leave window fullscreen → leave the player (mini-player keeps playing).
 * **Which playlist**: with two or more playlists of the item's kind, the top bar shows
   `● TV` left of the clock (§13.0, §29).
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
-  700 pt × rem the row retains transport, live zapping, the speaker (no slider), Next in Up
-  next, Audio & subtitles and the cog. Cast and Fullscreen move into the cog menu. Labels
+  700 pt × rem transport stays in the centre (in the row only when popped out). The row retains
+  Back to live when behind, live zapping, the speaker (no slider), Next in Up next, Audio &
+  subtitles and the cog. Cast and Fullscreen move into the cog menu. Labels
   collapse to glyphs before spacing shrinks; the cog stays at the right edge.
 * **Mouse** (row controls have a hover fill; all controls have a pointing hand and tooltip):
   ← at the left of the top bar leaves the player like `p`; the cog offers Channels
-  (live) and Pop out (not in the popped-out window); volume follows transport — the
+  (live) and Pop out (not in the popped-out window); volume follows the left-hand buttons — the
   speaker (glyph by level; click = mute, tooltip "Mute (m)"), a slider 0–130 % with a mark
   at 100 % (click sets, drag scrubs, wheel ±5; moving it while muted unmutes; 112 pt × s wide,
   80 pt × s from 1200 pt down) and the level ("80 %", "Muted"), its room reserved before the
@@ -2971,7 +2974,7 @@ no Ctrl+Shift+C (the terminal's copy).
 |---|---|
 | `←` / `→` | Move between controls / scrub |
 | `↑` / `↓` | Move between control rows |
-| `Enter` | Activate control |
+| `Enter` / `Space` | Activate control |
 | `Tab` / `Shift+Tab` | Next / previous control |
 | `Esc` | Leave the controls |
 

@@ -833,6 +833,7 @@ pub static PLAYER_OSD: &[Binding] = &[
     b(C::key(Key::ArrowUp), A::Up, "Move between control rows"),
     b(C::key(Key::ArrowDown), A::Down, "Move between control rows"),
     b(C::key(Key::Enter), A::Activate, "Activate control"),
+    b(C::key(Key::Space), A::Activate, "Activate control"),
     b(C::key(Key::Tab), A::FocusNext, "Next / previous control"),
     b(C::shift(Key::Tab), A::FocusPrev, "Next / previous control"),
     b(C::key(Key::Escape), A::LeaveOsdControls, "Leave the controls"),
@@ -1389,8 +1390,12 @@ mod tests {
         assert_eq!(resolve(&[K::PlayerLive], &key(Key::Enter, false)), Some(Action::FocusOsdControls));
         assert_eq!(resolve(&[K::PlayerOsd, K::PlayerLive], &key(Key::ArrowDown, false)), Some(Action::Down));
         assert_eq!(resolve(&[K::PlayerOsd, K::PlayerLive], &key(Key::Escape, false)), Some(Action::LeaveOsdControls));
-        // unbound keys fall through to the player context
-        assert_eq!(resolve(&[K::PlayerOsd, K::PlayerLive], &key(Key::Space, false)), Some(Action::PlayPause));
+        for base in [K::PlayerLive, K::PlayerVod] {
+            assert_eq!(resolve(&[base], &key(Key::Space, false)), Some(Action::PlayPause));
+            for activate in [Key::Enter, Key::Space] {
+                assert_eq!(resolve(&[K::PlayerOsd, base], &key(activate, false)), Some(Action::Activate));
+            }
+        }
     }
 
     // UX review B2: text fields own named keys.
