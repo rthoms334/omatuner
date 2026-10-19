@@ -198,9 +198,10 @@ impl MovieDetailScreen {
             return;
         }
         if let Some(origin) = self.watchlist {
-            if let Some(movie) = &self.movie {
-                let item = ItemRef { source: movie.source_id, kind: ItemKind::Movie, key: movie.key.clone() };
-                crate::ui::watchlists::play_from_page(ctx, origin, item, MediaRef::Movie(id), movie.name.clone(), None, resume, false);
+            // The summary enables Play before the async detail read finishes. Use the same
+            // fallback here so an early Enter or click still plays through the list.
+            if let Some(item) = self.item(ctx) {
+                crate::ui::watchlists::play_from_page(ctx, origin, item, MediaRef::Movie(id), self.title(ctx), None, resume, false);
             }
             return;
         }
@@ -936,6 +937,57 @@ pub(crate) mod tests {
 
     use crate::model::{ItemKey, SourceId};
     use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
+
+    #[test]
+    fn watchlist_film_plays_from_summary_while_details_are_pending() {
+        use crate::ui::screens::queue::tests::{seed_watchlist, start_engine};
+        use egui_kittest::kittest::Queryable;
+
+        let (mut t, one) = rig();
+        let (list, entries) = seed_watchlist(&mut t, "Films", crate::watchlist::PlayOrder::Ordered, 3);
+        let player = start_engine(&t);
+        let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        for (n, action) in [Some(Action::Activate), None, Some(Action::ActivateAlt)].into_iter().enumerate() {
+            let item = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{n:010}")) };
+            let movie = crate::store::vod::resolve_movie(&h.state().t.db, &item).unwrap().unwrap();
+            let origin = crate::ui::watchlists::Origin { list, entry: entries[n] };
+            h.state_mut().enter(Route::MovieDetailFromList { movie, origin });
+            // Hold the detail read until after Play. The summary already renders an enabled
+            // button, so neither keyboard activation nor a click may depend on this worker.
+            // Dropping the sender also releases the worker if an assertion panics.
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let app = h.state_mut();
+            app.s.loader = Some(app.t.with_ctx(|ctx| {
+                Loader::start(ctx, move |db| {
+                    let _ = wait.recv();
+                    Ok((crate::store::vod::movie(db, movie)?, None))
+                })
+            }));
+            h.run_steps(2);
+            assert!(has_label(&h, "Play"));
+            assert!(h.state().s.movie.is_none());
+            if let Some(action) = action {
+                assert!(h.state_mut().act(action));
+            } else {
+                h.get_by_label("Play").click();
+                h.run_steps(2);
+            }
+            let resume = action != Some(Action::ActivateAlt);
+            until(&mut h, "summary's film played through list", |_| {
+                player.0.lock().unwrap().iter().any(|c| {
+                    matches!(c, PlayerCommand::PlayCopy(p) if p.req.media == MediaRef::Movie(movie) && p.req.origin == PlayOrigin::Queue && p.req.resume == resume)
+                })
+            });
+            until(&mut h, "film list context", |h| h.state().t.services().agent.queue().context == Some(list));
+            let rows = crate::store::queue::load(&h.state().t.db).unwrap();
+            let row = rows.iter().find(|row| row.item == item).expect("selected film stored");
+            assert_eq!(row.watchlist_item_id, Some(origin.entry));
+            assert!(row.list_context);
+            assert!(h.state().s.movie.is_none(), "playback must precede the detail read");
+            assert!(h.state_mut().nav().is_empty(), "no Resume prompt or ordinary fullscreen playback");
+            drop(release);
+        }
+    }
 
     #[test]
     fn keyboard_scroll_reaches_wrapped_copies_and_returns_to_page_header() {
