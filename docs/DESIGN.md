@@ -7162,8 +7162,32 @@ programmes and the player. Film and episode files resume with validated HTTP ran
 Series choices include seasons, all episodes and Keep N unwatched. Finished copies resolve
 locally before credentials or a provider lease; partial recordings play only when selected
 in Downloads. Private counter names, parental locks, concealment and the spoiler guard apply.
-The screen groups running, waiting, scheduled, downloaded and failed jobs; Settings controls
-the cap, reserve, watched-file retention, padding, folder, speed and optional overnight window.
+The screen has a compact, reorderable Downloading strip above a Downloaded title library.
+Poster rows use the library's title stacks (`match_hash` / `title_link`), display names and
+image cache, newest download first. Series show unique episode counts, retained file sizes
+and unwatched counts. Enter opens their downloads page: seasons and episodes in S/E order,
+complete then newer files preferred for duplicates, with “Delete the other copy's file” in
+the row menu. All copies' queued and failed episodes appear there too. The footer opens the
+series page for more episodes and toggles its existing Keep N rule. Esc / ← / Alt+← returns
+with the title selected. Films play on Enter; recordings retain programme or channel titles.
+Concealed jobs never enter aggregates, episode titles use `Subject::Episode`, and playback
+still checks the PIN. Posters shrink at Medium and drop at Compact; controls wrap.
+
+```
+Downloading   ⠿ Landman · S2E7  [███████░░░] 71 %  TV  [Pause] [Cancel]
+Downloaded    [poster] Landman  9 episodes · 12.4 GB · 3 unwatched  >
+              [poster] Dune     5.2 GB · ✓ Watched
+Landman / Season 2   S2E7 · …   Waiting · Switched to TV 2
+              [Download more episodes]  [✓] Keep the next [3] unwatched
+```
+
+After retries, any-copy jobs advance through the copy plan, skipping missing episodes via
+`same_episode`; jobs waiting on a repeatedly failing account can switch too. Pinned jobs
+stay pinned. A part is retained only for an identical resolved resource and still requires
+matching HTTP validators; a different resource discards the part and starts fresh. The row
+reports “Switched to TV 2”. Each copy is tried once per retry cycle.
+Settings controls the cap, reserve, watched-file retention, padding, folder, speed and optional
+overnight window.
 “Pause downloads” persists across restarts; recordings and finishing continue. Downloads pause
 when the window closes and resume when it opens. Recordings consume none of the shared rate
 budget. Downloads and Settings list Keep N rules under “Kept topped up”, with Delete and Undo.

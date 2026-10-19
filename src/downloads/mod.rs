@@ -16,3 +16,6 @@ pub mod maintenance;
 pub mod limits;
 
 pub mod reader;
+
+#[cfg(test)]
+pub(crate) mod test_support;

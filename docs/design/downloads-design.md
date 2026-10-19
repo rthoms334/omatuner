@@ -35,31 +35,60 @@
 ### 2.1 Where downloads show up
 | Place | What |
 |---|---|
-| **Downloads screen**, `Alt+8`, sidebar entry "Downloads" with a live count | Sections: Now (progress bar, speed, ETA, account) · Waiting (queue, reorderable) · Scheduled recordings · Downloaded (grouped by series) · Failed / Missed |
+| **Downloads screen**, `Alt+8`, sidebar entry "Downloads" with a live count | Downloading (compact, reorderable queue) · Downloaded (one poster row per title stack) · Failed / Missed · Kept topped up |
 | **Cards, episode rows, guide cells** | ⤓ downloaded, ⤓ 62 % in progress, ⏺ recording scheduled or running (guide cells get a red dot) |
 | **Detail pages** | A `[⤓ Download ▾]` button. Series pages show "8 of 12 downloaded · 19 GB" |
 | **Player** | A "⤓ Playing from your download" line in stream info. While recording live, the OSD shows ⏺ and Ctrl+D stops recording |
 | **Status bar** | "⤓ 2 downloading · 4.1 MB/s" while anything runs |
 | **Settings ▸ Downloads** | Space cap, the free-space reserve, delete after watching, recording padding, folder, and "Pause downloads" |
 
-### 2.2 Downloads screen, Wide
+### 2.2 Downloads screen
+**Downloading** is a compact strip at the top: running, finishing, waiting, paused and
+scheduled jobs in queue order. Each row names the title, S/E for an episode, progress or
+state, playlist, Pause / Resume and Cancel. Alt+↑↓ and the drag handle reorder this strip.
+
+**Downloaded** has one poster row per title, using the library's `match_hash` / `title_link`
+stacks even when the library preference shows copies separately. Its display name and
+poster come from the stack's representative, through the image cache. Series show
+“9 episodes · 12.4 GB · 3 unwatched” (omit unwatched when zero); films show size and the
+watched mark. Counts are unique saved S/E pairs; sizes include every retained file,
+including duplicates until deleted. Watched on either copy counts as watched. Rows sort
+by the latest completed download. Partial, live and catch-up recordings retain their
+programme or channel title. Concealment is applied before grouping and all counts and
+sizes; locked files still ask for the PIN when played. At Medium posters shrink; Compact
+drops posters and wraps row controls.
+
+Enter or a click on a series opens **that series' downloads**. All copies' jobs appear in
+season / episode order under season headings, one row per S/E. A complete file wins over
+a partial or unfinished job, then the newer file wins. The row menu offers “Delete the
+other copy's file” for retained duplicates. Rows show Downloaded · size, progress, Waiting,
+or Failed with its reason, the watched mark, Play and Delete. Episode titles still pass
+through `Subject::Episode`. Delete uses Confirm and ten seconds of Undo.
+
+The page ends with “Download more episodes” (the series page) and “Keep the next [N]
+unwatched downloaded”, using the existing Keep N rule add/remove commands. Rules on any
+copy of the stack are recognised. Esc, ← or Alt+← returns to Downloads with its title row
+selected. Enter on a film or episode plays it. Ctrl+Enter / Shift+F10 keep the row menus.
+Failed jobs without a saved title remain under Failed / Missed; a saved series' failed
+and queued episodes are also visible on its downloads page.
+
 ```
-┌──────────────┬──────────────────────────────────────────────────────────────────────────────┐
-│ 󰓎 Watchlists  │ DOWNLOADS   38 GB used of 200 GB · 312 GB free           [⏸ Pause downloads]     │
-│ ⤓ Downloads 2 │ ─ Now ──────────────────────────────────────────────────────────────────────── │
-│ 󰒓 Settings    │  ⤓ Andor · S1E4 · Aldhani            ● TV    ▕██████░░░▏ 62 % · 6.2 MB/s · 4 min │
-│              │  ⏺ Bake Off · Tue 20:00–21:05           ● TV 2  recording · 21 min left          │
-│              │ ─ Waiting (7) ───────────────────────────────────────────────────────────────── │
-│              │ ▸⠿ Andor · S1E5 … S1E12               ● TV    8 episodes · ~19 GB              │
-│              │  ⠿ Dune (2021)                       ● TV 2  waiting for TV 2 (watching)      │
-│              │ ─ Scheduled ─────────────────────────────────────────────────────────────────── │
-│              │  ⏺ Newsnight · Wed 22:30             ● TV    ⚠ clashes with Andor downloads    │
-│              │ ─ Downloaded ────────────────────────────────────────────────────────────────── │
-│              │  ▸ Andor  3 episodes · 7.1 GB · 1 watched                                      │
-│              │    Slow Horses S2E1  · 2.4 GB · ✓ watched · deletes in 5 days                  │
-├──────────────┴──────────────────────────────────────────────────────────────────────────────┤
-│ ↵ play · Space pause/resume · Alt+↑↓ move · Del delete/cancel · Ctrl+↵ more · ? help        │
-└──────────────────────────────────────────────────────────────────────────────────────────────┘
+DOWNLOADS    38 GB of 200 GB · 312 GB free       [Pause downloads]
+Downloading
+  ⠿ Landman · S2E7   [███████░░░] 71 %   TV     [Pause] [Cancel]
+  ⠿ Dune            Waiting             TV 2   [Pause] [Cancel]
+Downloaded
+  [poster] Landman    9 episodes · 12.4 GB · 3 unwatched       >
+  [poster] Dune       5.2 GB · ✓ Watched
+
+← Downloads / Landman
+Season 1
+  S1E2 · …     Downloaded · 1.4 GB · ✓ Watched   [Play] [Delete]
+Season 2
+  S2E6 · …     Downloaded · 1.3 GB               [Play] [Delete]
+  S2E7 · …     Waiting · Switched to TV 2         [Play] [Delete]
+[Download more episodes]
+[✓] Keep the next [3] unwatched downloaded
 ```
 
 ### 2.3 The download menu (`Ctrl+D`)
@@ -99,8 +128,9 @@ Every choice shows its size (or "~2 GB per hour" for a recording) and the free s
 |---|---|---|
 | `Global` | **`Alt+8`** | Downloads screen (`GoDownloads`) |
 | Item contexts, guide, live player | **`Ctrl+D`** | Download / record… (`Download`) |
-| Downloads list | `Enter` | Play the download (in progress: play from the provider as usual) |
-| | `Space` | Pause / resume this download |
+| Downloads list | `Enter` | Open the series downloads page; play a film or episode (unfinished: from the provider) |
+| Series downloads | `Esc`, `←`, `Alt+←` | Back to Downloads, with the title selected |
+| Downloads list | `Space` | Pause / resume this download |
 | | `Alt+↑↓`, drag the handle | Reorder the queue |
 | | `Delete` | Cancel (waiting or running) or delete the file (Confirm, then Undo for 10 s before the file is unlinked) |
 | | `Ctrl+Enter` / `Shift+F10` | Menu: Play · Pause · Retry · Move to top · Download from another copy · Delete · Delete watched |
@@ -115,7 +145,7 @@ Every choice shows its size (or "~2 GB per hour" for a recording) and the free s
 | **One at a time per account** | Each download or recording holds one budget lease, like a player tile. With `max_connections = 1`, a playlist runs one job at a time. TV and TV 2 run in parallel. Jobs waiting on an account show "waiting for TV". |
 | **Which copy** | Decided when the job **starts**, by `copies::plan` (latest progress → trouble last → language → playlist order), skipping a busy account when another copy is free. "Download from TV 2" pins it. |
 | **Resume** | Film and episode files use HTTP `Range` from the `.part` length when the server sent `Accept-Ranges: bytes` and the ETag / Last-Modified / length still match; otherwise they start again. Pause keeps the `.part` file. |
-| **Failures** | Retries 3 times with backoff (30 s, 2 min, 10 min), then **Failed** (Retry is in the menu). 403 counts as busy only when other holders fill the account limit; the failing job’s own lease is excluded. Three failed jobs in a row on one account pause that account's queue with a toast, so it never hammers a provider overnight. |
+| **Failures** | Retries 3 times with backoff (30 s, 2 min, 10 min), then an any-copy film or episode tries the next untried copy in `copies::plan`; episodes must exist there (`same_episode`). Waiting jobs also leave an account paused by repeated failures. Pinned jobs never switch. The state says “Switched to TV 2”. A part survives only for the identical resolved resource, with normal HTTP validator checks on resume; otherwise its file and validators are discarded. When no eligible copy remains, the job is **Failed** (Retry starts a new cycle). 403 counts as busy only when other holders fill the account limit; the failing job’s own lease is excluded. Three failed jobs in a row on one account pause that account's queue with a toast, so it never hammers a provider overnight. |
 | **Playing a download** | `resolve` checks first for a **finished** download of this item, or of **any copy** of the title (for episodes, `same_episode`), and plays the local file: no lease and no network. Progress and watched state are stored against the downloaded copy's item, as today. Up next and watchlists use the download in the same way. |
 | **In-progress downloads** | They play from the provider as usual (through the Ask prompt when it's the downloading account). Playing a half-finished file isn't supported. |
 | **Live recording, HLS** (decided 2026-10-16) | A **keeping** variant of the `player/hls` recorder: no 1,800 s cut; segments, keys and maps are kept in the job's 0700 folder while recording. Saved HLS can't be played directly (mpv's clock resets at provider discontinuities; Codex's `downloaded_hls` probes in `tests/timeshift_transport.rs`). So when the recording stops it is **finished into one file**: each discontinuity run is remuxed with the cast relay's ffmpeg (`-c copy`, no re-encode), then joined with the concat demuxer, which offsets each run's timestamps, into `<id>.mkv`. The folder is deleted once the file is verified (duration within 2 s of the recorded total). The state is `finishing` ("Finishing… 40 %"), which takes about a minute per hour. A failed finish keeps the folder and retries on the next start. The finished file plays, seeks and casts like a downloaded film. |

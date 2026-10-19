@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::config::Config;
 use crate::downloads::{Job, Kind, SeriesScope, State, Target};
 use crate::error::{Error, Result};
-use crate::model::{ChannelId, DownloadId, ItemKind, ItemRef, MediaRef, SeriesId, Timestamp, VodKind};
+use crate::model::{ChannelId, DownloadId, ItemKind, ItemRef, MediaRef, SeriesId, SourceId, Timestamp, VodKind};
 use crate::player::budget::SharedBudget;
 use crate::shared::ParentalView;
 use crate::store::{self, library::Library};
@@ -206,43 +206,75 @@ pub fn series_targets(c: &Connection, item: &ItemRef, scope: SeriesScope) -> Res
 
 /// Copy planning is deferred until the worker starts, so another account can make progress
 /// while the preferred one is in use. A resumed part stays pinned to its validators.
-pub fn pick(c: &Connection, lib: &Library, cfg: &Config, budget: &SharedBudget, j: &Job) -> Result<Option<ItemRef>> {
+pub fn pick(
+    c: &Connection,
+    lib: &Library,
+    cfg: &Config,
+    budget: &SharedBudget,
+    j: &Job,
+    unavailable: impl Fn(SourceId) -> bool,
+) -> Result<Option<ItemRef>> {
     let Some(item) = j.item() else { return Ok(None) };
-    if !j.any_copy || j.bytes_done > 0 || j.kind.recording() {
-        return Ok((budget.admits(j.id, item.source) && budget.download_holder(item.source).is_none()).then_some(item));
+    let available = |source| !unavailable(source) && budget.admits(j.id, source) && budget.download_holder(source).is_none();
+    if !j.any_copy || j.bytes_done > 0 || j.kind.recording() || j.fp.get("download_switched_to").and_then(|v| v.as_str()).is_some() {
+        return Ok(available(item.source).then_some(item));
     }
+    Ok(planned(c, lib, cfg, j)?.into_iter().find(|copy| available(copy.source)))
+}
+
+/// The same ordered candidates for a new job and recovery. A series copy is a candidate
+/// only when it has this exact episode (DESIGN §43 §3).
+fn planned(c: &Connection, lib: &Library, cfg: &Config, j: &Job) -> Result<Vec<ItemRef>> {
+    let Some(item) = j.item() else { return Ok(vec![]) };
     let (movies, index, ep) = match media(c, j)? {
         MediaRef::Movie(id) => (true, lib.vod.index_of(VodKind::Movie(id)), None),
         MediaRef::Episode(id) => {
             let ep = store::vod::episode(c, id)?;
             (false, lib.vod.index_of(VodKind::Series(ep.series_id)), Some(ep))
         }
-        _ => return Ok(budget.admits(j.id, item.source).then_some(item)),
+        _ => return Ok(vec![item]),
     };
     let Some(index) = index else {
-        return Ok((budget.admits(j.id, item.source) && budget.download_holder(item.source).is_none()).then_some(item));
+        return Ok(vec![item]);
     };
     // Downloading a locked title in the app is permitted; playback still asks for the PIN.
     let plan = store::copies::plan(c, &lib.vod, movies, index, true, cfg.interface.copy_order, crate::model::now())?;
+    let mut candidates = Vec::new();
     for index in plan.order.iter().copied() {
         let Some(copy) = plan.get(index) else { continue };
         if (j.added_by == "agent" && copy.locked) || lib.conceals(&copy.item_ref) {
-            continue;
-        }
-        if !budget.admits(j.id, copy.item_ref.source) || budget.download_holder(copy.item_ref.source).is_some() {
             continue;
         }
         if let Some(ep) = &ep {
             let Some(VodKind::Series(series)) = lib.vod.series.get(index as usize).map(|s| s.kind) else { continue };
             if let Some(id) = store::copies::same_episode(c, series, ep.season, ep.episode)? {
                 let ep = store::vod::episode(c, id)?;
-                return Ok(Some(ItemRef { source: ep.source_id, kind: ItemKind::Episode, key: ep.key }));
+                let item = ItemRef { source: ep.source_id, kind: ItemKind::Episode, key: ep.key };
+                if !lib.conceals(&item) {
+                    candidates.push(item);
+                }
             }
         } else {
-            return Ok(Some(copy.item_ref.clone()));
+            candidates.push(copy.item_ref.clone());
         }
     }
-    Ok(None)
+    Ok(candidates)
+}
+
+/// Try each copy once per retry cycle; pinned jobs and recordings keep their chosen source.
+pub fn recovery(c: &Connection, lib: &Library, cfg: &Config, job: &Job, unavailable: impl Fn(SourceId) -> bool) -> Result<Option<ItemRef>> {
+    if !job.any_copy || job.kind.recording() {
+        return Ok(None);
+    }
+    let tried: Vec<ItemRef> = job.fp.get("download_tried").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    Ok(planned(c, lib, cfg, job)?.into_iter().find(|copy| job.item().as_ref() != Some(copy) && !tried.contains(copy) && !unavailable(copy.source)))
+}
+
+/// Only an identical resolved resource may retain a part across copies. HTTP still checks
+/// its validators before appending; matching titles or episode coordinates are not enough.
+pub fn same_file(c: &Connection, cfg: &Config, before: &Job, after: &Job) -> bool {
+    let resolve = |job| media(c, job).and_then(|m| crate::sources::resolve::resolve_provider(c, cfg, &m, false, crate::model::now()));
+    resolve(before).ok().zip(resolve(after).ok()).is_some_and(|(a, b)| a.url.expose() == b.url.expose() && a.headers == b.headers)
 }
 
 /// Copies offered by the clash prompt. Live channels use the shared ranking; VOD uses the

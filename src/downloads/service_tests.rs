@@ -345,3 +345,133 @@ fn folder_copy_keeps_ticking_and_waits_for_recording_before_switching() {
         assert_eq!(std::fs::read(path.join("kept")).unwrap(), b"old bytes");
     });
 }
+
+fn episode_fixture() -> (TestUi, Engine) {
+    let (ui, e) = fixture();
+    e.deps.store.writer().blocking(super::super::test_support::seed).unwrap();
+    let lib = Arc::new(crate::store::library::load(&e.deps.store.reader().unwrap()).unwrap());
+    drop(e.deps.shared.publish_library(&lib));
+    (ui, e)
+}
+
+async fn part(e: &mut Engine, pinned: bool) -> Job {
+    let mut job = super::super::test_support::job(&e.deps.store.reader().unwrap(), 1, 2, 7);
+    job.any_copy = !pinned;
+    job.attempts = 3;
+    job.bytes_done = 71;
+    job.bytes_total = Some(100);
+    job.etag = Some("same-file".into());
+    job.fp["download_validators"] = serde_json::json!({"accepts_ranges": true, "etag": "same-file", "last_modified": null, "length": 100});
+    let write = job.clone();
+    job.id = e.deps.store.writer().run(move |c| db::add(c, &write)).await.unwrap();
+    job.store_name = Some(format!("{}.mp4", job.id));
+    std::fs::write(e.root().unwrap().join(format!("{}.mp4.part", job.id)), [0; 71]).unwrap();
+    e.save(job.clone()).await.unwrap();
+    job
+}
+
+#[test]
+fn exhausted_episode_retries_switch_to_a_copy_with_the_episode_and_discard_a_different_part() {
+    let (ui, mut e) = episode_fixture();
+    ui.services().rt.block_on(async {
+        let job = part(&mut e, false).await;
+        let id = job.id;
+        e.paused = true;
+        running(&mut e, job, Some(Err(Error::other("connection failed")))).await;
+        complete(&e).await;
+        e.tick_at(crate::model::now(), 0).await.unwrap();
+        let switched = row(&e, id);
+        assert_eq!(switched.source_id, Some(SourceId(3)), "the earlier copy on source 2 lacks S2E7");
+        assert_eq!(switched.state, State::Waiting);
+        assert_eq!(switched.attempts, 0);
+        assert_eq!(switched.bytes_done, 0);
+        assert!(switched.bytes_total.is_none() && switched.etag.is_none());
+        assert!(!e.root().unwrap().join(format!("{id}.mp4.part")).exists());
+        assert!(crate::ui::downloads::state_text(&switched).contains("Switched to TV 2"));
+        let cfg = current(&e.deps.config);
+        let c = e.deps.store.reader().unwrap();
+        assert_eq!(
+            planning::pick(&c, &e.deps.shared.library(), &cfg, &e.deps.budget, &switched, |_| false).unwrap(),
+            switched.item(),
+            "starting must retain the replacement"
+        );
+        let mut failed_again = switched;
+        assert!(!e.recover(&mut failed_again).unwrap(), "do not cycle back to the failing copy or pick the missing episode");
+    });
+}
+
+#[test]
+fn pinned_episode_keeps_its_playlist_and_part_after_exhausted_retries() {
+    let (ui, mut e) = episode_fixture();
+    ui.services().rt.block_on(async {
+        let job = part(&mut e, true).await;
+        let id = job.id;
+        e.paused = true;
+        running(&mut e, job, Some(Err(Error::other("connection failed")))).await;
+        complete(&e).await;
+        e.tick_at(crate::model::now(), 0).await.unwrap();
+        let failed = row(&e, id);
+        assert_eq!(failed.source_id, Some(SourceId(1)));
+        assert_eq!(failed.state, State::Failed);
+        assert_eq!(failed.bytes_done, 71);
+        assert!(e.root().unwrap().join(format!("{id}.mp4.part")).exists());
+    });
+}
+
+#[test]
+fn waiting_episode_leaves_a_failed_account_but_pinned_jobs_wait() {
+    for pinned in [false, true] {
+        let (ui, mut e) = episode_fixture();
+        ui.services().rt.block_on(async {
+            let job = part(&mut e, pinned).await;
+            let id = job.id;
+            for _ in 0..3 {
+                e.failed_job(SourceId(1));
+            }
+            let mut cfg = (*current(&e.deps.config)).clone();
+            cfg.downloads.window = "01:00-07:00".into();
+            e.pending(job, &cfg, crate::model::now(), 0, &mut 0, u64::MAX).await.unwrap();
+            assert_eq!(row(&e, id).source_id, Some(SourceId(if pinned { 1 } else { 3 })));
+            assert!(e.running.is_empty(), "the closed window still applies");
+        });
+    }
+}
+
+#[test]
+fn switching_an_identical_resource_preserves_the_part_and_resume_validators() {
+    let (ui, mut e) = episode_fixture();
+    ui.services().rt.block_on(async {
+        e.deps
+            .store
+            .writer()
+            .run(|c| {
+                c.execute(
+                    "UPDATE episode SET stream=(SELECT stream FROM episode WHERE source_id=1 AND key='e2-7') WHERE source_id=3 AND key='e2-7'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut job = part(&mut e, false).await;
+        assert!(e.recover(&mut job).unwrap());
+        assert_eq!(job.source_id, Some(SourceId(3)));
+        assert_eq!(job.bytes_done, 71);
+        assert_eq!(job.fp["download_validators"]["etag"], "same-file");
+        assert_eq!(std::fs::metadata(e.root().unwrap().join(format!("{}.mp4.part", job.id))).unwrap().len(), 71);
+    });
+}
+
+#[test]
+fn new_episode_job_skips_a_free_copy_without_the_episode() {
+    let (ui, e) = episode_fixture();
+    let c = e.deps.store.reader().unwrap();
+    let job = super::super::test_support::job(&c, 1, 2, 7);
+    e.deps.budget.claim(TileId::A, Some(SourceId(1)));
+    let picked = planning::pick(&c, &e.deps.shared.library(), &current(&e.deps.config), &e.deps.budget, &job, |_| false).unwrap().unwrap();
+    assert_eq!(picked.source, SourceId(3));
+    let media = crate::store::vod::resolve_episode(&c, &picked).unwrap().unwrap();
+    let episode = crate::store::vod::episode(&c, media).unwrap();
+    assert_eq!((episode.season, episode.episode), (2, 7));
+    drop(ui);
+}
