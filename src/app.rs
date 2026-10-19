@@ -2457,6 +2457,7 @@ impl TunerApp {
             // Esc in the player or the pop-out while an automatic switch counts down (its strip
             // shows over the picture): calls the switch off rather than leaving
             if action == Action::Back
+                && !stack.contains(&KeyContext::PlayerSettings)
                 && self.overlays.is_empty()
                 && (self.view_screen() == ScreenId::Player || self.popout.is_out() || self.video_only)
                 && let Some(id) = self.reminder_ui.countdowns.first().map(|c| c.reminder)
@@ -4134,6 +4135,31 @@ mod tests {
         // control: in the pane itself the space marks
         rig.frame_with(vec![Event::Text(" ".into())]);
         assert_eq!(probe.borrow().actions, [Action::ToggleMark]);
+    }
+
+    #[test]
+    fn player_settings_take_escape_before_a_scheduled_switch_countdown() {
+        let mut rig = Rig::new();
+        rig.app.routes.push(Route::Player);
+        let probe = rig.probe(ScreenId::Player, vec![KeyContext::PlayerSettings, KeyContext::PlayerLive]);
+        probe.borrow_mut().handle_back = true;
+        rig.app.reminder_ui.countdowns.push(crate::reminders::ui::Countdown {
+            reminder: crate::model::ReminderId(999),
+            channel_name: "News".into(),
+            title: String::new(),
+            at: crate::model::now() + 60,
+            open_in: crate::model::OpenIn::FullWindow,
+        });
+        let stack = rig.app.key_stack();
+        rig.app.pending_actions.push((Action::Back, stack));
+        rig.app.dispatch_actions(&rig.ctx);
+        assert_eq!(probe.borrow().actions, [Action::Back]);
+        assert_eq!(rig.app.reminder_ui.countdowns.len(), 1);
+        probe.borrow_mut().contexts = vec![KeyContext::PlayerLive];
+        let stack = rig.app.key_stack();
+        rig.app.pending_actions.push((Action::Back, stack));
+        rig.app.dispatch_actions(&rig.ctx);
+        assert!(rig.app.reminder_ui.countdowns.is_empty(), "the next Esc still cancels the switch");
     }
 
     #[test]

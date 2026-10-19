@@ -171,14 +171,15 @@ fn info_banner_never_changes_the_keys_only_controls_focus_does() {
         assert_eq!(resolve(&live, &ev), Some(Action::FocusOsdControls), "{ev:?}");
         assert_eq!(resolve(&vod, &ev), Some(Action::FocusOsdControls), "{ev:?}");
     }
-    // in controls focus mode arrows move between controls; Esc leaves; the rest falls through
+    // in controls focus mode arrows move, Enter / Space activate, Esc leaves; the rest falls through
     for base in [K::PlayerLive, K::PlayerVod] {
         let osd = [K::PlayerOsd, base];
         assert_eq!(resolve(&osd, &key(Key::ArrowLeft)), Some(Action::Left));
         assert_eq!(resolve(&osd, &key(Key::ArrowDown)), Some(Action::Down));
         assert_eq!(resolve(&osd, &key(Key::Enter)), Some(Action::Activate));
         assert_eq!(resolve(&osd, &key(Key::Escape)), Some(Action::LeaveOsdControls));
-        assert_eq!(resolve(&osd, &key(Key::Space)), Some(Action::PlayPause));
+        assert_eq!(resolve(&osd, &key(Key::Space)), Some(Action::Activate));
+        assert_eq!(resolve(&[base], &key(Key::Space)), Some(Action::PlayPause));
         assert_eq!(resolve(&osd, &text("m")), Some(Action::Mute));
     }
     // Esc on the plain player is Back (the app's Esc ladder hides the banner first)
@@ -491,4 +492,40 @@ fn epg_mapping_adjust_keeps_panel_shortcuts() {
         assert_eq!(resolve(&[K::Settings], &text(&ch.to_string())), Some(Action::FilterInput(ch)));
     }
     assert_eq!(resolve(&stack, &text("z")), None, "Adjust does not filter");
+}
+
+#[test]
+fn player_settings_keys_keep_the_existing_player_shortcuts() {
+    for base in [K::PlayerLive, K::PlayerVod] {
+        for extra in [vec![], vec![K::PlayerOsd], vec![K::PopOut], vec![K::PopOut, K::MultiView]] {
+            let mut stack = extra;
+            stack.push(base);
+            assert_eq!(resolve(&stack, &text("O")), Some(Action::PlayerSettings), "{stack:?}");
+            assert_eq!(resolve(&stack, &text("o")), Some(Action::TogglePopOut));
+            assert_eq!(resolve(&stack, &text("I")), Some(Action::StreamInfo));
+            stack.insert(0, K::PlayerSettings);
+            for k in [Key::Escape, Key::ArrowLeft, Key::Backspace] {
+                assert_eq!(resolve(&stack, &key(k)), Some(Action::Back), "{stack:?}: {k:?}");
+            }
+            for k in [Key::Enter, Key::Space] {
+                assert_eq!(resolve(&stack, &key(k)), Some(Action::Activate));
+            }
+            assert_eq!(resolve(&stack, &key(Key::ArrowUp)), Some(Action::Up));
+            assert_eq!(resolve(&stack, &key(Key::ArrowDown)), Some(Action::Down));
+            assert_eq!(resolve(&stack, &key(Key::ArrowRight)), Some(Action::Right));
+            for (key, action) in [
+                ("A", Action::AudioMenu),
+                ("S", Action::SubtitleMenu),
+                ("[", Action::LipSyncEarlier),
+                ("]", Action::LipSyncLater),
+                ("z", Action::SubDelayMinus),
+                ("x", Action::SubDelayPlus),
+                ("Z", Action::SubDelayReset),
+            ] {
+                assert_eq!(resolve(&stack, &text(key)), Some(action));
+            }
+        }
+    }
+    assert_eq!(resolve(&[K::PlayerLive], &text("H")), Some(Action::ChannelHistory));
+    assert_eq!(resolve(&[K::PlayerLive], &text("i")), Some(Action::FocusOsdControls));
 }

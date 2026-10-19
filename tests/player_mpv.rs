@@ -671,13 +671,13 @@ fn skips_from_screen(url: String, seekable: bool) {
         // live zap. Both paths exercise +10 and -10 SeekBy commands.
         for button in [true, false] {
             if button && !seekable {
-                assert!(ui.query_by_label("Back").is_none() && ui.query_by_label("Forward").is_none());
+                assert!(ui.query_by_label("Skip back").is_none() && ui.query_by_label("Skip forward").is_none());
                 continue;
             }
             for forward in [true, true, false, false] {
                 let before = handle.snapshot().position.unwrap();
                 if button {
-                    ui.get_by_label(if forward { "Forward" } else { "Back" }).click();
+                    ui.get_by_label(if forward { "Skip forward" } else { "Skip back" }).click();
                 } else {
                     let key = if forward { egui::Key::ArrowRight } else { egui::Key::ArrowLeft };
                     let event = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
@@ -719,7 +719,7 @@ fn skips_from_screen(url: String, seekable: bool) {
         if seekable {
             let before = handle.snapshot().position.unwrap();
             for _ in 0..3 {
-                ui.get_by_label("Forward").click();
+                ui.get_by_label("Skip forward").click();
                 ui.run_steps(2);
             }
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -728,7 +728,7 @@ fn skips_from_screen(url: String, seekable: bool) {
                 let moved = handle.snapshot().position.is_some_and(|p| (p - before - 30.0).abs() < 0.6);
                 let ripple = ui.output().shapes.iter().any(|s| {
                     matches!(&s.shape,
-                    egui::Shape::Text(t) if t.galley.job.text == "⟳ 30")
+                    egui::Shape::Text(t) if t.galley.job.text == "+30 s")
                 });
                 if moved && ripple {
                     break;

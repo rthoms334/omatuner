@@ -21,6 +21,11 @@ pub const HIDDEN: &str = "\u{f0209}";
 pub const EXPLICIT: &str = HIDDEN;
 pub const PLAY: &str = "\u{f040a}";
 pub const PAUSE: &str = "\u{f03e4}";
+/// Centre transport: nf-md-play_outline / restore (anticlockwise) / reload (clockwise).
+/// Verified present and rendered in JetBrainsMono Nerd Font; skip seconds are overlaid.
+pub const PLAY_OUTLINE: &str = "\u{f0f1b}";
+pub const SKIP_BACK_CIRCULAR: &str = "\u{f099b}";
+pub const SKIP_FORWARD_CIRCULAR: &str = "\u{f0453}";
 pub const STOP: &str = "\u{f04db}";
 pub const NEXT: &str = "\u{f04ad}";
 pub const PREVIOUS: &str = "\u{f04ae}";
