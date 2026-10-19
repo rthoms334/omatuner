@@ -615,7 +615,7 @@ pub fn memberships(c: &Connection, lib: &Library, item: &ItemRef) -> Result<Vec<
         let Some(v) = view(c, lib, l.id, true, false)? else { continue };
         for (i, e) in v.entries.iter().enumerate() {
             if same_title(c, lib, &e.entry, &target)? {
-                out.push((l.clone(), i + 1, v.total));
+                out.push((l.clone(), i + 1, v.entries.len()));
                 break;
             }
         }
@@ -1031,15 +1031,15 @@ pub fn view_for_run(
         }
         states[i].entry.id
     });
-    let total = states.len();
-    let done = states.iter().filter(|e| e.done()).count();
     let remaining_s = states.iter().filter(|e| !e.done() && e.status != EntryStatus::Missing).try_fold(0.0, |sum, e| {
         e.duration_s
             .map(|d| sum + if e.entry.kind == ItemKind::Series { d } else { (d - e.progress.as_ref().map_or(0.0, |p| p.position_s)).max(0.0) })
     });
     let show_watched =
         c.query_row("SELECT value='1' FROM meta WHERE key=?1", [format!("watchlist:show_watched:{id}")], |r| r.get(0)).optional()?.unwrap_or(false);
-    Ok(Some(ListView { list: l, entries: states, next, done, total, remaining_s, passed_over, show_watched }))
+    let mut view = ListView { list: l, entries: states, next, done: 0, total: 0, remaining_s, passed_over, show_watched };
+    view.recount();
+    Ok(Some(view))
 }
 pub fn snapshot(c: &Connection, lib: &Library, unlocked: bool, agent: bool) -> Result<WatchlistsSnapshot> {
     snapshot_with_visibility(c, lib, unlocked, agent, !lib.visibility.explicit)
@@ -1743,6 +1743,33 @@ mod tests {
             assert!(view(c, &lib, list, false, false)?.unwrap().next.is_none());
             Ok(())
         })
+    }
+
+    #[test]
+    fn progress_counts_episodes_titles_and_skips_without_changing_entry_positions() {
+        with_db(|c| {
+            let lib = library::load(c)?;
+            let list = create(c, "Progress", None, PlayOrder::Ordered, "app", 1)?;
+            let ids = add_refs(c, &lib, list, &[series(1)])?;
+            progress(c, &ItemRef { source: SourceId(2), kind: ItemKind::Episode, key: ItemKey("s2-1-1".into()) }, true, 3000.0, 10)?;
+            let v = view(c, &lib, list, false, false)?.unwrap();
+            assert_eq!((v.done, v.total), (1, 6));
+            assert_eq!(v.progress_label(), "1 of 6 episodes");
+            assert_eq!(v.place(ids[0]), Some((1, 1)));
+            assert!(!v.finished());
+            skip(c, list, &ids, true)?;
+            let v = view(c, &lib, list, false, false)?.unwrap();
+            assert_eq!(v.progress_label(), "6 of 6 episodes");
+            assert!(v.finished());
+            let films = add_refs(c, &lib, list, &[movie(1, "hope"), movie(1, "empire")])?;
+            skip(c, list, &[films[0]], true)?;
+            let v = view(c, &lib, list, false, false)?.unwrap();
+            assert_eq!(v.progress_label(), "7 of 8 watched");
+            assert_eq!(v.place(films[1]), Some((3, 3)));
+            remove(c, list, &ids)?;
+            assert_eq!(view(c, &lib, list, false, false)?.unwrap().progress_label(), "1 of 2 titles");
+            Ok(())
+        });
     }
 
     /// DESIGN §42 §8.3–4: the agent passes locked rows even in an unlocked session. Ordered

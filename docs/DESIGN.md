@@ -2629,6 +2629,8 @@ no Ctrl+Shift+C (the terminal's copy).
 
 | Keys | Action |
 |---|---|
+| `Enter` | Open entry / open entries |
+| `Shift+Enter` | Play from here |
 | `→` | Open entries / move right |
 | `Ctrl+I` | Episodes… / film details |
 | `Ctrl+W` | Mark current episode / title watched; done entry unwatched |
@@ -5423,16 +5425,18 @@ every copy ("Removed from Favourites in TV and TV 2", "Marked unwatched in …",
 "… every copy". A page
 opened for one copy on purpose keeps acting on that copy, like the card that led there.
 
-**Series: episodes matched across copies.** A combined series page reads, with its own
-episodes, the progress of the other copies' episodes by (season, episode)
-(`copies::episode_progress`: a watched mark wins, else the latest progress) and shows it merged:
+**Series: episodes matched across copies.** A combined series lists the union of its copies'
+seasons and episodes by (season, episode): the page copy first, then play order, retaining each
+row's own reference for playback and actions. Progress is merged across those coordinates
+(`copies::episode_progress`: a watched mark wins, else the latest progress):
 an episode watched in TV 2's copy shows ✓ here, "Mark season watched" says *Season watched*.
-The page opens at the next episode of **the copy with the newest progress**
-(`copies::next_episode`, the same rule Play and Shift+Enter on a card use — verified), as this
-copy's episode. ✓ on an episode and "Mark season watched / unwatched" write the same episodes
+The page opens at the next episode of the union using merged progress (`copies::next_episode`,
+the same rule Play and Shift+Enter on a card use), including seasons absent from the page copy.
+✓ on an episode and "Mark season watched / unwatched" write the same episodes
 of **every copy** in one write with Undo (`copies::mark_episodes`; a copy without that episode
 is skipped; "Marked S01 watched in TV and TV 2"). Xtream series load episodes lazily: when
-another copy's aren't loaded (`copies::unloaded_series`) the page writes this copy and the
+another copy's aren't loaded (`copies::unloaded_series`) the page requests them and updates
+the union when they arrive. A pending ✓ writes this copy and the
 loaded ones **at once** (nothing is lost if the user leaves or quits) and submits
 `LoadSeriesDetails` for the others (`ui::copies::EpisodeFetch`: polls the job list and the
 database at most four times a second), shows "Loading the other copy's episodes to mark them
@@ -7116,12 +7120,29 @@ offers Undo; the entry advances, becoming Done after its last unwatched episode.
 names this action “Mark S01E04 watched” (Ctrl+W) and offers “Mark all watched” for the whole
 range (no key). A done series' “Mark unwatched” still clears the range; film and episode
 toggles are unchanged. S/E numbers always show; episode titles obey the spoiler guard.
-“Episodes…” / Ctrl+I opens series details with that episode's season selected and its row
-focused, including for a range. Ctrl+I reuses List's Details key and opens film details too.
+Click, Enter and “Episodes…” / Ctrl+I open series details on the entry's next episode,
+selecting its season and focusing its row. A range starts within that range (Landman S2
+opens season 2); a standalone episode opens its own row. Film entries open film details.
+A ▶ button, visible on hover and on the cursor row, and Shift+Enter (“Play from here”)
+start playback with the usual Resume prompt. The row menu also offers “Play from here”
+and “Play just this one” (Ctrl+Shift+Enter).
 Esc / Alt+← returns to the same watchlist and entry with refreshed progress; a newly done
 entry remains visible for that return even when other watched entries are folded.
 
+The header, lists pane and Home rail share progress counts: series/episode lists show
+“n of m episodes”, films-only lists “n of m titles”, and mixed lists “n of m watched”.
+Each known episode in a series/range counts once across copies; a film or standalone
+episode counts as one. Skipped entries contribute all their units to watched. Unloaded
+series contribute no episodes until details arrive; they do not make the list finished.
+Entry position chips and membership positions still count entries.
+
 ### 42.2 Playing through Up next
+Details routes retain the originating list and entry. Playing a film or selected episode
+on that page uses the same list engine, including Resume / Start over; the explicit first
+pick travels through `PlayListFrom`, then subsequent picks follow the list. Returning from
+a child page keeps that context and cursor. Opening the page from Series, Movies or Search
+has no list origin and retains ordinary playback.
+
 `QueueCommand::PlayList` sets `QueueMachine.context` and adds one entry. When the queue's
 pending rows run out, the engine derives the list's next entry afresh and counts down to it.
 Rows added with Ctrl+N play first. Chips identify list entries; Then from … previews the list
@@ -7148,8 +7169,9 @@ The next launch explains the move once; OK, Open Watchlists or Esc acknowledges 
 preserve lists across refreshes, re-keyed copies and playlist deletion.
 
 The `watchlist` MCP tool reads and edits lists and starts or stops their playback;
-`status.watchlist` identifies the active list. Locked entries are never played or added over
-MCP, concealed entries are absent from all views and counts, and episode labels use the
+`status.watchlist` identifies the active list. `watchlist lists` / `show` report the same
+`done`/`total` as the UI, with `progress_unit` (`episodes`, `titles` or `items`). Locked entries
+are never played or added over MCP, concealed entries are absent from all views and counts, and episode labels use the
 existing spoiler guard. Plugin skills and RULES.md describe watchlists and their confirmations.
 
 ## 43. Downloads and recordings

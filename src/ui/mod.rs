@@ -136,6 +136,15 @@ pub enum Route {
         group: Option<GroupId>,
     },
     MovieDetail(MovieId),
+    MovieDetailFromList {
+        movie: MovieId,
+        origin: watchlists::Origin,
+    },
+    SeriesDetailFromList {
+        series: SeriesId,
+        episode: Option<(u32, u32)>,
+        origin: watchlists::Origin,
+    },
     SeriesDetail(SeriesId),
     /// Series details with an explicit episode cursor (including a watchlist's range).
     SeriesDetailAt {
@@ -171,8 +180,8 @@ impl Route {
             Route::Guide { .. } => ScreenId::Guide,
             Route::Movies { .. } => ScreenId::Movies,
             Route::Series { .. } => ScreenId::Series,
-            Route::MovieDetail(_) => ScreenId::MovieDetail,
-            Route::SeriesDetail(_) | Route::SeriesDetailAt { .. } => ScreenId::SeriesDetail,
+            Route::MovieDetail(_) | Route::MovieDetailFromList { .. } => ScreenId::MovieDetail,
+            Route::SeriesDetail(_) | Route::SeriesDetailAt { .. } | Route::SeriesDetailFromList { .. } => ScreenId::SeriesDetail,
             Route::Player => ScreenId::Player,
             Route::Settings(_) | Route::Setting(_) | Route::EditPlaylist(_) => ScreenId::Settings,
             Route::Onboarding(_) => ScreenId::Onboarding,

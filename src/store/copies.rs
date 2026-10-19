@@ -27,7 +27,7 @@
 //! copies are left out unless the session is unlocked. The second copy of that order is the
 //! fallback the player tries once (`player::CopyPlay`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
@@ -35,8 +35,8 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use crate::config::CopyOrder;
 use crate::error::Result;
 use crate::model::{
-    AccountInfo, AccountStatus, Episode, FavListId, ItemKey, ItemKind, ItemOverride, ItemRef, SeriesId, SourceId, StreamLocator, Timestamp, VodKind,
-    VodSummary,
+    AccountInfo, AccountStatus, Episode, FavListId, ItemKey, ItemKind, ItemOverride, ItemRef, Season, SeriesId, SourceId, StreamLocator, Timestamp,
+    VodKind, VodSummary,
 };
 use crate::store::library::VodIndex;
 use crate::store::sql::atomic;
@@ -145,6 +145,19 @@ impl CopyPlan {
     /// Every copy's reference (the combined writes).
     pub fn refs(&self) -> Vec<ItemRef> {
         self.copies.iter().map(|c| c.item_ref.clone()).collect()
+    }
+    /// Series copies in play order, with the page's copy first (DESIGN §29.16).
+    /// Locked copies still contribute rows; playing them requires the PIN as usual.
+    pub fn series_ids(&self, vod: &VodIndex, page: u32) -> Vec<SeriesId> {
+        let mut ids = Vec::new();
+        for item in std::iter::once(page).chain(self.order.iter().copied()).chain(self.copies.iter().map(|c| c.item)) {
+            if let Some(VodKind::Series(id)) = vod.series.get(item as usize).map(|v| v.kind)
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        ids
     }
     /// The mini-card status of `item`.
     pub fn status(&self, item: u32) -> CopyStatus {
@@ -280,20 +293,72 @@ fn playlist_trouble(conn: &Connection, source: SourceId, now: Timestamp) -> Resu
     Ok(refused.map(|at| Trouble::AtLimit { at }))
 }
 
-/// The episode a series' combined page opens at: `vod::next_episode` of the copy with the
-/// newest episode progress, else of `copies[0]` (the copy that would play). With the episode
-/// comes the copy it belongs to.
+/// The next episode of the union (DESIGN §29.16), using merged progress: resume the
+/// newest unfinished episode, else advance past the newest watched one. The returned row
+/// belongs to the first copy in `copies` that has those coordinates.
 pub fn next_episode(conn: &Connection, copies: &[SeriesId]) -> Result<Option<(SeriesId, Episode)>> {
-    let mut newest: Option<(Timestamp, SeriesId)> = None;
-    for &s in copies {
-        if let Some(p) = series_progress(conn, s)?
-            && newest.is_none_or(|(at, _)| p.updated_at > at)
-        {
-            newest = Some((p.updated_at, s));
+    if let [id] = copies {
+        return Ok(crate::store::vod::next_episode(conn, *id)?.map(|e| (*id, e)));
+    }
+    let eps = episodes(conn, copies, None)?;
+    let progress = episode_progress(conn, copies)?;
+    let latest = |finished| {
+        eps.iter()
+            .enumerate()
+            .filter_map(|(i, e)| progress.get(&(e.season, e.episode)).filter(|p| p.finished == finished).map(|p| (i, p.updated_at)))
+            .max_by_key(|(_, at)| *at)
+            .map(|(i, _)| i)
+    };
+    let next = latest(false)
+        .map(|i| &eps[i])
+        .or_else(|| latest(true).and_then(|i| eps[i + 1..].iter().find(|e| !progress.get(&(e.season, e.episode)).is_some_and(|p| p.finished))))
+        .or_else(|| eps.iter().find(|e| e.season >= 1 && !progress.get(&(e.season, e.episode)).is_some_and(|p| p.finished)))
+        .or_else(|| eps.iter().find(|e| e.season >= 1))
+        .or(eps.first());
+    Ok(next.map(|e| (e.series_id, e.clone())))
+}
+
+/// Episodes matched by (season, episode), in season order (DESIGN §29.16). The first
+/// copy with a row supplies its metadata and durable reference; callers put the page first.
+pub fn episodes(conn: &Connection, ids: &[SeriesId], season: Option<u32>) -> Result<Vec<Episode>> {
+    if let [id] = ids {
+        return crate::store::vod::episodes(conn, *id, season);
+    }
+    let mut rows = BTreeMap::new();
+    for &id in ids {
+        for e in crate::store::vod::episodes(conn, id, season)? {
+            rows.entry((e.season, e.episode)).or_insert(e);
         }
     }
-    let Some(series) = newest.map(|(_, s)| s).or(copies.first().copied()) else { return Ok(None) };
-    Ok(crate::store::vod::next_episode(conn, series)?.map(|e| (series, e)))
+    Ok(rows.into_values().collect())
+}
+
+/// All season headers, including seasons supplied only as episodes. Combined counts are
+/// the actual distinct rows, rather than one provider's count (DESIGN §29.16).
+pub fn seasons(conn: &Connection, ids: &[SeriesId]) -> Result<Vec<Season>> {
+    if let [id] = ids {
+        return crate::store::vod::seasons(conn, *id);
+    }
+    let mut rows = BTreeMap::new();
+    for &id in ids {
+        for mut s in crate::store::vod::seasons(conn, id)? {
+            s.episode_count = 0;
+            rows.entry(s.number).or_insert(s);
+        }
+    }
+    for e in episodes(conn, ids, None)? {
+        let s = rows.entry(e.season).or_insert(Season {
+            series_id: e.series_id,
+            number: e.season,
+            name: None,
+            cover: None,
+            air_date: None,
+            overview: None,
+            episode_count: 0,
+        });
+        s.episode_count += 1;
+    }
+    Ok(rows.into_values().collect())
 }
 
 /// The same episode (season and number) in another copy of its series, when that copy's

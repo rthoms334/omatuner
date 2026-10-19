@@ -95,6 +95,7 @@ enum Btn {
 #[derive(Default)]
 pub struct MovieDetailScreen {
     id: Option<MovieId>,
+    watchlist: Option<crate::ui::watchlists::Origin>,
     movie: Option<Movie>,
     progress: Option<WatchProgress>,
     loader: Option<Loader<(Movie, Option<WatchProgress>)>>,
@@ -196,6 +197,14 @@ impl MovieDetailScreen {
         if self.missing {
             return;
         }
+        if let Some(origin) = self.watchlist {
+            // The summary enables Play before the async detail read finishes. Use the same
+            // fallback here so an early Enter or click still plays through the list.
+            if let Some(item) = self.item(ctx) {
+                crate::ui::watchlists::play_from_page(ctx, origin, item, MediaRef::Movie(id), self.title(ctx), None, resume, false);
+            }
+            return;
+        }
         if self.copies.is_stacked() {
             // the copy picked on the page, else the title's first; the next one as fallback
             let pick = self.copies.chosen();
@@ -212,6 +221,10 @@ impl MovieDetailScreen {
     /// Play the title's copies (`pick`: this copy first; the caller checked its PIN), with the
     /// fallback once before the first frame (DESIGN §29.15).
     fn play_copies(&mut self, ctx: &mut UiCtx<'_>, pick: Option<u32>, resume: bool) {
+        if self.watchlist.is_some() {
+            self.play(ctx, resume);
+            return;
+        }
         match crate::ui::copies::movie_command(&ctx.lib.vod, self.copies.plan(), pick, resume, PlayOrigin::Fullscreen) {
             Some(PlayerCommand::PlayCopy(copy)) => crate::ui::copies::start(ctx, copy),
             Some(cmd) => {
@@ -423,7 +436,12 @@ impl Screen for MovieDetailScreen {
     }
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
-        let Route::MovieDetail(id) = route else { return };
+        let (id, watchlist) = match route {
+            Route::MovieDetail(id) => (id, None),
+            Route::MovieDetailFromList { movie, origin } => (movie, Some(*origin)),
+            _ => return,
+        };
+        self.watchlist = watchlist;
         if self.id != Some(*id) {
             self.movie = None;
             self.progress = None;
@@ -554,7 +572,10 @@ impl Screen for MovieDetailScreen {
             super::copies::Outcome::NotMine => {}
             super::copies::Outcome::Done => return,
             super::copies::Outcome::Act(super::copies::CopyAct::Play(c)) => return self.play_copies(ctx, Some(c), true),
-            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Movie(id))) => return ctx.push(Route::MovieDetail(id)),
+            super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Movie(id))) => {
+                let route = self.watchlist.map_or(Route::MovieDetail(id), |origin| Route::MovieDetailFromList { movie: id, origin });
+                return ctx.push(route);
+            }
             super::copies::Outcome::Act(super::copies::CopyAct::Open(VodKind::Series(id))) => return ctx.push(Route::SeriesDetail(id)),
         }
         match result {
@@ -916,6 +937,57 @@ pub(crate) mod tests {
 
     use crate::model::{ItemKey, SourceId};
     use crate::ui::screens::home::testkit::{self, harness, has_label, rig, seed, until};
+
+    #[test]
+    fn watchlist_film_plays_from_summary_while_details_are_pending() {
+        use crate::ui::screens::queue::tests::{seed_watchlist, start_engine};
+        use egui_kittest::kittest::Queryable;
+
+        let (mut t, one) = rig();
+        let (list, entries) = seed_watchlist(&mut t, "Films", crate::watchlist::PlayOrder::Ordered, 3);
+        let player = start_engine(&t);
+        let mut h = harness(t, one, MovieDetailScreen::default(), egui::vec2(1400.0, 900.0));
+        for (n, action) in [Some(Action::Activate), None, Some(Action::ActivateAlt)].into_iter().enumerate() {
+            let item = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey(format!("m3u:movie{n:010}")) };
+            let movie = crate::store::vod::resolve_movie(&h.state().t.db, &item).unwrap().unwrap();
+            let origin = crate::ui::watchlists::Origin { list, entry: entries[n] };
+            h.state_mut().enter(Route::MovieDetailFromList { movie, origin });
+            // Hold the detail read until after Play. The summary already renders an enabled
+            // button, so neither keyboard activation nor a click may depend on this worker.
+            // Dropping the sender also releases the worker if an assertion panics.
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let app = h.state_mut();
+            app.s.loader = Some(app.t.with_ctx(|ctx| {
+                Loader::start(ctx, move |db| {
+                    let _ = wait.recv();
+                    Ok((crate::store::vod::movie(db, movie)?, None))
+                })
+            }));
+            h.run_steps(2);
+            assert!(has_label(&h, "Play"));
+            assert!(h.state().s.movie.is_none());
+            if let Some(action) = action {
+                assert!(h.state_mut().act(action));
+            } else {
+                h.get_by_label("Play").click();
+                h.run_steps(2);
+            }
+            let resume = action != Some(Action::ActivateAlt);
+            until(&mut h, "summary's film played through list", |_| {
+                player.0.lock().unwrap().iter().any(|c| {
+                    matches!(c, PlayerCommand::PlayCopy(p) if p.req.media == MediaRef::Movie(movie) && p.req.origin == PlayOrigin::Queue && p.req.resume == resume)
+                })
+            });
+            until(&mut h, "film list context", |h| h.state().t.services().agent.queue().context == Some(list));
+            let rows = crate::store::queue::load(&h.state().t.db).unwrap();
+            let row = rows.iter().find(|row| row.item == item).expect("selected film stored");
+            assert_eq!(row.watchlist_item_id, Some(origin.entry));
+            assert!(row.list_context);
+            assert!(h.state().s.movie.is_none(), "playback must precede the detail read");
+            assert!(h.state_mut().nav().is_empty(), "no Resume prompt or ordinary fullscreen playback");
+            drop(release);
+        }
+    }
 
     #[test]
     fn keyboard_scroll_reaches_wrapped_copies_and_returns_to_page_header() {

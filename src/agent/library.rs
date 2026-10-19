@@ -287,7 +287,7 @@ pub struct EpisodeRow {
 /// Episodes listed at most.
 const MAX_EPISODES: usize = 200;
 
-fn plan_episodes(q: &Q, p: &Episodes) -> Out<(EpisodesOut, Option<crate::jobs::JobKind>)> {
+fn plan_episodes(q: &Q, p: &Episodes) -> Out<(EpisodesOut, Vec<crate::jobs::JobKind>)> {
     let AgentRef::Item(r) = parse_ref(&p.series_ref)? else { return Err(Fail::bad("series_ref is a series ref")) };
     if r.kind != ItemKind::Series {
         return Err(Fail::bad("series_ref is a series ref"));
@@ -305,45 +305,20 @@ fn plan_episodes(q: &Q, p: &Episodes) -> Out<(EpisodesOut, Option<crate::jobs::J
         details_pending: false,
     };
     if locked {
-        return Ok((out, None));
+        return Ok((out, Vec::new()));
     }
     let words: Vec<String> = match p.query.as_deref() {
         Some(s) => text("query", s)?.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_owned).collect(),
         None => Vec::new(),
     };
-    let copies = q.series_copies(idx);
-    // the copy that plays first lists the episodes; progress of every copy counts
-    let Some(&first) = copies.first() else { return Ok((out, None)) };
-    let eps = crate::store::vod::episodes(q.conn, first, p.season)?;
+    let copies = q.series_copies(idx)?;
+    let eps = crate::store::copies::episodes(q.conn, &copies, p.season)?;
+    let unloaded = crate::store::copies::unloaded_series(q.conn, &copies)?;
+    out.details_pending = !unloaded.is_empty();
     if eps.is_empty() {
-        let s = crate::store::vod::series(q.conn, first)?;
-        let lazy = s.details_loaded_at.is_none() && q.lib.source(s.source_id).is_some_and(|m| m.kind == crate::model::SourceKind::Xtream);
-        out.details_pending = lazy;
-        return Ok((out, lazy.then_some(crate::jobs::JobKind::LoadSeriesDetails(first))));
+        return Ok((out, unloaded.into_iter().map(crate::jobs::JobKind::LoadSeriesDetails).collect()));
     }
-    // (season, episode) → (finished, progress, updated) over every copy
-    let mut seen: HashMap<(u32, u32), (bool, Option<ProgressOut>, i64)> = HashMap::new();
-    let marks = vec!["?"; copies.len()].join(",");
-    let mut stmt = q.conn.prepare(&format!(
-        "SELECT e.season, e.episode, p.position_s, p.duration_s, p.finished, p.updated_at FROM watch_progress p
-         JOIN episode e ON e.source_id = p.source_id AND e.key = p.item_key
-         WHERE p.kind = 'episode' AND p.orphaned_since IS NULL AND e.series_id IN ({marks})"
-    ))?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(copies.iter()), |r| {
-        Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?, r.get::<_, f64>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, bool>(4)?, r.get::<_, i64>(5)?))
-    })?;
-    for row in rows {
-        let (s, e, pos, dur, fin, at) = row?;
-        if seen.get(&(s, e)).is_none_or(|(_, _, t)| at > *t) {
-            let progress = (!fin && pos > 0.0).then(|| ProgressOut {
-                position_min: (pos / 60.0) as u32,
-                duration_min: dur.filter(|d| *d > 0.0).map(|d| (d / 60.0).round() as u32),
-                finished: false,
-                watched: fmt_time(at),
-            });
-            seen.insert((s, e), (fin, progress, at));
-        }
-    }
+    let seen = crate::store::copies::episode_progress(q.conn, &copies)?;
     for ep in eps {
         if out.episodes.len() == MAX_EPISODES {
             break;
@@ -355,7 +330,14 @@ fn plan_episodes(q: &Q, p: &Episodes) -> Out<(EpisodesOut, Option<crate::jobs::J
             }
         }
         let er = ItemRef { source: ep.source_id, kind: ItemKind::Episode, key: ep.key.clone() };
-        let (watched, progress) = seen.get(&(ep.season, ep.episode)).map(|(f, p, _)| (*f, p.clone())).unwrap_or_default();
+        let mark = seen.get(&(ep.season, ep.episode));
+        let watched = mark.is_some_and(|p| p.finished);
+        let progress = mark.filter(|p| !p.finished && p.position_s > 0.0).map(|p| ProgressOut {
+            position_min: (p.position_s / 60.0) as u32,
+            duration_min: p.duration_s.filter(|d| *d > 0.0).map(|d| (d / 60.0).round() as u32),
+            finished: false,
+            watched: fmt_time(p.updated_at),
+        });
         out.episodes.push(EpisodeRow {
             item: item_ref(&er),
             season: ep.season,
@@ -370,16 +352,18 @@ fn plan_episodes(q: &Q, p: &Episodes) -> Out<(EpisodesOut, Option<crate::jobs::J
     }
     out.next_episode = crate::store::copies::next_episode(q.conn, &copies)?
         .map(|(_, e)| item_ref(&ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key }));
-    Ok((out, None))
+    Ok((out, unloaded.into_iter().map(crate::jobs::JobKind::LoadSeriesDetails).collect()))
 }
 
 /// `episodes`, fetching a series' episodes from the provider first when they aren't loaded
 /// (up to 3 s, like `details`).
 pub(super) async fn episodes(h: &Arc<Inner>, p: Episodes) -> Out<Value> {
     let again = p.clone();
-    let (mut out, job) = h.run(true, move |q| plan_episodes(q, &p)).await?;
-    if let Some(job) = job {
-        h.jobs.submit(job);
+    let (mut out, jobs) = h.run(true, move |q| plan_episodes(q, &p)).await?;
+    if !jobs.is_empty() {
+        for job in jobs {
+            h.jobs.submit(job);
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while out.details_pending && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -646,4 +630,71 @@ pub(super) async fn lock(h: &Arc<Inner>, p: Lock) -> Out<Value> {
         note: (!pin_set).then(|| "No parental PIN is set: these locks act once the user sets a PIN in Tuner's Settings ▸ Parental.".into()),
         refused,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::screens::home::testkit::{self, rig, seed};
+
+    #[test]
+    fn combined_landman_tools_list_both_seasons_with_each_rows_own_ref() {
+        let (mut t, _one) = rig();
+        let ids = seed(&mut t, testkit::landman);
+        let series = crate::store::vod::series(&t.db, ids[0]).unwrap();
+        let item = item_ref(&ItemRef { source: series.source_id, kind: ItemKind::Series, key: series.key });
+        let params: Episodes = serde_json::from_value(serde_json::json!({"series_ref": item})).unwrap();
+        let details: super::super::proto::Details = serde_json::from_value(serde_json::json!({"ref": item})).unwrap();
+        for combined in [true, false] {
+            let mut cfg = (*t.config).clone();
+            if !combined {
+                cfg.interface.same_title = crate::config::SameTitle::ShowEach;
+            }
+            let q = Q::new(&t.lib, &t.db, crate::shared::ParentalView { unlocked: true, hides_explicit: false, pin_active: false }, t.now, &cfg);
+            let (out, jobs) = plan_episodes(&q, &params).unwrap();
+            assert!(jobs.is_empty());
+            assert_eq!(out.episodes.len(), if combined { 20 } else { 10 });
+            for e in crate::store::vod::episodes(&t.db, ids[0], None).unwrap() {
+                let row = out.episodes.iter().find(|r| (r.season, r.episode) == (e.season, e.episode)).unwrap();
+                assert_eq!(row.item, item_ref(&ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key }));
+                assert!(row.watched);
+            }
+            if combined {
+                let e = crate::store::vod::episodes(&t.db, ids[1], Some(2)).unwrap().remove(0);
+                let row = &out.episodes[10];
+                assert_eq!(row.item, item_ref(&ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key }));
+                assert_eq!(out.next_episode, Some(row.item.clone()));
+                assert!(!row.watched);
+                let mut season = params.clone();
+                season.season = Some(2);
+                assert_eq!(plan_episodes(&q, &season).unwrap().0.episodes.len(), 10);
+            }
+            let (d, jobs) = super::super::query::details(&q, &details).unwrap();
+            assert!(jobs.is_empty());
+            assert_eq!(
+                d.seasons.iter().map(|s| (s.number, s.episodes)).collect::<Vec<_>>(),
+                if combined { vec![(1, 10), (2, 10)] } else { vec![(1, 10)] }
+            );
+            if combined {
+                assert_eq!(d.next_episode.unwrap().season, 2);
+            }
+        }
+        // Loaded page, unloaded siblings: both tools request all missing copies even when
+        // the requested season already has rows on the page copy.
+        seed(&mut t, move |c| {
+            for id in &ids[1..] {
+                c.execute("DELETE FROM episode WHERE series_id=?1", [id])?;
+                c.execute("UPDATE series SET details_at=NULL WHERE id=?1", [id])?;
+            }
+            c.execute("UPDATE source SET kind='xtream'", [])?;
+            Ok(())
+        });
+        let q = Q::new(&t.lib, &t.db, crate::shared::ParentalView { unlocked: true, hides_explicit: false, pin_active: false }, t.now, &t.config);
+        let (out, jobs) = plan_episodes(&q, &params).unwrap();
+        assert!(out.details_pending);
+        assert_eq!(jobs, ids[1..].iter().copied().map(crate::jobs::JobKind::LoadSeriesDetails).collect::<Vec<_>>());
+        let (d, jobs) = super::super::query::details(&q, &details).unwrap();
+        assert!(d.details_pending);
+        assert_eq!(jobs.len(), 2);
+    }
 }

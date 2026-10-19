@@ -1392,8 +1392,10 @@ impl TunerApp {
         }
         // pages and groups of explicit titles
         self.routes.retain(|r| match r {
-            Route::MovieDetail(id) => !x.vod.contains(&crate::model::VodKind::Movie(*id)),
-            Route::SeriesDetail(id) | Route::SeriesDetailAt { series: id, .. } => !x.vod.contains(&crate::model::VodKind::Series(*id)),
+            Route::MovieDetail(id) | Route::MovieDetailFromList { movie: id, .. } => !x.vod.contains(&crate::model::VodKind::Movie(*id)),
+            Route::SeriesDetail(id) | Route::SeriesDetailAt { series: id, .. } | Route::SeriesDetailFromList { series: id, .. } => {
+                !x.vod.contains(&crate::model::VodKind::Series(*id))
+            }
             _ => true,
         });
         for r in &mut self.routes {
@@ -2617,7 +2619,11 @@ impl TunerApp {
             self.entered = Some(route.clone());
             let idx = self.screen_index(route.screen());
             self.with_ctx(|ctx, screens, _| screens[idx].on_enter(ctx, &route));
-            if let Route::SeriesDetailAt { series, .. } = route {
+            if let Route::SeriesDetailFromList { series, origin, episode: Some(_) } = route {
+                let route = Route::SeriesDetailFromList { series, origin, episode: None };
+                *self.routes.last_mut().expect("current route") = route.clone();
+                self.entered = Some(route);
+            } else if let Route::SeriesDetailAt { series, .. } = route {
                 // The page now owns the pending episode. Returning from a child route
                 // must keep the user's selection, while a new Episodes… visit applies anew.
                 let route = Route::SeriesDetail(series);
@@ -3982,7 +3988,7 @@ mod tests {
         rig.press(Key::ArrowRight, NONE);
         rig.press(Key::ArrowDown, NONE);
         rig.press(Key::I, CTRL);
-        assert!(matches!(rig.route(), Route::SeriesDetail(_)));
+        assert!(matches!(rig.route(), Route::SeriesDetailFromList { .. }));
         // The page's focused row owns Ctrl+W. Earlier seasons remain unwatched, so this
         // also proves the route overrides the series' ordinary next episode.
         rig.until("focused S2E4", |r| find(&texts(&r.frame_with(vec![])), "S2E4").is_some());
@@ -3995,7 +4001,7 @@ mod tests {
         assert_eq!(rig.route(), &origin);
         wait_watchlist_episode(&mut rig, list, (2, 5));
         choose_watchlist_menu(&mut rig, "Episodes…");
-        assert!(matches!(rig.route(), Route::SeriesDetail(_)));
+        assert!(matches!(rig.route(), Route::SeriesDetailFromList { .. }));
         rig.until("focused S2E5", |r| find(&texts(&r.frame_with(vec![])), "S2E5").is_some());
         rig.press(Key::W, CTRL);
         rig.until("last episode watched", |r| {
@@ -4017,7 +4023,7 @@ mod tests {
         }
         rig.press(Key::ArrowUp, NONE);
         rig.press(Key::I, CTRL);
-        assert_eq!(rig.route(), &Route::MovieDetail(crate::model::MovieId(1)), "films use the same Details key");
+        assert!(matches!(rig.route(), Route::MovieDetailFromList { movie: crate::model::MovieId(1), .. }), "films use the same Details key");
     }
 
     #[test]
@@ -4026,7 +4032,7 @@ mod tests {
         let origin = rig.route().clone();
         choose_watchlist_menu(&mut rig, "Episodes…");
         let page = rig.route().clone();
-        assert!(matches!(page, Route::SeriesDetail(_)));
+        assert!(matches!(page, Route::SeriesDetailFromList { .. }));
         let focused = |r: &mut Rig| {
             let idx = r.app.screen_index(ScreenId::SeriesDetail);
             let target = r.app.with_ctx(|ctx, screens, _| screens[idx].reveal_target(ctx));
@@ -4055,6 +4061,111 @@ mod tests {
         assert_eq!(rig.route(), &origin);
         choose_watchlist_menu(&mut rig, "Episodes…");
         rig.until("new visit reapplies S2E4", |r| focused(r) == Some((2, 4)));
+    }
+
+    #[test]
+    fn watchlist_click_and_enter_open_the_range_and_shift_enter_and_play_button_play() {
+        let (mut rig, list) = watchlist_episode_rig(2);
+        let origin = rig.route().clone();
+        let selected = |r: &mut Rig| {
+            let idx = r.app.screen_index(ScreenId::SeriesDetail);
+            match r.app.with_ctx(|ctx, screens, _| screens[idx].reveal_target(ctx)) {
+                Some(crate::ui::item_menu::Target::Episode { episode, .. }) => {
+                    let e = crate::store::vod::episode(&r.app.db, episode).unwrap();
+                    Some((e.season, e.episode))
+                }
+                _ => None,
+            }
+        };
+        // Real key routing and a real pointer click both open S2 at its resumed episode.
+        for click in [false, true] {
+            if click {
+                let nodes = texts(&rig.frame_with(vec![]));
+                let (_, bounds, _) = nodes
+                    .iter()
+                    .find(|(label, _, role)| label.ends_with(" · S2") && !label.starts_with("Drag ") && *role == egui::accesskit::Role::Button)
+                    .unwrap();
+                rig.click(centre(bounds), egui::PointerButton::Primary);
+            } else {
+                rig.press(Key::Enter, NONE);
+            }
+            rig.frame_with(vec![]);
+            assert!(matches!(rig.route(), Route::SeriesDetailFromList { origin, .. } if origin.list == list), "click={click}: {:?}", rig.route());
+            rig.until("range's next episode", |r| selected(r) == Some((2, 4)));
+            assert!(!rig.log().commands.iter().any(|c| matches!(c, PlayerCommand::Play(_) | PlayerCommand::PlayCopy(_))));
+            assert!(crate::store::queue::load(&rig.app.db).unwrap().is_empty());
+            rig.press(Key::Escape, NONE);
+            assert_eq!(rig.route(), &origin);
+        }
+        // Both immediate-play affordances reach the usual Resume prompt, not details.
+        for click in [false, true] {
+            if click {
+                let nodes = texts(&rig.frame_with(vec![]));
+                rig.click(centre(button(&nodes, "Play from here").unwrap()), egui::PointerButton::Primary);
+            } else {
+                rig.press(Key::Enter, Modifiers::SHIFT);
+            }
+            rig.frame_with(vec![]);
+            assert_eq!(rig.route(), &origin);
+            assert!(!rig.app.overlays.is_empty(), "Resume prompt");
+            let nodes = texts(&rig.frame_with(vec![]));
+            assert!(nodes.iter().any(|(label, _, _)| label.starts_with("Resume")), "{nodes:?}");
+            rig.press(Key::Escape, NONE);
+        }
+        // Confirming the row's play uses the real queue and keeps the range's entry chip.
+        rig.press(Key::Enter, Modifiers::SHIFT);
+        rig.press(Key::Enter, NONE);
+        rig.until("range queued", |r| !crate::store::queue::load(&r.app.db).unwrap().is_empty());
+        let rows = crate::store::queue::load(&rig.app.db).unwrap();
+        assert_eq!(rows[0].item.key.as_str(), "m3u:ep0-2-4");
+        let entry = crate::store::watchlist::entries(&rig.app.db, list).unwrap()[1].id;
+        assert_eq!(rows[0].watchlist_item_id, Some(entry));
+    }
+
+    #[test]
+    fn watchlist_film_and_episode_entries_open_their_pages() {
+        let (mut rig, _) = watchlist_episode_rig(2);
+        let list = rig
+            .writer()
+            .blocking(|c| {
+                let lib = crate::store::library::load(c)?;
+                let list = crate::store::watchlist::create(c, "Individual titles", None, crate::watchlist::PlayOrder::Ordered, "app", 1)?;
+                let film = ItemRef { source: SourceId(1), kind: ItemKind::Movie, key: ItemKey("m3u:movie0000000000".into()) };
+                let entries =
+                    [crate::store::watchlist::new_entry(c, &film)?, crate::store::watchlist::new_entry(c, &watchlist_episode_ref(1, 3, 2))?];
+                crate::store::watchlist::add(c, &lib, list, &entries, crate::watchlist::Insert::End, 1)?;
+                Ok(list)
+            })
+            .unwrap();
+        crate::ui::watchlists::invalidate();
+        rig.app.nav.push(NavRequest::Switch(Route::Watchlists { list: Some(list) }));
+        rig.frame_with(vec![]);
+        rig.until("individual entries", |r| r.app.with_ctx(|ctx, _, _| crate::ui::watchlists::snapshot(ctx).list(list).is_some()));
+        rig.press(Key::Enter, NONE);
+        let movie = match rig.route() {
+            Route::MovieDetailFromList { movie, origin } if origin.list == list => *movie,
+            route => panic!("{route:?}"),
+        };
+        rig.until("film loaded", |r| button(&texts(&r.frame_with(vec![])), "Play").is_some());
+        rig.press(Key::Enter, NONE);
+        rig.until("film played through list", |r| crate::store::queue::load(&r.app.db).unwrap().iter().any(|row| row.watchlist_item_id.is_some()));
+        rig.until("film list context", |r| r.app.services().agent.queue().context == Some(list));
+        // The same cached film page opened normally uses ordinary fullscreen playback.
+        rig.app.nav.push(NavRequest::Switch(Route::MovieDetail(movie)));
+        rig.frame_with(vec![]);
+        rig.press(Key::Enter, NONE);
+        // Details send directly to the player; the app's command log does not record them.
+        rig.until("ordinary film playback", |r| r.app.snapshot.origin == Some(PlayOrigin::Fullscreen));
+        assert_eq!(rig.route(), &Route::Player);
+        rig.app.nav.push(NavRequest::Switch(Route::Watchlists { list: Some(list) }));
+        rig.frame_with(vec![]);
+        rig.press(Key::ArrowDown, NONE);
+        rig.press(Key::Enter, NONE);
+        assert!(matches!(rig.route(), Route::SeriesDetailFromList { origin, .. } if origin.list == list));
+        rig.until("standalone episode focused", |r| {
+            let idx = r.app.screen_index(ScreenId::SeriesDetail);
+            matches!(r.app.with_ctx(|ctx, screens, _| screens[idx].reveal_target(ctx)), Some(crate::ui::item_menu::Target::Episode { episode, .. }) if crate::store::vod::episode(&r.app.db, episode).is_ok_and(|ep| (ep.season, ep.episode) == (3, 2)))
+        });
     }
 
     // ---- key consumption -----------------------------------------------------------------

@@ -49,7 +49,7 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 9. **Skip.** "Skip the Holiday Special" marks the entry skipped in this list. It isn't marked as watched anywhere.
 10. **Add as I browse.** `Ctrl+F` on a film or series saves it to My list, the way it saves a channel to Favourites. `Ctrl+Shift+F` picks another list ("Star Wars", "New list…") and the place in it. Up next stays on Ctrl+N.
 11. **A genre list.** "Christmas films" is an Any order list. "Play something from my Christmas list" picks one I haven't watched and carries on shuffling through the unwatched ones. "Something under 90 minutes from it" lets the agent choose by length.
-12. **Where am I.** Home shows a "Your watchlists" rail with one tile per active list ("Star Wars · next: Rogue One · 4 of 15"). Enter plays the list from that entry.
+12. **Where am I.** Home shows a "Your watchlists" rail with one tile per active list ("Star Wars · next: Rogue One · 3 of 15 titles"). Enter plays the list from that entry.
 
 ---
 
@@ -69,7 +69,7 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 ### 2.2 Watchlists screen, Wide
 ```
 ┌──────────────┬───────────────────────────────┬──────────────────────────────────────────────────────────────────┐
-│ 󰍉 Search      │ WATCHLISTS                 + │ STAR WARS · story order          5 of 15 · ~27 h left            │
+│ 󰍉 Search      │ WATCHLISTS                 + │ STAR WARS · story order          5 of 15 titles · ~27 h left     │
 │ 󰋜 Home        │ ▸ Star Wars        5/15     │ ─ Watched ──────────────────────────────────────── ✓ 4 · show ▾  │
 │ 󰔂 Live TV     │     next Rogue One          │ ─ Next ───────────────────────────────────────────────────────── │
 │ 󰃰 Guide       │   Marvel           12/33    │ ▸ 5 ⠿ Rogue One (2016)                ● TV 2   2 h 13  41:20 ▕██░▏│
@@ -83,11 +83,13 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 │ ↵ play · Ctrl+N add to Up next · Alt+↑↓ move · Del remove · Ctrl+W watched · Ctrl+↵ more · ? help                │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-- **List mode.** The header shows `In order ▾` / `Any order ▾` (click or `o`). An Any order list hides the number column, shows unwatched first, and Enter on the header plays a pick.
+- **List mode.** The header shows `In order ▾` / `Any order ▾` (click or `o`). An Any order list hides the number column and shows unwatched first; the header Play button plays a pick.
 - **Lists pane.** Enter, → or a click selects a list and moves to its entries; it does not start playback. Play is available in the list menu, header button and Home tile. You arrange the lists yourself (`Alt+↑↓` or drag; stored in `sort_index`). My list is always first. Finished lists sink to the bottom as "✓ … (done)". Only the Home rail sorts by most recently played (decided 2026-10-14). `+` (or Ctrl+↵ › New list…) asks for a name.
 - **My list** is always first in the lists pane and can't be deleted or renamed. It starts as Any order.
 - **Entries pane.** The number column is the play order. Watched entries fold into one "✓ 4" row by default (the toggle is remembered per list).
 - **The "next" entry** is the first unfinished one (§3). The cursor opens on it.
+- **Opening and playing.** Clicking an entry or Enter opens its page. A series/range selects the next episode's season and row within the range; a standalone episode selects that episode; a film opens its page. Esc / Alt+← restores the list entry. The route carries the list and entry so Play from that page (including a different selected episode) plays through the list. A page opened from Series, Movies or Search has no list context. The row's ▶ is shown on hover and on the cursor row; it and Shift+Enter play from here. The row menu retains “Play from here” and “Play just this one”.
+- **List progress.** The header, lists pane and Home tiles use “n of m episodes” for series/episode lists, “n of m titles” for films-only lists and “n of m watched” for mixed lists. Each known episode in a series/range counts once across copies, and each film or standalone episode counts as one. Skips count all the entry's units as watched. Unloaded series add episodes when details arrive and cannot finish a list prematurely. Position chips and membership positions still count entries. The agent's `lists`/`show` `done`/`total` use the same units, with `progress_unit` = `episodes`, `titles` or `items`.
 - **Row marks.** The progress bar shows a partly watched entry. Series rows show "next S1E4" or "3 of 8 watched". ⊘ marks a placeholder. ↷ marks a skipped entry. 󰌾 marks a locked entry. Copy marks work as in Up next.
 - **Narrower layouts.** Medium shows the lists as a header switcher, "Star Wars ▾" (`Tab` cycles). Compact drops the time and copy columns.
 
@@ -116,7 +118,8 @@ Up next keeps its job: Ctrl+N still adds whatever you're looking at to tonight's
 | `Global` | **`Alt+7`** | Watchlists screen (`GoWatchlists`) |
 | Item contexts on a film, series or episode | **`Ctrl+F`** | Add to / remove from My list (`ToggleFavourite` keeps its key; on a channel it still means Favourites) |
 | same | **`Ctrl+Shift+F`** | Watchlists… (the dialog in §2.3; on a channel it is still Favourites lists…) |
-| Watchlist entries | `Enter` | Play the list from this entry (the normal Resume prompt applies) |
+| Watchlist entries | `Enter` / row click | Open details: series/range on its next episode and season, standalone episode on its own row, film on its page; keep the originating list and entry for playback and Back |
+| | `Shift+Enter` / row ▶ | Play from here (the normal Resume prompt applies) |
 | | `Ctrl+N` / `Ctrl+Shift+N` | Add this entry to Up next / play it next |
 | | `Ctrl+Shift+Enter` | Play just this one (no list after it) |
 | | `Alt+↑↓`, drag the handle | Reorder |
@@ -147,12 +150,12 @@ now done and other watched entries are folded.
 | **Any order lists** | "Next" is a random pick among the entries that are not done and are playable (a partly watched entry wins over a random one, so a film you stopped halfway comes back first). The agent can instead choose from `show` by mood, length or genre. Positions still exist so you can arrange the list, but they don't drive play. A series entry plays its own next episode. |
 | **Next** (In order lists) | The first entry, in order, that is not done, is visible (not concealed) and is not a placeholder. A placeholder or a locked entry before it is passed over and named ("Skipping The Holiday Special: not in your playlists"). A locked entry is passed over only by the agent. The app shows it and asks for the PIN on play (§6). |
 | **Next inside a series entry** | `copies::next_episode` limited to the range: the most recently progressed unfinished episode in the range, else the first unfinished one after the last finished, else the range's first episode. |
-| **Resume** | Playing the next entry resumes a partly watched film or episode, as Continue watching does (the agent says "from 41 min"). Enter in the app shows the normal Resume prompt. |
+| **Resume** | Playing the next entry resumes a partly watched film or episode, as Continue watching does (the agent says "from 41 min"). Playing from the row shows the normal Resume prompt. |
 | **Order and duplicates** | The order belongs to the user. Nothing is sorted automatically. A film can't appear twice in one list. A series can appear twice as long as the ranges don't overlap. One title can be in any number of lists. |
 | **Watching outside the list** | It counts. Done is derived from `watch_progress` at read time, so there is no "played from the list" bookkeeping. |
 | **Unwatching** | Ctrl+W (unwatched) on a title makes it "not done" in every list. The list's cursor moves back. |
 | **Start again** | Sets `list.since = now` and clears the list's skips. History is untouched. Undo restores both. |
-| **Playing a list** (decided) | Playing **from a list** (Play in the list menu/header, Enter on an entry or a Home tile, or the agent's `watchlist play`) makes that list Up next's **context**. The entry goes in as Up next's next row and plays. When Up next has no pending rows left, the engine takes the list's next entry (§3, Next), adds it as a row and counts down as usual. Like a music app: rows you add to Up next play first, then the list carries on. |
+| **Playing a list** (decided) | Playing **from a list** (Play in the list menu/header, Shift+Enter / ▶ on an entry, playing on a details page opened from that entry, Enter on a Home tile, or the agent's `watchlist play`) makes that list Up next's **context**. The entry goes in as Up next's next row and plays. When Up next has no pending rows left, the engine takes the list's next entry (§3, Next), adds it as a row and counts down as usual. Like a music app: rows you add to Up next play first, then the list carries on. |
 | **Ended without being watched** | A movie or episode that ends is excluded for the rest of this context run, even if EOF comes before `watched_pct` or the duration is unknown. This never marks it watched; a series can continue to its other episodes. |
 | **What ends a list** | The list runs out ("That was Star Wars ✓"), Esc or "Stop the list" on the card, "Play just this one", the agent's `stop_after`, the sleep timer's `end_of_queue`, three failures in a row, or starting another list (it replaces the context). Ending a context discards its automatic pending rows, preserving rows the user added with Ctrl+N. A timed sleep stop retains the context. Esc on an unrelated next-episode card also retains it. Playing something else steps aside as Up next does today ("Up next paused · Alt+6 to carry on"), and the context is kept. |
 | **Playing elsewhere** | The same film played from Movies, Search or a detail page has no context, so nothing follows it, exactly as today. |
@@ -273,7 +276,7 @@ Watchlists don't need an engine of their own. A list's state is derived when it'
 ## 6. Guardrails
 
 - **Parental lock.** Locked entries show in the app (dimmed) and ask for the PIN when played, as in Up next. Over MCP, a locked entry is never played or queued. "Next" for the agent passes over it and says "The next one, *X*, is locked: it needs your PIN in Tuner." Adding a locked title over MCP is refused, the same as `queue add`.
-- **Explicit content while hidden.** Concealed entries are absent from rows, counts ("5 of 15" counts visible entries only), the Home rail, search and MCP. They are never deleted. A list that contains only concealed entries is hidden too.
+- **Explicit content while hidden.** Concealed entries are absent from rows, counts ("5 of 15" counts visible films and episodes only), the Home rail, search and MCP. They are never deleted. A list that contains only concealed entries is hidden too.
 - **Spoiler guard.** Rows show the title and the S/E only, never a plot. A series entry's "next S2E5" episode title goes through `Subject::Episode`. Watchlists don't add spoiler rules of their own (decided).
 - **Privacy.** No titles at INFO (`watchlist: list 3 → entry 12 (movie, source 2)`). No URLs in any result. Watchlists are included in backups.
 - **The 3-failures pause** also ends the list's context, so a list never hammers a provider overnight.
@@ -286,7 +289,7 @@ Watchlists don't need an engine of their own. A list's state is derived when it'
 **One `watchlist` tool** (same action shape as `queue`):
 | action | params | result |
 |---|---|---|
-| `lists` | — | `[{id, name, note, play_order, done, total, next?:{ref, title, kind, s?, e?, position_s?, locked}}]` |
+| `lists` | — | `[{id, name, note, play_order, done, total, progress_unit, next?:{ref, title, kind, s?, e?, position_s?, locked}}]` |
 | `show` | `list` (name or id), `include_done?` | `{list, items:[{id, ref?, kind, title, year, seasons?, state: done\|next\|todo\|skipped\|missing\|locked, progress?}]}` |
 | `next` | `list` | `{item, episode?, resume_at?, passed_over:[{title, why}]}`. Read-only, so the agent can say what's next before playing it. For an Any order list it returns the pick, and `play` with `id` plays the agent's own choice instead |
 | `play` | `list`, `id?`, `just_one?`, `open_in?` | Plays the list from its next entry (or `id`) and carries on through it. `just_one` stops after it. It replaces current playback, so `status` comes first (RULES 2). Returns `{playing, opened_in, then?}` or `{waiting_for_pin}` |

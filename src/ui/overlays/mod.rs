@@ -130,8 +130,9 @@ pub struct QueueResume {
 }
 
 /// Resume an entry while preserving its list context (DESIGN §42 §3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchlistResume {
+    pub item: Option<crate::model::ItemRef>,
     pub list: crate::model::WatchlistId,
     pub from: Option<crate::model::WatchlistItemId>,
     pub just_one: bool,

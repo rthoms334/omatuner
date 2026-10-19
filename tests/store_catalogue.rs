@@ -1665,7 +1665,8 @@ fn series_copies_continue_from_the_newest_progress() {
         user::save_progress(c, &new)
     });
     let (e, ep) = copies::next_episode(&r, &[sa, sb]).unwrap().unwrap();
-    assert_eq!((e, ep.key.0.as_str()), (sb, "ep:b102"), "TV 2 was watched last");
+    assert_eq!((e, ep.key.0.as_str()), (sa, "ep:a102"), "TV 2's progress, the page copy's row");
+    let (_, ep) = copies::next_episode(&r, &[sb, sa]).unwrap().unwrap();
     assert_eq!(first(&r), Some(at(sb)));
     let same = copies::same_episode(&r, sa, 1, 2).unwrap().unwrap();
     assert_eq!(vod::episode(&r, same).unwrap().key.0, "ep:a102");
@@ -1684,7 +1685,7 @@ fn series_copies_continue_from_the_newest_progress() {
     assert_eq!(rows(), 0, "every copy's episodes forgotten");
     w(&s, move |c| copies::undo(c, &u));
     assert_eq!(rows(), 2);
-    assert_eq!(copies::next_episode(&r, &[sa, sb]).unwrap().unwrap().1.key.0, "ep:b102");
+    assert_eq!(copies::next_episode(&r, &[sa, sb]).unwrap().unwrap().1.key.0, "ep:a102");
 }
 
 /// Deleting a playlist (DESIGN §29.16, P3): its favourites and progress can move to the other

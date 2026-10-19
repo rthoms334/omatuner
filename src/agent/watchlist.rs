@@ -87,7 +87,7 @@ fn entry_out(e: &EntryState) -> Value {
 fn list_out(view: &ListView) -> Value {
     let mut out = json!({
         "id": view.list.id.0, "name": clean(&view.list.name), "note": view.list.note.as_deref().map(clean),
-        "play_order": view.list.play_order.as_str(), "done": view.done, "total": view.total,
+        "play_order": view.list.play_order.as_str(), "done": view.done, "total": view.total, "progress_unit": view.progress_unit(),
     });
     let next = view
         .entries

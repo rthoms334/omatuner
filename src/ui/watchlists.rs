@@ -12,6 +12,13 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// The entry which opened a details page. Kept in the route, including across Back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin {
+    pub list: WatchlistId,
+    pub entry: WatchlistItemId,
+}
+
 #[derive(Default)]
 struct Cache {
     key: Option<(std::path::PathBuf, u64, bool, u64, bool, crate::config::CopyOrder)>,
@@ -53,14 +60,13 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<WatchlistsSnapshot> {
             // Relocking must conceal rows in the same frame, before the worker answers.
             let mut visible = (*c.snapshot).clone();
             visible.lists.retain_mut(|l| {
-                let was_empty = l.total == 0;
+                let was_empty = l.entries.is_empty();
                 l.entries.retain(|e| !(hides && e.entry.explicit) && e.entry.item.as_ref().is_none_or(|i| !ctx.lib.conceals(i)));
-                l.total = l.entries.len();
-                l.done = l.entries.iter().filter(|e| e.done()).count();
+                l.recount();
                 if l.next.is_some_and(|id| !l.entries.iter().any(|e| e.entry.id == id)) {
                     l.next = None;
                 }
-                l.total != 0 || was_empty
+                !l.entries.is_empty() || was_empty
             });
             c.snapshot = Arc::new(visible);
             c.revision = SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
@@ -251,13 +257,45 @@ pub fn play(ctx: &mut UiCtx<'_>, list: WatchlistId, from: Option<WatchlistItemId
                 copy: None,
                 queue: None,
                 cast: None,
-                watchlist: Some(crate::ui::overlays::WatchlistResume { list, from: Some(e.entry.id), just_one }),
+                watchlist: Some(crate::ui::overlays::WatchlistResume { item: None, list, from: Some(e.entry.id), just_one }),
             }));
             return;
         }
     }
     let from = from.or_else(|| snap.list(list).filter(|l| l.list.play_order == crate::watchlist::PlayOrder::Any).and_then(|l| l.next));
     crate::queue::ui::send(ctx, crate::queue::QueueCommand::PlayList { list, from, just_one });
+}
+
+/// Start the selected media through the list engine, including the normal episode prompt.
+/// A page opened elsewhere never calls this path.
+#[allow(clippy::too_many_arguments)]
+pub fn play_from_page(
+    ctx: &mut UiCtx<'_>,
+    origin: Origin,
+    item: ItemRef,
+    media: crate::model::MediaRef,
+    title: String,
+    progress: Option<&crate::model::WatchProgress>,
+    resume: bool,
+    prompt: bool,
+) {
+    if let Some(p) = progress.filter(|p| resume && prompt && !p.finished && p.position_s >= f64::from(ctx.config.player.resume_min_s)) {
+        ctx.open(OverlayRequest::Resume(crate::ui::overlays::ResumeSpec {
+            media,
+            title,
+            position_s: p.position_s,
+            duration_s: p.duration_s,
+            copy: None,
+            queue: None,
+            cast: None,
+            watchlist: Some(crate::ui::overlays::WatchlistResume { item: Some(item), list: origin.list, from: Some(origin.entry), just_one: false }),
+        }));
+    } else {
+        crate::queue::ui::send(
+            ctx,
+            crate::queue::QueueCommand::PlayListFrom { item: Some(item), list: origin.list, from: Some(origin.entry), just_one: false, resume },
+        );
+    }
 }
 
 pub fn label(ctx: &UiCtx<'_>, e: &EntryState) -> String {

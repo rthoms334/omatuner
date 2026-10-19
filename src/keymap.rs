@@ -1053,6 +1053,8 @@ pub static DOWNLOADS: &[Binding] = &[
 ];
 
 pub static WATCHLISTS: &[Binding] = &[
+    b(C::key(Key::Enter), A::Activate, "Open entry / open entries"),
+    b(C::shift(Key::Enter), A::ActivateAlt, "Play from here"),
     b(C::key(Key::ArrowRight), A::Right, "Open entries / move right"),
     b(C::ctrl(Key::I), A::ShowDetails, "Episodes… / film details"),
     b(C::ctrl(Key::W), A::MarkWatched, "Mark current episode / title watched; done entry unwatched"),
@@ -1241,6 +1243,7 @@ pub fn help_rows(ctx: KeyContext) -> Vec<(String, &'static str)> {
 /// Curated short verbs per context for the status-bar hint line; the KEYS are looked up in the
 /// tables, so the line can never disagree with the keymap.
 const HINTS: &[(KeyContext, &[(Action, &str)])] = &[
+    (KeyContext::Watchlists, &[(A::Activate, "open"), (A::ActivateAlt, "play from here"), (A::ToggleHelp, "help")]),
     (
         KeyContext::List,
         &[(A::Activate, "play"), (A::ActivateAlt, "fullscreen"), (A::ToggleFavourite, "fav"), (A::ContextMenu, "more"), (A::ToggleHelp, "help")],

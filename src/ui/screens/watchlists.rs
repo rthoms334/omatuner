@@ -322,16 +322,19 @@ impl WatchlistsScreen {
     fn details(&mut self, ctx: &mut UiCtx<'_>) {
         let Some(e) = self.entry() else { return };
         let Some(item) = e.playable.as_ref().or(e.entry.item.as_ref()) else { return };
+        let origin = shared::Origin { list: e.entry.list_id, entry: e.entry.id };
         let route = match item.kind {
-            ItemKind::Movie => crate::store::vod::resolve_movie(ctx.db, item).ok().flatten().map(Route::MovieDetail),
+            ItemKind::Movie => {
+                crate::store::vod::resolve_movie(ctx.db, item).ok().flatten().map(|movie| Route::MovieDetailFromList { movie, origin })
+            }
             ItemKind::Episode => crate::store::vod::resolve_episode(ctx.db, item)
                 .ok()
                 .flatten()
                 .and_then(|id| crate::store::vod::episode(ctx.db, id).ok())
-                .map(|ep| Route::SeriesDetailAt { series: ep.series_id, season: ep.season, episode: ep.episode }),
+                .map(|ep| Route::SeriesDetailFromList { series: ep.series_id, episode: Some((ep.season, ep.episode)), origin }),
             ItemKind::Series => resolve_series(ctx.db, item).ok().flatten().map(|series| {
                 let (season, episode) = e.episode.unwrap_or((e.entry.season_from.unwrap_or(1), 1));
-                Route::SeriesDetailAt { series, season, episode }
+                Route::SeriesDetailFromList { series, episode: Some((season, episode)), origin }
             }),
             _ => None,
         };
@@ -451,7 +454,7 @@ impl WatchlistsScreen {
                 .map(|e| format!("next {}", shared::label(ctx, e)))
                 .unwrap_or_else(|| if v.finished() { "✓ Done" } else { "No playable entries" }.into());
             let title = if v.finished() { format!("✓ {} (done)", v.list.name) } else { v.list.name.clone() };
-            let label = format!("{title}   {}/{}\n{next}", v.done, v.total);
+            let label = format!("{title} · {}\n{next}", v.progress_label());
             let row = ui.horizontal(|ui| {
                 let (grip, drag) = ui.allocate_exact_size(
                     egui::vec2(24.0 * ctx.theme.rem(), 38.0 * ctx.theme.rem()),
@@ -519,7 +522,7 @@ impl WatchlistsScreen {
             if let Some(note) = &v.list.note {
                 ui.label(note);
             }
-            ui.label(format!("{} of {} · {} left", v.done, v.total, crate::queue::ui::duration(v.remaining_s)));
+            ui.label(format!("{} · {} left", v.progress_label(), crate::queue::ui::duration(v.remaining_s)));
             order = ui.button(if v.list.play_order == PlayOrder::Any { "Any order ▾" } else { "In order ▾" }).clicked();
             if ui.button("Play").clicked() {
                 shared::play(ctx, v.list.id, None, false);
@@ -556,6 +559,7 @@ impl WatchlistsScreen {
         }
         let height = (54.0 * theme.rem()).round();
         let mut play = None;
+        let mut open = false;
         let mut menu = false;
         let mut dropped = None;
         egui::ScrollArea::vertical().id_salt("watchlist-entries").show_rows(ui, height, entries.len(), |ui, range| {
@@ -620,6 +624,19 @@ impl WatchlistsScreen {
                     ""
                 };
                 let title = format!("{number}{mark}{}", shared::label(ctx, e));
+                let play_rect = egui::Rect::from_center_size(
+                    egui::pos2(rect.right() - 24.0 * theme.rem(), rect.center().y),
+                    egui::vec2(36.0, 36.0) * theme.rem(),
+                );
+                if selected || r.hovered() || ui.rect_contains_pointer(play_rect) {
+                    let response = ui.put(play_rect, egui::Button::new(glyphs::PLAY)).on_hover_text("Play from here (Shift+Enter)");
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, e.playable.is_some(), "Play from here"));
+                    if crate::ui::widgets::fresh_click(&response) && e.playable.is_some() {
+                        self.cursor = i;
+                        self.lists_focus = false;
+                        play = Some(e.entry.id);
+                    }
+                }
                 let x = grip.right() + 4.0;
                 crate::ui::video_host::osd_text(
                     ui.painter(),
@@ -628,7 +645,7 @@ impl WatchlistsScreen {
                     &title,
                     egui::FontId::proportional(theme.font(TypeToken::Body)),
                     color,
-                    rect.right() - x - 8.0,
+                    play_rect.left() - x - 8.0,
                 );
                 let mut detail = if e.status == EntryStatus::Missing {
                     "Not in your playlists".into()
@@ -654,7 +671,7 @@ impl WatchlistsScreen {
                     &detail,
                     egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
                     t.text_secondary,
-                    rect.right() - x - 8.0,
+                    play_rect.left() - x - 8.0,
                 );
                 if let Some(p) = &e.progress
                     && let Some(d) = p.duration_s.filter(|d| *d > 0.0)
@@ -665,10 +682,13 @@ impl WatchlistsScreen {
                     );
                     ui.painter().rect_filled(bar, 0.0, t.accent);
                 }
-                if crate::ui::widgets::fresh_click(&r) && !grip.contains(ui.input(|x| x.pointer.interact_pos()).unwrap_or_default()) {
+                if crate::ui::widgets::fresh_click(&r)
+                    && !grip.contains(ui.input(|x| x.pointer.interact_pos()).unwrap_or_default())
+                    && !play_rect.contains(ui.input(|x| x.pointer.interact_pos()).unwrap_or_default())
+                {
                     self.cursor = i;
                     self.lists_focus = false;
-                    play = Some(e.entry.id);
+                    open = true;
                 }
                 if r.secondary_clicked() {
                     self.cursor = i;
@@ -688,6 +708,9 @@ impl WatchlistsScreen {
         });
         if let Some((id, to)) = dropped {
             self.move_entry(ctx, id, to);
+        }
+        if open {
+            self.details(ctx);
         }
         if let Some(id) = play {
             shared::play(ctx, v.list.id, Some(id), false);
@@ -769,7 +792,8 @@ impl Screen for WatchlistsScreen {
                 }
             }
             Action::Activate | Action::ActivateAlt if self.lists_focus => self.lists_focus = false,
-            Action::Activate | Action::ActivateAlt => self.play(ctx, false),
+            Action::Activate => self.details(ctx),
+            Action::ActivateAlt => self.play(ctx, false),
             Action::WatchlistOne if !self.lists_focus => self.play(ctx, true),
             Action::WatchlistNew => self.new_list(ctx),
             Action::WatchlistSkip if !self.lists_focus => self.choose(ctx, SKIP),
@@ -947,6 +971,156 @@ mod tests {
     }
 
     type H = egui_kittest::Harness<'static, testkit::App<WatchlistsScreen>>;
+
+    #[test]
+    fn progress_labels_match_in_the_header_lists_pane_and_home() {
+        let (mut t, one) = rig();
+        let lists = seed(&mut t, |c| {
+            let ids = testkit::landman(c)?;
+            let series = crate::store::vod::series(c, ids[0])?;
+            testkit::movies(c, series.source_id, 2)?;
+            let lib = crate::store::library::load(c)?;
+            let series = store::new_entry(c, &ItemRef { source: series.source_id, kind: ItemKind::Series, key: series.key })?;
+            let films = [store::new_entry(c, &movie(SourceId(1), 0))?, store::new_entry(c, &movie(SourceId(1), 1))?];
+            let mut lists = Vec::new();
+            for (name, entries) in [("Shows", vec![series.clone()]), ("Mixed", vec![series, films[0].clone()]), ("Films", films.to_vec())] {
+                let id = store::create(c, name, None, PlayOrder::Ordered, "app", 1)?;
+                let added = store::add(c, &lib, id, &entries, crate::watchlist::Insert::End, 1)?.added;
+                if name == "Films" || name == "Mixed" {
+                    store::skip(c, id, &[added[if name == "Films" { 0 } else { 1 }]], true)?;
+                }
+                lists.push(id);
+            }
+            Ok(lists)
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1400.0, 900.0));
+        let labels = ["10 of 20 episodes", "11 of 21 watched", "1 of 2 titles"];
+        for (id, label) in lists.into_iter().zip(labels) {
+            h.state_mut().enter(Route::Watchlists { list: Some(id) });
+            until(&mut h, label, |h| testkit::painted(h).iter().filter(|s| s.contains(label)).count() >= 2);
+        }
+        let (t, one) = h.into_state().into_parts();
+        let mut home = harness(t, one, super::super::home::HomeScreen::default(), egui::vec2(1400.0, 1200.0));
+        home.state_mut().enter(Route::Home);
+        until(&mut home, "Home progress", |h| labels.iter().all(|label| testkit::painted(h).iter().any(|s| s.contains(label))));
+    }
+
+    #[test]
+    fn details_play_the_selected_episode_through_the_list_but_a_normal_page_does_not() {
+        use crate::model::{MediaRef, PlayOrigin};
+        use crate::ui::NavRequest;
+        let (mut t, one) = rig();
+        let (series, list) = seed(&mut t, |c| {
+            let ids = testkit::landman(c)?;
+            let s = crate::store::vod::series(c, ids[0])?;
+            let list = store::create(c, "Landman", None, PlayOrder::Ordered, "app", 1)?;
+            let lib = crate::store::library::load(c)?;
+            let mut range = store::new_entry(c, &ItemRef { source: s.source_id, kind: ItemKind::Series, key: s.key })?;
+            range.season_from = Some(2);
+            range.season_to = Some(2);
+            store::add(c, &lib, list, &[range], crate::watchlist::Insert::End, 1)?;
+            // The range opens at its resumable second episode.
+            let e = crate::store::vod::episodes(c, ids[1], Some(2))?[1].clone();
+            crate::store::user::save_progress(
+                c,
+                &crate::model::WatchProgress {
+                    item: ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key },
+                    position_s: 90.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 20,
+                    finished: false,
+                    title: e.title,
+                    fingerprint: Default::default(),
+                },
+            )?;
+            Ok((ids[0], list))
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::Watchlists { list: Some(list) });
+        until(&mut h, "range", |h| h.state().s.entry().is_some());
+        let entry = h.state().s.entry().unwrap().entry.id;
+        h.state_mut().act(Action::Activate);
+        let nav = h.state_mut().nav();
+        let [NavRequest::Push(route)] = nav.as_slice() else { panic!("{nav:?}") };
+        let route = route.clone();
+        let (t, one) = h.into_state().into_parts();
+        let mut h = harness(t, one, super::super::series_detail::SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(route);
+        until(&mut h, "episodes", |h| testkit::has_label(h, "Season 2"));
+        h.state_mut().act(Action::Activate);
+        let nav = h.state_mut().nav();
+        let Some(NavRequest::Open(OverlayRequest::Resume(spec))) = nav.last() else { panic!("{nav:?}") };
+        let w = spec.watchlist.as_ref().expect("page keeps its list");
+        assert_eq!((w.list, w.from), (list, Some(entry)));
+        assert!(w.item.as_ref().is_some_and(|i| i.kind == ItemKind::Episode));
+        assert!(matches!(spec.media, MediaRef::Episode(_)));
+        let selected = spec.media.clone();
+        h.state_mut().act(Action::FocusNext); // Episodes → header buttons.
+        h.state_mut().act(Action::Activate);
+        let nav = h.state_mut().nav();
+        let Some(NavRequest::Open(OverlayRequest::Resume(spec))) = nav.last() else { panic!("{nav:?}") };
+        assert_eq!(spec.media, selected, "the main Play button follows the entry's episode");
+        assert!(spec.watchlist.is_some());
+        // Reuse the same screen instance, just as navigating from Series does.
+        h.state_mut().enter(Route::SeriesDetail(series));
+        h.step();
+        until(&mut h, "ordinary Series page", |h| testkit::has_label(h, "Season 2"));
+        h.state_mut().act(Action::Activate);
+        let nav = h.state_mut().nav();
+        let Some(NavRequest::Open(OverlayRequest::Resume(spec))) = nav.last() else { panic!("{nav:?}") };
+        assert!(spec.watchlist.is_none());
+        assert_eq!(spec.copy.as_ref().unwrap().req.origin, PlayOrigin::Fullscreen);
+    }
+
+    #[test]
+    fn landman_series_entry_counts_the_union_and_opens_both_seasons() {
+        let (mut t, one) = rig();
+        let (ids, list) = seed(&mut t, |c| {
+            let ids = testkit::landman(c)?;
+            let s = crate::store::vod::series(c, ids[0])?;
+            let item = ItemRef { source: s.source_id, kind: ItemKind::Series, key: s.key };
+            let list = store::create(c, "Landman", None, PlayOrder::Ordered, "app", 1)?;
+            let lib = crate::store::library::load(c)?;
+            store::add(c, &lib, list, &[store::new_entry(c, &item)?], crate::watchlist::Insert::End, 1)?;
+            Ok((ids, list))
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::Watchlists { list: Some(list) });
+        until(&mut h, "series progress", |h| testkit::painted(h).iter().any(|s| s.contains("next S2E1 · 10 of 20 watched")));
+        let e = h.state().s.entry().unwrap();
+        assert_eq!((e.done_episodes, e.total_episodes, e.episode), (10, 20, Some((2, 1))));
+        // Resuming on the short 4K copy must still open a page containing S2.
+        seed(&mut h.state_mut().t, move |c| {
+            let e = crate::store::vod::episodes(c, ids[0], Some(1))?.pop().unwrap();
+            crate::store::user::save_progress(
+                c,
+                &crate::model::WatchProgress {
+                    item: ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key },
+                    position_s: 600.0,
+                    duration_s: Some(2700.0),
+                    updated_at: 200,
+                    finished: false,
+                    title: e.title,
+                    fingerprint: Default::default(),
+                },
+            )
+        });
+        h.state().t.services().bus.send(AppEvent::Data(crate::msg::DataScope::Progress));
+        until(&mut h, "resume on the 4K copy", |h| testkit::painted(h).iter().any(|s| s.contains("next S1E10 · 9 of 20 watched")));
+        h.state_mut().nav();
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(DETAILS)));
+        let nav = h.state_mut().nav();
+        assert!(
+            matches!(nav.as_slice(), [crate::ui::NavRequest::Push(Route::SeriesDetailFromList { series, episode: Some((1, 10)), .. })] if *series == ids[0]),
+            "{nav:?}"
+        );
+        let [crate::ui::NavRequest::Push(route)] = nav.as_slice() else { unreachable!() };
+        let route = route.clone();
+        let (t, one) = h.into_state().into_parts();
+        let mut detail = harness(t, one, super::super::series_detail::SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        detail.state_mut().enter(route);
+        until(&mut detail, "watchlist episode page", |h| testkit::has_label(h, "Season 1") && testkit::has_label(h, "Season 2"));
+    }
 
     fn unloaded_series() -> H {
         let (mut t, one) = rig();
