@@ -1,6 +1,6 @@
 {
   "name": "omatuner",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Watch, pick, plan and fix TV in Tuner (the IPTV player for Omarchy) from Claude Code: the tuner MCP server plus skills for live TV, picks, series, plans and reminders, kids and parental locks, troubleshooting and trending titles.",
   "author": {
     "name": "Robert Thomson"
