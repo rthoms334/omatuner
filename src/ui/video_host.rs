@@ -171,6 +171,8 @@ pub struct VideoHost {
     other_copy: Option<String>,
     /// What the casting card adds ([`VideoHost::set_cast_context`]); one frame's worth.
     cast_ctx: CastContext,
+    /// The fullscreen player's centre ▶ is up ([`VideoHost::set_centre_play`]).
+    centre_play: bool,
 }
 
 fn slot(tile: TileId) -> usize {
@@ -325,6 +327,12 @@ impl VideoHost {
     /// every `paint`; the preview and the mini player paint the card without it).
     pub fn set_cast_context(&mut self, c: CastContext) {
         self.cast_ctx = c;
+    }
+
+    /// The fullscreen player shows its own centre ▶ this frame, so a paused picture paints no
+    /// ⏸ badge under it (the fullscreen player sets it before every `paint`).
+    pub fn set_centre_play(&mut self, on: bool) {
+        self.centre_play = on;
     }
 
     /// The recovery buttons laid out by the last fullscreen [`paint`](Self::paint).
@@ -578,7 +586,7 @@ impl VideoHost {
                         );
                     }
                 }
-                if snap.state == PlayerState::Paused || snap.paused {
+                if (snap.state == PlayerState::Paused || snap.paused) && !(placement == Placement::Fullscreen && self.centre_play) {
                     let s = (36.0 * k).round();
                     let r = Rect::from_center_size(rect.center(), egui::vec2(s * 1.6, s * 1.6));
                     if !audio_only {
