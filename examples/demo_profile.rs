@@ -1,17 +1,21 @@
-//! A made-up demo profile for screenshots (README) and manual checks: three fictional playlists,
-//! a few days of guide, movies and series with generated posters, and some favourites, history,
-//! progress, reminders, Up next, Following rules and channels for Guide fixes.
+//! The demo profile for the README's demo video and manual checks: three fictional playlists,
+//! a few days of guide, public-domain films and series, and some favourites, history, progress,
+//! reminders, Up next, watchlists, downloads, Following rules and channels for Guide fixes.
 //!
 //! `cargo run --example demo_profile -- <dir> [--media <video file>] [--media2 <video file>]
-//! [--silent]`, then
-//! `tuner --profile-dir <dir>`. `--silent` gives mpv no audio output (screenshots).
+//! [--art <dir>] [--silent]`, then `tuner --profile-dir <dir>`. `--silent` gives mpv no audio
+//! output (the video).
 //!
-//! Everything is invented and generated here — names, programmes, logos (monograms), posters
-//! (gradients + title) — so screenshots never show a real provider, channel or artwork. The
-//! content is fixed (seeded); only the guide's times follow today's date. Live channels play
-//! `--media` (looped; `scripts/screenshots.sh` passes public-domain NASA footage), the channels
-//! in `SECOND_CLIP` play `--media2` instead when given (so multi-view's two pictures differ),
-//! movies and episodes point at `*.tuner-demo.invalid` and never play.
+//! The playlists, channels, programmes and logos (monograms) are invented here, so nothing shows
+//! a real provider or channel. The films and series are real US public-domain titles (`MOVIES`,
+//! `SERIES`); `--art` is a directory of their posters and backdrops (`poster/<slug>.jpg`,
+//! `backdrop/<slug>.jpg`: public-domain files from Wikimedia Commons, listed in
+//! `docs/demo-media.tsv`, which `scripts/demo-video.sh` fetches and cuts). Without it they get
+//! generated posters (gradients + title). The content is fixed (seeded); only the guide's times
+//! follow today's date. Live channels play `--media` (looped; the script passes public-domain
+//! NASA footage), the channels in `SECOND_CLIP` play `--media2` instead when given (so
+//! multi-view's two pictures differ), movies and episodes point at `*.tuner-demo.invalid` and
+//! never play (downloaded ones play `--media`).
 //!
 //! It goes through the app's own import path: M3U files are imported by the `RefreshSource`
 //! job (smart names, quality badges, country tags, stacks), the XMLTV file by `RefreshEpg`;
@@ -45,7 +49,7 @@ use tuner::ui::widgets::glyphs;
 const SEED: u64 = 0x7475_6e65_7264_656d; // "tunerdem"
 const IMG: &str = "https://img.tuner-demo.invalid";
 
-const USAGE: &str = "usage: demo_profile <dir> [--media <video file>] [--media2 <video file>] [--silent]";
+const USAGE: &str = "usage: demo_profile <dir> [--media <video file>] [--media2 <video file>] [--art <dir>] [--silent]";
 
 #[allow(dead_code)] // the test includes this file and uses `build` only
 fn main() -> Result<()> {
@@ -53,11 +57,13 @@ fn main() -> Result<()> {
     let mut dir = None;
     let mut media = None;
     let mut media2 = None;
+    let mut art = None;
     let mut silent = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--media" => media = Some(PathBuf::from(args.next().context("--media needs a file")?)),
             "--media2" => media2 = Some(PathBuf::from(args.next().context("--media2 needs a file")?)),
+            "--art" => art = Some(PathBuf::from(args.next().context("--art needs a directory")?)),
             "--silent" => silent = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -68,7 +74,7 @@ fn main() -> Result<()> {
         }
     }
     let dir = dir.context(USAGE)?;
-    let summary = build(&dir, media.as_deref(), media2.as_deref(), silent)?;
+    let summary = build_with_art(&dir, media.as_deref(), media2.as_deref(), art.as_deref(), silent)?;
     println!("{summary}");
     println!("run: tuner --profile-dir {}", dir.display());
     Ok(())
@@ -207,123 +213,375 @@ const HARBOR_LIVE: Lineup = &[
 /// (name, hue) of the channels no guide lists: a logo, no programmes.
 const UNLISTED: &[(&str, u32)] = &[("Quarry Lane TV", 75), ("Seabright Local", 165)];
 
-/// (title, year, genre line, minutes): the movie catalogue.
-const MOVIES: &[(&str, u16, &str, u32)] = &[
-    ("The Keeper of Wren Point", 2019, "Drama, Mystery", 118),
-    ("Midnight Orchard", 2021, "Thriller", 104),
-    ("Paper Satellites", 2018, "Science Fiction", 126),
-    ("Glass Harbour", 2022, "Crime, Drama", 111),
-    ("The Last Cartographer", 2016, "Adventure", 132),
-    ("Copper Sky", 2020, "Western", 97),
-    ("Northbound", 2023, "Road Movie, Comedy", 101),
-    ("Salt & Ember", 2017, "Romance", 109),
-    ("Quiet Frequencies", 2024, "Science Fiction, Thriller", 115),
-    ("The Orchid Protocol", 2015, "Action, Thriller", 122),
-    ("Kites Over Lisbon", 2019, "Comedy, Romance", 94),
-    ("Tin Moon", 2014, "Animation, Family", 88),
-    ("Velvet Static", 2022, "Music, Drama", 107),
-    ("Wolves of Wintermere", 2020, "Fantasy, Adventure", 141),
-    ("Small Hours", 2018, "Drama", 99),
-    ("A Map of Tides", 2021, "Documentary", 92),
-    ("Hollow Crown Road", 2013, "Crime", 116),
-    ("The Saffron Detective", 2023, "Mystery, Comedy", 103),
-    ("Signal Lost", 2016, "Horror", 91),
-    ("Echoes in Amber", 2025, "Drama, History", 128),
-    ("The Clockmaker's Daughter", 2012, "Fantasy", 112),
-    ("Blue Hour Express", 2024, "Action", 106),
-    // a trilogy (Up next)
-    ("Starling Bay", 2016, "Adventure, Drama", 112),
-    ("Starling Bay: Undertow", 2019, "Adventure, Thriller", 118),
-    ("Starling Bay: Landfall", 2023, "Adventure, Drama", 124),
+/// One film of the catalogue: real public-domain titles (US), with their year, length, genre,
+/// director and leads; the plots are written for the demo. Their posters and backdrops are
+/// public-domain files from Wikimedia Commons (`docs/demo-media.tsv`), fetched by
+/// `scripts/demo-video.sh` and passed in with `--art`; without them each gets a generated poster.
+struct Film {
+    title: &'static str,
+    year: u16,
+    genre: &'static str,
+    minutes: u32,
+    director: &'static str,
+    cast: &'static [&'static str],
+    plot: &'static str,
+}
+
+const MOVIES: &[Film] = &[
+    // 0
+    Film {
+        title: "Metropolis",
+        year: 1927,
+        genre: "Science Fiction, Drama",
+        minutes: 153,
+        director: "Fritz Lang",
+        cast: &["Brigitte Helm", "Alfred Abel", "Gustav Fröhlich"],
+        plot: "In a towering future city, the son of its ruler joins the oppressed underground workers, while an inventor builds a robot in a woman's likeness.",
+    },
+    // 1
+    Film {
+        title: "Night of the Living Dead",
+        year: 1968,
+        genre: "Horror",
+        minutes: 96,
+        director: "George A. Romero",
+        cast: &["Duane Jones", "Judith O'Dea", "Karl Hardman"],
+        plot: "Strangers barricade themselves inside a rural Pennsylvania farmhouse as the recently dead rise and close in, and tensions among the survivors boil over.",
+    },
+    // 2
+    Film {
+        title: "His Girl Friday",
+        year: 1940,
+        genre: "Comedy, Romance",
+        minutes: 92,
+        director: "Howard Hawks",
+        cast: &["Cary Grant", "Rosalind Russell", "Ralph Bellamy"],
+        plot: "A fast-talking newspaper editor schemes to stop his star reporter and ex-wife from remarrying by luring her onto one last big story.",
+    },
+    // 3
+    Film {
+        title: "The General",
+        year: 1926,
+        genre: "Comedy, Adventure",
+        minutes: 79,
+        director: "Buster Keaton, Clyde Bruckman",
+        cast: &["Buster Keaton", "Marion Mack", "Glen Cavender"],
+        plot: "A Confederate train engineer, turned away by the army, chases Union spies across enemy lines after they steal his locomotive with his sweetheart aboard.",
+    },
+    // 4
+    Film {
+        title: "D.O.A.",
+        year: 1949,
+        genre: "Film Noir, Thriller",
+        minutes: 84,
+        director: "Rudolph Maté",
+        cast: &["Edmond O'Brien", "Pamela Britton", "Luther Adler"],
+        plot: "Told he has swallowed a slow-acting poison, an accountant spends his remaining hours racing around San Francisco and Los Angeles to identify his own killer.",
+    },
+    // 5
+    Film {
+        title: "The Little Shop of Horrors",
+        year: 1960,
+        genre: "Comedy, Horror",
+        minutes: 72,
+        director: "Roger Corman",
+        cast: &["Jonathan Haze", "Jackie Joseph", "Mel Welles"],
+        plot: "A clumsy florist's clerk wins fame by breeding a strange new plant, then learns it craves human flesh and will keep demanding more.",
+    },
+    // 6
+    Film {
+        title: "The Cabinet of Dr. Caligari",
+        year: 1920,
+        genre: "Horror",
+        minutes: 74,
+        director: "Robert Wiene",
+        cast: &["Werner Krauss", "Conrad Veidt", "Lil Dagover"],
+        plot: "A young man recounts how a sinister showman and his sleepwalking servant arrived at a town fair, soon followed by a string of murders.",
+    },
+    // 7
+    Film {
+        title: "The Phantom of the Opera",
+        year: 1925,
+        genre: "Horror",
+        minutes: 107,
+        director: "Rupert Julian",
+        cast: &["Lon Chaney", "Mary Philbin", "Norman Kerry"],
+        plot: "A disfigured genius haunting the cellars beneath the Paris Opera schemes to make a young understudy its leading star, whatever the cost.",
+    },
+    // 8
+    Film {
+        title: "Sherlock Jr.",
+        year: 1924,
+        genre: "Comedy",
+        minutes: 45,
+        director: "Buster Keaton",
+        cast: &["Buster Keaton", "Kathryn McGuire", "Joe Keaton"],
+        plot: "A cinema projectionist who dreams of being a detective is falsely accused of theft, then falls asleep and walks into the film he is screening.",
+    },
+    // 9
+    Film {
+        title: "Steamboat Bill, Jr.",
+        year: 1928,
+        genre: "Comedy",
+        minutes: 70,
+        director: "Charles Reisner",
+        cast: &["Buster Keaton", "Ernest Torrence", "Marion Byron"],
+        plot: "A dapper college boy joins his gruff riverboat-captain father on the Mississippi, falls for a rival's daughter, and faces a devastating cyclone.",
+    },
+    // 10
+    Film {
+        title: "The Kid",
+        year: 1921,
+        genre: "Comedy, Drama",
+        minutes: 68,
+        director: "Charlie Chaplin",
+        cast: &["Charlie Chaplin", "Jackie Coogan", "Edna Purviance"],
+        plot: "Five years after finding a baby left in an alley, the Tramp and the streetwise boy he raised fight to stay together when officials intervene.",
+    },
+    // 11
+    Film {
+        title: "The Gold Rush",
+        year: 1925,
+        genre: "Comedy, Adventure",
+        minutes: 95,
+        director: "Charlie Chaplin",
+        cast: &["Charlie Chaplin", "Georgia Hale", "Mack Swain"],
+        plot: "A lone prospector braves the Klondike winter, shares a storm-battered cabin with a hulking miner, and falls for a dance-hall girl in a boomtown.",
+    },
+    // 12
+    Film {
+        title: "Safety Last!",
+        year: 1923,
+        genre: "Comedy",
+        minutes: 73,
+        director: "Fred C. Newmeyer, Sam Taylor",
+        cast: &["Harold Lloyd", "Mildred Davis", "Bill Strother"],
+        plot: "A small-town clerk desperate to impress his sweetheart in the city ends up climbing the outside of a twelve-storey department store.",
+    },
+    // 13
+    Film {
+        title: "The Freshman",
+        year: 1925,
+        genre: "Comedy",
+        minutes: 76,
+        director: "Fred C. Newmeyer, Sam Taylor",
+        cast: &["Harold Lloyd", "Jobyna Ralston", "Brooks Benedict"],
+        plot: "A college freshman desperate to be popular becomes a campus joke without realising it, then gets one chance to prove himself on the football field.",
+    },
+    // 14
+    Film {
+        title: "The Stranger",
+        year: 1946,
+        genre: "Film Noir, Thriller",
+        minutes: 95,
+        director: "Orson Welles",
+        cast: &["Edward G. Robinson", "Loretta Young", "Orson Welles"],
+        plot: "A war-crimes investigator tracks a fugitive Nazi official to a quiet Connecticut college town, where the man now teaches and has just married.",
+    },
+    // 15
+    Film {
+        title: "The Lodger",
+        year: 1927,
+        genre: "Thriller",
+        minutes: 90,
+        director: "Alfred Hitchcock",
+        cast: &["Ivor Novello", "June Tripp", "Malcolm Keen"],
+        plot: "While a serial killer stalks fair-haired women in fog-bound London, a landlady begins to suspect the secretive young man renting her upstairs room.",
+    },
+    // 16
+    Film {
+        title: "Sunrise",
+        year: 1927,
+        genre: "Drama, Romance",
+        minutes: 95,
+        director: "F. W. Murnau",
+        cast: &["George O'Brien", "Janet Gaynor", "Margaret Livingston"],
+        plot: "Urged by a city seductress to drown his wife, a farmer rows her across the lake, and their unexpected day in the city changes everything.",
+    },
+    // 17
+    Film {
+        title: "Wings",
+        year: 1927,
+        genre: "War, Drama",
+        minutes: 144,
+        director: "William A. Wellman",
+        cast: &["Clara Bow", "Charles \"Buddy\" Rogers", "Richard Arlen"],
+        plot: "Two small-town rivals for the same girl train as fighter pilots in the First World War and forge a deep friendship in combat.",
+    },
+    // 18
+    Film {
+        title: "The Passion of Joan of Arc",
+        year: 1928,
+        genre: "Drama, History",
+        minutes: 82,
+        director: "Carl Theodor Dreyer",
+        cast: &["Renée Jeanne Falconetti", "Eugène Silvain", "Antonin Artaud"],
+        plot: "Captured and put on trial by English-aligned clergy, Joan of Arc endures relentless interrogation and pressure to recant in the final hours before her execution.",
+    },
+    // 19
+    Film {
+        title: "The Hunchback of Notre Dame",
+        year: 1923,
+        genre: "Drama, Romance",
+        minutes: 102,
+        director: "Wallace Worsley",
+        cast: &["Lon Chaney", "Patsy Ruth Miller", "Norman Kerry"],
+        plot: "In medieval Paris, the deformed bell-ringer of Notre Dame is drawn into a web of intrigue around a kind-hearted street dancer pursued by several men.",
+    },
+    // 20
+    Film {
+        title: "The Thief of Bagdad",
+        year: 1924,
+        genre: "Adventure, Fantasy",
+        minutes: 140,
+        director: "Raoul Walsh",
+        cast: &["Douglas Fairbanks", "Julanne Johnston", "Anna May Wong"],
+        plot: "A thief who sneaks into the palace falls for the Caliph's daughter and, posing as a prince, sets off on a quest for magical treasure.",
+    },
+    // 21
+    Film {
+        title: "Battleship Potemkin",
+        year: 1925,
+        genre: "Drama, History",
+        minutes: 74,
+        director: "Sergei Eisenstein",
+        cast: &["Aleksandr Antonov", "Vladimir Barsky", "Grigori Aleksandrov"],
+        plot: "Sailors on a Russian battleship rebel against their officers over rotten rations, and the people of Odessa rally to their cause before troops intervene.",
+    },
+    // 22
+    Film {
+        title: "Nosferatu",
+        year: 1922,
+        genre: "Horror",
+        minutes: 94,
+        director: "F. W. Murnau",
+        cast: &["Max Schreck", "Gustav von Wangenheim", "Greta Schröder"],
+        plot: "An estate agent travels to a remote castle to sell a house to a reclusive count, who follows him home and brings a plague with him.",
+    },
 ];
+
+/// Buster Keaton's three, in release order (Up next).
+pub const UP_NEXT: &[&str] = &["Sherlock Jr.", "The General", "Steamboat Bill, Jr."];
 
 /// Movies or series of one playlist: (index in MOVIES / SERIES, language prefix, 4K copy,
 /// category). The same title in two playlists (or twice in one) is a stack in "All playlists".
 type VodLineup = &'static [(usize, &'static str, bool, &'static str)];
 
+// Silent films come with English intertitles, and the German, French and Russian ones also
+// with their own (a second language copy to stack).
 const NORTHWIND_MOVIES: VodLineup = &[
     (0, "EN - ", false, "EN | Movies"),
-    (0, "FR - ", false, "FR | Films"),
+    (0, "DE - ", false, "DE | Filme"),
     (1, "EN - ", false, "EN | Movies"),
     (2, "EN - ", false, "EN | Movies"),
     (3, "EN - ", false, "EN | Movies"),
     (4, "EN - ", false, "EN | Movies"),
     (5, "EN - ", false, "EN | Movies"),
     (6, "EN - ", false, "EN | Movies"),
-    (7, "FR - ", false, "FR | Films"),
-    (8, "EN - ", true, "EN | 4K"),
+    (7, "EN - ", false, "EN | Movies"),
+    (8, "EN - ", false, "EN | Movies"),
     (9, "EN - ", false, "EN | Movies"),
-    (10, "EN - ", false, "EN | Movies"),
-    (11, "EN - ", false, "EN | Kids"),
-    (13, "EN - ", true, "EN | 4K"),
-    (15, "EN - ", false, "EN | Movies"),
+    (10, "EN - ", false, "EN | Kids"),
+    (11, "EN - ", false, "EN | Movies"),
+    (12, "EN - ", false, "EN | Movies"),
+    (14, "EN - ", false, "EN | Movies"),
+    (16, "EN - ", true, "EN | 4K"),
     (17, "EN - ", false, "EN | Movies"),
-    (19, "EN - ", false, "EN | Movies"),
-    (20, "EN - ", false, "EN | Kids"),
+    (18, "FR - ", false, "FR | Films"),
+    (21, "EN - ", false, "EN | Movies"),
     (22, "EN - ", false, "EN | Movies"),
-    (23, "EN - ", false, "EN | Movies"),
-    (24, "EN - ", false, "EN | Movies"),
+    (22, "DE - ", false, "DE | Filme"),
 ];
 const AURORA_MOVIES: VodLineup = &[
     (0, "EN - ", true, "EN | 4K Movies"),
-    (1, "DE - ", false, "DE | Filme"),
-    (2, "EN - ", false, "EN | New Releases"),
+    (1, "EN - ", false, "EN | Classics"),
+    (2, "EN - ", true, "EN | 4K Movies"),
     (3, "EN - ", true, "EN | 4K Movies"),
-    (8, "EN - ", false, "EN | New Releases"),
-    (9, "DE - ", false, "DE | Filme"),
-    (12, "EN - ", false, "EN | New Releases"),
-    (13, "EN - ", false, "EN | New Releases"),
-    (14, "EN - ", false, "EN | New Releases"),
-    (16, "EN - ", false, "EN | New Releases"),
-    (18, "EN - ", false, "EN | New Releases"),
-    (19, "EN - ", true, "EN | 4K Movies"),
-    (21, "EN - ", false, "EN | New Releases"),
-    (24, "EN - ", true, "EN | 4K Movies"),
+    (6, "DE - ", false, "DE | Filme"),
+    (7, "EN - ", false, "EN | Classics"),
+    (11, "EN - ", true, "EN | 4K Movies"),
+    (13, "EN - ", false, "EN | Classics"),
+    (14, "EN - ", false, "EN | Classics"),
+    (15, "EN - ", false, "EN | Classics"),
+    (16, "EN - ", false, "EN | Classics"),
+    (18, "EN - ", false, "EN | Classics"),
+    (19, "EN - ", false, "EN | Classics"),
+    (20, "EN - ", true, "EN | 4K Movies"),
+    (22, "EN - ", true, "EN | 4K Movies"),
 ];
 
-/// (title, year, seasons, episodes per season, genre).
-const SERIES: &[(&str, u16, u32, u32, &str)] = &[
-    ("Gullhaven", 2022, 2, 6, "Drama"),
-    ("The Cartographers", 2021, 1, 8, "Adventure"),
-    ("Static Bloom", 2023, 2, 5, "Science Fiction"),
-    ("Fernwood Station", 2019, 3, 6, "Comedy"),
-    ("Blue Hour", 2024, 1, 6, "Crime"),
-    ("Ninth Floor", 2020, 2, 8, "Thriller"),
-    ("Kitchen Confidential Club", 2018, 1, 10, "Reality"),
-    ("Moss & Stone", 2025, 1, 6, "Fantasy"),
-];
-const NORTHWIND_SERIES: VodLineup = &[
-    (0, "EN - ", false, "EN | Series"),
-    (1, "EN - ", false, "EN | Series"),
-    (2, "EN - ", false, "EN | Series"),
-    (3, "EN - ", false, "EN | Comedy"),
-    (6, "EN - ", false, "EN | Series"),
-];
-const AURORA_SERIES: VodLineup = &[
-    (0, "EN - ", true, "EN | Series 4K"),
-    (2, "DE - ", false, "DE | Serien"),
-    (4, "EN - ", false, "EN | Series"),
-    (5, "EN - ", false, "EN | Series"),
-    (7, "EN - ", false, "EN | Series"),
-];
+/// One series: real public-domain episodes (US; copyright not renewed), with their own titles
+/// and numbers. The premise is written for the demo.
+struct Show {
+    title: &'static str,
+    year: u16,
+    genre: &'static str,
+    minutes: u32,
+    plot: &'static str,
+    /// (season, episode, title)
+    episodes: &'static [(u32, u32, &'static str)],
+}
 
-const EPISODE_TITLES: &[&str] = &[
-    "Pilot",
-    "The Long Way Round",
-    "Low Tide",
-    "Lanterns",
-    "A Quiet Arrangement",
-    "North of Nowhere",
-    "Old Maps",
-    "Crosswinds",
-    "The Visitor",
-    "Paper Walls",
+const SERIES: &[Show] = &[
+    Show {
+        title: "The Beverly Hillbillies",
+        year: 1962,
+        genre: "Comedy",
+        minutes: 25,
+        plot: "A widowed hill-country man's oil windfall moves his family to a Beverly Hills mansion, where their rustic habits puzzle a banker and his snobbish wife.",
+        episodes: &[
+            (1, 1, "The Clampetts Strike Oil"),
+            (1, 2, "Getting Settled"),
+            (1, 4, "The Clampetts Meet Mrs. Drysdale"),
+            (1, 6, "Trick or Treat"),
+            (1, 13, "Home for Christmas"),
+            (1, 26, "Jed Cuts the Family Tree"),
+            (2, 1, "Jed Gets the Misery"),
+            (2, 3, "Granny's Garden"),
+            (2, 5, "The Clampett Look"),
+            (2, 10, "Turkey Day"),
+            (2, 14, "Christmas at the Clampetts"),
+        ],
+    },
+    Show {
+        title: "One Step Beyond",
+        year: 1959,
+        genre: "Drama, Mystery",
+        minutes: 25,
+        plot: "Host John Newland introduces dramatised accounts of premonitions, ghosts and other unexplained events, each presented as drawn from real reported cases.",
+        episodes: &[
+            (1, 1, "The Bride Possessed"),
+            (1, 2, "Night of April 14th"),
+            (1, 9, "The Dead Part of the House"),
+            (1, 17, "The Haunted U-Boat"),
+            (1, 19, "The Captain's Guests"),
+            (2, 2, "Ordeal on Locust Street"),
+            (2, 6, "The Inheritance"),
+            (2, 8, "Message From Clara"),
+            (2, 14, "Make Me Not a Witch"),
+            (2, 26, "The Explorer"),
+        ],
+    },
+    Show {
+        title: "Petticoat Junction",
+        year: 1963,
+        genre: "Comedy",
+        minutes: 25,
+        plot: "A widow runs a hotel by a branch railway with her three daughters and lazy uncle, while a railroad boss schemes to close the line.",
+        episodes: &[
+            (1, 1, "Spur Line to Shady Rest"),
+            (1, 2, "Quick, Hide the Railroad"),
+            (1, 3, "The President Who Came to Dinner"),
+            (1, 5, "The Courtship of Floyd Smoot"),
+            (1, 9, "The Little Train Robbery"),
+            (1, 11, "Uncle Joe's Replacement"),
+            (1, 13, "A Night at the Hooterville Hilton"),
+            (1, 14, "Cannonball Christmas"),
+        ],
+    },
 ];
-
-const FIRST_NAMES: &[&str] =
-    &["Ada", "Marek", "Ines", "Tobias", "Noor", "Elliot", "Sana", "Ruben", "Mila", "Jonas", "Priya", "Callum", "Lea", "Oskar"];
-const LAST_NAMES: &[&str] =
-    &["Hollis", "Varga", "Okafor", "Lindqvist", "Moreau", "Castellan", "Brandt", "Achterberg", "Quill", "Sato", "Ferreira", "Dunmore"];
+const NORTHWIND_SERIES: VodLineup = &[(0, "EN - ", false, "EN | Series"), (1, "EN - ", false, "EN | Series"), (2, "EN - ", false, "EN | Comedy")];
+const AURORA_SERIES: VodLineup = &[(0, "EN - ", false, "EN | Classic TV"), (1, "EN - ", false, "EN | Classic TV")];
 
 fn programmes(g: Genre) -> &'static [&'static str] {
     match g {
@@ -358,16 +616,7 @@ fn programmes(g: Genre) -> &'static [&'static str] {
             "Secrets of the Glacier",
             "Cities After Dark",
         ],
-        Genre::Cinema => &[
-            "The Keeper of Wren Point",
-            "Copper Sky",
-            "Small Hours",
-            "Tin Moon",
-            "Kites Over Lisbon",
-            "Hollow Crown Road",
-            "Signal Lost",
-            "Midnight Orchard",
-        ],
+        Genre::Cinema => &["His Girl Friday", "The Gold Rush", "Sunrise", "The Kid", "Wings", "D.O.A.", "The Stranger", "Safety Last!"],
         Genre::Music => &["Night Shift Mix", "Top 20 Countdown", "Unplugged Sessions", "Vinyl Hour", "Festival Highlights", "Fresh Tracks"],
         Genre::Food => &["Fire & Salt", "The Weekend Baker", "Market to Table", "Street Food Atlas", "Kitchen Rescue"],
         Genre::Entertainment => {
@@ -651,18 +900,17 @@ fn m3u(p: &Playlist, media: (&str, &str)) -> String {
     }
     let uhd = |on: bool| if on { " [4K]" } else { "" };
     for (n, (i, prefix, four_k, group)) in p.movies.iter().enumerate() {
-        let (title, year, ..) = MOVIES[*i];
+        let Film { title, year, .. } = MOVIES[*i];
         let q = uhd(*four_k);
         let _ = writeln!(s, r#"#EXTINF:-1 tvg-logo="{IMG}/poster/{}.png" group-title="{group}",{prefix}{title} ({year}){q}"#, slug(title));
         let _ = writeln!(s, "http://{}/movie/viewer/k7q2/{}.mkv", p.host, 5000 + n);
     }
     let mut ep_id = 9000;
     for (i, prefix, four_k, group) in p.series {
-        let (title, year, seasons, eps, _) = SERIES[*i];
+        let Show { title, year, episodes, .. } = &SERIES[*i];
         let q = uhd(*four_k);
-        for season in 1..=seasons {
-            for e in 1..=eps {
-                let ep_title = EPISODE_TITLES[((e - 1 + season * 3) as usize) % EPISODE_TITLES.len()];
+        for &(season, e, ep_title) in *episodes {
+            {
                 let _ = writeln!(
                     s,
                     r#"#EXTINF:-1 tvg-logo="{IMG}/poster/{}.png" group-title="{group}",{prefix}{title} ({year}){q} S{season:02} E{e:02} {ep_title}"#,
@@ -685,6 +933,25 @@ const FIXTURES: &[(&str, i64, i64, &str, i64, bool)] = &[
     ("Summit Sports", 2, 19 * 60 + 45, "Harbour City v Northport Albion", 120, true),
 ];
 
+/// The match that is on whenever the profile is built (the demo video's agent asks for it):
+/// (channel brand, title, minutes). It started on the last half hour but one; no Following rule
+/// names its teams.
+pub const LIVE_MATCH: (&str, &str, i64) = ("Summit Sports", "Kestrel United v Granite Rovers", 150);
+
+/// A fixture at an absolute time: (channel brand, start, title, seconds, live).
+type Fixture = (&'static str, Timestamp, &'static str, i64, bool);
+
+/// [`FIXTURES`] for the day starting at `day_start`, and [`LIVE_MATCH`] around `now`.
+fn fixtures_at(day_start: Timestamp, now: Timestamp) -> Vec<Fixture> {
+    let mut out: Vec<Fixture> = FIXTURES
+        .iter()
+        .map(|&(brand, day, minute, title, minutes, live)| (brand, day_start + day * 86_400 + minute * 60, title, minutes * 60, live))
+        .collect();
+    let (brand, title, minutes) = LIVE_MATCH;
+    out.push((brand, now.div_euclid(1800) * 1800 - 1800, title, minutes * 60, true));
+    out
+}
+
 /// One programme of the demo guide.
 struct Prog {
     channel: String,
@@ -693,8 +960,9 @@ struct Prog {
     title: String,
 }
 
-/// A guide from 06:00 yesterday to 06:00 three days ahead (local), for every brand.
-fn guide(day_start: Timestamp) -> (String, Vec<Prog>) {
+/// A guide from 06:00 yesterday to 06:00 three days ahead (local), for every brand, around
+/// `fixtures`.
+fn guide(day_start: Timestamp, fixtures: &[Fixture]) -> (String, Vec<Prog>) {
     let mut progs = Vec::new();
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv generator-info-name=\"tuner demo_profile\">\n");
     for (name, ..) in BRANDS {
@@ -704,11 +972,8 @@ fn guide(day_start: Timestamp) -> (String, Vec<Prog>) {
     for (name, genre, _) in BRANDS {
         let mut rng = Rng::new(name);
         let titles = programmes(*genre);
-        let fixtures: Vec<(Timestamp, &str, i64, bool)> = FIXTURES
-            .iter()
-            .filter(|f| f.0 == *name)
-            .map(|&(_, day, minute, title, minutes, live)| (day_start + day * 86_400 + minute * 60, title, minutes * 60, live))
-            .collect();
+        let fixtures: Vec<(Timestamp, &str, i64, bool)> =
+            fixtures.iter().filter(|f| f.0 == *name).map(|&(_, start, title, len, live)| (start, title, len, live)).collect();
         let mut prev = String::new();
         let mut t = day_start - 18 * 3600;
         let end = day_start + 3 * 86_400 + 6 * 3600;
@@ -800,9 +1065,14 @@ impl std::fmt::Display for Summary {
 }
 
 /// Build the demo profile in `dir` (must be empty or missing). Live channels play `media`, those
-/// in `SECOND_CLIP` play `media2` (`media` without it); `silent`: mpv gets no audio output. Also writes `demo/refs.env` (shell variables naming
-/// demo items for `scripts/screenshots.sh`).
+/// in `SECOND_CLIP` play `media2` (`media` without it); `silent`: mpv gets no audio output. Also
+/// writes `demo/refs.env` (shell variables naming demo items for `scripts/demo-video.sh`).
 pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bool) -> Result<Summary> {
+    build_with_art(dir, media, media2, None, silent)
+}
+
+/// [`build`] with the films' and series' artwork from `art` (see the module docs).
+pub fn build_with_art(dir: &Path, media: Option<&Path>, media2: Option<&Path>, art: Option<&Path>, silent: bool) -> Result<Summary> {
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} is not empty", dir.display());
     }
@@ -833,6 +1103,10 @@ pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bo
         cfg.player.mpv_options.insert("ao".into(), "null".into());
     }
     cfg.integration.mpris = false;
+    // nothing looks at (or updates) the AI agents installed on this computer
+    cfg.agents.offer_connect = false;
+    cfg.agents.keep_in_sync = false;
+    cfg.agents.checked_version = Some(env!("CARGO_PKG_VERSION").into());
     cfg.follow.news_flash.quiet_from_min = Some(22 * 60);
     cfg.follow.news_flash.quiet_to_min = Some(7 * 60);
     cfg.save(&paths.config_file())?;
@@ -849,11 +1123,21 @@ pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bo
     for (name, hue) in BRANDS.iter().map(|b| (b.0, b.2)).chain(UNLISTED.iter().copied()) {
         put(&format!("{IMG}/logo/{}.png", slug(name)), painter.png(&logo_svg(name, hue))?)?;
     }
-    for (title, year, ..) in MOVIES.iter().map(|m| (m.0, m.1)).chain(SERIES.iter().map(|s| (s.0, s.1))) {
+    // the real artwork when `art` has it (`<art>/poster/<slug>.jpg`, `<art>/backdrop/<slug>.jpg`)
+    let artwork = |kind: &str, title: &str| art.and_then(|a| std::fs::read(a.join(kind).join(format!("{}.jpg", slug(title)))).ok());
+    for (title, year) in MOVIES.iter().map(|m| (m.title, m.year)).chain(SERIES.iter().map(|s| (s.title, s.year))) {
         let mut rng = Rng::new(title);
         let hue = title_hue(title);
-        put(&format!("{IMG}/poster/{}.png", slug(title)), painter.png(&poster_svg(title, year, hue, &mut rng))?)?;
-        put(&format!("{IMG}/backdrop/{}.png", slug(title)), painter.png(&backdrop_svg(hue, &mut rng))?)?;
+        let poster = match artwork("poster", title) {
+            Some(jpg) => jpg,
+            None => painter.png(&poster_svg(title, year, hue, &mut rng))?,
+        };
+        put(&format!("{IMG}/poster/{}.png", slug(title)), poster)?;
+        let backdrop = match artwork("backdrop", title) {
+            Some(jpg) => jpg,
+            None => painter.png(&backdrop_svg(hue, &mut rng))?,
+        };
+        put(&format!("{IMG}/backdrop/{}.png", slug(title)), backdrop)?;
     }
 
     // playlists + guide files
@@ -862,7 +1146,7 @@ pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bo
         std::fs::write(fixtures.join(p.file), m3u(p, (&media_url, &media2_url)))?;
     }
     let day_start = jiff::Zoned::now().start_of_day().map(|z| z.timestamp().as_second()).unwrap_or_else(|_| tuner::model::now() / 86_400 * 86_400);
-    let (xmltv, progs) = guide(day_start);
+    let (xmltv, progs) = guide(day_start, &fixtures_at(day_start, tuner::model::now()));
     let guide_path = fixtures.join("guide.xml");
     std::fs::write(&guide_path, xmltv)?;
 
@@ -899,10 +1183,13 @@ pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bo
     let progs = Arc::new(progs);
     let p2 = progs.clone();
     let follow_cfg = cfg.follow.clone();
+    let dl_cfg = cfg.clone();
+    let clip = media.map(|m| std::fs::canonicalize(m).unwrap_or_else(|_| m.to_path_buf()));
     store.writer().blocking(move |c| {
         details(c, now)?;
         user_data(c, now, &p2)?;
         follow_rules(c, now, &follow_cfg)?;
+        downloads(c, now, &p2, &dl_cfg, clip.as_deref())?;
         Ok(())
     })?;
     run(&jobs, &events, JobKind::EvaluateFollows { reason: FollowReason::Rules })?;
@@ -926,7 +1213,7 @@ pub fn build(dir: &Path, media: Option<&Path>, media2: Option<&Path>, silent: bo
     Ok(summary)
 }
 
-/// `NAME=value` lines for the screenshot script: playlist ids and `--play` references.
+/// `NAME=value` lines for the video script: playlist ids and `--play` references.
 fn refs(c: &Connection) -> Result<String> {
     let mut out = String::new();
     for (var, name) in [("NORTHWIND", "Northwind"), ("AURORA", "Aurora"), ("HARBOR", "Harbor Free")] {
@@ -995,29 +1282,25 @@ fn details(c: &mut Connection, now: Timestamp) -> tuner::error::Result<()> {
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
     };
     for (id, name) in movies {
-        let Some(&(title, year, genre, minutes)) = MOVIES.iter().find(|m| name.contains(m.0)) else { continue };
-        let mut rng = Rng::new(title);
-        let person = |rng: &mut Rng| format!("{} {}", rng.pick(FIRST_NAMES), rng.pick(LAST_NAMES));
-        let cast = (0..4).map(|_| person(&mut rng)).collect::<Vec<_>>().join(", ");
+        // the longest title that matches ("The Kid" is also in no other title, but be sure)
+        let Some(film) = MOVIES.iter().filter(|m| name.contains(m.title)).max_by_key(|m| m.title.len()) else { continue };
         let d = MovieDetails {
-            plot: Some(movie_plot(genre)),
-            genre: Some(genre.into()),
-            cast: Some(cast),
-            director: Some(person(&mut rng)),
-            duration_s: Some(minutes * 60),
-            release_date: Some(format!("{year}-{:02}-{:02}", 1 + rng.below(12), 1 + rng.below(28))),
-            rating: Some(5.8 + rng.below(32) as f32 / 10.0),
-            backdrop: Some(format!("{IMG}/backdrop/{}.png", slug(title))),
+            plot: Some(film.plot.into()),
+            genre: Some(film.genre.into()),
+            cast: Some(film.cast.join(", ")),
+            director: Some(film.director.into()),
+            duration_s: Some(film.minutes * 60),
+            backdrop: Some(format!("{IMG}/backdrop/{}.png", slug(film.title))),
             ..Default::default()
         };
         tuner::store::import::store_movie_details(c, MovieId(id), &d, now)?;
     }
     // M3U series have no details path: `store_series_details` is the Xtream one, which
     // replaces the episode list and carries no genre, so plots and backdrops go in directly.
-    for (title, _, _, _, genre) in SERIES {
+    for show in SERIES {
         c.execute(
             "UPDATE series SET plot = ?1, genre = ?2, backdrop = ?3 WHERE name LIKE '%' || ?4 || '%'",
-            params![series_plot(title), genre, format!("{IMG}/backdrop/{}.png", slug(title)), title],
+            params![show.plot, show.genre, format!("{IMG}/backdrop/{}.png", slug(show.title)), show.title],
         )?;
     }
     Ok(())
@@ -1048,29 +1331,6 @@ fn follow_rules(c: &mut Connection, now: Timestamp, cfg: &tuner::config::FollowC
     show.mode = FollowMode::List;
     save_rule(c, &show, cfg.max_rules, now)?;
     Ok(())
-}
-
-fn movie_plot(genre: &str) -> String {
-    let lead = match genre.split(',').next().unwrap_or("") {
-        "Drama" | "Music" => "A family secret surfaces one winter and changes three lives for good.",
-        "Thriller" | "Action" => "With forty-eight hours on the clock, an unlikely team chases a signal across the city.",
-        "Science Fiction" => "A small research crew picks up a message that should not exist.",
-        "Crime" => "A retired inspector takes one last case that leads back to her own past.",
-        "Adventure" | "Fantasy" => "An apprentice sets out across the mountains with an unfinished map.",
-        "Comedy" | "Road Movie" => "Two estranged siblings share one car, one week and far too many detours.",
-        "Romance" => "A chef and a ferry captain keep missing each other by one crossing.",
-        "Animation" => "A tin robot and a moth set out to fix the moon.",
-        "Documentary" => "Five coastal towns, one year of tides, and the people who read them.",
-        "Horror" => "The night shift at a remote relay station hears a voice on a dead channel.",
-        "Mystery" => "A small-town detective follows a trail of saffron and forged postcards.",
-        "Western" => "A drifter and a telegraph operator stand between a town and a copper baron.",
-        _ => "An unforgettable story, told with warmth and wit.",
-    };
-    lead.into()
-}
-
-fn series_plot(title: &str) -> String {
-    format!("Season after season, the people of {title} keep each other's secrets — until they don't.")
 }
 
 /// Favourites, watchlists, recently watched channels, Continue Watching, reminders, Up next and the
@@ -1117,11 +1377,11 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
     let night = tuner::store::watchlist::create(c, "Films & series", None, tuner::watchlist::PlayOrder::Any, "app", now - 80_000)?;
     let library = tuner::store::library::load(c)?;
     let titles = [
-        need(movie(c, north, "Keeper of Wren Point")?, "The Keeper of Wren Point")?,
-        need(movie(c, aurora, "Quiet Frequencies")?, "Quiet Frequencies")?,
-        need(series(c, north, "Gullhaven")?, "Gullhaven")?,
-        need(movie(c, aurora, "Blue Hour Express")?, "Blue Hour Express")?,
-        need(movie(c, north, "Copper Sky")?, "Copper Sky")?,
+        need(movie(c, north, "Night of the Living Dead")?, "Night of the Living Dead")?,
+        need(movie(c, aurora, "His Girl Friday")?, "His Girl Friday")?,
+        need(series(c, north, "Beverly Hillbillies")?, "The Beverly Hillbillies")?,
+        need(movie(c, aurora, "Nosferatu")?, "Nosferatu")?,
+        need(movie(c, north, "The Gold Rush")?, "The Gold Rush")?,
     ];
     for (i, f) in titles.iter().enumerate() {
         let entry = tuner::store::watchlist::new_entry(c, f)?;
@@ -1137,7 +1397,7 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
     }
 
     // Continue Watching: two movies and an episode
-    for (src, name, pos, dur, ago) in [(north, "Paper Satellites", 2830.0, 7560.0, 3600), (aurora, "Small Hours", 4100.0, 5940.0, 26 * 3600)] {
+    for (src, name, pos, dur, ago) in [(north, "The Phantom of the Opera", 2830.0, 6420.0, 3600), (aurora, "Sunrise", 4100.0, 5700.0, 26 * 3600)] {
         let item = need(movie(c, src, name)?, name)?;
         user::save_progress(
             c,
@@ -1155,20 +1415,20 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
     let ep: Option<(i64, String, String)> = c
         .query_row(
             "SELECT e.source_id, e.key, s.name FROM episode e JOIN series s ON s.id = e.series_id
-             WHERE s.source_id = ?1 AND s.name LIKE '%Fernwood Station%' AND e.season = 2 AND e.episode = 3",
+             WHERE s.source_id = ?1 AND s.name LIKE '%Beverly Hillbillies%' AND e.season = 1 AND e.episode = 6",
             [north],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
     if let Some((src, key, show)) = ep {
         let item = ItemRef { source: SourceId(src), kind: ItemKind::Episode, key: ItemKey(key) };
-        let title = format!("{show} · S02E03");
+        let title = format!("{show} · S01E06");
         user::save_progress(
             c,
             &WatchProgress {
                 item,
                 position_s: 812.0,
-                duration_s: Some(1560.0),
+                duration_s: Some(f64::from(SERIES[0].minutes * 60)),
                 updated_at: now - 5400,
                 finished: false,
                 title,
@@ -1209,8 +1469,8 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
 
     // Up next: the trilogy's first film played, an episode, then the other two films
     let mut rows = Vec::new();
-    for (title, year, minutes) in MOVIES.iter().filter(|m| m.0.starts_with("Starling Bay")).map(|m| (m.0, m.1, m.3)) {
-        // the plain title would also find its sequels
+    for Film { title, year, minutes, .. } in UP_NEXT.iter().filter_map(|t| MOVIES.iter().find(|m| m.title == *t)) {
+        // the plain title could also find a longer one
         let item = need(
             one(c, "SELECT source_id, key FROM movie WHERE source_id = ?1 AND name LIKE ?2 ORDER BY id", north, &format!("{title} ("))?
                 .map(|i| ItemRef { kind: ItemKind::Movie, ..i }),
@@ -1229,7 +1489,7 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
     }
     let ep: (i64, String, String, i64, i64) = c.query_row(
         "SELECT e.source_id, e.key, e.title, e.season, e.episode FROM episode e JOIN series s ON s.id = e.series_id
-         WHERE s.source_id = ?1 AND s.name LIKE '%Fernwood Station%' AND e.season = 2 AND e.episode = 4",
+         WHERE s.source_id = ?1 AND s.name LIKE '%Beverly Hillbillies%' AND e.season = 1 AND e.episode = 13",
         [north],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
@@ -1239,9 +1499,9 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
             item: ItemRef { source: SourceId(ep.0), kind: ItemKind::Episode, key: ItemKey(ep.1) },
             any_copy: true,
             programme: None,
-            title: "Fernwood Station".into(),
+            title: SERIES[0].title.into(),
             subtitle: Some(format!("S{:02}E{:02} · {}", ep.3, ep.4, ep.2)),
-            duration_s: Some(1560.0),
+            duration_s: Some(f64::from(SERIES[0].minutes * 60)),
             from_start: false,
             by: AddedBy::App,
         },
@@ -1256,6 +1516,97 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
     for src in [north, aurora] {
         let account = AccountInfo { status: AccountStatus::Active, max_connections: Some(1), ..Default::default() };
         tuner::store::sources::set_account(c, SourceId(src), &account)?;
+    }
+    Ok(())
+}
+
+/// Downloads and recordings, planned by the app's own `downloads::planning::new_job`. Nothing
+/// fetches anything: the finished ones are links to the demo clip (`media`; an empty file
+/// without one), the others are paused or scheduled. Two series' episodes (grouped per series),
+/// a film, a documentary recorded earlier today and tomorrow's match scheduled.
+fn downloads(c: &mut Connection, now: Timestamp, progs: &[Prog], cfg: &Config, media: Option<&Path>) -> tuner::error::Result<()> {
+    use tuner::downloads::{State, Target, planning};
+    use tuner::error::Error;
+    use tuner::store::downloads as dl;
+    let lib = tuner::store::library::load(c)?;
+    let view = tuner::shared::ParentalView { unlocked: true, hides_explicit: false, pin_active: false };
+    let root = dl::root(c, &cfg.downloads)?;
+    std::fs::create_dir_all(&root).map_err(|e| Error::io(&root, e))?;
+    let north: i64 = c.query_row("SELECT id FROM source WHERE name = 'Northwind'", [], |r| r.get(0))?;
+    let item = |c: &Connection, kind: ItemKind, sql: &str, args: &[&dyn rusqlite::ToSql]| -> tuner::error::Result<ItemRef> {
+        let (src, key): (i64, String) = c.query_row(sql, args, |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(ItemRef { source: SourceId(src), kind, key: ItemKey(key) })
+    };
+    let episode = |c: &Connection, show: &str, season: i64, ep: i64| {
+        item(
+            c,
+            ItemKind::Episode,
+            "SELECT e.source_id, e.key FROM episode e JOIN series s ON s.id = e.series_id
+             WHERE s.source_id = ?1 AND s.name LIKE '%' || ?2 || '%' AND e.season = ?3 AND e.episode = ?4",
+            &[&north, &show, &season, &ep],
+        )
+    };
+    let movie = |c: &Connection, name: &str| {
+        item(c, ItemKind::Movie, "SELECT source_id, key FROM movie WHERE source_id = ?1 AND name LIKE '%' || ?2 || '%' ORDER BY id", &[&north, &name])
+    };
+    let channel = |c: &Connection, name: &str| {
+        item(c, ItemKind::Channel, "SELECT source_id, key FROM channel WHERE source_id = ?1 AND name LIKE ?2 || '%' ORDER BY id", &[&north, &name])
+    };
+    let slot = |brand: &str, pick: &dyn Fn(&Prog) -> bool| {
+        progs.iter().filter(|p| p.channel == slug(brand) && pick(p)).min_by_key(|p| (now - p.start).abs()).map(|p| tuner::queue::Slot {
+            start: p.start,
+            stop: p.stop,
+            catchup_id: None,
+        })
+    };
+    const GB: u64 = 1_000_000_000;
+    // (what, programme, state, bytes, added this long ago, watched)
+    let last_night = slot("Polar Nature", &|p| p.stop <= now - 6 * 3600 && p.start >= now - 30 * 3600 && p.title != "Wild Frontiers");
+    let match_day = slot("Bluefield Sports", &|p| p.title.contains(" v ") && p.start > now);
+    let plan = [
+        (episode(c, "One Step Beyond", 1, 1)?, None, State::Done, 6 * GB / 10, 5 * 3600, true),
+        (episode(c, "One Step Beyond", 1, 2)?, None, State::Done, 5 * GB / 10, 5 * 3600 - 600, false),
+        (episode(c, "One Step Beyond", 1, 9)?, None, State::Done, 6 * GB / 10, 5 * 3600 - 1200, false),
+        (episode(c, "One Step Beyond", 1, 17)?, None, State::Paused, 6 * GB / 10, 1800, false),
+        (episode(c, "Petticoat Junction", 1, 1)?, None, State::Done, 5 * GB / 10, 2 * 86_400, false),
+        (episode(c, "Petticoat Junction", 1, 2)?, None, State::Done, 5 * GB / 10, 2 * 86_400 - 600, false),
+        (movie(c, "D.O.A.")?, None, State::Done, 21 * GB / 10, 86_400, false),
+        (movie(c, "Wings")?, None, State::Paused, 34 * GB / 10, 1200, false),
+        (channel(c, "Polar Nature")?, last_night, State::Done, 27 * GB / 10, 20 * 3600, false),
+        (channel(c, "Bluefield Sports")?, match_day, State::Scheduled, 0, 600, false),
+    ];
+    for (item, programme, state, bytes, ago, watched) in plan {
+        if programme.is_none() && item.kind == ItemKind::Channel {
+            continue;
+        }
+        let target = Target { item, programme, minutes: None, any_copy: true };
+        let job = planning::new_job(c, &lib, view, cfg, &target, false, now - ago)?;
+        let id = dl::add(c, &job)?;
+        let mut job = dl::job(c, id)?.ok_or_else(|| Error::other("download vanished"))?;
+        job.state = state;
+        match state {
+            State::Done => {
+                let name = format!("{id}.mp4");
+                let path = root.join(&name);
+                let linked = media.filter(|m| m.is_file()).map(|m| std::os::unix::fs::symlink(m, &path));
+                if !matches!(linked, Some(Ok(()))) {
+                    std::fs::write(&path, b"").map_err(|e| Error::io(&path, e))?;
+                }
+                job.store_name = Some(name);
+                job.bytes_done = bytes;
+                job.bytes_total = Some(bytes);
+                let done = now - ago + 1200;
+                job.done_at = Some(done);
+                job.watched_at = watched.then_some(done + (now - done) / 2);
+            }
+            // paused part of the way through
+            State::Paused => {
+                job.bytes_done = bytes * 38 / 100;
+                job.bytes_total = Some(bytes);
+            }
+            _ => {}
+        }
+        dl::put(c, &job)?;
     }
     Ok(())
 }

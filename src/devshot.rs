@@ -1,11 +1,12 @@
-//! Developer-only screenshot capture for the README images (DESIGN §23.1). Not part of the
-//! product: no CLI flag, nothing in `--help`; `scripts/screenshots.sh` drives it.
+//! Developer-only scripting and capture for the README's demo video (DESIGN §23.1). Not part of
+//! the product: no CLI flag, nothing in `--help`; `scripts/demo-video.sh` drives it.
 //!
 //! ```text
 //! TUNER_SCREENSHOT=out.png            capture the window to this PNG, then exit
 //! TUNER_SCREENSHOT_SIZE=1600x1000     float + resize + centre our window first (Hyprland IPC)
 //! TUNER_SCREENSHOT_SCRIPT="view:movies;key:Down;key:Space;wait:1"
 //! TUNER_SCREENSHOT_AFTER=2            seconds after the last step (default 2)
+//! TUNER_SCREENSHOT_MARKS=marks.txt    where `mark:` steps append "<label> <unix µs>" lines
 //! ```
 //! The script starts once the first library snapshot is in and the window has the requested
 //! size; steps run [`STEP_GAP`] apart. Steps: `wait:<secs>`, `key:<Ctrl+Shift+Name>` (egui key
@@ -13,8 +14,9 @@
 //! character, as a keyboard does), `text:<chars>`, `view:<home|live|
 //! guide|movies|series|settings|search>`, `play:<source>:<item-key>` (both as the CLI does),
 //! `move:<x>,<y>` / `click:<x>,<y>` (logical px), `size:<w>x<h>` and `categories:<source id>`
-//! ("Choose what to show" of that playlist, which only a context menu opens). A `;` inside
-//! `text:` is written `\;`.
+//! ("Choose what to show" of that playlist, which only a context menu opens) and `mark:<label>`
+//! (appends the label and the wall-clock time to `TUNER_SCREENSHOT_MARKS`: `scripts/demo-video.sh`
+//! cuts its recordings there). A `;` inside `text:` is written `\;`.
 //!
 //! The PNG is scaled to the window's logical size, so a capture looks the same on any monitor
 //! scale. Captures are only stable with a fixed theme: see `theme::THEME_DIR_ENV`.
@@ -42,6 +44,7 @@ pub enum Step {
     Click(egui::Pos2),
     Size(i32, i32),
     Categories(i64),
+    Mark(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +53,7 @@ pub struct ShotConfig {
     pub size: Option<(i32, i32)>,
     pub after: Duration,
     pub steps: Vec<Step>,
+    pub marks: Option<PathBuf>,
 }
 
 impl ShotConfig {
@@ -66,7 +70,8 @@ impl ShotConfig {
             None => Duration::from_secs(2),
         };
         let steps = parse_script(&get("TUNER_SCREENSHOT_SCRIPT").unwrap_or_default())?;
-        Ok(Some(Self { path: PathBuf::from(path), size, after, steps }))
+        let marks = get("TUNER_SCREENSHOT_MARKS").filter(|m| !m.trim().is_empty()).map(PathBuf::from);
+        Ok(Some(Self { path: PathBuf::from(path), size, after, steps, marks }))
     }
 }
 
@@ -168,6 +173,7 @@ pub fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                 Step::Size(w, h)
             }
             "categories" => Step::Categories(arg.trim().parse().map_err(|_| format!("bad playlist id '{arg}'"))?),
+            "mark" => Step::Mark(arg.trim().to_owned()),
             other => return Err(format!("unknown step '{other}'")),
         };
         steps.push(step);
@@ -293,6 +299,10 @@ impl Driver {
                         }
                         Step::Size(w, h) => out.push(Command::Size(*w, *h)),
                         Step::Categories(id) => out.push(Command::Categories(*id)),
+                        Step::Mark(label) => {
+                            wait = Duration::ZERO;
+                            self.mark(label);
+                        }
                     }
                     self.phase = Phase::Running { next: next + 1, at: now + wait };
                 }
@@ -307,6 +317,19 @@ impl Driver {
             tracing::debug!("screenshot: {:?} (window {window:?}, ready {ready})", self.phase);
         }
         out
+    }
+
+    /// `mark:` — append "<label> <unix µs>" to the marks file (no file: the log only).
+    fn mark(&self, label: &str) {
+        let us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
+        tracing::info!("screenshot mark: {label} {us}");
+        let Some(path) = &self.cfg.marks else { return };
+        let line = format!("{label} {us}\n");
+        let written =
+            std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        if let Err(e) = written {
+            tracing::error!("screenshot marks {}: {e}", path.display());
+        }
     }
 
     /// Called during the frame's pass (`ui`): sends the pending viewport commands and keeps
@@ -358,7 +381,10 @@ mod tests {
         assert_eq!(ShotConfig::from_vars(vars(&[])), Ok(None));
         assert_eq!(ShotConfig::from_vars(vars(&[("TUNER_SCREENSHOT", " ")])), Ok(None));
         let cfg = ShotConfig::from_vars(vars(&[("TUNER_SCREENSHOT", "/tmp/a.png"), ("TUNER_SCREENSHOT_SIZE", "1600x1000")])).unwrap().unwrap();
-        assert_eq!((cfg.path, cfg.size, cfg.after, cfg.steps), (PathBuf::from("/tmp/a.png"), Some((1600, 1000)), Duration::from_secs(2), vec![]));
+        assert_eq!(
+            (cfg.path, cfg.size, cfg.after, cfg.steps, cfg.marks),
+            (PathBuf::from("/tmp/a.png"), Some((1600, 1000)), Duration::from_secs(2), vec![], None)
+        );
         for (k, v) in [
             ("TUNER_SCREENSHOT_SIZE", "big"),
             ("TUNER_SCREENSHOT_SIZE", "10x10"),
@@ -372,7 +398,7 @@ mod tests {
     #[test]
     fn script_steps() {
         use egui::{Key, Modifiers};
-        let steps = parse_script("view:movies; key:Down;key:Ctrl+K;key:shift+tab;text:news\\; weather;wait:1.5;play:2:xt:live:7;click:10,20;size:950x1000;key:Ctrl++;categories:3").unwrap();
+        let steps = parse_script("view:movies; key:Down;key:Ctrl+K;key:shift+tab;text:news\\; weather;wait:1.5;play:2:xt:live:7;click:10,20;size:950x1000;key:Ctrl++;categories:3;mark:in").unwrap();
         assert_eq!(
             steps,
             vec![
@@ -387,6 +413,7 @@ mod tests {
                 Step::Size(950, 1000),
                 Step::Key(Key::Plus, Modifiers::CTRL | Modifiers::COMMAND),
                 Step::Categories(3),
+                Step::Mark("in".into()),
             ]
         );
         assert!(parse_script("key:Hyper+A").is_err());
