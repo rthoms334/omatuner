@@ -282,7 +282,7 @@ pub fn finish_epg_import(conn: &mut Connection, imp: &EpgImport, now: Timestamp)
         })?;
     let n = tx.execute(
         "UPDATE epg_source SET active_gen = ?2, n_channels = ?3, n_programmes = ?4, max_stop = ?5, last_refresh = ?6,
-                last_attempt = ?6, last_error = NULL
+                last_attempt = ?6, last_error = NULL, failing_since = NULL
          WHERE id = ?1",
         params![imp.epg_source, imp.generation, channels, counters.n as i64, counters.max_stop, now],
     )?;

@@ -469,8 +469,15 @@ impl GuideScreen {
                 return (format!("No guide data for {}", day_label(view_start + 3600)), t.text_secondary);
             }
         }
-        if let Some(at) = info.last_refresh.filter(|at| ctx.now - at >= GUIDE_STALE_S) {
-            return (format!("{} Guide updated {} · {refresh} refresh", glyphs::WARNING, live::age_label(ctx.now, at)), t.warning);
+        let now = ctx.now;
+        let note = self.guide.health(ctx).and_then(|h| crate::ui::widgets::status_bar::guide_note(now, h));
+        let note = note.map(|n| format!(" · {n}")).unwrap_or_default();
+        if let Some(at) = info.last_refresh.filter(|at| now - at >= GUIDE_STALE_S) {
+            return (format!("{} Guide updated {}{note} · {refresh} refresh", glyphs::WARNING, live::age_label(now, at)), t.warning);
+        }
+        if !note.is_empty() {
+            let updated = info.last_refresh.map(|at| format!("Guide updated {}", live::age_label(now, at))).unwrap_or_else(|| "Guide".into());
+            return (format!("{} {updated}{note}", glyphs::WARNING), t.warning);
         }
         // the focused channel isn't in the guides, and they cover few channels: say so, the
         // action first (the label truncates); the cells already say it for well-covered ones
@@ -937,5 +944,35 @@ mod tests {
         h.run_steps(2);
         let g = h.state().s.grid.as_ref().expect("grid");
         assert_eq!(g.rows.get(g.focus_row).map(|r| r.channel), Some(ch));
+    }
+
+    /// A guide that failed and is days old is named next to the freshest one's age, with when
+    /// it is retried (the report: "Guide updated 23 h ago" hid a guide failing for days).
+    #[test]
+    fn the_header_names_an_old_failing_guide() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let a = testkit::source(c, "Alpha")?;
+            testkit::channels(c, a, 2)?;
+            let now = crate::model::now();
+            c.execute(
+                "INSERT INTO epg_source(id, name, kind, last_refresh, max_stop, refresh_h) VALUES (1, 'Main', 'url', ?1, ?2, 12)",
+                rusqlite::params![now - 3600, now + 86_400],
+            )?;
+            c.execute(
+                "INSERT INTO epg_source(id, name, kind, last_refresh, max_stop, refresh_h, last_attempt, last_error, failing_since)
+                 VALUES (2, 'TV', 'url', ?1, ?2, 12, ?3, 'refused', ?4)",
+                rusqlite::params![now - 5 * 86_400, now + 86_400, now - 600, now - 5 * 86_400],
+            )?;
+            Ok(())
+        });
+        let mut h = harness(t, one, GuideScreen::default(), egui::vec2(1600.0, 900.0));
+        h.state_mut().enter(Route::Guide { collection: Some(Collection::AllChannels), focus: None });
+        h.run_steps(3);
+        assert!(
+            testkit::has_label_containing(&h, "Guide updated 1 h ago · TV guide 5 d old, update failed, retrying in"),
+            "{:?}",
+            testkit::painted(&h)
+        );
     }
 }

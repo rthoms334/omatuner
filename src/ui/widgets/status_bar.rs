@@ -19,14 +19,17 @@ use super::glyphs;
 use crate::jobs::JobStatus;
 use crate::keymap::{self, Action};
 use crate::model::Timestamp;
+use crate::store::sources::{GuideHealth, GuideNote};
 use crate::theme::{SpaceToken, Theme, TypeToken};
 
 /// Guide data older than this is flagged (warning glyph + refresh hint).
-const GUIDE_STALE_S: i64 = 2 * 86_400;
+pub(crate) const GUIDE_STALE_S: i64 = 2 * 86_400;
 
 pub struct StatusInfo<'a> {
     pub jobs: &'a [JobStatus],
     pub epg_updated: Option<crate::model::Timestamp>,
+    /// A failed guide update / a much older guide, said after "Guide updated …".
+    pub guide_note: Option<String>,
     pub offline: bool,
     pub now: crate::model::Timestamp,
     /// Keymap hint line for the current context stack.
@@ -141,6 +144,37 @@ fn jobs_summary(jobs: &[JobStatus]) -> Option<String> {
     Some(format!("{} {}{pct}{more}", glyphs::REFRESH, j.label))
 }
 
+/// "update failed, retrying in 10 min" / "TV guide 5 d old" for the guides' health, `None` when
+/// all is well. A failing guide that is also the old one gets one note: "TV guide 5 d old,
+/// update failed, retrying in 6 h". Short, the status bar truncates.
+pub(crate) fn guide_note(now: Timestamp, h: &GuideHealth) -> Option<String> {
+    let retry = |n: &GuideNote| {
+        let wait = n.retry_at.map_or(0, |t| t - now);
+        match wait {
+            ..=59 => "retrying soon".to_owned(),
+            60..=3_599 => format!("retrying in {} min", wait / 60),
+            3_600..=172_799 => format!("retrying in {} h", wait / 3_600),
+            _ => format!("retrying in {} d", wait / 86_400),
+        }
+    };
+    let age = |t: Timestamp| match (now - t).max(0) {
+        a @ 0..=3_599 => format!("{} min", a / 60),
+        a @ 3_600..=172_799 => format!("{} h", a / 3_600),
+        a => format!("{} d", a / 86_400),
+    };
+    let failed = |n: &GuideNote| format!("update failed, {}", retry(n));
+    match (&h.old, &h.failing) {
+        (Some(o), Some(f)) if o.name == f.name => Some(format!("{} guide {} old, {}", o.name, age(o.last_refresh?), failed(f))),
+        (Some(o), f) => {
+            let old = format!("{} guide {} old", o.name, age(o.last_refresh?));
+            Some(f.as_ref().map_or(old.clone(), |f| format!("{old} · {} {}", f.name, failed(f))))
+        }
+        (None, Some(f)) if h.several => Some(format!("{} {}", f.name, failed(f))),
+        (None, Some(f)) => Some(failed(f)),
+        (None, None) => None,
+    }
+}
+
 /// "Guide updated 2 h ago" (+ stale flag) for the last EPG import at `at`.
 fn guide_freshness(now: Timestamp, at: Timestamp) -> (String, bool) {
     let age = (now - at).max(0);
@@ -204,13 +238,23 @@ pub fn status_bar(ui: &mut egui::Ui, theme: &Theme, info: &StatusInfo<'_>) -> St
         if info.offline {
             ui.label(egui::RichText::new(format!("{} Offline — showing saved data", glyphs::OFFLINE)).size(size).color(t.warning));
         }
+        if info.epg_updated.is_none()
+            && let Some(note) = &info.guide_note
+        {
+            // nothing imported yet, and the first update failed
+            ui.label(egui::RichText::new(format!("Guide {note}")).size(size).color(t.warning));
+        }
         if let Some(at) = info.epg_updated {
-            let (text, stale) = guide_freshness(info.now, at);
+            let (mut text, stale) = guide_freshness(info.now, at);
+            if let Some(note) = &info.guide_note {
+                text = format!("{text} · {note}");
+            }
             if stale {
                 let key = keymap::GLOBAL.iter().find(|b| b.action == Action::RefreshSource).map(|b| b.chord.label()).unwrap_or_default();
                 ui.label(egui::RichText::new(format!("{} {text} · {key} refresh", glyphs::WARNING)).size(size).color(t.warning));
             } else {
-                ui.label(egui::RichText::new(text).size(size).color(t.text_secondary));
+                let color = if info.guide_note.is_some() { t.warning } else { t.text_secondary };
+                ui.label(egui::RichText::new(text).size(size).color(color));
             }
         }
         // the left side takes whatever is left
@@ -260,6 +304,37 @@ mod tests {
         assert_eq!(guide_freshness(1_000_000, 1_000_000 - 3 * 86_400), ("Guide updated 3 d ago".into(), true));
         // clock skew never shows negative ages
         assert_eq!(guide_freshness(0, 50), ("Guide updated just now".into(), false));
+    }
+
+    fn note(name: &str, last_refresh: Option<Timestamp>, retry_at: Option<Timestamp>) -> GuideNote {
+        GuideNote { name: name.into(), last_refresh, retry_at }
+    }
+
+    #[test]
+    fn guide_notes_say_what_failed_and_which_guide_is_old() {
+        let now = 1_000_000;
+        let health = |several, failing, old| GuideHealth { newest: Some(now - 3_600), several, failing, old };
+        assert_eq!(guide_note(now, &health(false, None, None)), None);
+        // the report: one guide, its launch refresh failed
+        let f = note("TV 2", Some(now - 23 * 3_600), Some(now + 600));
+        assert_eq!(guide_note(now, &health(false, Some(f.clone()), None)).as_deref(), Some("update failed, retrying in 10 min"));
+        assert_eq!(guide_note(now, &health(true, Some(f), None)).as_deref(), Some("TV 2 update failed, retrying in 10 min"));
+        // due already: the scheduler ticks every 15 min
+        let due = note("TV", Some(now - 100), Some(now - 5));
+        assert_eq!(guide_note(now, &health(false, Some(due), None)).as_deref(), Some("update failed, retrying soon"));
+        // an old guide, failing too: one note
+        let old = note("TV", Some(now - 5 * 86_400), Some(now + 6 * 3_600 + 60));
+        assert_eq!(
+            guide_note(now, &health(true, Some(old.clone()), Some(old.clone()))).as_deref(),
+            Some("TV guide 5 d old, update failed, retrying in 6 h")
+        );
+        // old but not failing; another failing
+        let other = note("Main", Some(now - 3_600), Some(now + 1_200));
+        assert_eq!(guide_note(now, &health(true, None, Some(note("TV", old.last_refresh, None)))).as_deref(), Some("TV guide 5 d old"));
+        assert_eq!(
+            guide_note(now, &health(true, Some(other), Some(note("TV", old.last_refresh, None)))).as_deref(),
+            Some("TV guide 5 d old · Main update failed, retrying in 20 min")
+        );
     }
 
     #[test]

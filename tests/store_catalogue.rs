@@ -276,25 +276,25 @@ fn epg_sources_provider_lifecycle_priority_and_staleness() {
     assert!(!list[1].enabled && list[1].refresh_h == Some(6));
     assert_eq!(list[0].last_error.as_deref(), Some("nope"));
 
-    // staleness: never refreshed → stale (F never imported and failed just now: retried after an
-    // hour, not a whole interval); disabled never; max_stop rule
+    // staleness: never refreshed → stale (F never imported and failed just now: its first retry
+    // comes after 10 min, not a whole interval); disabled never; max_stop rule
     assert_eq!(sources::stale_epg_sources(&r, NOW, 12).unwrap(), vec![ids2[0]]);
-    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600 - 1, 12).unwrap(), vec![ids2[0]]);
-    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600, 12).unwrap(), vec![f, ids2[0]]);
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 600 - 1, 12).unwrap(), vec![ids2[0]]);
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 600, 12).unwrap(), vec![f, ids2[0]]);
     let p = ids2[0];
     w(&s, move |c| {
         c.execute("UPDATE epg_source SET last_refresh = ?2, max_stop = ?3 WHERE id = ?1", rusqlite::params![p, NOW - 7200, NOW + 3 * 86400])?;
-        let ok = "UPDATE epg_source SET last_refresh = ?2, max_stop = ?3, last_error = NULL WHERE id = ?1";
+        let ok = "UPDATE epg_source SET last_refresh = ?2, max_stop = ?3, last_error = NULL, failing_since = NULL WHERE id = ?1";
         c.execute(ok, rusqlite::params![f, NOW - 7200, NOW + 3600])?;
         Ok(())
     });
     assert_eq!(sources::stale_epg_sources(&r, NOW, 12).unwrap(), vec![f], "guide running out");
     assert_eq!(sources::stale_epg_sources(&r, NOW + 11 * 3600, 12).unwrap(), vec![f, p]);
-    // a running-out guide that fails is not fetched again on every tick: it has been due for an
-    // hour (since NOW - 1 h), so it waits an hour
+    // a running-out guide that fails is not fetched again on every tick: however long it has
+    // been due, its first retry waits 10 min (counted from the failure, not from when it was due)
     w(&s, move |c| sources::mark_epg_failed(c, f, "down", NOW));
-    assert!(sources::stale_epg_sources(&r, NOW + 3540, 12).unwrap().is_empty());
-    assert_eq!(sources::stale_epg_sources(&r, NOW + 3600, 12).unwrap(), vec![f]);
+    assert!(sources::stale_epg_sources(&r, NOW + 600 - 1, 12).unwrap().is_empty());
+    assert_eq!(sources::stale_epg_sources(&r, NOW + 600, 12).unwrap(), vec![f]);
 }
 
 /// Audit fix: a provider that is down was retried (WARN + error toast) on every 15-minute

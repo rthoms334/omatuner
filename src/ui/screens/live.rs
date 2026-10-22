@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Rect};
 
 use crate::config::LiveOpensOn;
+use crate::jobs::{JobEvent, JobKind};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{
     ChannelId, ChannelSummary, Collection, FavListId, Group, GroupId, GroupKey, ItemKind, ItemRef, MediaRef, PlayOrigin, Programme, ProgrammeSlim,
@@ -224,6 +225,8 @@ pub(crate) struct GuideInfo {
 #[derive(Default)]
 pub(crate) struct GuideStatus {
     info: Option<GuideInfo>,
+    /// A failed update / a much older guide, re-read with `info` and after a failed refresh.
+    health: Option<crate::store::sources::GuideHealth>,
     /// (library snapshot, channels with a guide, all channels).
     coverage: Option<(u64, usize, usize)>,
 }
@@ -286,7 +289,26 @@ impl GuideStatus {
     pub(crate) fn on_event(&mut self, ev: &AppEvent) {
         if matches!(ev, AppEvent::Data(DataScope::Epg | DataScope::Sources | DataScope::All)) {
             self.info = None;
+            self.health = None;
         }
+        // a failed update sends no data event
+        if matches!(ev, AppEvent::Job(JobEvent::Finished { kind: JobKind::RefreshEpg { .. }, .. })) {
+            self.health = None;
+        }
+    }
+
+    /// How the guides are doing (cached like [`Self::info`]); `None` while the read waits for budget.
+    pub(crate) fn health(&mut self, ctx: &mut UiCtx<'_>) -> Option<&crate::store::sources::GuideHealth> {
+        if self.health.is_none() {
+            let (db, now, h) = (ctx.db, ctx.now, ctx.config.general.epg_refresh_h);
+            self.health = ctx.budget.run(|| {
+                crate::store::sources::guide_health(db, now, h, crate::ui::widgets::status_bar::GUIDE_STALE_S).unwrap_or_else(|e| {
+                    tracing::debug!("guide health: {e}");
+                    Default::default()
+                })
+            });
+        }
+        self.health.as_ref()
     }
 
     /// (shown channels with a guide, shown channels) of the library (cached per snapshot;

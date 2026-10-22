@@ -576,7 +576,7 @@ fn label_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::ExportBackup { .. } => "Exporting backup".into(),
         JobKind::ImportBackup { .. } => "Restoring backup".into(),
         JobKind::EvaluateFollows { .. } => "Checking what you follow".into(),
-        JobKind::GuideCheck => "Checking guide data".into(),
+        JobKind::GuideCheck => "Matching channels to the guide".into(),
     }
 }
 
