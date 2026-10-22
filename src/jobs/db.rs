@@ -22,7 +22,10 @@ pub(super) fn set_epg_validators(conn: &Connection, id: EpgSourceId, etag: Optio
 
 /// A 304 for an EPG source: the stored guide is current (`last_refresh`), no error.
 pub(super) fn mark_epg_not_modified(conn: &Connection, id: EpgSourceId, now: Timestamp) -> Result<()> {
-    conn.execute("UPDATE epg_source SET last_refresh = ?2, last_attempt = ?2, last_error = NULL WHERE id = ?1", params![id, now])?;
+    conn.execute(
+        "UPDATE epg_source SET last_refresh = ?2, last_attempt = ?2, last_error = NULL, failing_since = NULL WHERE id = ?1",
+        params![id, now],
+    )?;
     Ok(())
 }
 
@@ -44,4 +47,22 @@ pub(super) fn set_last_maintenance(conn: &Connection, at: Timestamp) -> Result<(
         params![LAST_MAINTENANCE, at.to_string()],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 304 ends a guide's failing streak like a download does (the back-off counts from it).
+    #[test]
+    fn not_modified_clears_the_failing_streak() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::store::migrations::migrate(&mut c).unwrap();
+        c.execute("INSERT INTO epg_source(id, name, kind) VALUES (1, 'g', 'url')", []).unwrap();
+        crate::store::sources::mark_epg_failed(&c, EpgSourceId(1), "dns error", 100).unwrap();
+        let streak = |c: &Connection| c.query_row("SELECT failing_since FROM epg_source", [], |r| r.get::<_, Option<Timestamp>>(0)).unwrap();
+        assert_eq!(streak(&c), Some(100));
+        mark_epg_not_modified(&c, EpgSourceId(1), 200).unwrap();
+        assert_eq!(streak(&c), None);
+    }
 }

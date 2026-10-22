@@ -1,0 +1,4 @@
+-- 0017 When the current streak of failed refreshes began (NULL = not failing). The scheduler's
+-- retry back-off counts from it, so a refresh that was long overdue when it first failed is
+-- retried soon instead of after as long as it was overdue.
+-- The columns are added in Rust (`add_column_if_missing`: a re-run must not fail).

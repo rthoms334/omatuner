@@ -184,6 +184,9 @@ pub struct TunerApp {
     layout: LayoutClass,
     /// Last successful EPG import of any enabled guide (status-bar freshness).
     epg_updated: Option<Timestamp>,
+    /// A failed guide update / a much older guide ([`crate::ui::widgets::status_bar::guide_note`]),
+    /// as of the last [`Self::refresh_epg_updated`].
+    guide_health: crate::store::sources::GuideHealth,
     /// A refresh failed with a network error; the next successful refresh clears it.
     offline: bool,
     /// The last failure toasted per refresh target (`JobKind::dedupe_key`): a background
@@ -350,6 +353,7 @@ impl TunerApp {
             entered: None,
             layout: LayoutClass::Wide,
             epg_updated: None,
+            guide_health: Default::default(),
             offline: false,
             refresh_failures: Default::default(),
             user_refreshes: Default::default(),
@@ -1038,6 +1042,9 @@ impl TunerApp {
     fn on_job_finished(&mut self, kind: &JobKind, outcome: &Result<JobOutcome, String>, failure: Option<FailureKind>) {
         let key = kind.dedupe_key();
         let started_by_key = self.user_refreshes.remove(&key);
+        if matches!(kind, JobKind::RefreshEpg { .. }) && outcome.is_err() {
+            self.refresh_epg_updated();
+        }
         if outcome.is_ok() {
             self.refresh_failures.remove(&key);
         }
@@ -1251,8 +1258,16 @@ impl TunerApp {
         }
     }
 
-    /// Newest `last_refresh` of the enabled EPG sources (one aggregate over a tiny table).
+    /// Newest `last_refresh` of the enabled EPG sources and how the guides are doing (a failed
+    /// update, a much older guide): one small query over a tiny table. Also after a failed
+    /// guide refresh, which sends no data event.
     fn refresh_epg_updated(&mut self) {
+        let h = self.services().config().general.epg_refresh_h;
+        self.guide_health = crate::store::sources::guide_health(&self.db, crate::model::now(), h, crate::ui::widgets::status_bar::GUIDE_STALE_S)
+            .unwrap_or_else(|e| {
+                tracing::debug!("guide health: {e}");
+                Default::default()
+            });
         self.epg_updated = self
             .db
             .query_row("SELECT max(last_refresh) FROM epg_source WHERE enabled = 1", [], |r| r.get::<_, Option<Timestamp>>(0))
@@ -3156,6 +3171,7 @@ impl eframe::App for TunerApp {
             let info = StatusInfo {
                 jobs: &jobs,
                 epg_updated: self.epg_updated,
+                guide_note: crate::ui::widgets::status_bar::guide_note(crate::model::now(), &self.guide_health),
                 offline: self.offline,
                 now: crate::model::now(),
                 hint: &hint,
@@ -4778,6 +4794,17 @@ mod tests {
         rig.event(AppEvent::Data(DataScope::Epg));
         assert_eq!(rig.app.epg_updated, Some(1_234_567));
         assert_eq!(rig.log().jobs, [JobKind::RebuildLibrary]);
+        // a failed guide refresh sends no data event: the job's end refreshes the health
+        assert_eq!(rig.app.guide_health.failing, None);
+        let at = crate::model::now();
+        rig.writer().blocking(move |c| crate::store::sources::mark_epg_failed(c, crate::model::EpgSourceId(1), "dns error", at)).unwrap();
+        rig.event(AppEvent::Job(JobEvent::Finished {
+            id: JobId(10),
+            kind: JobKind::RefreshEpg { epg_source: crate::model::EpgSourceId(1), force: false },
+            outcome: Err("dns error".into()),
+            failure: Some(FailureKind::Network),
+        }));
+        assert_eq!(rig.app.guide_health.failing.as_ref().map(|n| n.retry_at), Some(Some(at + 600)));
         // favourites reload from the DB into the app-owned index
         let item = channel_ref(1);
         assert!(!rig.app.favs.is_fav(&item));

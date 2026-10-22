@@ -33,6 +33,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0014_cast", include_str!("migrations/0014_cast.sql")),
     ("0015_watchlists", include_str!("migrations/0015_watchlists.sql")),
     ("0016_downloads", include_str!("migrations/0016_downloads.sql")),
+    ("0017_failing_since", include_str!("migrations/0017_failing_since.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -180,6 +181,10 @@ fn backfill(conn: &Connection, name: &str) -> Result<()> {
         "0011_follow" => follow_columns(conn),
         "0013_agent_names" => agent_names(conn),
         "0016_downloads" => download_follow_action(conn),
+        "0017_failing_since" => {
+            add_column_if_missing(conn, "source", "failing_since", "INTEGER")?;
+            add_column_if_missing(conn, "epg_source", "failing_since", "INTEGER")
+        }
         "0015_watchlists" => {
             add_column_if_missing(conn, "queue_item", "watchlist_item_id", "INTEGER")?;
             add_column_if_missing(conn, "queue_item", "list_context", "INTEGER NOT NULL DEFAULT 0")?;
@@ -508,11 +513,14 @@ mod tests {
                 "0013_agent_names",
                 "0014_cast",
                 "0015_watchlists",
-                "0016_downloads"
+                "0016_downloads",
+                "0017_failing_since"
             ]
         );
         for (t, col) in [
             ("grp", "raw_name"),
+            ("source", "failing_since"),
+            ("epg_source", "failing_since"),
             ("group_override", "shown"),
             ("channel", "quality"),
             ("channel", "family"),

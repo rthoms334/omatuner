@@ -516,7 +516,7 @@ pub fn mark_attempt(conn: &Connection, id: SourceId, now: Timestamp) -> Result<(
 pub fn mark_refreshed(conn: &Connection, id: SourceId, status: &SourceStatus) -> Result<()> {
     let c = &status.counts;
     conn.execute(
-        "UPDATE source SET last_refresh = ?2, last_attempt = COALESCE(?3, last_attempt), last_error = NULL, etag = ?4,
+        "UPDATE source SET last_refresh = ?2, last_attempt = COALESCE(?3, last_attempt), last_error = NULL, failing_since = NULL, etag = ?4,
                 last_modified = ?5, n_channels = ?6, n_movies = ?7, n_series = ?8, n_groups = ?9,
                 account = COALESCE(?10, account)
          WHERE id = ?1",
@@ -536,11 +536,15 @@ pub fn mark_refreshed(conn: &Connection, id: SourceId, status: &SourceStatus) ->
     Ok(())
 }
 
-/// Record a failure (message must already be redacted).
+/// Record a failure (message must already be redacted). The first failure of a streak sets
+/// `failing_since`, which the retry back-off counts from ([`retry_due`]).
 pub fn mark_failed(conn: &Connection, id: SourceId, error: &str, now: Timestamp) -> Result<()> {
     // defence in depth: the message is shown in Settings and logged
     let error = crate::redact::redact(error);
-    conn.execute("UPDATE source SET last_error = ?2, last_attempt = ?3 WHERE id = ?1", params![id, error.as_ref(), now])?;
+    conn.execute(
+        "UPDATE source SET last_error = ?2, last_attempt = ?3, failing_since = COALESCE(failing_since, ?3) WHERE id = ?1",
+        params![id, error.as_ref(), now],
+    )?;
     Ok(())
 }
 
@@ -553,52 +557,56 @@ pub fn set_account(conn: &Connection, id: SourceId, account: &AccountInfo) -> Re
 const RETRY_MIN_S: i64 = 10 * 60;
 /// Longest wait between scheduled retries of a failing refresh, whatever its interval.
 const RETRY_MAX_S: i64 = 86_400;
-/// Wait between retries when it's unknown how long the refresh has been failing (a guide that
-/// never imported): short enough that a transient first failure doesn't leave the guide empty
-/// for a whole interval, long enough not to toast on every tick.
-const RETRY_UNKNOWN_S: i64 = 3600;
 
 /// Back-off of a refresh whose last attempt failed: the scheduler waits as long after the last
-/// attempt as the refresh has been failing, so the gaps double — at least [`RETRY_MIN_S`], at
-/// most its interval (and [`RETRY_MAX_S`]). `due_since` = when it became due; `None` (unknown)
-/// waits a fixed [`RETRY_UNKNOWN_S`] (or the interval, if shorter). The start of the failing
-/// streak isn't stored: a refresh that was long overdue when it started failing (app closed
-/// meanwhile) backs off the most. A manual Refresh (`force`) never goes through here.
-fn retry_due(now: Timestamp, last_attempt: Timestamp, due_since: Option<Timestamp>, interval_s: i64) -> bool {
+/// attempt as the refresh has been failing (`failing_since` → `last_attempt`), so the first
+/// retry comes after [`RETRY_MIN_S`] and the gaps then double — at most the refresh interval
+/// (and [`RETRY_MAX_S`]). How overdue the refresh was when it first failed doesn't matter. A
+/// row without `failing_since` (failing since before it was stored) waits [`RETRY_MIN_S`]; its
+/// next failure starts the streak. A manual Refresh (`force`) never goes through here.
+fn retry_wait(last_attempt: Timestamp, failing_since: Option<Timestamp>, interval_s: i64) -> i64 {
     let cap = interval_s.clamp(RETRY_MIN_S, RETRY_MAX_S);
-    let wait = due_since.map_or(cap.min(RETRY_UNKNOWN_S), |d| (last_attempt - d).clamp(RETRY_MIN_S, cap));
-    now - last_attempt >= wait
+    failing_since.map_or(RETRY_MIN_S, |f| (last_attempt - f).clamp(RETRY_MIN_S, cap))
+}
+
+/// When the scheduler next retries a refresh whose last attempt (at `last_attempt`) failed
+/// (what the status bar quotes: "retrying in 10 min"). The scheduler only ticks every 15 min,
+/// so the real retry can come a little later.
+pub fn retry_at(last_attempt: Timestamp, failing_since: Option<Timestamp>, interval_s: i64) -> Timestamp {
+    last_attempt.saturating_add(retry_wait(last_attempt, failing_since, interval_s))
+}
+
+fn retry_due(now: Timestamp, last_attempt: Timestamp, failing_since: Option<Timestamp>, interval_s: i64) -> bool {
+    now >= retry_at(last_attempt, failing_since, interval_s)
 }
 
 /// Sources whose `last_refresh` is older than their `refresh_h` (or `default_h`), enabled only;
 /// one whose last refresh failed only once its back-off is over ([`retry_due`]).
 pub fn stale_sources(conn: &Connection, now: Timestamp, default_h: u32) -> Result<Vec<SourceId>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, settings, created_at, last_refresh, last_attempt, last_error IS NOT NULL FROM source
+        "SELECT id, settings, last_refresh, last_attempt, last_error IS NOT NULL, failing_since FROM source
          WHERE enabled = 1 ORDER BY sort_index, id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, SourceId>(0)?,
             r.get::<_, Option<String>>(1)?,
-            r.get::<_, Timestamp>(2)?,
+            r.get::<_, Option<Timestamp>>(2)?,
             r.get::<_, Option<Timestamp>>(3)?,
-            r.get::<_, Option<Timestamp>>(4)?,
-            r.get::<_, bool>(5)?,
+            r.get::<_, bool>(4)?,
+            r.get::<_, Option<Timestamp>>(5)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, settings, created, last, attempt, failed) = row?;
+        let (id, settings, last, attempt, failed, since) = row?;
         let h = from_json_opt::<SourceSettings>(settings).and_then(|s| s.refresh_h).unwrap_or(default_h);
         let interval = i64::from(h) * 3600;
         if last.is_some_and(|t| now < t.saturating_add(interval)) {
             continue;
         }
-        // never imported: due since it was added
-        let due_since = last.map_or(created, |t| t.saturating_add(interval));
         if let Some(at) = attempt.filter(|_| failed)
-            && !retry_due(now, at, Some(due_since), interval)
+            && !retry_due(now, at, since, interval)
         {
             continue;
         }
@@ -798,9 +806,13 @@ pub fn reorder_epg_sources(conn: &mut Connection, order: &[EpgSourceId]) -> Resu
     Ok(())
 }
 
+/// Record a failed guide refresh (the first of a streak sets `failing_since`, as [`mark_failed`]).
 pub fn mark_epg_failed(conn: &Connection, id: EpgSourceId, error: &str, now: Timestamp) -> Result<()> {
     let error = crate::redact::redact(error);
-    conn.execute("UPDATE epg_source SET last_error = ?2, last_attempt = ?3 WHERE id = ?1", params![id, error.as_ref(), now])?;
+    conn.execute(
+        "UPDATE epg_source SET last_error = ?2, last_attempt = ?3, failing_since = COALESCE(failing_since, ?3) WHERE id = ?1",
+        params![id, error.as_ref(), now],
+    )?;
     Ok(())
 }
 
@@ -812,7 +824,7 @@ pub fn mark_epg_failed(conn: &Connection, id: EpgSourceId, error: &str, now: Tim
 /// 15-minute scheduler tick.
 pub fn stale_epg_sources(conn: &Connection, now: Timestamp, default_h: u32) -> Result<Vec<EpgSourceId>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, COALESCE(refresh_h, ?2), last_refresh, max_stop, last_attempt, last_error IS NOT NULL FROM epg_source
+        "SELECT id, COALESCE(refresh_h, ?2), last_attempt, last_error IS NOT NULL, failing_since FROM epg_source
          WHERE enabled = 1
            AND (last_refresh IS NULL
                 OR last_refresh <= ?1 - COALESCE(refresh_h, ?2) * 3600
@@ -824,29 +836,80 @@ pub fn stale_epg_sources(conn: &Connection, now: Timestamp, default_h: u32) -> R
             r.get::<_, EpgSourceId>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, Option<Timestamp>>(2)?,
-            r.get::<_, Option<Timestamp>>(3)?,
+            r.get::<_, bool>(3)?,
             r.get::<_, Option<Timestamp>>(4)?,
-            r.get::<_, bool>(5)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, h, last, max_stop, attempt, failed) = row?;
+        let (id, h, attempt, failed, since) = row?;
         let interval = h.saturating_mul(3600);
-        if let Some(at) = attempt.filter(|_| failed) {
-            // when it became due (the WHERE above, solved for `now`): by age or by running out;
-            // never imported → unknown (fixed wait)
-            let due_since = last.map(|t| {
-                let by_age = t.saturating_add(interval);
-                max_stop.map_or(by_age, |m| by_age.min((t + 3600).max(m - 43_200 + 1)))
-            });
-            if !retry_due(now, at, due_since, interval) {
-                continue;
-            }
+        if let Some(at) = attempt.filter(|_| failed)
+            && !retry_due(now, at, since, interval)
+        {
+            continue;
         }
         out.push(id);
     }
     Ok(out)
+}
+
+/// A guide worth a word in the status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuideNote {
+    pub name: String,
+    pub last_refresh: Option<Timestamp>,
+    /// Its latest attempt failed (after the last success): when the scheduler retries it.
+    pub retry_at: Option<Timestamp>,
+}
+
+/// What the status bar and the Guide screen say about the enabled guides beyond "updated N ago"
+/// (`newest`): a failed update, and a guide much older than the newest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuideHealth {
+    /// Newest `last_refresh` of the enabled guides.
+    pub newest: Option<Timestamp>,
+    /// More than one guide is enabled (a note then names its guide).
+    pub several: bool,
+    /// The guide whose failed update is retried first.
+    pub failing: Option<GuideNote>,
+    /// The oldest guide that is stale (`stale_s` old) and `stale_s` older than the newest.
+    pub old: Option<GuideNote>,
+}
+
+/// [`GuideHealth`] of the enabled guides at `now`; `default_h` is the default refresh interval
+/// (hours) of a guide without its own — `general.epg_refresh_h`, 0 = manual.
+pub fn guide_health(conn: &Connection, now: Timestamp, default_h: u32, stale_s: i64) -> Result<GuideHealth> {
+    let default_h = if default_h == 0 { u32::MAX } else { default_h };
+    let mut stmt = conn.prepare_cached(
+        "SELECT name, COALESCE(refresh_h, ?1), last_refresh, last_attempt, last_error IS NOT NULL, failing_since FROM epg_source
+         WHERE enabled = 1 ORDER BY priority, id",
+    )?;
+    let rows = stmt.query_map([default_h], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<Timestamp>>(2)?,
+            r.get::<_, Option<Timestamp>>(3)?,
+            r.get::<_, bool>(4)?,
+            r.get::<_, Option<Timestamp>>(5)?,
+        ))
+    })?;
+    let mut notes = Vec::new();
+    for row in rows {
+        let (name, h, last_refresh, attempt, failed, since) = row?;
+        // the latest attempt failed after the last success (a guide that never imported counts)
+        let retry_at = attempt.filter(|at| failed && last_refresh.is_none_or(|ok| *at >= ok)).map(|at| retry_at(at, since, h.saturating_mul(3600)));
+        notes.push(GuideNote { name, last_refresh, retry_at });
+    }
+    let newest = notes.iter().filter_map(|n| n.last_refresh).max();
+    let failing = notes.iter().filter(|n| n.retry_at.is_some()).min_by_key(|n| n.retry_at).cloned();
+    let old = notes
+        .iter()
+        .filter(|n| n.last_refresh.zip(newest).is_some_and(|(t, new)| new - t >= stale_s && now - t >= stale_s))
+        .min_by_key(|n| n.last_refresh)
+        .cloned();
+    Ok(GuideHealth { newest, several: notes.len() > 1, failing, old })
 }
 
 /// Stored provider connection limits (`AccountInfo.max_connections`) per source, for the
@@ -861,4 +924,115 @@ pub fn account_limits(conn: &Connection) -> Result<Vec<(SourceId, Option<u32>)>>
         out.push((id, max));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H: i64 = 3600;
+    const T0: Timestamp = 1_000_000_000;
+
+    fn db() -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        crate::store::migrations::migrate(&mut c).unwrap();
+        c
+    }
+
+    /// Playlist 1 and guide 1 (name `g1`), both refreshed every 12 h, last refreshed at `ok`.
+    fn rows(c: &Connection, ok: Timestamp) {
+        c.execute("INSERT INTO source(id, name, kind, created_at, last_refresh) VALUES (1, 'p', 'm3u-url', 0, ?1)", [ok]).unwrap();
+        c.execute("INSERT INTO epg_source(id, name, kind, last_refresh, refresh_h) VALUES (1, 'g1', 'url', ?1, 12)", [ok]).unwrap();
+    }
+
+    fn due(c: &Connection, now: Timestamp) -> (Vec<SourceId>, Vec<EpgSourceId>) {
+        (stale_sources(c, now, 12).unwrap(), stale_epg_sources(c, now, 12).unwrap())
+    }
+
+    fn failing_since(c: &Connection) -> (Option<Timestamp>, Option<Timestamp>) {
+        let q = |t: &str| c.query_row(&format!("SELECT failing_since FROM {t} WHERE id = 1"), [], |r| r.get(0)).unwrap();
+        (q("source"), q("epg_source"))
+    }
+
+    fn fail(c: &Connection, at: Timestamp) {
+        mark_failed(c, SourceId(1), "dns error", at).unwrap();
+        mark_epg_failed(c, EpgSourceId(1), "dns error", at).unwrap();
+    }
+
+    #[test]
+    fn a_long_overdue_refresh_is_retried_soon_after_its_first_failure() {
+        let c = db();
+        // last refreshed 19 h ago; the app was closed, so it is 7 h overdue at the failed launch refresh
+        let now = T0 + 7 * H;
+        rows(&c, T0 - 12 * H);
+        assert_eq!(due(&c, now), (vec![SourceId(1)], vec![EpgSourceId(1)]));
+        fail(&c, now);
+        assert_eq!(failing_since(&c), (Some(now), Some(now)));
+        assert_eq!(due(&c, now + RETRY_MIN_S - 1), (vec![], vec![]));
+        assert_eq!(due(&c, now + RETRY_MIN_S), (vec![SourceId(1)], vec![EpgSourceId(1)]));
+    }
+
+    #[test]
+    fn successive_failures_back_off_up_to_the_interval() {
+        let c = db();
+        rows(&c, T0 - 12 * H);
+        let mut at = T0;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            fail(&c, at);
+            let next = (T0..T0 + 48 * H).step_by(60).find(|t| *t > at && !due(&c, *t).1.is_empty()).unwrap();
+            assert_eq!(due(&c, next).0, vec![SourceId(1)], "playlists and guides back off alike");
+            waits.push(next - at);
+            at = next;
+        }
+        let m = RETRY_MIN_S;
+        // 10, 10, 20, 40, 80, 160 min, then the 12 h interval caps it
+        assert_eq!(waits, [m, m, 2 * m, 4 * m, 8 * m, 16 * m, 32 * m, 64 * m]);
+        assert_eq!(retry_at(at, Some(at - 100 * H), 12 * H), at + 12 * H);
+        // the failing_since of the streak never moved
+        assert_eq!(failing_since(&c), (Some(T0), Some(T0)));
+    }
+
+    #[test]
+    fn rows_from_before_the_column_wait_the_minimum() {
+        assert_eq!(retry_at(T0, None, 12 * H), T0 + RETRY_MIN_S);
+    }
+
+    #[test]
+    fn success_clears_the_streak() {
+        let c = db();
+        rows(&c, T0 - 12 * H);
+        fail(&c, T0);
+        let status = crate::model::SourceStatus { last_refresh: Some(T0 + 1), last_attempt: Some(T0 + 1), ..Default::default() };
+        mark_refreshed(&c, SourceId(1), &status).unwrap();
+        assert_eq!(failing_since(&c), (None, Some(T0)));
+        // a later failure starts a new streak
+        fail(&c, T0 + 20 * H);
+        assert_eq!(failing_since(&c), (Some(T0 + 20 * H), Some(T0)));
+    }
+
+    #[test]
+    fn health_reports_a_failed_update_and_an_old_guide() {
+        let c = db();
+        let now = T0 + 30 * H;
+        rows(&c, T0);
+        let health = |c: &Connection| guide_health(c, now, 12, 2 * 86_400).unwrap();
+        assert_eq!(health(&c), GuideHealth { newest: Some(T0), several: false, failing: None, old: None });
+        fail(&c, now);
+        let h = health(&c);
+        assert_eq!(h.failing, Some(GuideNote { name: "g1".into(), last_refresh: Some(T0), retry_at: Some(now + RETRY_MIN_S) }));
+        // a second guide, failing for days
+        c.execute(
+            "INSERT INTO epg_source(id, name, kind, last_refresh, last_attempt, last_error) VALUES (2, 'g2', 'url', ?1, ?2, 'refused')",
+            params![T0 - 5 * 86_400, now - H],
+        )
+        .unwrap();
+        let h = health(&c);
+        assert!(h.several);
+        assert_eq!(h.old.as_ref().map(|n| (n.name.as_str(), n.retry_at)), Some(("g2", Some(now - H + RETRY_MIN_S))));
+        // a failure older than the last success is not shown
+        c.execute("UPDATE epg_source SET last_refresh = ?1 WHERE id = 1", [now + 1]).unwrap();
+        assert_eq!(health(&c).failing.map(|n| n.name), Some("g2".into()));
+    }
 }
