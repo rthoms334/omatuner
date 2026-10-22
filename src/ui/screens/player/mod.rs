@@ -758,6 +758,7 @@ impl Screen for PlayerScreen {
         }
         self.update_other_copy(ctx, &snap);
         self.update_cast_context(ctx, &snap);
+        ctx.video.set_centre_play(self.banner_visible(&snap) && !ctx.video_only && !ctx.multiview.on());
         // multi-view: both pictures in their layout (the response covers every picture)
         let resp = match self.paint_multiview(ui, ctx, rect) {
             Some(r) => r,
@@ -1632,6 +1633,15 @@ mod tests {
         h.run_steps(2);
         let play = centre_text(&h, labels[1], glyphs::PLAY_OUTLINE);
         assert!((height(&play) - 56.0 * scale).abs() < 3.0 && height(&play) > height(&back) * 1.25);
+        let pauses =
+            |h: &H| paint_shapes(h).iter().filter(|s| matches!(s, egui::Shape::Text(t) if t.galley.job.text.contains(glyphs::PAUSE))).count();
+        assert_eq!(pauses(&h), 0, "paused shows only the centre play: no pause badge under it or by the title");
+        // Esc hides the controls while paused: the badge alone says the picture is paused.
+        let s = &mut h.state_mut().s;
+        (s.osd_focus, s.banner_dismissed, s.banner_until) = (false, true, None);
+        h.run_steps(2);
+        assert!(h.query_by_label(labels[1]).is_none());
+        assert!(pauses(&h) > 0, "the paused badge returns without the centre controls");
     }
 
     #[test]

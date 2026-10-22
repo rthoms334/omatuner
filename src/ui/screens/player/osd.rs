@@ -940,7 +940,6 @@ impl PlayerScreen {
         }
         let playable = snap.playable.as_ref();
         let title = playable.map(|p| p.title.clone()).unwrap_or_default();
-        let title = if snap.paused { format!("{} {title}", glyphs::PAUSE) } else { title };
         osd_text(&p, inner.left_top(), Align2::LEFT_TOP, &title, font.clone(), t.osd_text, (back.left() - pad - inner.left()).max(0.0));
         let second = if is_live(snap) {
             let ch = playing_channel(snap).and_then(|id| ctx.lib.live.get(id)).cloned();
