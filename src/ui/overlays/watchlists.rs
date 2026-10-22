@@ -27,6 +27,20 @@ pub struct PickerSpec {
     pub create: bool,
 }
 
+/// Xtream series load their episodes lazily and a list's progress counts them: start the load
+/// for the series just added, so the Watchlists screen has its totals without opening each one.
+fn fetch_episodes(
+    c: &rusqlite::Connection,
+    lib: &crate::store::library::Library,
+    jobs: &crate::jobs::JobManager,
+    entries: &[crate::watchlist::NewEntry],
+) {
+    let items: Vec<ItemRef> = entries.iter().filter_map(|e| e.item.clone()).collect();
+    for id in store::series_to_fetch(c, lib, &items).unwrap_or_default() {
+        jobs.submit(crate::jobs::JobKind::LoadSeriesDetails(id));
+    }
+}
+
 pub struct Picker {
     spec: PickerSpec,
     cursor: usize,
@@ -131,6 +145,7 @@ impl Picker {
         }
         let at = self.insertion();
         let omitted = self.spec.omitted;
+        let jobs = ctx.services.jobs.clone();
         shared::write_result(ctx, move |c| {
             crate::store::sql::atomic(c, |c| {
                 let (mut entries, omitted) = additions(c, &refs, omitted)?;
@@ -142,6 +157,7 @@ impl Picker {
                 }
                 let added = store::add(c, &lib, list_id, &entries, at, now)?;
                 check_refusals(&added)?;
+                fetch_episodes(c, &lib, &jobs, &entries);
                 c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('watchlist:last_used',?1)", [list_id.0.to_string()])?;
                 Ok((saved_text(&name, added.added.len(), added.refused.len(), omitted), None))
             })
@@ -161,6 +177,7 @@ impl Picker {
         let now = ctx.now;
         let range = (!self.whole && self.series()).then_some((self.from, self.to.max(self.from)));
         let omitted = self.spec.omitted;
+        let jobs = ctx.services.jobs.clone();
         shared::write_result(ctx, move |c| {
             crate::store::sql::atomic(c, |c| {
                 let list = store::create(c, &name, None, PlayOrder::Ordered, "app", now)?;
@@ -175,6 +192,7 @@ impl Picker {
                 for chunk in entries.chunks(50) {
                     let result = store::add(c, &lib, list, chunk, Insert::End, now)?;
                     check_refusals(&result)?;
+                    fetch_episodes(c, &lib, &jobs, chunk);
                     saved += result.added.len();
                     duplicates += result.refused.len();
                 }
