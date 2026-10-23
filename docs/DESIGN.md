@@ -7286,7 +7286,7 @@ coordinate it ever had; an arrival is a covered coordinate in no copy's ledger. 
 baselined silently when it becomes tracked, a copy is first seen, the feature is switched back
 on, or a playlist's first import brought it; a new copy of a tracked title alerts only beyond
 the title's frontier. One episode alerts once whatever the copies, an episode a provider drops
-and restores never alerts twice, and one already finished or started in any copy is recorded,
+and restores (or a copy that leaves the library and comes back) never alerts twice, and one already finished or started in any copy is recorded,
 not alerted. The guard's `spoiler_seen` events record an arrival as watched. An arrival Following
 already reminded about, switched to or recorded in the last 30 days is quiet (“aired on TV”):
 on Home and in Recent, no notification. Locked, concealed and explicit copies exclude the whole

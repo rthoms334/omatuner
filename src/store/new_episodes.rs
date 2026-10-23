@@ -14,7 +14,8 @@
 //!   playlist's first import brought it. A copy no longer tracked loses its rows, so a later
 //!   add baselines again.
 //! * **The diff** ([`check`], one write transaction): per title, the coordinates of its loaded
-//!   copies minus the ledger, once per title whatever the copies. Then coverage, mute, already
+//!   copies minus the ledger, once per title whatever the copies, minus what any copy already
+//!   has an arrival row for (a copy back in the library). Then coverage, mute, already
 //!   watched (any copy finished or started), the spoiler guard's seen events (recorded as
 //!   watched, `quiet = 'seen'`) and Following's ledger (an airing it reminded about, switched
 //!   to or recorded in the last 30 days: on Home, no notification, `quiet = 'following'`).
@@ -511,8 +512,11 @@ fn check_tracked(conn: &Connection, tracked: &[Tracked], opts: &Opts, input: &Ch
         let progress = copies::episode_progress(conn, &t.series)?;
         let facts: Vec<CopyFacts> = t.series.iter().filter_map(|&id| copy_facts(conn, id).transpose()).collect::<Result<_>>()?;
         let why = serde_json::to_string(&t.why.iter().map(Why::code).collect::<Vec<_>>()).map_err(Error::other)?;
+        // a copy that left the library and came back lost its ledger: what it announced before
+        // is still in `newep_arrival`, and never alerts twice
+        let announced = arrival_coords(conn, &t.copies)?;
         for ((season, episode), i) in found {
-            if !t.coverage.covers(season, &newest_at) || t.muted {
+            if !t.coverage.covers(season, newest_at) || t.muted || announced.contains(&(season, episode)) {
                 continue;
             }
             // already watched or started in any copy (progress moved with a re-key, or watched
@@ -1444,6 +1448,15 @@ mod tests {
             let r = run(c, &lib, NOW + DAY)?;
             assert_eq!(coords(c, &r.announce)?, [(3, 1), (3, 2), (3, 3)]);
             assert!(arrivals(c, &r.announce)?.iter().all(|a| a.series.as_ref().is_some_and(|s| s.source == SourceId(2))));
+            // TV 2's copy leaves the library and comes back: its ledger went with it and S3 is
+            // beyond TV's frontier again, but what it announced never alerts twice
+            c.execute("INSERT INTO item_override(source_id,kind,item_key,hidden,fp) VALUES (2,'series','bear2',1,'{}')", [])?;
+            let hidden = super::tests::lib(c)?;
+            assert_eq!(run(c, &hidden, NOW + DAY + 1)?.arrivals, 0);
+            assert_eq!(c.query_row("SELECT count(*) FROM newep_known WHERE source_id = 2", [], |r| r.get::<_, i64>(0))?, 0, "ledger gone");
+            c.execute("DELETE FROM item_override WHERE source_id = 2", [])?;
+            let lib = super::tests::lib(c)?;
+            assert_eq!(run(c, &lib, NOW + DAY + 2)?.arrivals, 0, "back in the library: nothing new");
             // a playlist's first import: silent, even beyond the frontier
             series(c, 3, 3, "bear3", "The Bear", 2022)?;
             for s in 1..=4 {
