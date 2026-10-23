@@ -2098,3 +2098,48 @@ helper's outcome.
 - [ ] Kill an HLS recording before its stop, restart, and verify it continues in the kept folder. Stop or Delete then Undo a raw TS recording: it stays Partial with its original bytes.
 - [ ] Move a large downloads folder across filesystems while a recording becomes due: it starts on time, the move waits for active recordings, and all saved files play after the switch.
 - [ ] Agent download list and busy play replies show plain titles but omit future episode titles protected by a series spoiler rule.
+
+## 33. New episodes (DESIGN §44)
+
+- [ ] **A real provider adds an episode overnight:** with an Xtream playlist you use, put one
+  of its series on My list (Ctrl+F) and bind another by marking over 60 % of a season watched
+  (at least three episodes). Run once and leave Tuner open, or close it and use
+  `tuner --refresh`. Wait for the provider to add an episode to one of them (a currently
+  airing show; note the series and S/E), then let the next playlist refresh run (or start Tuner
+  and wait for the launch check). **Expect:** the first run recorded what already existed and
+  said nothing; the new episode alerts once, with one notification per series and a single
+  summary when four or more shows changed; Home gains a *New episodes* row, the Watchlists
+  entry gets a *New* chip, and the sidebar's Watchlists item a dot until you open it.
+  Record whether `last_modified` moved for that series (Settings ▸ New episodes ▸ Recent and
+  the log's `newep:` line, counts only) and, for a provider that never moves it, that the
+  fallback found the episode within a refresh or two and later fetched that playlist's tracked
+  series at every refresh. Check that no stream was opened and a one-connection account kept
+  playing while the check ran.
+- [ ] **The notification's two actions on Omarchy:** trigger an alert (add a series, baseline,
+  then delete one of its episodes from the database in an isolated profile and refresh; or
+  wait for a real one). **Expect:** the notification shows **Play S…E…** and **Download**
+  buttons on Omarchy's notification server (mako or swaync, whichever is running); the body
+  click is Play. Play starts the series' next unwatched episode (named on the button, which
+  can be an earlier one if you are behind); Download queues the new episodes in Downloads.
+  Repeat with the server stopped: the same text arrives as an in-app toast with Play and
+  Download. With four or more shows: one summary whose *Open* button shows Home's row. Check
+  that a server that hides extra actions still has Play through the body click.
+- [ ] **Held while you watch:** start a film full screen, then trigger a check. **Expect:** no
+  notification during the film, Home updates at once, and the held alert arrives after you
+  leave full screen. Repeat inside the news flash's quiet hours.
+- [ ] **Clearing and undo:** finish a new episode (it leaves the row), press Delete on a tile
+  and Undo within 10 s, open a series page and a watchlist entry (the chip goes), open the
+  Watchlists screen (the dot goes). Mute a series from its page, a tile and Settings with Undo;
+  unmute it. **Expect:** muting never replays what arrived while muted.
+- [ ] **Following and duplicates:** follow a show in Following (reminder) whose episode also
+  arrives on demand. **Expect:** the on-demand arrival is quiet ("aired on TV"): on Home, no
+  notification. Two playlists with the same series alert once.
+- [ ] **Locks and spoilers:** lock a tracked series, then one with an explicit copy, and use a
+  series spoiler rule. **Expect:** those series never appear in the row, the notification, the
+  counts or MCP; guarded episode titles show numbers only.
+- [ ] **Agent:** ask "anything new on my shows?", "why do I get alerts for X?" and "play the
+  new Landman". **Expect:** `new_episodes list` names the shows with `next_episode`, reading
+  clears nothing, `tracked` explains the reason, and the agent plays `next_episode`. Ask it to
+  "clear my new episodes" and then to stop alerts for one show. **Expect:** it asks nothing
+  more, each shows an Undo toast in Tuner, watched state is unchanged, and an agent that is
+  not Claude (any MCP client) sees the same tool.

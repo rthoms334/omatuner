@@ -206,6 +206,13 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   Play In order or Any order, with progress from every copy and missing-title placeholders.
   Playing a list carries on through Up next; anything you queue plays first. `Ctrl+F` saves
   titles to My list and `Ctrl+Shift+F` chooses another list. Favourites now hold channels only.
+- **New episodes:** when a new episode of a series you follow appears in a playlist, Tuner tells
+  you once: a desktop notification with **Play** and **Download**, a *New episodes* row on Home,
+  and a *New* chip on the series in Watchlists. The series are the ones on any watchlist plus the
+  ones you've binged (over 60 % of a season watched); there is nothing to set up, and the first
+  run only records what already exists. It reads the playlist refreshes Tuner already does, so
+  an episode can arrive a day late. Mute a series from its page or menu; Settings ▸ New episodes
+  holds the switch. An agent can list what's new and why a show is tracked, over MCP.
 - **Following:** rules that watch the guide for a team, a show, an event or a news bulletin and
   set reminders or switches for you (`R` on a programme, *Follow…* in its menu, or Settings ▸
   Following). Repeats, +1 channels and the same match on two channels count once; your other
@@ -1400,7 +1407,7 @@ when you can see it, the pop-out when it's on another workspace) or always the *
 (Tuner adds `--json` to the `claude plugin` commands so it can read their answers.)
 
 - Claude Code gets the omatuner plugin: the tools and the seven skills. The other agents get the
-  MCP server and its 29 tools (the skills are written for Claude Code).
+  MCP server and its 32 tools (the skills are written for Claude Code).
 - **Keeping the plugin up to date:** Claude Code records which plugin version it installed.
   After a Tuner update, with *Keep Claude Code's plugin up to date after Tuner updates* on (the
   default), Tuner runs `claude plugin marketplace update omatuner` and `claude plugin update
@@ -1447,7 +1454,7 @@ in the directory you ran the command in. `claude mcp list` shows whether it is c
 
 #### Other agents
 
-Other agents get the same 29 tools. The skills are part of the Claude Code plugin, but Tuner
+Other agents get the same 32 tools. The skills are part of the Claude Code plugin, but Tuner
 sends its own instructions when an agent connects and each tool's description says how to use
 it, so the requests in [What you can ask](#what-you-can-ask) work in other agents too.
 
@@ -1504,7 +1511,7 @@ skills (Claude picks the right one from what you say), but the example asks work
 |---|---|---|
 | *watch* | "Touring cars is on", "I missed the news, play it from the start", "What's on BBC One at 9?", "Put both semis on side by side", "Switch me over at kick-off" | Searches the guide and plays it live, from the start or from catch-up. Something that starts later gets a scheduled switch: Tuner changes channel by itself at the start, with a *Switching in 10 s · Cancel* toast first. Two live channels open in multi-view. |
 | *pick* | "Something light under 2 hours", "Like *Arrival*", "Surprise me", "A film for the four of us", "Line up the Bourne films in order" | Browses your movie and series categories by mood, runtime, rating, year or cast, picks something unwatched and starts it or adds it to Up next. |
-| *series* | "Carry on with my series", "Where am I in *Slow Horses*?", "Recap season 1", "Which episode is the one where…", "Next three, then stop" | Finds your progress across every copy, plays the next episode, recaps without spoiling what's ahead, and queues episodes with a sleep timer after them. |
+| *series* | "Carry on with my series", "Anything new on my shows?", "Where am I in *Slow Horses*?", "Recap season 1", "Which episode is the one where…", "Next three, then stop" | Finds your progress across every copy, plays the next episode, lists the new episodes of your shows, recaps without spoiling what's ahead, and queues episodes with a sleep timer after them. |
 | *plan* | "Plan my Saturday", "Follow Arsenal, spoiler-safe", "Pop up the 1 o'clock news every weekday, headlines only", "What clashes tonight?", "Stop at 11" | Sets reminders and automatic switches, adds Following rules (including news flashes in the pop-out) after showing you what they'd match, lists or cancels them, and sets the sleep timer. |
 | *kids* | "Something for a 6-year-old", "Is *Coraline* OK for her?", "What finishes before bedtime?", "Lock that film" | Picks from kids' and family categories by age, checks content ratings, plans viewing that ends before bedtime, and adds parental locks. |
 | *fix* | "This channel keeps buffering", "Is it me or the provider?", "The guide is an hour off", "Fix my guide", "When does my subscription expire?" | Reads playback health and your playlists' status to tell an outage, a connection limit, a dead channel and a local problem apart. Finds a better copy of a channel, and proposes guide fixes with a before/after preview. |
@@ -1564,7 +1571,7 @@ list and the confirm card are enforced by Tuner itself, whatever the agent sends
 
 - **Before acting:** following a show or team (the agent shows the matches and what it left out
   first), a reminder that switches channel, more than three reminders or Up next items, clearing
-  or replacing Up next, guide fixes, favourites changes, spoiler-guard rules and new locks.
+  or replacing Up next, guide fixes, favourites changes, spoiler-guard rules and new locks. Clearing the New episodes row or muting a show happens only when you ask, and shows an Undo in Tuner.
 - **In Tuner, not in chat:** guide fixes to more than 50 channels open a confirm card for you to
   press Enter. Moving the playing picture to another playlist for multi-view asks first, because
   it pauses for up to 30 seconds.
@@ -1582,13 +1589,13 @@ every agent gets the same limits.
 
 ### Tools
 
-The plugin's skills use these 29 tools; other agents, and Claude Code with *just the tools*,
+The plugin's skills use these 32 tools; other agents, and Claude Code with *just the tools*,
 use them directly. Their full descriptions are in `src/agent/tools.rs` and
 `src/agent/tools_batch.rs`.
 
 | Area | Tools |
 |---|---|
-| Find | `guide_search` (programmes by title, category or time window), `whats_on` (what's on at a time), `search` (channels, movies and series by name), `details` (plot, cast, what's on next, other copies), `categories`, `browse` (filters for picking by mood), `episodes`, `continue_watching`, `favourites`, `history`, `match_titles` (which titles from a web list you have) |
+| Find | `guide_search` (programmes by title, category or time window), `whats_on` (what's on at a time), `search` (channels, movies and series by name), `details` (plot, cast, what's on next, other copies), `categories`, `browse` (filters for picking by mood), `episodes`, `new_episodes` (new episodes of your shows and why each is tracked), `continue_watching`, `favourites`, `history`, `match_titles` (which titles from a web list you have) |
 | Play | `play`, `control` (pause, volume, mute, previous channel, pop-out, stop casting, play here), `status`, `cast_devices` (the TVs Tuner can cast to; `play` takes a `device`), `multiview`, `queue` (Up next), `watchlist`, `sleep_timer` |
 | Plan | `reminders` (notify or switch), `schedule_switch`, `cancel_switch`, `follow` (Following rules and news flashes) |
 | Look after | `spoiler_guard`, `guide_fix`, `favourites_edit`, `lock` (add locks only), `parental_status`, `diagnose` (playback health), `sources` (account status, expiry, connections, guide coverage) |

@@ -1,6 +1,6 @@
 # New episodes: design
 
-> Draft for review, 2026-10-22. Built on origin/main c36f13d (v0.3.6). It is meant to become DESIGN §44. The user's answers so far and the questions still open are in §11.
+> Approved and built, 2026-10-23. Built on origin/main c36f13d (v0.3.6); it became DESIGN §44, which is the contract as built. Every question in §11 is answered.
 
 **The idea in one line:** when a new episode of a series you care about appears in a playlist's series catalogue (on demand, not live TV), Tuner tells you once: a desktop notification with Play, a "New episodes" row on Home, and a "New" badge in Watchlists. The series you care about are the ones on any watchlist plus the ones you've binged.
 
