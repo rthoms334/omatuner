@@ -7273,7 +7273,8 @@ what you haven't seen) and **Download**; four or more series in one check make a
 whose Open shows Home's row. There is no automatic download. Notifications are held while Tuner
 plays a film or episode full screen and in the news flash's quiet hours, then sent; Home updates
 at once. A server without actions or without a notification service falls back to an in-app toast
-with the same text. A row tile leaves when its episodes are finished in any copy, dismissed
+with the same text. Names in a notification lose their links, and every notification body is
+sent escaped (servers render body markup). A row tile leaves when its episodes are finished in any copy, dismissed
 (Delete, with a ten-second Undo) or older than 30 days. The chip goes when the series page or
 entry is opened or an episode played; the dot when the Watchlists screen opens. Mute (“Stop
 alerts for this series”) is on the series page, the tile menu and Settings, with Undo, and not on

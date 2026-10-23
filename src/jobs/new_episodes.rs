@@ -529,9 +529,12 @@ async fn flush(ctx: &JobContext) {
 /// The notes of one round (§2.2, §3.4): one per series, or one summary for more than
 /// [`MAX_SINGLE`] series. Names pass the spoiler guard (`Subject::Notification`; a hidden one
 /// is left out, never guessed); an episode title shows only when exactly one episode is new and
-/// the guard allows it. Each note comes with the arrivals it announces.
+/// the guard allows it. Provider text (series, episode and playlist names) loses its links, as
+/// in agents' replies (`agent::query::clean`); `platform::notify` sends the body without markup.
+/// Each note comes with the arrivals it announces.
 pub(crate) fn notes(ann: &[Announcement], playlists: &[Option<String>], guard: &Guard, now: Timestamp) -> Vec<(Note, Vec<ArrivalId>)> {
-    let name = |t: &str| guard.text(&Subject::Notification { title: t }, Field::Title, t, Policy::Normal, now).text().map(str::to_owned);
+    use crate::agent::query::clean;
+    let name = |t: &str| guard.text(&Subject::Notification { title: t }, Field::Title, t, Policy::Normal, now).text().map(clean);
     if ann.len() > MAX_SINGLE {
         let names: Vec<String> = ann.iter().filter_map(|a| name(&a.title)).collect();
         let body = match names.len() {
@@ -555,11 +558,11 @@ pub(crate) fn notes(ann: &[Announcement], playlists: &[Option<String>], guard: &
             if let ([(s, e)], Some(title)) = (a.episodes.as_slice(), a.episode_title.as_deref()) {
                 let subject = Subject::Episode { series_norm: &a.series_norm, season: *s as i32, episode: *e as i32 };
                 if let Some(t) = guard.text(&subject, Field::EpisodeTitle, title, Policy::Normal, now).text() {
-                    body = format!("{body} · {t}");
+                    body = format!("{body} · {}", clean(t));
                 }
             }
             if let Some(p) = playlist {
-                body = format!("{body} · on {p}");
+                body = format!("{body} · on {}", clean(p));
             }
             if a.downloading {
                 body = format!("{body} · Downloading");
@@ -723,6 +726,16 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// Provider text in a note loses its links (as in agents' replies).
+    #[test]
+    fn notes_carry_no_links() {
+        let mut a = ann("Landman https://spam.example/x", &[(2, 9)]);
+        a.episode_title = Some("Tomorrow www http://h.tv/watch".into());
+        let n = notes(&[a], &[Some("TV http://panel.example".into())], &Guard::default(), 0).remove(0).0;
+        assert_eq!(n.summary, "Landman [link]: new episode");
+        assert_eq!(n.body, "S2E9 · Tomorrow www [link] · on TV [link]");
     }
 
     /// §8.12: Play and the body click send `NewEpisodePlay`, Download `NewEpisodeDownload`.

@@ -125,7 +125,7 @@ fn build(summary: &str, body: &str, urgency_critical: bool, actions: &[(&str, &s
     let mut n = Notification::new();
     n.appname(crate::APP_NAME)
         .summary(&crate::redact::redact(summary))
-        .body(&crate::redact::redact(body))
+        .body(&escape_markup(&crate::redact::redact(body)))
         .icon(crate::APP_ID)
         .hint(Hint::DesktopEntry(crate::APP_ID.into()))
         .urgency(if urgency_critical { Urgency::Critical } else { Urgency::Normal });
@@ -133,6 +133,26 @@ fn build(summary: &str, body: &str, urgency_critical: bool, actions: &[(&str, &s
         n.action(id, label);
     }
     n
+}
+
+/// A body as plain text: servers render the body's markup (`body-markup`: mako, dunst, GNOME
+/// read Pango / HTML-ish tags), and bodies carry provider text (programme, episode, channel and
+/// playlist names) that may hold `&`, `<` or a tag of its own. The summary is plain text by the
+/// specification; servers escape it themselves.
+fn escape_markup(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['&', '<', '>']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 async fn show(n: &Notification, bus: Option<&str>) -> Result<notify_rust::NotificationHandle> {
@@ -1508,6 +1528,17 @@ mod tests {
             }
         });
         (conn, calls)
+    }
+
+    /// Bodies reach the server as plain text whatever provider text they carry: a stray `&`
+    /// or a tag in a name never turns into markup (or a body the server can't parse). The
+    /// summary is plain text by the spec and goes as it is.
+    #[test]
+    fn bodies_are_sent_without_markup() {
+        let n = build("Tom & Jerry: new episode", "S1E2 · <b>Cats</b> & Dogs · on TV <i>HD</i>", false, &[]);
+        assert_eq!(n.summary, "Tom & Jerry: new episode");
+        assert_eq!(n.body, "S1E2 · &lt;b&gt;Cats&lt;/b&gt; &amp; Dogs · on TV &lt;i&gt;HD&lt;/i&gt;");
+        assert_eq!(build("News", "Starts in 2 min on BBC One", false, &[]).body, "Starts in 2 min on BBC One");
     }
 
     #[test]
