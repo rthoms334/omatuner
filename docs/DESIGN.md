@@ -325,7 +325,7 @@ the running job never saw). Follow-ups go through
 `JobContext::submit` (refresh → provider EPG → RebuildLibrary; restore → refresh each source;
 AddSource → RefreshSource). `JobContext::player_busy` (set by the app from each snapshot) makes
 the scheduler skip ticks while a stream is Loading/Zapping. Semaphores: playlists 2, EPG 1,
-details 4, other 2. Heavy CPU **and every SQLite read** run in `spawn_blocking` with their own
+details 4, features 1 (Following, guide check), new episodes 1, other 2. Heavy CPU **and every SQLite read** run in `spawn_blocking` with their own
 reader (never on the 3 async workers). Progress (`JobPhase`: Queued, Connecting,
 Downloading{done,total}, Parsing{items}, Writing{done,total}, Matching, Indexing, Finishing) is
 throttled to 10 Hz per job. Cancellation via `CancellationToken` checked every 64 KiB / 1 000
@@ -7302,7 +7302,8 @@ cleared by a moved `last_modified`, then those older than seven days, oldest fir
 tracked copy of a playlist marked `newep:lm_unreliable:<id>` (a provider that never moved
 `last_modified` yet had an arrival), at most 40 per playlist per check, one at a time, paused
 while the player is Loading or Zapping. These are API calls: no stream opens and no connection
-lease is taken. A failed fetch waits for the next refresh. Watchlist and progress changes re-track
+lease is taken. The check has a job lane of its own, so its fetches never delay Following's
+evaluation or the guide check, and its notifications go out after the job ends. A failed fetch waits for the next refresh. Watchlist and progress changes re-track
 60 seconds later without the network, so a title is baselined before the refresh that brings its
 next episode. Backups carry the arrivals and mutes, never the ledger: a restore re-baselines.
 INFO logs hold counts and playlist ids only.

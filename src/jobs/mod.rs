@@ -6,7 +6,8 @@
 //!   further along, a `rerun` flag is set and the job is submitted again when it finishes —
 //!   a newer request is never dropped.
 //! * Concurrency limits (semaphores): playlist refreshes 2, EPG refreshes 1 (DB-write heavy),
-//!   detail loads 4, everything else 2.
+//!   detail loads 4, Following's evaluation and the guide check 1 ("features"), the new-episode
+//!   check 1 (its own lane), everything else 2.
 //! * Every job gets a `CancellationToken`; downloads/parsers check it at least every 64 KiB /
 //!   1 000 items. Cancelled imports never sweep (see `store::import`).
 //! * Progress: `JobEvent::Updated` at most every 100 ms per job (throttled) through the
@@ -694,9 +695,12 @@ struct Limits {
     epg: Arc<Semaphore>,
     details: Arc<Semaphore>,
     other: Arc<Semaphore>,
-    /// Following's evaluation, the guide check and the new-episode check: one at a time (B7),
-    /// after the import that submitted them.
+    /// Following's evaluation and the guide check: one at a time (B7), after the import that
+    /// submitted them.
     features: Arc<Semaphore>,
+    /// The new-episode check, one at a time in a lane of its own: its serial fetches and its
+    /// pauses while the player is busy take minutes, which must not hold up Following.
+    new_episodes: Arc<Semaphore>,
 }
 
 impl Limits {
@@ -707,6 +711,7 @@ impl Limits {
             details: Arc::new(Semaphore::new(4)),
             other: Arc::new(Semaphore::new(2)),
             features: Arc::new(Semaphore::new(1)),
+            new_episodes: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -715,7 +720,8 @@ impl Limits {
             JobKind::RefreshSource { .. } | JobKind::AddSource(_) | JobKind::ProbeSource(_) => self.playlists.clone(),
             JobKind::RefreshEpg { .. } | JobKind::RematchEpg => self.epg.clone(),
             JobKind::LoadMovieDetails(_) | JobKind::LoadSeriesDetails(_) => self.details.clone(),
-            JobKind::EvaluateFollows { .. } | JobKind::GuideCheck | JobKind::CheckNewEpisodes { .. } => self.features.clone(),
+            JobKind::EvaluateFollows { .. } | JobKind::GuideCheck => self.features.clone(),
+            JobKind::CheckNewEpisodes { .. } => self.new_episodes.clone(),
             _ => self.other.clone(),
         }
     }
@@ -1082,6 +1088,17 @@ mod tests {
         };
         assert_eq!(check(Launch, &[], &[]).merged_with(&check(Refresh, &[2], &[2])), check(Refresh, &[2], &[2]));
         assert_eq!(check(Refresh, &[2], &[2]).merged_with(&check(Refresh, &[1, 2], &[])), check(Refresh, &[1, 2], &[2]));
+    }
+
+    /// The new-episode check's minutes of fetches never hold Following's lane.
+    #[test]
+    fn the_new_episode_check_has_a_lane_of_its_own() {
+        let limits = Limits::new();
+        let check = JobKind::CheckNewEpisodes { reason: crate::new_episodes::CheckReason::Refresh, sources: Vec::new(), silent: Vec::new() };
+        let follows = JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Guide };
+        assert!(!Arc::ptr_eq(&limits.for_kind(&check), &limits.for_kind(&follows)));
+        assert!(Arc::ptr_eq(&limits.for_kind(&JobKind::GuideCheck), &limits.for_kind(&follows)));
+        assert_eq!(limits.for_kind(&check).available_permits(), 1, "one check at a time");
     }
 
     fn status(id: u64) -> JobStatus {

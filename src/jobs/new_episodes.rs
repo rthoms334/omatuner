@@ -1,6 +1,8 @@
 //! `JobKind::CheckNewEpisodes`: the tracked set, fetch the tracked Xtream copies that changed,
-//! diff against the ledger, announce (DESIGN §44 §5). OWNER: N-core. Runs in the "features"
-//! lane, one at a time with Following's evaluation and the guide check.
+//! diff against the ledger, announce (DESIGN §44 §5). OWNER: N-core. Runs in a job lane of its
+//! own, one at a time: its serial fetches and its pauses while the player is busy never hold up
+//! Following's evaluation or the guide check (the "features" lane). Its notifications go out
+//! after the job, off the lane.
 //!
 //! * **Triggers.** A playlist import calls [`request`] (Xtream once its series finished; M3U
 //!   unless the playlist was unchanged); the app's first library asks once ([`CheckReason::
@@ -385,7 +387,9 @@ pub async fn run(
         tracing::info!(target: "tuner::jobs", "newep: source {} doesn't update series dates; its tracked series are fetched at every refresh", s.0);
     }
     if cfg.new_episodes.notify && !report.announce.is_empty() {
-        announce(ctx, report.announce).await;
+        // off the job: the notification server's round trips don't keep the lane busy
+        let ctx = ctx.clone();
+        tokio::spawn(async move { announce(&ctx, report.announce).await });
     }
     Ok(())
 }
