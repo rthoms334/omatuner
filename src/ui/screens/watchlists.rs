@@ -454,7 +454,8 @@ impl WatchlistsScreen {
                 .map(|e| format!("next {}", shared::label(ctx, e)))
                 .unwrap_or_else(|| if v.finished() { "✓ Done" } else { "No playable entries" }.into());
             let title = if v.finished() { format!("✓ {} (done)", v.list.name) } else { v.list.name.clone() };
-            let label = format!("{title} · {}\n{next}", v.progress_label());
+            let head = format!("{title} · {}", v.progress_label());
+            let selected = self.selected == Some(v.list.id);
             let row = ui.horizontal(|ui| {
                 let (grip, drag) = ui.allocate_exact_size(
                     egui::vec2(24.0 * ctx.theme.rem(), 38.0 * ctx.theme.rem()),
@@ -476,7 +477,35 @@ impl WatchlistsScreen {
                         self.lists_focus = true;
                     }
                 }
-                ui.selectable_label(self.selected == Some(v.list.id), label)
+                // One elided line each for the name and the next entry, so a long name stays
+                // inside the lists pane.
+                let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), grip.height()), egui::Sense::click());
+                r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, format!("{head}\n{next}")));
+                let visuals = ui.visuals();
+                if selected {
+                    ui.painter().rect_filled(rect, ctx.theme.tokens.rounding, visuals.selection.bg_fill);
+                } else if r.hovered() {
+                    ui.painter().rect_filled(rect, ctx.theme.tokens.rounding, visuals.widgets.hovered.weak_bg_fill);
+                }
+                let (fg, dim) = if selected {
+                    (visuals.selection.stroke.color, visuals.selection.stroke.color)
+                } else {
+                    (visuals.text_color(), ctx.theme.tokens.text_secondary)
+                };
+                let x = rect.left() + ui.spacing().button_padding.x;
+                let max_w = rect.right() - x - ui.spacing().button_padding.x;
+                for (text, y, token, color) in [(&head, 0.3, TypeToken::Body, fg), (&next, 0.72, TypeToken::BodySmall, dim)] {
+                    crate::ui::video_host::osd_text(
+                        ui.painter(),
+                        egui::pos2(x, rect.top() + rect.height() * y),
+                        egui::Align2::LEFT_CENTER,
+                        text,
+                        egui::FontId::proportional(ctx.theme.font(token)),
+                        color,
+                        max_w,
+                    );
+                }
+                r
             });
             let r = row.inner;
             if crate::ui::widgets::fresh_click(&r) {
@@ -1003,6 +1032,32 @@ mod tests {
         let mut home = harness(t, one, super::super::home::HomeScreen::default(), egui::vec2(1400.0, 1200.0));
         home.state_mut().enter(Route::Home);
         until(&mut home, "Home progress", |h| labels.iter().all(|label| testkit::painted(h).iter().any(|s| s.contains(label))));
+    }
+
+    #[test]
+    fn a_long_list_name_is_elided_inside_the_lists_pane() {
+        let (mut t, one) = rig();
+        let short = seed(&mut t, |c| {
+            store::create(c, &"Taylor Sheridan collection ".repeat(6), None, PlayOrder::Ordered, "app", 1)?;
+            store::create(c, "Saga", None, PlayOrder::Ordered, "app", 1)
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1400.0, 800.0));
+        h.state_mut().enter(Route::Watchlists { list: Some(short) });
+        until(&mut h, "lists", |h| h.state().s.snapshot.lists.len() == 3);
+        h.run_steps(2);
+        let texts: Vec<(egui::Rect, String)> = h
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some((t.galley.rect.translate(t.pos.to_vec2()), t.galley.job.text.clone())),
+                _ => None,
+            })
+            .collect();
+        // The selected list's heading starts the entries pane.
+        let pane = texts.iter().find(|(_, s)| s == "Saga").expect("heading").0.left();
+        let long = texts.iter().find(|(_, s)| s.starts_with("Taylor")).expect("long name").0;
+        assert!(long.right() < pane, "{long:?} runs into the entries pane at {pane}");
     }
 
     #[test]
