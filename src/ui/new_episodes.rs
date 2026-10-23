@@ -151,16 +151,10 @@ pub fn since_line(news: &SeriesNews) -> String {
     format!("{n} new episode{} since {}", if n == 1 { "" } else { "s" }, crate::ui::widgets::time::local(since, "%a", ""))
 }
 
-/// "Stop alerts for this series" is on for `item`'s copy. One indexed read on the UI thread,
-/// made when a menu opens.
+/// "Stop alerts for this series" is on for the title holding `item` (any of its copies muted,
+/// as the tracked set reads it). A few indexed reads on the UI thread, made when a menu opens.
 pub fn is_muted(ctx: &UiCtx<'_>, item: &ItemRef) -> bool {
-    ctx.db
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM newep_mute WHERE source_id = ?1 AND series_key = ?2)",
-            rusqlite::params![item.source, item.key.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap_or(false)
+    store::is_muted(ctx.db, ctx.lib, item).unwrap_or(false)
 }
 
 /// The library index of series copy `item`.

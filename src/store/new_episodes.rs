@@ -1153,6 +1153,12 @@ pub fn mute(conn: &Connection, lib: &Library, item: &ItemRef, on: bool, now: Tim
     })
 }
 
+/// Alerts are stopped for the title holding `item` (Q1): any of its copies muted, as
+/// [`tracked`] reads it — a copy that joined the title after the mute has no row of its own.
+pub fn is_muted(conn: &Connection, lib: &Library, item: &ItemRef) -> Result<bool> {
+    muted(conn, &title_refs(conn, lib, item)?)
+}
+
 /// The first-run card is due: the first baseline happened and the card wasn't acknowledged.
 pub fn card_due(conn: &Connection) -> Result<bool> {
     Ok(crate::store::follow::meta_get(conn, META_BASELINED)?.is_some() && crate::store::follow::meta_get(conn, META_CARD)?.is_none())
@@ -1807,6 +1813,17 @@ mod tests {
             assert_eq!(run(c, &lib, NOW + 2 * DAY)?.arrivals, 0, "unmuting doesn't replay");
             eps(c, 1, 1, [9])?;
             assert_eq!(run(c, &lib, NOW + 3 * DAY)?.arrivals, 1);
+
+            // muted, then another playlist's copy joins the title: the series page of either copy
+            // says it's muted, as the tracked set does
+            mute(c, &lib, &s, true, NOW + 3 * DAY)?;
+            let other = series(c, 2, 2, "landman2", "Landman", 2024)?;
+            eps(c, 2, 1, 1..=9)?;
+            let lib = super::tests::lib(c)?;
+            assert!(is_muted(c, &lib, &s)? && is_muted(c, &lib, &other)?);
+            assert!(tracked(c, &lib, &opts(NOW + 3 * DAY))?[0].muted);
+            mute(c, &lib, &other, false, NOW + 3 * DAY)?;
+            assert!(!is_muted(c, &lib, &s)?, "allowing alerts from either copy allows them for the title");
             Ok(())
         })
     }
