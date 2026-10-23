@@ -1,6 +1,6 @@
 [package]
 name = "tuner"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2024"
 rust-version = "1.95"
 description = "Tuner: a keyboard-first IPTV player for Omarchy (Hyprland)"
