@@ -834,6 +834,145 @@ pub fn last_new(conn: &Connection, tracked: &[Tracked]) -> Result<Vec<Option<Tim
         .collect()
 }
 
+// ------------------------------------------------------------------ the job's reads
+
+/// A tracked Xtream copy the check may fetch (`jobs::details::load_series_checked`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchCandidate {
+    pub series: SeriesId,
+    pub source: SourceId,
+    /// When its episodes were fetched; `None`: never, or `last_modified` moved since
+    /// (`store::import::upsert_series` clears it).
+    pub details_at: Option<Timestamp>,
+    /// Its playlist doesn't move `last_modified` ([`unreliable_key`]): fetched at every refresh.
+    pub unreliable: bool,
+}
+
+/// The tracked copies on Xtream playlists (playlist series arrive with their episodes).
+pub fn fetch_candidates(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<FetchCandidate>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.details_at, s.source_id FROM series s JOIN source src ON src.id = s.source_id WHERE s.id = ?1 AND src.kind = 'xtream'",
+    )?;
+    let mut unreliable: HashMap<SourceId, bool> = HashMap::new();
+    let mut out = Vec::new();
+    for t in tracked(conn, lib, opts)? {
+        for &id in &t.series {
+            let Some((details_at, source)) = stmt.query_row([id], |r| Ok((r.get(0)?, r.get::<_, SourceId>(1)?))).optional()? else { continue };
+            let unreliable = match unreliable.get(&source) {
+                Some(u) => *u,
+                None => {
+                    let u = crate::store::follow::meta_get(conn, &unreliable_key(source))?.is_some();
+                    unreliable.insert(source, u);
+                    u
+                }
+            };
+            out.push(FetchCandidate { series: id, source, details_at, unreliable });
+        }
+    }
+    Ok(out)
+}
+
+/// The check fetched these copies' episodes at `now` (`newep_copy.checked_at`).
+pub fn mark_checked(conn: &Connection, series: &[SeriesId], now: Timestamp) -> Result<()> {
+    let mut stmt = conn
+        .prepare_cached("UPDATE newep_copy SET checked_at = ?2 WHERE (source_id, series_key) IN (SELECT source_id, key FROM series WHERE id = ?1)")?;
+    for id in series {
+        stmt.execute(params![id, now])?;
+    }
+    Ok(())
+}
+
+/// One title's new episodes for a notification: `jobs::new_episodes` adds the spoiler guard and
+/// the words (§2.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Announcement {
+    /// The title's display name (the guard decides whether it shows).
+    pub title: String,
+    /// `series.norm_name` of its top copy (`Subject::Episode`).
+    pub series_norm: String,
+    pub copies: Vec<ItemRef>,
+    pub arrivals: Vec<ArrivalId>,
+    /// (season, episode), in order.
+    pub episodes: Vec<(u32, u32)>,
+    /// The new episodes, for Download (in the copy each arrived in, else any copy).
+    pub refs: Vec<ItemRef>,
+    /// The playlist the first of them arrived in ("on TV").
+    pub playlist: Option<SourceId>,
+    /// What Play plays (Q4): the next unwatched episode — (its series copy, the episode,
+    /// season, number).
+    pub next: Option<(ItemRef, ItemRef, u32, u32)>,
+    /// The episode's own title when exactly one is new.
+    pub episode_title: Option<String>,
+    /// Every one of them is queued in Downloads already (a Keep N rule): no Download button.
+    pub downloading: bool,
+}
+
+/// The arrivals `ids` (one check's, or several held ones) as notifications, title by title in
+/// arrival order. Quiet, cleared and since-watched arrivals and guarded titles are left out.
+pub fn announcements(conn: &Connection, lib: &Library, ids: &[ArrivalId]) -> Result<Vec<Announcement>> {
+    let mut res = Resolver::new(conn, lib);
+    let mut groups: Vec<(u32, Vec<Arrival>)> = Vec::new();
+    for a in arrivals(conn, ids)? {
+        if a.quiet.is_some() || a.cleared_at.is_some() {
+            continue;
+        }
+        let Some(series) = &a.series else { continue };
+        let Some(key) = res.title_key(series)? else { continue };
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(a),
+            None => groups.push((key, vec![a])),
+        }
+    }
+    let mut queued = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM download WHERE kind = 'episode' AND source_id = ?1 AND item_key = ?2
+                         AND state IN ('scheduled', 'waiting', 'running', 'finishing', 'paused', 'done'))",
+    )?;
+    let mut out = Vec::new();
+    for (key, mut rows) in groups {
+        let t = res.title(key).clone();
+        let progress = copies::episode_progress(conn, &t.ids)?;
+        rows.retain(|a| !progress.get(&(a.season, a.episode)).is_some_and(|p| p.finished || p.position_s > 0.0));
+        if rows.is_empty() {
+            continue;
+        }
+        rows.sort_by_key(|a| (a.season, a.episode));
+        let mut refs = Vec::new();
+        for a in &rows {
+            refs.extend(episode_ref(conn, &t, a)?);
+        }
+        let mut downloading = !refs.is_empty();
+        for r in &refs {
+            downloading &= queued.query_row(params![r.source, r.key.as_str()], |r| r.get::<_, bool>(0))?;
+        }
+        let next = copies::next_episode(conn, &t.ids)?.and_then(|(sid, e)| {
+            let series = t.ids.iter().position(|id| *id == sid).map(|i| t.refs[i].clone())?;
+            Some((series, ItemRef { source: e.source_id, kind: ItemKind::Episode, key: e.key.clone() }, e.season, e.episode))
+        });
+        let episode_title = match refs.as_slice() {
+            [one] if rows.len() == 1 => conn
+                .prepare_cached("SELECT title FROM episode WHERE source_id = ?1 AND key = ?2")?
+                .query_row(params![one.source, one.key.as_str()], |r| r.get::<_, String>(0))
+                .optional()?
+                .filter(|t| !t.trim().is_empty()),
+            _ => None,
+        };
+        let series_norm: String = conn.query_row("SELECT norm_name FROM series WHERE id = ?1", [t.ids[0]], |r| r.get(0))?;
+        out.push(Announcement {
+            title: t.name.clone(),
+            series_norm,
+            copies: t.refs.clone(),
+            arrivals: rows.iter().map(|a| a.id).collect(),
+            episodes: rows.iter().map(|a| (a.season, a.episode)).collect(),
+            refs,
+            playlist: rows[0].series.as_ref().map(|s| s.source),
+            next,
+            episode_title,
+            downloading,
+        });
+    }
+    Ok(out)
+}
+
 // ------------------------------------------------------------------ the screens' writes
 
 /// What a dismiss or a mute changed, put back by [`undo`] (Undo for 10 s).
@@ -1026,6 +1165,10 @@ struct BackupMute {
 /// The arrivals (Home's state) and the mutes; `None` when there are none. The ledger is never
 /// exported: a restore re-baselines silently.
 pub fn export(conn: &Connection) -> Result<Option<serde_json::Value>> {
+    // the backup taken before an older migration (`backup::before_watchlists`) predates 0018
+    if !crate::store::migrations::has_column(conn, "newep_arrival", "id")? {
+        return Ok(None);
+    }
     let arrivals: Vec<BackupArrival> = conn
         .prepare_cached(&format!("SELECT {ARRIVAL_COLS} FROM newep_arrival WHERE source_id IS NOT NULL ORDER BY id"))?
         .query_map([], arrival_row)?
@@ -1489,6 +1632,33 @@ mod tests {
             assert_eq!(snap.series[0].new.iter().map(|e| (e.episode, e.quiet)).collect::<Vec<_>>(), [(4, Some(Quiet::Following))]);
             let seen = recent(c, &lib, NOW, RECENT_DAYS)?.into_iter().find(|a| a.episode == 5).unwrap();
             assert_eq!((seen.quiet, seen.cleared_how), (Some(Quiet::Seen), Some(Cleared::Watched)));
+            Ok(())
+        })
+    }
+
+    /// §8.9 (store side): only tracked Xtream copies are fetch candidates; an arrival the
+    /// fallback found while `last_modified` stayed put marks the playlist unreliable.
+    #[test]
+    fn only_tracked_xtream_copies_are_fetched_and_a_static_last_modified_is_caught() {
+        with_db(|c| {
+            c.execute("INSERT INTO source(id,name,kind,created_at) VALUES (4,'Panel','xtream',0)", [])?;
+            let tracked_ref = series(c, 1, 4, "xt:series:1", "Landman", 2024)?;
+            series(c, 2, 4, "xt:series:2", "Other", 2020)?;
+            c.execute("UPDATE series SET details_at = NULL, last_modified = 100 WHERE id IN (1, 2)", [])?;
+            let lib = lib(c)?;
+            list(c, &lib, None, &tracked_ref, None)?;
+            let cands = fetch_candidates(c, &lib, &opts(NOW))?;
+            assert_eq!(cands, [FetchCandidate { series: SeriesId(1), source: SourceId(4), details_at: None, unreliable: false }]);
+            // the first fetch loads it: a silent baseline that remembers last_modified
+            eps(c, 1, 1, 1..=3)?;
+            c.execute("UPDATE series SET details_at = ?1 WHERE id = 1", [NOW - 8 * DAY])?;
+            run(c, &lib, NOW - 8 * DAY)?;
+            // a week later the fallback fetches it although last_modified never moved, and finds E4
+            eps(c, 1, 1, [4])?;
+            let input = CheckInput { diff: true, fallback: [SeriesId(1)].into(), ..Default::default() };
+            let r = check(c, &lib, &opts(NOW), &input)?;
+            assert_eq!((r.arrivals, r.unreliable.as_slice()), (1, [SourceId(4)].as_slice()));
+            assert!(fetch_candidates(c, &lib, &opts(NOW))?[0].unreliable);
             Ok(())
         })
     }

@@ -49,6 +49,7 @@ pub mod guide_check;
 pub mod import_epg;
 pub mod import_source;
 pub mod maintenance;
+pub mod new_episodes;
 pub mod probe;
 pub mod scheduler;
 
@@ -374,6 +375,9 @@ pub enum JobEvent {
 /// Submits a follow-up job (returns its id). Installed by [`JobManager::new`].
 pub type JobSubmitter = Arc<dyn Fn(JobKind) -> JobId + Send + Sync>;
 
+/// The kinds of the jobs queued or running now. Installed by [`JobManager::new`].
+pub type JobLister = Arc<dyn Fn() -> Vec<JobKind> + Send + Sync>;
+
 /// Shared dependencies handed to every job.
 #[derive(Clone)]
 pub struct JobContext {
@@ -397,6 +401,12 @@ pub struct JobContext {
     pub headless: bool,
     /// The guide check's debounce and whether it is running (`guide_check::request`).
     pub guide_check: Arc<guide_check::CheckState>,
+    /// What is queued or running (the new-episode check waits for refreshes and library builds
+    /// before it is submitted).
+    pub active: JobLister,
+    /// New episodes' debounces, held notifications and whether a check runs
+    /// (`new_episodes::request`).
+    pub new_episodes: Arc<new_episodes::CheckState>,
 }
 
 impl JobContext {
@@ -414,6 +424,8 @@ impl JobContext {
             shared: None,
             headless: false,
             guide_check: Arc::default(),
+            active: Arc::new(Vec::new),
+            new_episodes: Arc::default(),
         }
     }
 
@@ -714,15 +726,23 @@ impl JobManager {
     /// `ctx.submit` (a weak reference back to this manager — no reference cycle).
     pub fn new(mut ctx: JobContext, rt: tokio::runtime::Handle) -> Self {
         let inner = Arc::new_cyclic(|weak: &std::sync::Weak<ManagerInner>| {
-            let weak = weak.clone();
-            ctx.submit = Arc::new(move |kind| match weak.upgrade() {
+            let w = weak.clone();
+            ctx.submit = Arc::new(move |kind| match w.upgrade() {
                 Some(inner) => JobManager { inner }.submit(kind),
                 None => JobId(0),
+            });
+            let w = weak.clone();
+            ctx.active = Arc::new(move || match w.upgrade() {
+                Some(inner) => lock(&inner.jobs).by_id.values().map(|e| e.kind.clone()).collect(),
+                None => Vec::new(),
             });
             ManagerInner { ctx, rt, jobs: Mutex::default(), next_id: AtomicU64::new(1), limits: Limits::new(), closing: AtomicBool::new(false) }
         });
         if crate::guide_fix::ENABLED && !inner.ctx.headless && inner.ctx.shared.is_some() {
             inner.rt.spawn(guide_check::after_first_publish(Arc::downgrade(&inner)));
+        }
+        if crate::new_episodes::ENABLED && !inner.ctx.headless && inner.ctx.shared.is_some() {
+            inner.rt.spawn(new_episodes::after_first_publish(Arc::downgrade(&inner)));
         }
         Self { inner }
     }
@@ -973,8 +993,10 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
             guide_check::run(ctx, progress, cancel).await?;
             Ok(JobOutcome::Nothing)
         }
-        // N-core
-        JobKind::CheckNewEpisodes { .. } => Ok(JobOutcome::Nothing),
+        JobKind::CheckNewEpisodes { reason, sources, silent } => {
+            new_episodes::run(ctx, *reason, sources, silent, progress, cancel).await?;
+            Ok(JobOutcome::Nothing)
+        }
     }
 }
 
@@ -1051,6 +1073,15 @@ mod tests {
         let (mapping, guide) = (JobKind::EvaluateFollows { reason: Mapping }, JobKind::EvaluateFollows { reason: Guide });
         assert_eq!(mapping.merged_with(&guide), mapping);
         assert_eq!(guide.merged_with(&mapping), mapping);
+        // a wave of refreshes makes one new-episode check covering every playlist of it
+        use crate::new_episodes::CheckReason::{Launch, Refresh};
+        let check = |reason, sources: &[i64], silent: &[i64]| JobKind::CheckNewEpisodes {
+            reason,
+            sources: sources.iter().map(|s| SourceId(*s)).collect(),
+            silent: silent.iter().map(|s| SourceId(*s)).collect(),
+        };
+        assert_eq!(check(Launch, &[], &[]).merged_with(&check(Refresh, &[2], &[2])), check(Refresh, &[2], &[2]));
+        assert_eq!(check(Refresh, &[2], &[2]).merged_with(&check(Refresh, &[1, 2], &[])), check(Refresh, &[1, 2], &[2]));
     }
 
     fn status(id: u64) -> JobStatus {

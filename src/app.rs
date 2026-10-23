@@ -1181,6 +1181,8 @@ impl TunerApp {
         crate::ui::watchlists::invalidate();
         match scope {
             DataScope::Watchlists => {
+                // a series added to or removed from a list: tracked (baselined) or not any more
+                crate::jobs::new_episodes::track_from(&self.services().jobs);
                 if let Ok(f) = crate::store::library::load_favs(&self.db) {
                     self.favs = f;
                 }
@@ -1222,6 +1224,8 @@ impl TunerApp {
             // manual mark or the save at stop rebuilds; the player's 10 s saves during a film or
             // episode don't (the guard's tracker rebuilds once an episode reaches 90 %)
             DataScope::Progress => {
+                // a finished episode may make a series binged (debounced, off the UI thread)
+                crate::jobs::new_episodes::track_from(&self.services().jobs);
                 let saving = self.services().tiles.handles().iter().any(|h| {
                     let s = h.snapshot();
                     s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| !p.kind.is_live())
