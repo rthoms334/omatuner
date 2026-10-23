@@ -8,12 +8,14 @@
 //!   title that also carries a result verb is hidden;
 //! * while a topic with "sport descriptions" is active, every sport programme loses its
 //!   sub-title and description;
-//! * a guarded series hides episodes after the next-up one (EPG airings with S/E likewise; an
-//!   airing without S/E is placed by [`airing_beyond`] — its sub-title naming an episode, a
-//!   seen repeat, its date against the catalogue's air dates, the guide's "new" flag — and
-//!   loses its sub-title and description when it's later or when nothing places it);
-//! * before the first build the guard fails closed: every episode is hidden, sport text hidden,
-//!   scores rewritten.
+//! * a guarded series hides the plot and still of episodes after the next-up one (their titles
+//!   always show); its guide airings with S/E after next-up lose their sub-title (the episode
+//!   title on TV), description and image; an airing without S/E is placed by
+//!   [`airing_beyond`] — its sub-title naming an episode, a seen repeat, its date against the
+//!   catalogue's air dates, the guide's "new" flag — and loses its sub-title and description
+//!   when it's later or when nothing places it;
+//! * before the first build the guard fails closed: every episode's plot and still hidden,
+//!   sport text hidden, scores rewritten.
 
 use crate::guard::{Reason, ReasonKind, Subject, Verdict};
 use crate::model::Timestamp;
@@ -57,7 +59,7 @@ pub fn judge(snap: &GuardSnapshot, subj: &Subject<'_>, now: Timestamp) -> Verdic
             if let Some(m) = snap.series.get(series_norm)
                 && (season, episode) > m.next_up
             {
-                v.hide_sub = true;
+                // its title always shows (`guard::Field::EpisodeTitle`)
                 v.hide_descr = true;
                 v.obscure_image = true;
                 v.reason = Some(series_reason(m));
@@ -198,7 +200,7 @@ fn series_reason(m: &SeriesMark) -> Reason {
 fn fail_closed(subj: &Subject<'_>) -> Verdict {
     let reason = Some(Reason { rule: "Spoiler guard".into(), kind: ReasonKind::Embargo, until: None });
     match *subj {
-        Subject::Episode { .. } => Verdict { hide_sub: true, hide_descr: true, obscure_image: true, reason, ..Default::default() },
+        Subject::Episode { .. } => Verdict { hide_descr: true, obscure_image: true, reason, ..Default::default() },
         Subject::Programme { categories, .. } if crate::spoiler::is_sport(categories) => {
             Verdict { hide_sub: true, hide_descr: true, neutralise_title: true, reason, ..Default::default() }
         }

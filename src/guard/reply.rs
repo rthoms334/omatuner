@@ -7,8 +7,8 @@
 //!   ("Arsenal v Chelsea") or, when they must not show, replaced by "‹rule› · title hidden";
 //! * `subtitle` / `sub_title`, `description` and `plot` are removed when guarded;
 //! * an object with `season` and `episode` numbers under a series (an object of `kind` series, or
-//!   one carrying a `series` name) is an episode: after the next-up one its `title` and `plot`
-//!   go;
+//!   one carrying a `series` name) is an episode: after the next-up one its `plot` goes (its
+//!   `title` always stays, as on screen);
 //! * every object that lost or changed something gains
 //!   `spoiler: {hidden: [fields], rule, reason, until}`;
 //! * `reveal(ref)` true for an object's `ref` → that object and everything in it unguarded

@@ -101,7 +101,7 @@ pub(super) fn kind_enum() -> Value {
 
 /// `spoiler_safe`: strip sub-titles, descriptions and plots for everything in the answer.
 pub(super) fn spoiler_safe() -> Value {
-    json!({ "type": "boolean", "default": false, "description": "Strip episode titles, descriptions and plots, neutralise scores (sport, part-watched series, \"no spoilers\")." })
+    json!({ "type": "boolean", "default": false, "description": "Strip guide sub-titles, descriptions and plots, neutralise scores (sport, part-watched series, \"no spoilers\")." })
 }
 
 /// `reveal_spoilers`: refs whose guarded text comes back (only when the user asked in that turn).

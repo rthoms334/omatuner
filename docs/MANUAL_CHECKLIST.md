@@ -1413,8 +1413,8 @@ with Claude Code, and *Second agent* with another one.
   disappears from the list and counts; *Clear Up next* doesn't delete it (unlock: it's still
   there).
 - [ ] **Next episode, empty queue:** watch an episode to the end with Up next empty. **Expect:**
-  "Next episode in 10 s" with its label through the spoiler guard (a later episode's title
-  hidden for a part-way series); it plays. Lock the series and repeat with the session locked:
+  "Next episode in 10 s" with its label through the spoiler guard (the episode's title shows,
+  also for a part-way series); it plays. Lock the series and repeat with the session locked:
   "Next episode is locked", nothing plays.
 - [ ] **Restart:** quit during an item, start Tuner. **Expect:** nothing plays; Home shows
   "Resume Up next".
@@ -1478,16 +1478,21 @@ with Claude Code, and *Second agent* with another one.
 ## 25. Spoiler guard
 
 - [ ] **Part-way series:** with a series half watched, open its page and the guide. **Expect:**
-  later episodes' titles are bars, plots say "hidden — … · Ctrl+B to show"; the next-up episode
-  and earlier ones show. `Ctrl+B` on one reveals it until you move.
+  every episode's title shows (no bars, no 󰈉 in the rows); later episodes' plots say "hidden
+  — … · Ctrl+B to show"; the next-up episode and earlier ones show. `Ctrl+B` on one reveals it
+  until you move.
+- [ ] **Watchlist and Up next rows:** add a later episode of that series to a watchlist and to
+  Up next. **Expect:** its row reads "Series · S2E7 · Title" with no bar or eye; clicking the
+  row does the row's action (open / play) only.
 - [ ] **Guide airings of that series:** find its airings in the guide (some guides give no
   season/episode). **Expect:** an airing whose sub-title is an episode you've seen (or the
   next-up one) shows it; later episodes and first showings ("new") are bars; the status bar
   says "Ctrl+B show spoilers" on a hidden one. Watch one to the end (or Ctrl+W it): its repeats
   show their sub-title afterwards.
-- [ ] **In the player:** play the channel airing a hidden episode. **Expect:** the banner reads
-  "Show · ▆▆▆▆▆▆▆▆ 󰈉" with "Ctrl+B show spoilers"; Ctrl+B shows the episode title ("Ctrl+B
-  hide spoilers"); a zap hides it again.
+- [ ] **In the player:** play the channel airing a hidden episode (live TV). **Expect:** the
+  banner reads "Show · ▆▆▆▆▆▆▆▆ 󰈉" with "Ctrl+B show spoilers"; Ctrl+B shows the episode title
+  ("Ctrl+B hide spoilers"); a zap hides it again. Play a later on-demand episode of the series:
+  its title shows in the player, the Omarchy bar (MPRIS) and Up next.
 - [ ] **Series guarded before you start it:** guard a series you haven't watched (item menu ▸
   Spoiler guard), then find a repeat of a late episode whose guide entry has no season/episode.
   **Expect:** its sub-title is a bar; an old airing from before the series' guarded episodes
@@ -2097,7 +2102,7 @@ helper's outcome.
 - [ ] Forget a downloaded movie or episode, including another copy: Confirm offers file deletion and Undo restores it. Ctrl+D recognises the saved copy.
 - [ ] Kill an HLS recording before its stop, restart, and verify it continues in the kept folder. Stop or Delete then Undo a raw TS recording: it stays Partial with its original bytes.
 - [ ] Move a large downloads folder across filesystems while a recording becomes due: it starts on time, the move waits for active recordings, and all saved files play after the switch.
-- [ ] Agent download list and busy play replies show plain titles but omit future episode titles protected by a series spoiler rule.
+- [ ] Agent download list and busy play replies show plain titles, including later episodes' titles of a series under a spoiler rule.
 
 ## 33. New episodes (DESIGN §44)
 
@@ -2136,7 +2141,7 @@ helper's outcome.
   notification. Two playlists with the same series alert once.
 - [ ] **Locks and spoilers:** lock a tracked series, then one with an explicit copy, and use a
   series spoiler rule. **Expect:** those series never appear in the row, the notification, the
-  counts or MCP; guarded episode titles show numbers only.
+  counts or MCP; episode titles show (the spoiler guard keeps back plots only).
 - [ ] **Agent:** ask "anything new on my shows?", "why do I get alerts for X?" and "play the
   new Landman". **Expect:** `new_episodes list` names the shows with `next_episode`, reading
   clears nothing, `tracked` explains the reason, and the agent plays `next_episode`. Ask it to

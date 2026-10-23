@@ -35,7 +35,7 @@ a New episodes row on Home); this is the same list. Name each show with its new 
 S2E9 and S2E10") and `next_episode`, the one to play: it can be an earlier unwatched episode, so
 say "S1E6 is next" rather than naming the newest. Offer `play` with `next_episode.ref`, or
 `downloads add` with the `new[].ref`s (RULES.md §14). The list is spoiler-guarded like
-`episodes`: an episode title may be hidden, so give numbers only. "Why am I told about X?" /
+`episodes`: episode titles show, plots of later episodes don't. "Why am I told about X?" /
 "which shows do you watch for?": `new_episodes tracked` (`why` says the list or "binged"; `muted`
 shows are silenced). Reading never clears anything, and "what's new" is not "seen": call `seen`
 only when the user asks to clear them ("clear my new episodes"), `mute` only when they ask to stop
@@ -46,7 +46,8 @@ in Tuner (Settings ▸ New episodes).
 
 Use the library's plots up to the last finished episode (`episodes` with `spoiler_safe: false`
 only for those episodes) plus your own knowledge, labelled. Never go past that boundary. If you
-don't know the show, say so. The spoiler guard hides later episodes; that is expected.
+don't know the show, say so. The spoiler guard hides later episodes' plots (their titles
+show); that is expected.
 
 ## Find an episode ("the Friends one with the football")
 

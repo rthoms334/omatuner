@@ -815,8 +815,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// The next-episode card of a series watched part-way: a later episode's title is guarded
-    /// (the number shows), the next-up one shows as is.
+    /// The next-episode card goes through the spoiler guard, which shows an on-demand episode's
+    /// title even after the next-up one of a series watched part-way (only plots are guarded).
     #[test]
     fn the_next_episode_card_is_spoiler_guarded() {
         use crate::spoiler::snapshot::{GuardSnapshot, SeriesMark, Settings};
@@ -835,8 +835,7 @@ pub(crate) mod tests {
             episode,
         };
         let raw = QueueSnapshot { next_episode: Some(next(6, "Who Dies")), ..Default::default() };
-        let label = guard_snapshot(&sp, &raw).next_episode.unwrap().label;
-        assert!(label.starts_with("S02E06 · ") && !label.contains("Who Dies"), "{label}");
+        assert_eq!(guard_snapshot(&sp, &raw).next_episode.unwrap().label, "S02E06 · Who Dies");
         let raw = QueueSnapshot { next_episode: Some(next(4, "Fine")), ..Default::default() };
         assert_eq!(guard_snapshot(&sp, &raw).next_episode.unwrap().label, "S02E04 · Fine");
     }

@@ -1157,8 +1157,6 @@ impl Screen for SeriesDetailScreen {
             ui.add_space(theme.space(SpaceToken::Md));
             let season = data.seasons.get(season_idx).copied().unwrap_or(0);
             for (i, e) in data.season_episodes(season).into_iter().enumerate() {
-                // the spoiler guard's view of the episode (title and plot after next-up)
-                let e = &*spoilers.episode(&series_norm, e);
                 let p = shown.get(&e.id);
                 let watched = p.is_some_and(|p| p.finished);
                 let cursor = section == Section::Episodes && i == ep_idx;

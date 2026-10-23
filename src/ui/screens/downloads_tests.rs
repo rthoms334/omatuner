@@ -184,15 +184,17 @@ fn locked_download_still_requests_pin_when_played() {
     assert!(ui.nav.iter().any(|n| matches!(n, NavRequest::Open(OverlayRequest::Pin { .. }))));
 }
 
+/// The spoiler guard keeps back plots, not episode titles: the series page names its episodes
+/// even while the guard hides everything it can (before its first build).
 #[test]
-fn episode_titles_remain_guarded_in_the_series_page() {
+fn episode_titles_show_in_the_series_page_under_the_guard() {
     let (mut ui, _) = fixture();
     ui.services().agent.set_guard(crate::guard::Guard::live());
     let mut screen = DownloadsScreen::default();
     ui.with_ctx(|ctx| {
         screen.on_action(ctx, Action::Activate);
         let rows = screen.rows(ctx, &shared::snapshot(ctx));
-        assert!(rows.iter().all(|r| !r.job().unwrap().subtitle.as_ref().unwrap().contains("A spoiler")));
+        assert!(rows.iter().all(|r| r.job().unwrap().subtitle.as_ref().unwrap().ends_with(" · A spoiler")));
         assert!(rows[0].job().unwrap().subtitle.as_ref().unwrap().starts_with("S01E02 · "));
     });
 }

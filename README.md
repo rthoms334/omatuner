@@ -223,9 +223,10 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   whole programme or the first few minutes, then puts back what you were watching. Never in
   quiet hours, while another app is fullscreen, over a film, or when you're already watching it.
 - **Spoiler guard:** on by default, but narrow: series you're part-way through and sport you
-  follow. Scores in guide titles are rewritten ("Arsenal v Chelsea 󰈉"), later episodes' titles
-  and plots are hidden, and zapping onto a channel showing the match you're saving stops at a
-  card first (in multi-view, over that picture only). `Ctrl+B` shows an item — in the player,
+  follow. Scores in guide titles are rewritten ("Arsenal v Chelsea 󰈉"), later episodes' plots
+  are hidden (their titles always show), and zapping onto a channel
+  showing the match you're saving stops at a card first (in multi-view, over that picture
+  only). `Ctrl+B` shows an item — in the player,
   the banner's programme — and the hint line says so when something is hidden; `Ctrl+Shift+B`
   pauses the guard or adds a topic ("I'll watch it later"), and watching the match lifts it.
   Guide airings without episode numbers are placed by their episode title, a repeat you've seen,
