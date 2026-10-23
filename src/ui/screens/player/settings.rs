@@ -66,12 +66,13 @@ impl PlayerScreen {
         }
         rows.extend(optional.panel.then_some(C::UpNext));
         rows.push(C::Info);
-        if !video_only && snap.cast.is_none() {
-            rows.push(C::PopOut);
-        }
         if narrow {
             rows.extend(optional.cast.then_some(C::Cast));
             rows.push(C::Fullscreen);
+            // wide windows have it on the row, beside Fullscreen
+            if !video_only && snap.cast.is_none() {
+                rows.push(C::PopOut);
+            }
         }
         rows
     }
@@ -460,19 +461,49 @@ mod tests {
         key(h, egui::Key::Enter);
     }
 
+    /// Pop out is a row button right after Fullscreen (not in the cog), and the VOD seek bar
+    /// carries no "−n / +n s" hint.
+    #[test]
+    fn pop_out_sits_beside_fullscreen_and_the_skip_hint_is_gone() {
+        let mut h = player(WIDE);
+        let mut snap = (*shown(&h)).clone();
+        snap.playable = Some(Arc::new(crate::model::Playable { kind: PlayableKind::Movie, ..(*playable()).clone() }));
+        snap.seekable = true;
+        snap.position = Some(60.0);
+        snap.duration = Some(3600.0);
+        h.state_mut().t.snapshot = Arc::new(snap);
+        h.run_steps(3);
+        let fullscreen = h.get_by_label("Fullscreen").rect();
+        let pop_out = h.get_by_label("Pop out").rect();
+        let cog = h.get_by_label("Player settings").rect();
+        assert!(fullscreen.right() <= pop_out.left() && pop_out.right() <= cog.left(), "{fullscreen:?} {pop_out:?} {cog:?}");
+        let n = h.state().t.config.player.skip_small_s;
+        assert!(!painted(&h).iter().any(|t| t.contains(&format!("−{n} / +{n} s"))), "{:?}", painted(&h));
+        h.get_by_label("Pop out").click();
+        h.run_steps(1);
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::TogglePopOut]);
+        let app = h.state_mut();
+        app.act(Action::PlayerSettings);
+        let rows = app.t.with_ctx(|ctx| app.s.settings_rows(ctx));
+        assert!(!rows.iter().any(|r| r.choice == Choice::Control(Control::PopOut)));
+    }
+
     #[test]
     fn row_and_menu_contents_follow_playback_width_and_window() {
         use Control as C;
         let mut snap = PlayerSnapshot { playable: Some(playable()), ..Default::default() };
         let none = OptionalButtons::default();
-        assert_eq!(PlayerScreen::controls(&snap, false, false, none), vec![C::Prev, C::Next, C::AudioSubtitles, C::Fullscreen, C::Settings]);
+        assert_eq!(
+            PlayerScreen::controls(&snap, false, false, none),
+            vec![C::Prev, C::Next, C::AudioSubtitles, C::Fullscreen, C::PopOut, C::Settings]
+        );
         assert_eq!(
             PlayerScreen::controls(&snap, false, true, none),
             vec![C::PlayPause, C::Prev, C::Next, C::AudioSubtitles, C::Fullscreen, C::Settings]
         );
         assert_eq!(
             PlayerScreen::settings_controls(&snap, false, false, none),
-            vec![C::AudioSubtitles, C::Delay, C::Channels, C::Guide, C::History, C::Info, C::PopOut]
+            vec![C::AudioSubtitles, C::Delay, C::Channels, C::Guide, C::History, C::Info]
         );
         snap.seekable = true;
         snap.live_buffer = Some(crate::player::LiveBufferRange { start: 0.0, end: 100.0 });
@@ -480,10 +511,21 @@ mod tests {
         let optional = OptionalButtons { panel: true, next: true, cast: true };
         for popped in [false, true] {
             let transport = if popped { vec![C::SkipBack, C::PlayPause, C::SkipForward] } else { vec![] };
+            // Pop out sits right after Fullscreen, and not in the popped-out window itself
+            let pop_out = if popped { vec![] } else { vec![C::PopOut] };
             assert_eq!(
                 PlayerScreen::controls(&snap, false, popped, optional),
-                [transport.clone(), vec![C::BackToLive, C::Prev, C::Next, C::QueueNext, C::AudioSubtitles, C::Cast, C::Fullscreen, C::Settings]]
-                    .concat()
+                [
+                    transport.clone(),
+                    vec![C::BackToLive, C::Prev, C::Next, C::QueueNext, C::AudioSubtitles, C::Cast, C::Fullscreen],
+                    pop_out,
+                    vec![C::Settings]
+                ]
+                .concat()
+            );
+            assert!(
+                !PlayerScreen::settings_controls(&snap, false, popped, optional).contains(&C::PopOut),
+                "wide: Pop out is on the row, not in the cog"
             );
             assert_eq!(
                 PlayerScreen::controls(&snap, true, popped, optional),
@@ -494,13 +536,16 @@ mod tests {
             assert_eq!(menu.contains(&C::PopOut), !popped);
         }
         snap.playable = Some(Arc::new(crate::model::Playable { kind: PlayableKind::Movie, ..(*playable()).clone() }));
-        assert_eq!(PlayerScreen::controls(&snap, false, false, optional), vec![C::QueueNext, C::AudioSubtitles, C::Cast, C::Fullscreen, C::Settings]);
+        assert_eq!(
+            PlayerScreen::controls(&snap, false, false, optional),
+            vec![C::QueueNext, C::AudioSubtitles, C::Cast, C::Fullscreen, C::PopOut, C::Settings]
+        );
         assert_eq!(PlayerScreen::controls(&snap, true, false, optional), vec![C::QueueNext, C::AudioSubtitles, C::Settings]);
         assert_eq!(
             PlayerScreen::controls(&snap, true, true, optional),
             vec![C::SkipBack, C::PlayPause, C::SkipForward, C::QueueNext, C::AudioSubtitles, C::Settings]
         );
-        assert_eq!(PlayerScreen::settings_controls(&snap, false, false, optional), vec![C::AudioSubtitles, C::Delay, C::UpNext, C::Info, C::PopOut]);
+        assert_eq!(PlayerScreen::settings_controls(&snap, false, false, optional), vec![C::AudioSubtitles, C::Delay, C::UpNext, C::Info]);
         snap.cast = Some(crate::model::CastView {
             device: crate::model::DeviceId::from_bytes([1; 16]),
             name: "TV".into(),
@@ -722,7 +767,7 @@ mod tests {
                     assert!(h.get_by_label(label).rect().bottom() < rects[0].top());
                 }
             }
-            assert!(!has_label(&h, "Volume") && !has_label(&h, "Fullscreen") && !has_label(&h, "Cast to a TV"));
+            assert!(!has_label(&h, "Volume") && !has_label(&h, "Fullscreen") && !has_label(&h, "Cast to a TV") && !has_label(&h, "Pop out"));
             h.state_mut().t.multiview.view.on = true;
             let optional = h.state_mut().t.with_ctx(|ctx| OptionalButtons::of(ctx));
             assert!(!optional.next && !optional.cast);

@@ -1421,9 +1421,10 @@ with Claude Code, and *Second agent* with another one.
 - [ ] **OSD essentials and cog:** play live TV, a seekable film and a live rewind, then add
   two items to Up next. **Expect:** transport · Back to live when behind · live channel zapping
   · volume on the left; Next only with a next item · one Audio & subtitles glyph · Cast when
-  enabled · Fullscreen · cog on the right. No track names, Channels, Guide, History, Info,
-  Up next panel or Pop out on the row. Next plays the next item. Repeat below 700 pt: speaker
-  only; Cast and Fullscreen in the cog. Repeat popped out and in multi-view (no Cast / Next).
+  enabled (glyph only, no label, even while casting) · Fullscreen · Pop out beside it · cog on the
+  right. No track names, Channels, Guide, History, Info or Up next panel on the row; no
+  "−10 / +10 s" hint under a film's seek bar. Next plays the next item. Repeat below 700 pt: speaker
+  only; Cast, Fullscreen and Pop out in the cog. Repeat popped out and in multi-view (no Cast / Next).
 - [ ] **Cog mouse and keyboard:** click the cog, or press `O`. **Expect:** a pop-up above the
   cog, never a side panel; applicable rows show their existing keys (`H` history, `I` info,
   lowercase `o` still pops out). Open Audio & subtitles and Delay, use their back buttons,
@@ -1432,7 +1433,7 @@ with Claude Code, and *Second agent* with another one.
   Arrow through OSD focus to the cog; Enter and Space open it. ↑/↓ move, Enter/→ choose,
   ←/Backspace go back. Esc closes the sub-page, then pop-up, then countdown if present,
   then OSD focus. Wait past the banner timeout: the open pop-up keeps it visible. Clicking
-  outside closes it without activating the covered row. Cast, Fullscreen, Pop out, Channels,
+  outside closes it without activating the covered row. Channels,
   Guide, History, Info and Up next keep their former actions. Test light and dark themes.
 
 - [ ] **Resume prompt:** watch 5 minutes of a queued film, stop, `Alt+6`, Enter on it.
