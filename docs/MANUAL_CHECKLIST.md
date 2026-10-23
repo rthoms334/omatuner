@@ -1478,12 +1478,16 @@ with Claude Code, and *Second agent* with another one.
 ## 25. Spoiler guard
 
 - [ ] **Part-way series:** with a series half watched, open its page and the guide. **Expect:**
-  every episode's title shows (no bars, no 󰈉 in the rows); later episodes' plots say "hidden
-  — … · Ctrl+B to show"; the next-up episode and earlier ones show. `Ctrl+B` on one reveals it
-  until you move.
+  every episode's title shows (no bars, no 󰈉 in the rows); the plot under the focused episode's
+  row shows for the next-up episode and earlier ones, and for a later one is a block "Plot
+  hidden — … · Ctrl+B or click to show". Click the block: the plot shows with 󰈈 and nothing
+  plays; click 󰈈: hidden again. `Ctrl+B` on a later episode shows its plot until you move.
 - [ ] **Watchlist and Up next rows:** add a later episode of that series to a watchlist and to
   Up next. **Expect:** its row reads "Series · S2E7 · Title" with no bar or eye; clicking the
   row does the row's action (open / play) only.
+- [ ] **Movie page:** guard a topic in a film's name (item menu ▸ Spoiler guard) and open the
+  film. **Expect:** its plot is a "Plot hidden — …" block; a click shows it with 󰈈 (no play),
+  󰈈 hides it again.
 - [ ] **Guide airings of that series:** find its airings in the guide (some guides give no
   season/episode). **Expect:** an airing whose sub-title is an episode you've seen (or the
   next-up one) shows it; later episodes and first showings ("new") are bars; the status bar

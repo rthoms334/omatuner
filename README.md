@@ -224,7 +224,7 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   quiet hours, while another app is fullscreen, over a film, or when you're already watching it.
 - **Spoiler guard:** on by default, but narrow: series you're part-way through and sport you
   follow. Scores in guide titles are rewritten ("Arsenal v Chelsea 󰈉"), later episodes' plots
-  are hidden (their titles always show), and zapping onto a channel
+  are hidden (click one to show it; their titles always show), and zapping onto a channel
   showing the match you're saving stops at a card first (in multi-view, over that picture
   only). `Ctrl+B` shows an item — in the player,
   the banner's programme — and the hint line says so when something is hidden; `Ctrl+Shift+B`

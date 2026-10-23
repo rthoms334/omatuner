@@ -661,12 +661,11 @@ impl Screen for MovieDetailScreen {
             meta.extend(sparse_meta(ctx, groups));
         }
         let mut text = Vec::new();
+        let plot = m.as_ref().and_then(|m| {
+            let p = m.plot.as_deref().filter(|p| !p.trim().is_empty())?;
+            Some((crate::guard::Subject::Vod { title: &m.name, series_norm: None }, p))
+        });
         if let Some(m) = &m {
-            let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
-            let subj = crate::guard::Subject::Vod { title: &m.name, series_norm: None };
-            if let Some(p) = m.plot.as_deref().filter(|p| !p.trim().is_empty()).and_then(|p| spoilers.text(&subj, crate::guard::Field::Plot, p)) {
-                text.push((p.into_owned(), false));
-            }
             if let Some(c) = m.cast.as_deref().filter(|c| !c.trim().is_empty()) {
                 text.push((format!("Cast: {c}"), true));
             }
@@ -674,7 +673,7 @@ impl Screen for MovieDetailScreen {
                 text.push((format!("Director: {d}"), true));
             }
         }
-        if sparse && text.is_empty() {
+        if sparse && text.is_empty() && plot.is_none() {
             text.push((NO_DESCRIPTION.to_owned(), true));
         }
         let loading = !sparse && (m.is_none() || self.loader.is_some() && m.as_ref().is_some_and(|m| m.details_loaded_at.is_none()));
@@ -695,6 +694,7 @@ impl Screen for MovieDetailScreen {
             let header = DetailHeader {
                 title: &title,
                 meta: &meta.join(" · "),
+                plot,
                 text: &text,
                 poster: poster_url.as_deref(),
                 backdrop: backdrop.as_deref(),
@@ -813,7 +813,11 @@ pub(super) fn sparse_meta(ctx: &UiCtx<'_>, group_ids: &[crate::model::GroupId]) 
 pub(super) struct DetailHeader<'a> {
     pub title: &'a str,
     pub meta: &'a str,
-    /// (text, secondary) paragraphs.
+    /// The plot and whose it is, painted through the spoiler guard
+    /// (`ui::widgets::spoiler::field`): a hidden plot is a block that a click (or Ctrl+B)
+    /// shows, and the shown one carries 󰈈 to hide it again.
+    pub plot: Option<(crate::guard::Subject<'a>, &'a str)>,
+    /// (text, secondary) paragraphs after the plot.
     pub text: &'a [(String, bool)],
     pub poster: Option<&'a str>,
     pub backdrop: Option<&'a str>,
@@ -878,11 +882,15 @@ impl DetailHeader<'_> {
                     }
                     None => {}
                 }
-                if self.loading && self.text.is_empty() {
+                if self.loading && self.text.is_empty() && self.plot.is_none() {
                     for w in [0.9, 0.75, 0.5] {
                         let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width() * w, theme.font(TypeToken::Body)), egui::Sense::hover());
                         ui.painter().rect_filled(r, t.rounding, t.fill_field);
                     }
+                }
+                if let Some((subject, plot)) = &self.plot {
+                    let sp = crate::ui::widgets::spoiler::Spoilers::of(ctx);
+                    crate::ui::widgets::spoiler::field(ui, theme, &sp, subject, crate::guard::Field::Plot, plot, theme.font(TypeToken::Body), t.fg);
                 }
                 for (p, secondary) in self.text {
                     let (size, color) =

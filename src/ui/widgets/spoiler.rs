@@ -8,13 +8,14 @@
 //!   hidden description or plot says why and how to see it ("󰈉 Description hidden — mentions
 //!   Arsenal · until you watch it or Mon 19:30 · Ctrl+B to show"). An on-demand episode's title
 //!   always shows (`guard::Field::EpisodeTitle`). Every base-B call site goes through it (the
-//!   programme popover, the guide's tooltip, Live's details pane, the series and movie pages'
-//!   plots, rows and labels).
+//!   programme popover, the guide's tooltip, Live's details pane, rows and labels).
 //! * [`field`]: a painter of one field with the full treatment (Omarchy tokens): the bar as a
 //!   rounded `separator` rect, the description block (`fill_field`, 1 px `card_border`), the
 //!   revealed text with the 2 px `accent` rule and 󰈈 — a click on a bar or block reveals the
-//!   item, a click on 󰈈 hides it; hover says why. [`obscured_image`] for stills and icons
-//!   (`ImageKind::Obscured`: 12 px wide, stretched, scrim and 󰈉).
+//!   item, a click on 󰈈 hides it; hover says why. The detail pages paint their plots with it
+//!   (the movie page, the series page's own and its focused episode's).
+//!   [`obscured_image`] for stills and icons (`ImageKind::Obscured`: 12 px wide, stretched,
+//!   scrim and 󰈉).
 //!
 //! Accessible names never carry hidden text ("Hidden by spoiler guard (Arsenal)").
 

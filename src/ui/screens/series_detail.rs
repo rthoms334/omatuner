@@ -27,7 +27,7 @@ use crate::keymap::{Action, KeyContext};
 use crate::model::{Episode, EpisodeId, ItemKind, ItemRef, MediaRef, PlayOrigin, Series, SeriesId, SourceKind, VodKind, WatchProgress};
 use crate::msg::{AppEvent, DataScope};
 use crate::player::PlayerEvent;
-use crate::theme::{SpaceToken, TypeToken};
+use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::widgets::button::{ButtonStyle, button};
 use crate::ui::widgets::{RowState, empty_state, glyphs, rows, section};
@@ -898,6 +898,7 @@ impl Screen for SeriesDetailScreen {
             let header = DetailHeader {
                 title: &title,
                 meta: "",
+                plot: None,
                 text: &[],
                 poster: summary.as_ref().and_then(|s| s.poster.as_deref()),
                 backdrop: None,
@@ -924,16 +925,17 @@ impl Screen for SeriesDetailScreen {
         let mut text = Vec::new();
         let spoilers = crate::ui::widgets::spoiler::Spoilers::of(ctx);
         let series_norm = crate::spoiler::series_key(&s.name);
-        let subj = crate::guard::Subject::Vod { title: s.display_name(), series_norm: Some(&series_norm) };
-        if let Some(p) = s.plot.as_deref().filter(|p| !p.trim().is_empty()).and_then(|p| spoilers.text(&subj, crate::guard::Field::Plot, p)) {
-            text.push((p.into_owned(), false));
-        }
+        let plot = s
+            .plot
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| (crate::guard::Subject::Vod { title: s.display_name(), series_norm: Some(&series_norm) }, p));
         if let Some(c) = s.cast.as_deref().filter(|c| !c.trim().is_empty()) {
             text.push((format!("Cast: {c}"), true));
         }
         if sparse {
             meta.extend(sparse_meta(ctx, &s.group_ids));
-            if text.is_empty() {
+            if text.is_empty() && plot.is_none() {
                 text.push((NO_DESCRIPTION.to_owned(), true));
             }
         }
@@ -975,6 +977,7 @@ impl Screen for SeriesDetailScreen {
             let header = DetailHeader {
                 title: s.display_name(),
                 meta: &meta.join(" · "),
+                plot,
                 text: &text,
                 poster: s.cover.as_deref(),
                 backdrop: s.backdrop.as_deref(),
@@ -1171,10 +1174,18 @@ impl Screen for SeriesDetailScreen {
                     new_eps.contains(&(e.season, e.episode)),
                     RowState::from_flags(cursor, selected),
                 );
+                // the focused episode's plot under its row (its own widget, so a click on it
+                // never plays the episode)
+                let mut shown_rect = resp.rect;
+                if i == ep_idx
+                    && let Some(plot) = e.plot.as_deref().filter(|p| !p.trim().is_empty())
+                {
+                    shown_rect = shown_rect.union(episode_plot(ui, theme, &spoilers, &series_norm, e, plot));
+                }
                 // Selection changes (playback / season) reveal the episode even when
                 // focus stays on buttons or copies; cursor moves reveal only the cursor.
                 if cursor && scroll || i == ep_idx && target == Some(ScrollTarget::SelectedEpisode) {
-                    let rect = if i == 0 { resp.rect.union(seasons_rect) } else { resp.rect };
+                    let rect = if i == 0 { shown_rect.union(seasons_rect) } else { shown_rect };
                     ui.scroll_to_rect(rect, None);
                 }
                 // a click plays it, as Enter does (a double-click plays once)
@@ -1217,6 +1228,42 @@ impl Screen for SeriesDetailScreen {
             self.on_action(ctx, Action::ContextMenu);
         }
     }
+}
+
+/// An episode's plot under its row, indented to the row's title, through the spoiler guard: a
+/// hidden plot (an episode after the next-up one of a guarded series) is a block that a click
+/// or Ctrl+B shows, and 󰈈 on the shown one hides it again. Returns the rect it took.
+fn episode_plot(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    sp: &crate::ui::widgets::spoiler::Spoilers,
+    series_norm: &str,
+    e: &Episode,
+    plot: &str,
+) -> egui::Rect {
+    let t = &theme.tokens;
+    let inset = theme.space(SpaceToken::Lg);
+    let num = ui.painter().layout_no_wrap("E000".to_owned(), egui::FontId::proportional(theme.font(TypeToken::Body)), t.text_secondary).size().x;
+    let indent = inset + theme.space(SpaceToken::Sm) + num + theme.space(SpaceToken::Lg);
+    let subject = crate::guard::Subject::Episode { series_norm, season: e.season as i32, episode: e.episode as i32 };
+    let r = ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.vertical(|ui| {
+            ui.set_max_width((ui.available_width() - inset).max(0.0));
+            crate::ui::widgets::spoiler::field(
+                ui,
+                theme,
+                sp,
+                &subject,
+                crate::guard::Field::Plot,
+                plot,
+                theme.font(TypeToken::Body),
+                t.text_secondary,
+            );
+        });
+    });
+    ui.add_space(theme.space(SpaceToken::Md));
+    r.response.rect
 }
 
 #[cfg(test)]
@@ -1597,6 +1644,51 @@ mod tests {
         assert_eq!(h.state_mut().nav(), vec![], "no second up-next card over the player's");
         let next = h.state().s.data.as_ref().unwrap().episodes.iter().find(|e| e.season == 2 && e.episode == 1).unwrap().id;
         assert_eq!(h.state().s.focused_episode().map(|e| e.id), Some(next));
+    }
+
+    /// A guarded series (next up E2): E4's title shows in its row; its plot under the row is a
+    /// hidden block. A click on the block shows the plot and plays nothing; a click on 󰈈 hides
+    /// it again.
+    #[test]
+    fn a_click_on_a_hidden_episode_plot_shows_it_without_playing_and_the_eye_hides_it() {
+        use crate::spoiler::snapshot::{GuardSnapshot, SeriesMark};
+        use egui_kittest::kittest::Queryable;
+        crate::spoiler::ui::hide_all();
+        let (mut t, one) = rig();
+        let ids = seed(&mut t, |c| {
+            let s = testkit::source(c, "My IPTV")?;
+            let ids = testkit::series(c, s, 1, 1, 4)?;
+            c.execute("UPDATE episode SET plot = 'What happens in episode ' || episode", [])?;
+            Ok(ids)
+        });
+        let norm = crate::spoiler::series_key("Series 0");
+        let mark = SeriesMark { label: "Series 0".into(), next_up: (1, 2), automatic: true, ..Default::default() };
+        let snap = GuardSnapshot::from_parts(Default::default(), Vec::new(), HashMap::from([(norm.clone(), mark)]), Default::default());
+        t.services().agent.set_guard(crate::guard::Guard::with_snapshot(snap));
+        let mut h = harness(t, one, SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        h.state_mut().enter(Route::SeriesDetail(ids[0]));
+        until(&mut h, "the episodes", |h| h.state().s.data.as_ref().is_some_and(|d| d.episodes.len() == 4));
+        h.state_mut().s.section = Section::Episodes;
+        h.state_mut().s.ep = 3;
+        h.run_steps(2);
+        let hidden = "Hidden by spoiler guard (Series 0)";
+        assert!(testkit::painted(&h).iter().any(|t| t.starts_with("Episode 4")), "its title shows");
+        assert!(has_label(&h, hidden) && !has_label(&h, "What happens in episode 4"));
+        h.get_by_label(hidden).click();
+        h.run_steps(2);
+        let e4 = crate::guard::Subject::Episode { series_norm: &norm, season: 1, episode: 4 };
+        assert!(crate::spoiler::ui::reveals().covers(&e4));
+        assert!(has_label(&h, "What happens in episode 4"));
+        assert_eq!(h.state_mut().nav(), vec![], "the click played nothing");
+        h.get_by_label("Hide spoilers again").click();
+        h.run_steps(2);
+        assert!(crate::spoiler::ui::reveals().is_empty());
+        assert!(has_label(&h, hidden) && !has_label(&h, "What happens in episode 4"));
+        assert_eq!(h.state_mut().nav(), vec![]);
+        // the next-up episode's plot shows as is
+        h.state_mut().s.ep = 1;
+        h.run_steps(2);
+        assert!(has_label(&h, "What happens in episode 2") && !has_label(&h, hidden));
     }
 
     #[test]
