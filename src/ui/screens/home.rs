@@ -43,7 +43,8 @@ use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::overlays::{ContextMenuSpec, MenuItem, OverlayResult};
 use crate::ui::stacks as st;
 use crate::ui::widgets::badge::{InlineBadge, name_with_quality};
-use crate::ui::widgets::poster::{self, StackDecor, TileDecor};
+use crate::ui::widgets::button::{ButtonStyle, button};
+use crate::ui::widgets::poster::{self, NewsDecor, StackDecor, TileDecor};
 use crate::ui::widgets::{badge, empty_state, glyphs, section};
 use crate::ui::{OnboardingStart, OverlayRequest, Route, Screen, ScreenId, UiCtx};
 
@@ -461,6 +462,8 @@ enum Tile {
         name: String,
         detail: String,
     },
+    /// A title with new episodes (DESIGN §44): index into `HomeScreen::news`.
+    NewEpisodes(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +471,8 @@ enum RailKind {
     UpNext,
     Watchlists,
     Continue,
+    /// New episodes of the series you follow (DESIGN §44).
+    NewEpisodes,
     Favourites,
     Recent,
     Movies,
@@ -510,6 +515,8 @@ struct RailsKey {
     combine: bool,
     /// Up next's tile: (items to go, the row it resumes) while nothing plays.
     up_next: Option<(usize, Option<crate::model::QueueId>)>,
+    /// `ui::new_episodes::revision`: the New episodes row changed.
+    news: u64,
 }
 
 #[derive(Default)]
@@ -528,10 +535,91 @@ pub struct HomeScreen {
     /// The rails the user sees (actions resolve against them).
     rails: Vec<Rail>,
     rails_key: Option<RailsKey>,
+    /// The New episodes row (`ui::new_episodes::snapshot`), as the rails were built from it.
+    news: Arc<crate::new_episodes::NewEpisodesSnapshot>,
+    /// The summary notification's Open: put the cursor on the New episodes row.
+    focus_news: bool,
+    /// The first-run card, while it is due (DESIGN §44 §2.7).
+    card: Option<NewEpisodesCard>,
+    card_loader: Option<Loader<Option<NewEpisodesCard>>>,
+    /// The card was answered this session (a read that was already on its way is ignored).
+    card_answered: bool,
     scroll_to_cursor: bool,
     /// The rail under the last mouse motion and when it happened (egui time).
     rail_bar: Option<(egui::Id, f64)>,
     playing: kit::PlayingVod,
+}
+
+/// What the first-run card says: how many series are watched, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NewEpisodesCard {
+    lists: usize,
+    binged: usize,
+}
+
+/// The card, when it is due: the first baseline happened and nobody answered it yet.
+fn load_card(
+    c: &rusqlite::Connection,
+    lib: &crate::store::library::Library,
+    opts: &crate::store::new_episodes::Opts,
+) -> crate::error::Result<Option<NewEpisodesCard>> {
+    if !crate::store::new_episodes::card_due(c)? {
+        return Ok(None);
+    }
+    let tracked = crate::store::new_episodes::tracked(c, lib, opts)?;
+    let lists = tracked.iter().filter(|t| t.on_list()).count();
+    Ok(Some(NewEpisodesCard { lists, binged: tracked.len() - lists }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardAnswer {
+    Ok,
+    Settings,
+    TurnOff,
+}
+
+/// The first-run card (DESIGN §44 §2.7): what Tuner will watch, once.
+fn card_ui(ui: &mut egui::Ui, ctx: &UiCtx<'_>, card: NewEpisodesCard) -> Option<CardAnswer> {
+    let theme = ctx.theme;
+    let t = &theme.tokens;
+    let n = card.lists + card.binged;
+    let what = match (card.lists, card.binged) {
+        (0, 0) => "Add series to a watchlist and Tuner will tell you when new episodes arrive.".to_owned(),
+        (l, 0) => format!("Tuner will tell you when new episodes arrive for {l} series on your watchlists."),
+        (0, b) => format!("Tuner will tell you when new episodes arrive for {b} series you've binged."),
+        (l, b) => format!("Tuner will tell you when new episodes arrive for {n} series: {l} on your watchlists and {b} you've binged."),
+    };
+    let mut answer = None;
+    egui::Frame::NONE
+        .fill(t.fill_field)
+        .stroke(egui::Stroke::new(1.0, t.border_field))
+        .corner_radius(t.rounding)
+        .inner_margin(theme.space(SpaceToken::Lg))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new("New episode alerts").size(theme.font(TypeToken::Title)).strong().color(t.fg));
+            ui.label(egui::RichText::new(what).size(theme.font(TypeToken::Body)).color(t.fg));
+            if n > 0 {
+                ui.label(
+                    egui::RichText::new("Nothing that exists today counts as new.").size(theme.font(TypeToken::BodySmall)).color(t.text_secondary),
+                );
+            }
+            ui.add_space(theme.space(SpaceToken::Md));
+            ui.horizontal(|ui| {
+                let primary = ButtonStyle { primary: true, bordered: true, ..Default::default() };
+                for (label, a, style) in [
+                    ("OK · Enter", CardAnswer::Ok, primary),
+                    ("Settings…", CardAnswer::Settings, ButtonStyle { bordered: true, ..Default::default() }),
+                    ("Turn off", CardAnswer::TurnOff, ButtonStyle { bordered: true, ..Default::default() }),
+                ] {
+                    if button(ui, theme, None, label, style).clicked() {
+                        answer = Some(a);
+                    }
+                }
+            });
+        });
+    ui.add_space(theme.space(SpaceToken::Xxl));
+    answer
 }
 
 /// A cheap fingerprint of the favourites lists (their order, names and items).
@@ -549,10 +637,32 @@ impl HomeScreen {
         self.continue_loader = Some(Loader::start(ctx, load_continue));
     }
 
+    /// Ask whether the first-run card is due (on entering Home and after a check wrote).
+    fn reload_card(&mut self, ctx: &UiCtx<'_>) {
+        if self.card_answered || !crate::ui::new_episodes::on(ctx) {
+            return;
+        }
+        let (lib, opts) = (ctx.lib.clone(), crate::store::new_episodes::Opts::from_config(&ctx.config.new_episodes, ctx.now));
+        self.card_loader = Some(Loader::start(ctx, move |db| load_card(db, &lib, &opts)));
+    }
+
+    /// Any button of the first-run card, or Enter / Esc.
+    fn answer_card(&mut self, ctx: &mut UiCtx<'_>, answer: CardAnswer) {
+        self.card = None;
+        self.card_answered = true;
+        crate::ui::new_episodes::ack_card(ctx);
+        match answer {
+            CardAnswer::Ok => {}
+            CardAnswer::Settings => ctx.push(Route::Settings(crate::ui::SettingsPage::NewEpisodes)),
+            CardAnswer::TurnOff => crate::ui::new_episodes::set_enabled(ctx, false),
+        }
+    }
+
     /// Rebuild the rails when the library, the favourites or Continue watching changed.
     fn build_rails(&mut self, ctx: &mut UiCtx<'_>) {
         let combine = st::combine(ctx.config);
         let watchlists = crate::ui::watchlists::snapshot(ctx);
+        self.news = crate::ui::new_episodes::snapshot(ctx);
         let key = RailsKey {
             generation: ctx.lib.generation,
             favs: favs_signature(ctx.favs),
@@ -560,6 +670,7 @@ impl HomeScreen {
             watchlists: crate::ui::watchlists::revision(),
             combine,
             up_next: up_next_key(ctx),
+            news: crate::ui::new_episodes::revision(),
         };
         if self.rails_key == Some(key) {
             return;
@@ -611,6 +722,11 @@ impl HomeScreen {
             .collect();
         if !continues.is_empty() {
             rails.push(Rail { kind: RailKind::Continue, title: "Continue watching".into(), list: None, tiles: continues });
+        }
+        // new episodes of the series you follow, newest first (the title's copies are one tile)
+        let news: Vec<Tile> = (0..self.news.series.len()).take(RAIL_MAX).map(Tile::NewEpisodes).collect();
+        if !news.is_empty() {
+            rails.push(Rail { kind: RailKind::NewEpisodes, title: "New episodes".into(), list: None, tiles: news });
         }
         let mut active: Vec<_> = watchlists.active().collect();
         active.sort_by_key(|v| std::cmp::Reverse(v.list.last_played_at));
@@ -775,6 +891,19 @@ impl HomeScreen {
             }
             Tile::UpNext => resume_up_next(ctx),
             Tile::Watchlist { id, .. } => crate::ui::watchlists::play(ctx, id, None, false),
+            // Enter: the series page on the first new episode; Shift+Enter: what the
+            // notification's Play does (the next unwatched episode, Q4)
+            Tile::NewEpisodes(i) => {
+                let Some(news) = self.news.series.get(i) else { return };
+                match (alt, news.copies.first(), news.series.first(), news.new.first()) {
+                    (true, Some(item), ..) => crate::ui::new_episodes::play(ctx, item),
+                    (false, _, Some(&series), Some(first)) => {
+                        ctx.push(Route::SeriesDetailAt { series, season: first.season, episode: first.episode })
+                    }
+                    (false, _, Some(&series), None) => ctx.push(Route::SeriesDetail(series)),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -794,6 +923,7 @@ impl HomeScreen {
             Tile::Channel { id, .. } => ctx.lib.live.get(*id).map(|c| ItemRef { source: c.source_id, kind: ItemKind::Channel, key: c.key.clone() }),
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map(vod_ref),
             Tile::Continue(i) => self.continue_items.get(*i).map(|c| c.item.clone()),
+            Tile::NewEpisodes(i) => self.news.series.get(*i).and_then(|n| n.copies.first().cloned()),
             Tile::Start(_) | Tile::UpNext | Tile::Watchlist { .. } => None,
         }
     }
@@ -805,6 +935,7 @@ impl HomeScreen {
             Tile::Channel { id, .. } => Target::Channel(*id),
             Tile::Vod(kind) => Target::vod(*kind),
             Tile::Continue(i) => Target::vod(self.continue_items.get(*i)?.card.kind),
+            Tile::NewEpisodes(i) => Target::Series(*self.news.series.get(*i)?.series.first()?),
             Tile::Start(_) | Tile::UpNext | Tile::Watchlist { .. } => return None,
         })
     }
@@ -817,6 +948,7 @@ impl HomeScreen {
             Tile::Continue(i) => self.continue_items.get(*i).map(|c| c.card.name.to_string()),
             Tile::UpNext => Some("Up next".to_owned()),
             Tile::Watchlist { name, .. } => Some(name.clone()),
+            Tile::NewEpisodes(i) => self.news.series.get(*i).map(|n| n.title.clone()),
             Tile::Start(_) => None,
         }
         .unwrap_or_default()
@@ -830,8 +962,60 @@ impl HomeScreen {
             }
             Tile::Vod(kind) => ctx.lib.vod.find(*kind).map_or((false, false), |v| (v.locked, vod_group_locked(ctx, v))),
             Tile::Continue(i) => self.continue_items.get(*i).map_or((false, false), |c| (c.card.locked, vod_group_locked(ctx, &c.card))),
-            Tile::Start(_) | Tile::UpNext | Tile::Watchlist { .. } => (false, false),
+            Tile::Start(_) | Tile::UpNext | Tile::Watchlist { .. } | Tile::NewEpisodes(_) => (false, false),
         }
+    }
+
+    /// The keys and menu choices of a New episodes tile (DESIGN §44 §2.3); false: not one of its
+    /// own, the tile's title acts as any series tile does.
+    fn news_action(&mut self, ctx: &mut UiCtx<'_>, action: Action) -> bool {
+        let Some((_, Tile::NewEpisodes(i))) = self.current_tile() else { return false };
+        let Some(news) = self.news.series.get(*i).cloned() else { return false };
+        let Some(item) = news.copies.first() else { return false };
+        match action {
+            Action::Remove => crate::ui::new_episodes::dismiss_title(ctx, item, &news.title),
+            Action::Download => {
+                let eps: Vec<ItemRef> = news.new.iter().filter_map(|e| e.episode_ref.clone()).collect();
+                crate::ui::new_episodes::download(ctx, &eps);
+            }
+            Action::MarkWatched => {
+                let eps = news.new.iter().map(|e| (e.season, e.episode)).collect();
+                crate::ui::copies::mark_episodes(ctx, news.series.clone(), eps, true);
+            }
+            Action::NewEpisodes(crate::keymap::NewEpisodesAct::StopAlerts) => crate::ui::new_episodes::mute(ctx, item, &news.title, true),
+            Action::ContextMenu => self.news_menu(ctx, &news),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Shift+F10 / right-click on a New episodes tile.
+    fn news_menu(&self, ctx: &mut UiCtx<'_>, news: &crate::new_episodes::SeriesNews) {
+        let mi = |icon: &'static str, label: String, action: Action, shortcut: Option<&str>| MenuItem {
+            icon,
+            label,
+            action,
+            enabled: true,
+            shortcut: shortcut.map(str::to_owned),
+        };
+        let mut items = vec![
+            mi(
+                glyphs::PLAY,
+                crate::ui::new_episodes::play_label(ctx, &news.series).unwrap_or_else(|| "Play".into()),
+                Action::ActivateAlt,
+                Some("Shift+Enter"),
+            ),
+            mi(glyphs::INFO, "Open series".into(), Action::Activate, Some("Enter")),
+        ];
+        if crate::downloads::ENABLED {
+            items.push(mi("⤓", "Download the new episodes".into(), Action::Download, Some("Ctrl+D")));
+        }
+        items.extend([
+            mi(glyphs::CHECK, "Mark watched".into(), Action::MarkWatched, Some("Ctrl+W")),
+            mi(glyphs::CLOSE, "Dismiss".into(), Action::Remove, Some("Delete")),
+            mi(glyphs::HIDDEN, "Stop alerts for this series".into(), Action::NewEpisodes(crate::keymap::NewEpisodesAct::StopAlerts), None),
+        ]);
+        ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: news.title.clone(), items }));
     }
 
     /// Item shortcuts (Help lists them for `[PosterGrid]`) and the context menu.
@@ -973,6 +1157,7 @@ impl HomeScreen {
                 ctx.open(OverlayRequest::ContextMenu(ContextMenuSpec { title: name.to_owned(), items }));
                 return;
             }
+            Tile::NewEpisodes(_) => return,
             Tile::Start(_) => return,
         }
         let fav = self.tile_item(ctx, tile).is_some_and(|i| ctx.favs.is_fav(&i));
@@ -1090,6 +1275,7 @@ impl Screen for HomeScreen {
 
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, _route: &Route) {
         self.reload_continue(ctx);
+        self.reload_card(ctx);
         self.scroll_to_cursor = true;
         self.rail_bar = None;
     }
@@ -1103,6 +1289,8 @@ impl Screen for HomeScreen {
                 self.reload_continue(ctx)
             }
             AppEvent::Player(crate::player::PlayerEvent::Ended { .. }) => self.reload_continue(ctx),
+            // the first check wrote its baseline: the card may be due now
+            AppEvent::Data(DataScope::NewEpisodes) if self.card.is_none() => self.reload_card(ctx),
             _ => {}
         }
     }
@@ -1116,6 +1304,14 @@ impl Screen for HomeScreen {
                 return true;
             }
             return matches!(action, Action::Up | Action::Down | Action::Left | Action::Right | Action::FilterInput(_));
+        }
+        // the first-run card answers to Enter and Esc until it is acknowledged
+        if self.card.is_some() && matches!(action, Action::Activate | Action::ActivateAlt | Action::Back) {
+            self.answer_card(ctx, CardAnswer::Ok);
+            return true;
+        }
+        if self.news_action(ctx, action) {
+            return true;
         }
         // the batch features' keys on the tile (Ctrl+N, Ctrl+M…)
         if let Some(t) = self.current_tile().and_then(|(_, t)| self.tile_target(t))
@@ -1185,8 +1381,9 @@ impl Screen for HomeScreen {
             OverlayResult::Unlocked(Action::ToggleLock) => self.item_action(ctx, Action::ToggleLock),
             // Up next's tile menu
             OverlayResult::Chosen(Action::GoQueue) => ctx.navigate(crate::ui::NavRequest::Switch(Route::Queue)),
-            // the context menu (its entries are the shortcuts themselves)
-            OverlayResult::Chosen(a) if a != Action::ContextMenu => self.item_action(ctx, a),
+            // the context menu (its entries are the shortcuts themselves); a New episodes
+            // tile takes its own choices first
+            OverlayResult::Chosen(a) if a != Action::ContextMenu && !self.news_action(ctx, a) => self.item_action(ctx, a),
             _ => {}
         }
     }
@@ -1202,6 +1399,12 @@ impl Screen for HomeScreen {
             Some(Err(e)) => tracing::warn!("continue watching: {e}"),
             None => {}
         }
+        match kit::poll(&mut self.card_loader) {
+            Some(Ok(card)) if !self.card_answered => self.card = card,
+            Some(Err(e)) => tracing::warn!("new episodes card: {e}"),
+            _ => {}
+        }
+        self.focus_news |= crate::ui::new_episodes::take_focus_row();
         let theme = ctx.theme;
         if ctx.lib.built_at == 0 {
             loading_rails(ui, theme);
@@ -1226,6 +1429,13 @@ impl Screen for HomeScreen {
             return;
         }
         self.build_rails(ctx);
+        // the summary notification's Open: the cursor goes to the New episodes row
+        if std::mem::take(&mut self.focus_news)
+            && let Some(at) = self.rails.iter().position(|r| r.kind == RailKind::NewEpisodes)
+        {
+            self.rail = at;
+            self.scroll_to_cursor = true;
+        }
         let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         let consumed_key = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("home-rail-keyboard"))).unwrap_or(false);
         let keyboard =
@@ -1243,14 +1453,29 @@ impl Screen for HomeScreen {
         let scroll = std::mem::take(&mut self.scroll_to_cursor);
         let rails = std::mem::take(&mut self.rails);
         let playing_vod = self.playing.get(ctx);
+        let card = self.card;
+        let mut card_answer = None;
         egui::ScrollArea::vertical().id_salt("home-rails").auto_shrink([false, false]).show(ui, |ui| {
+            if let Some(card) = card {
+                card_answer = card_ui(ui, ctx, card);
+            }
             // Only mouse motion over a rail enables its bar, for 1.5 s or until a key.
             // A stationary pointer must not light up rails scrolling beneath it. Keep
             // egui's floating fade, horizontal swipe / Shift+wheel, and scroll offsets.
             let mut target = None;
             for (ri, rail) in rails.iter().enumerate() {
                 let top = ui.cursor().min;
-                section::section_header(ui, theme, &rail.title);
+                let head = section::section_header(ui, theme, &rail.title);
+                if rail.kind == RailKind::NewEpisodes && ctx.layout != crate::ui::LayoutClass::Compact {
+                    let hint = if ctx.layout == crate::ui::LayoutClass::Wide { "Delete dismisses · Ctrl+D downloads" } else { "Delete dismisses" };
+                    ui.painter().text(
+                        egui::pos2(ui.max_rect().right(), head.rect.center().y),
+                        Align2::RIGHT_CENTER,
+                        hint,
+                        egui::FontId::proportional(theme.font(TypeToken::Caption)),
+                        theme.tokens.text_secondary,
+                    );
+                }
                 ui.add_space(theme.space(SpaceToken::Md));
                 let cursor_col = (ri == self.rail).then(|| self.cols.get(ri).map(|c| c.2)).flatten();
                 let salt = ("home-rail", rail.kind as u8, &rail.title);
@@ -1269,7 +1494,7 @@ impl Screen for HomeScreen {
                         ui.spacing_mut().item_spacing.x = theme.space(SpaceToken::Xxl);
                         for (ci, tile) in rail.tiles.iter().enumerate() {
                             let is_cursor = cursor_col == Some(ci);
-                            let resp = draw_tile(ui, ctx, &self.continue_items, tile, is_cursor, playing_vod);
+                            let resp = draw_tile(ui, ctx, &self.continue_items, &self.news, tile, is_cursor, playing_vod);
                             if is_cursor && scroll {
                                 ui.scroll_to_rect(resp.rect, None);
                             }
@@ -1314,6 +1539,9 @@ impl Screen for HomeScreen {
             }
         });
         self.rails = rails;
+        if let Some(answer) = card_answer {
+            self.answer_card(ctx, answer);
+        }
         if let Some((ri, ci, activate)) = clicked {
             self.rail = ri;
             if let Some(c) = self.cols.get_mut(ri) {
@@ -1360,6 +1588,7 @@ fn draw_tile(
     ui: &mut egui::Ui,
     ctx: &mut UiCtx<'_>,
     continues: &[ContinueItem],
+    news: &crate::new_episodes::NewEpisodesSnapshot,
     tile: &Tile,
     cursor: bool,
     playing_vod: Option<VodKind>,
@@ -1408,6 +1637,32 @@ fn draw_tile(
             let is_playing = playing == Some(MediaRef::Channel(*id));
             channel_tile(ui, ctx, *id, cursor, is_playing)
         }
+        Tile::NewEpisodes(i) => match news.series.get(*i).and_then(|n| Some((n, ctx.lib.vod.find(VodKind::Series(*n.series.first()?))?))) {
+            Some((n, v)) => {
+                let (badge, span) = (if n.new.len() > 1 { format!("{} NEW", n.new.len()) } else { "NEW".to_owned() }, n.span());
+                // a lone started episode shows its progress, as Continue watching does
+                let progress = n.new.iter().find_map(|e| e.progress);
+                let why = n.why.first().map(|w| match (w, n.why.len()) {
+                    (crate::new_episodes::Why::List { name, .. }, 1) => name.clone(),
+                    (crate::new_episodes::Why::List { name, .. }, k) => format!("{name} +{}", k - 1),
+                    (w, _) => w.label().split(" (").next().unwrap_or("binged").to_owned(),
+                });
+                let wide = ctx.layout == crate::ui::LayoutClass::Wide;
+                let decor = TileDecor {
+                    progress,
+                    source: ctx.source_of(crate::ui::scope::vod_item_kind(v.kind), v.source_id),
+                    news: Some(NewsDecor { badge: &badge, span: &span, why: why.as_deref().filter(|_| wide) }),
+                    ..Default::default()
+                };
+                let w = if ctx.layout == crate::ui::LayoutClass::Compact { (poster_w * 0.8).round() } else { poster_w };
+                let resp = poster::poster_tile(ui, theme, ctx.images, v, w, cursor, decor);
+                match why {
+                    Some(why) if !wide => resp.on_hover_text(egui::RichText::new(format!("{span} · {why}")).size(theme.font(TypeToken::BodySmall))),
+                    _ => resp,
+                }
+            }
+            None => ui.allocate_exact_size(egui::vec2(poster_w, poster_w), egui::Sense::hover()).1,
+        },
         Tile::UpNext => up_next_tile(ui, ctx, cursor),
         Tile::Watchlist { id, name, detail } => {
             let q = crate::queue::ui::snapshot(ctx);
@@ -1697,6 +1952,10 @@ pub(crate) mod testkit {
                 }
                 return crate::ui::copies::undo(self.t.services(), n);
             }
+            if let Action::NewEpisodes(crate::keymap::NewEpisodesAct::Undo(n)) = a {
+                crate::ui::new_episodes::undo(self.t.services(), n);
+                return true;
+            }
             let s = &mut self.s;
             self.t.with_ctx(|ctx| s.on_action(ctx, a))
         }
@@ -1721,6 +1980,11 @@ pub(crate) mod testkit {
                     self.t.lib = lib.clone();
                     self.t.favs = lib.favs.clone();
                     self.t.search_index = None;
+                }
+                if let AppEvent::Data(scope) = &ev
+                    && crate::ui::new_episodes::feeds(*scope)
+                {
+                    crate::ui::new_episodes::invalidate();
                 }
                 if matches!(ev, AppEvent::Data(crate::msg::DataScope::Favourites | crate::msg::DataScope::Watchlists)) {
                     self.t.favs = crate::store::library::load_favs(&self.t.db).expect("reload saved items");
@@ -3051,5 +3315,163 @@ mod tests {
         assert_eq!(kit::ago(10_000, 10_000 - 7200), "2 h ago");
         assert_eq!(kit::ago(1_000_000, 1_000_000 - 3 * 86_400), "3 d ago");
         assert_eq!(kit::date(1_791_576_000).len(), 10);
+    }
+
+    type NewsHarness = egui_kittest::Harness<'static, testkit::App<HomeScreen>>;
+
+    /// Put the cursor on the New episodes row (it was built after the other rails: the cursor
+    /// keeps the rail it was on, as it does when Continue watching arrives late).
+    fn on_news_row(h: &mut NewsHarness) {
+        let at = h.state().s.rails.iter().position(|r| r.kind == RailKind::NewEpisodes).expect("the row");
+        h.state_mut().s.rail = at;
+    }
+
+    fn news_tiles(h: &NewsHarness) -> usize {
+        h.state().s.rails.iter().find(|r| r.kind == RailKind::NewEpisodes).map_or(0, |r| r.tiles.len())
+    }
+
+    fn undo_new(h: &mut NewsHarness) -> crate::keymap::NewEpisodesAct {
+        let _ = h.state().t.services().store.writer().blocking(|_| Ok(()));
+        h.state_mut().pump();
+        h.state()
+            .t
+            .toasts
+            .iter()
+            .rev()
+            .find_map(|t| match t.action {
+                Some((_, Action::NewEpisodes(a @ crate::keymap::NewEpisodesAct::Undo(_)))) => Some(a),
+                _ => None,
+            })
+            .expect("an Undo toast")
+    }
+
+    /// §8 UI: the row shows one tile per title with its badge and span; Delete dismisses it with
+    /// an Undo, and watching the new episodes takes the tile off by itself.
+    #[test]
+    fn new_episodes_row_has_a_tile_per_title_delete_dismisses_with_undo_and_watching_clears_it() {
+        let (mut t, one) = rig();
+        let landman = crate::ui::new_episodes::testkit::landman_with_news(&mut t, 4, 2);
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "the New episodes row", |h| news_tiles(h) == 1);
+        h.run_steps(3);
+        assert!(has_label(&h, "NEW EPISODES"));
+        let painted = testkit::painted(&h);
+        assert!(painted.iter().any(|t| t == "2 NEW"), "{painted:?}");
+        assert!(painted.iter().any(|t| t == "S1E5–E6"), "{painted:?}");
+        assert!(painted.iter().any(|t| t == "My list"), "why it is tracked: {painted:?}");
+        on_news_row(&mut h);
+
+        // Delete: the title's new episodes leave Home; Undo brings them back
+        assert!(h.state_mut().act(Action::Remove));
+        let undo = undo_new(&mut h);
+        until(&mut h, "the tile is dismissed", |h| news_tiles(h) == 0);
+        assert!(h.state_mut().act(Action::NewEpisodes(undo)));
+        until(&mut h, "the tile is back", |h| news_tiles(h) == 1);
+
+        // watching them (Ctrl+W marks, as playing to the end does) clears the tile
+        let _ = h.state().t.services().store.writer().submit_notify(crate::msg::DataScope::Progress, move |c| {
+            crate::store::copies::mark_episodes(c, &[landman], &[(1, 5), (1, 6)], true, crate::model::now()).map(drop)
+        });
+        until(&mut h, "the tile is cleared by watching", |h| news_tiles(h) == 0);
+    }
+
+    /// Enter opens the series page on the first new episode; Shift+Enter plays what the
+    /// notification's Play would, the next unwatched episode (Q4), named on the menu entry.
+    #[test]
+    fn new_episodes_tile_enter_opens_the_first_new_episode_and_shift_enter_plays_the_next_unwatched() {
+        let (mut t, one) = rig();
+        let landman = crate::ui::new_episodes::testkit::landman_with_news(&mut t, 4, 2);
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "the New episodes row", |h| news_tiles(h) == 1);
+        on_news_row(&mut h);
+        assert!(h.state_mut().act(Action::Activate));
+        assert_eq!(h.state_mut().nav(), vec![NavRequest::Push(Route::SeriesDetailAt { series: landman, season: 1, episode: 5 })]);
+        assert!(h.state_mut().act(Action::ActivateAlt));
+        assert!(h.state_mut().nav().contains(&NavRequest::Push(Route::Player)));
+        // nothing watched yet: what Play starts is S1E1, not the first new episode
+        let label = h.state_mut().t.with_ctx(|ctx| crate::ui::new_episodes::play_label(ctx, &[landman]));
+        assert_eq!(label.as_deref(), Some("Play S1E1"));
+        // the menu: Play · Open series · Download · Mark watched · Dismiss · Stop alerts
+        assert!(h.state_mut().act(Action::ContextMenu));
+        let nav = h.state_mut().nav();
+        let [NavRequest::Open(OverlayRequest::ContextMenu(spec))] = nav.as_slice() else { panic!("{nav:?}") };
+        let labels: Vec<_> = spec.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels[..2], ["Play S1E1", "Open series"]);
+        assert!(labels.contains(&"Dismiss") && labels.contains(&"Stop alerts for this series"), "{labels:?}");
+    }
+
+    /// The summary notification's Open puts the cursor on the New episodes row.
+    #[test]
+    fn open_from_the_summary_focuses_the_new_episodes_row() {
+        let (mut t, one) = rig();
+        crate::ui::new_episodes::testkit::landman_with_news(&mut t, 4, 2);
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "the New episodes row", |h| news_tiles(h) == 1);
+        let row = h.state().s.rails.iter().position(|r| r.kind == RailKind::NewEpisodes).unwrap();
+        h.state_mut().s.rail = h.state().s.rails.len() - 1;
+        h.state_mut().t.with_ctx(crate::ui::new_episodes::show_row);
+        h.run_steps(2);
+        assert_eq!(h.state().s.rail, row);
+        assert!(h.state_mut().nav().contains(&NavRequest::Switch(Route::Home)));
+    }
+
+    /// Stop alerts from the tile menu: the title leaves Home and the mute is undoable.
+    #[test]
+    fn stop_alerts_from_the_tile_menu_mutes_the_title_with_undo() {
+        let (mut t, one) = rig();
+        let landman = crate::ui::new_episodes::testkit::landman_with_news(&mut t, 4, 2);
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "the New episodes row", |h| news_tiles(h) == 1);
+        on_news_row(&mut h);
+        h.state_mut().result(crate::ui::overlays::OverlayResult::Chosen(Action::NewEpisodes(crate::keymap::NewEpisodesAct::StopAlerts)));
+        until(&mut h, "the tile is gone", |h| news_tiles(h) == 0);
+        let muted = |h: &NewsHarness| {
+            let item = h.state().t.services().store.reader().and_then(|c| crate::ui::new_episodes::testkit::series_ref(&c, landman)).unwrap();
+            h.state()
+                .t
+                .db
+                .query_row(
+                    "SELECT count(*) FROM newep_mute WHERE source_id = ?1 AND series_key = ?2",
+                    rusqlite::params![item.source, item.key.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(muted(&h), 1);
+        let undo = undo_new(&mut h);
+        assert!(h.state_mut().act(Action::NewEpisodes(undo)));
+        until(&mut h, "the tile is back", |h| news_tiles(h) == 1);
+        assert_eq!(muted(&h), 0);
+    }
+
+    /// §2.7: after the first baseline a card says what is watched, once; Enter answers it.
+    #[test]
+    fn first_run_card_shows_once_and_enter_answers_it() {
+        let (mut t, one) = rig();
+        seed(&mut t, |c| {
+            let tv = testkit::source(c, "TV")?;
+            let id = testkit::named_series(c, tv, &[("Landman", "Landman")], 4)?[0];
+            let list = crate::store::user::default_fav_list(c)?;
+            testkit::save_favourite(c, list, &crate::ui::new_episodes::testkit::series_ref(c, id)?, true, crate::model::now())?;
+            assert!(crate::ui::new_episodes::testkit::run(c)?.first_run);
+            Ok(())
+        });
+        let mut h = harness(t, one, HomeScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Home);
+        until(&mut h, "the card", |h| h.state().s.card.is_some());
+        h.run_steps(2);
+        assert_eq!(h.state().s.card, Some(NewEpisodesCard { lists: 1, binged: 0 }));
+        assert!(has_label(&h, "OK · Enter") && has_label(&h, "Settings…") && has_label(&h, "Turn off"));
+        assert!(h.state_mut().act(Action::Activate));
+        assert!(h.state().s.card.is_none());
+        let _ = h.state().t.services().store.writer().blocking(|_| Ok(()));
+        assert!(!crate::store::new_episodes::card_due(&h.state().t.db).unwrap(), "answered for good");
+        h.state_mut().enter(Route::Home);
+        h.run_steps(5);
+        assert!(h.state().s.card.is_none(), "it does not come back");
     }
 }
