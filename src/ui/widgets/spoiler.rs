@@ -4,16 +4,18 @@
 //! Two levels:
 //! * [`Spoilers::text`]: the text a painter shows, whatever it paints with (a `Label`, a row's
 //!   galley, a tooltip). A rewritten title gets the dim glyph ("Arsenal v Chelsea 󰈉"), a hidden
-//!   sub-title or episode title becomes a fixed-width bar ("▆▆▆▆▆▆▆▆ 󰈉": never the text's
-//!   length), a hidden description or plot says why and how to see it ("󰈉 Description hidden —
-//!   mentions Arsenal · until you watch it or Mon 19:30 · Ctrl+B to show"). Every base-B call
-//!   site goes through it (the programme popover, the guide's tooltip, Live's details pane, the
-//!   series page's plot and episode rows, the movie page).
+//!   guide sub-title becomes a fixed-width bar ("▆▆▆▆▆▆▆▆ 󰈉": never the text's length), a
+//!   hidden description or plot says why and how to see it ("󰈉 Description hidden — mentions
+//!   Arsenal · until you watch it or Mon 19:30 · Ctrl+B to show"). An on-demand episode's title
+//!   always shows (`guard::Field::EpisodeTitle`). Every base-B call site goes through it (the
+//!   programme popover, the guide's tooltip, Live's details pane, rows and labels).
 //! * [`field`]: a painter of one field with the full treatment (Omarchy tokens): the bar as a
 //!   rounded `separator` rect, the description block (`fill_field`, 1 px `card_border`), the
 //!   revealed text with the 2 px `accent` rule and 󰈈 — a click on a bar or block reveals the
-//!   item, a click on 󰈈 hides it; hover says why. [`obscured_image`] for stills and icons
-//!   (`ImageKind::Obscured`: 12 px wide, stretched, scrim and 󰈉).
+//!   item, a click on 󰈈 hides it; hover says why. The detail pages paint their plots with it
+//!   (the movie page, the series page's own and its focused episode's).
+//!   [`obscured_image`] for stills and icons (`ImageKind::Obscured`: 12 px wide, stretched,
+//!   scrim and 󰈉).
 //!
 //! Accessible names never carry hidden text ("Hidden by spoiler guard (Arsenal)").
 
@@ -22,7 +24,7 @@ use std::borrow::Cow;
 use eframe::egui;
 
 use crate::guard::{Field, Guard, Guarded, Policy, Reason, ReasonKind, Subject};
-use crate::model::{Episode, Programme, Timestamp};
+use crate::model::{Programme, Timestamp};
 use crate::spoiler::ui::{RevealKey, RevealSet};
 use crate::theme::{SpaceToken, Theme, TypeToken};
 use crate::ui::UiCtx;
@@ -108,25 +110,6 @@ impl Spoilers {
     pub fn obscures_image(&self, subject: &Subject<'_>) -> bool {
         matches!(self.guarded(subject, Field::Image, ""), Guarded::Hidden { .. })
     }
-
-    /// An episode as its row and page may show it (title / plot replaced when guarded;
-    /// borrowed when nothing is). `series_norm`: `spoiler::series_key` of the series' name.
-    pub fn episode<'e>(&self, series_norm: &str, e: &'e Episode) -> Cow<'e, Episode> {
-        if self.guard.is_none() {
-            return Cow::Borrowed(e);
-        }
-        let subj = Subject::Episode { series_norm, season: e.season as i32, episode: e.episode as i32 };
-        let title = self.text(&subj, Field::EpisodeTitle, &e.title);
-        let plot = e.plot.as_deref().and_then(|p| self.text(&subj, Field::Plot, p));
-        let same = |a: &Option<Cow<'_, str>>, b: Option<&str>| match a {
-            Some(t) => Some(t.as_ref()) == b,
-            None => b.is_none_or(str::is_empty),
-        };
-        if same(&title, Some(&e.title)) && same(&plot, e.plot.as_deref()) {
-            return Cow::Borrowed(e);
-        }
-        Cow::Owned(Episode { title: title.map(Cow::into_owned).unwrap_or_default(), plot: plot.map(Cow::into_owned), ..e.clone() })
-    }
 }
 
 /// The subject of a full guide programme.
@@ -200,17 +183,12 @@ impl TitleCache {
 
 // ------------------------------------------------------------------ text forms
 
-/// A bar's length in blocks per field kind: fixed, so its width never tells the text's.
-fn bar_blocks(field: Field) -> usize {
-    match field {
-        Field::EpisodeTitle => 10,
-        _ => 8,
-    }
-}
+/// A bar's length in blocks: fixed, so its width never tells the text's.
+const BAR_BLOCKS: usize = 8;
 
 /// "▆▆▆▆▆▆▆▆ 󰈉".
-fn bar_text(field: Field) -> String {
-    format!("{} {HIDDEN}", "▆".repeat(bar_blocks(field)))
+fn bar_text() -> String {
+    format!("{} {HIDDEN}", "▆".repeat(BAR_BLOCKS))
 }
 
 /// What a field shows as text.
@@ -223,7 +201,7 @@ pub fn display<'a>(g: Guarded<'a>, field: Field, now: Timestamp, h24: bool) -> C
                 Some(r) if !starting(r) => format!("{} · title hidden {HIDDEN}", r.rule),
                 _ => format!("Title hidden {HIDDEN}"),
             },
-            Field::SubTitle | Field::EpisodeTitle | Field::Image => bar_text(field),
+            Field::SubTitle | Field::EpisodeTitle | Field::Image => bar_text(),
             Field::Description | Field::Plot => hidden_line(field, reason.as_ref(), now, h24, &crate::spoiler::ui::reveal_key_label()),
         }),
     }
@@ -339,7 +317,7 @@ pub fn field(
                     let label = display(Guarded::Hidden { reason: reason.clone() }, field, sp.now, sp.h24);
                     ui.add(egui::Label::new(egui::RichText::new(label.as_ref()).size(size).color(t.text_secondary)).sense(egui::Sense::click()))
                 }
-                _ => bar(ui, theme, field, size),
+                _ => bar(ui, theme, size),
             };
             let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_name(reason.as_ref())));
@@ -354,11 +332,11 @@ pub fn field(
     }
 }
 
-/// The redaction bar: a rounded `separator` rect one glyph high and of a fixed width per field
-/// kind, then the dim 󰈉. Clickable.
-pub fn bar(ui: &mut egui::Ui, theme: &Theme, field: Field, size: f32) -> egui::Response {
+/// The redaction bar: a rounded `separator` rect one glyph high and of a fixed width, then the
+/// dim 󰈉. Clickable.
+pub fn bar(ui: &mut egui::Ui, theme: &Theme, size: f32) -> egui::Response {
     let t = &theme.tokens;
-    let w = (bar_blocks(field) as f32 * size * 0.6).round();
+    let w = (BAR_BLOCKS as f32 * size * 0.6).round();
     let gap = theme.space(SpaceToken::Sm);
     let font = egui::FontId::proportional(size);
     let glyph = ui.painter().layout_no_wrap(HIDDEN.to_owned(), font, t.text_disabled);
@@ -430,40 +408,37 @@ mod tests {
         Guard::with_snapshot(GuardSnapshot::from_parts(Settings::default(), Vec::new(), series, HashMap::new()))
     }
 
-    fn episode(n: u32, title: &str) -> Episode {
-        Episode {
-            id: crate::model::EpisodeId(i64::from(n)),
-            series_id: crate::model::SeriesId(1),
-            source_id: crate::model::SourceId(1),
-            key: crate::model::ItemKey(format!("e{n}")),
-            provider_id: None,
-            season: 2,
-            episode: n,
-            title: title.into(),
-            plot: Some(format!("What happens in {title}")),
-            duration_s: None,
-            still: None,
-            air_date: None,
-            rating: None,
-            stream: crate::model::StreamLocator::Url { url: "http://127.0.0.1/e.mkv".into() },
-        }
-    }
-
     #[test]
-    fn hidden_episode_text_shows_as_a_fixed_bar_and_a_reason_never_the_text() {
+    fn an_episode_title_always_shows_and_a_hidden_plot_says_why_never_the_text() {
         crate::spoiler::ui::hide_all();
         let sp = Spoilers::with_guard(severance(), 0, true);
-        let next = episode(4, "Woe's Hollow");
-        assert!(matches!(sp.episode("severance", &next), Cow::Borrowed(_)), "the next-up episode shows as is");
-        let short = sp.episode("severance", &episode(5, "Trojan's Horse")).into_owned();
-        let long = sp.episode("severance", &episode(6, "Attila the Hun and the Very Long Episode Title")).into_owned();
-        assert_eq!(short.title, long.title, "a bar's width never tells the title's length");
-        assert!(short.title.starts_with('▆') && !short.title.contains("Trojan"));
-        let plot = short.plot.unwrap();
+        let ep4 = Subject::Episode { series_norm: "severance", season: 2, episode: 4 };
+        assert_eq!(sp.text(&ep4, Field::Plot, "Mark goes to the retreat").as_deref(), Some("Mark goes to the retreat"), "the next-up episode");
+        let ep5 = Subject::Episode { series_norm: "severance", season: 2, episode: 5 };
+        assert_eq!(sp.text(&ep5, Field::EpisodeTitle, "Trojan's Horse").as_deref(), Some("Trojan's Horse"));
+        let plot = sp.text(&ep5, Field::Plot, "What happens in Trojan's Horse").unwrap();
         assert!(plot.contains("Plot hidden") && plot.contains("Severance") && !plot.contains("Trojan"), "{plot}");
         // the identity guard (feature off) shows everything
         let off = Spoilers::default();
-        assert_eq!(off.episode("severance", &episode(5, "Trojan's Horse")).title, "Trojan's Horse");
+        assert_eq!(off.text(&ep5, Field::Plot, "What happens").as_deref(), Some("What happens"));
+    }
+
+    #[test]
+    fn a_guide_airings_hidden_sub_title_is_a_fixed_bar() {
+        let sp = Spoilers::with_guard(severance(), 0, true);
+        let cats = vec!["Drama".to_owned()];
+        let airing = |sub| Subject::Programme {
+            title: "Severance",
+            sub_title: Some(sub),
+            categories: &cats,
+            season_episode: Some((2, 5)),
+            start: 0,
+            is_new: false,
+        };
+        let short = sp.text(&airing("Trojan's Horse"), Field::SubTitle, "Trojan's Horse").unwrap().into_owned();
+        let long = "Attila the Hun and the Very Long Episode Title";
+        assert_eq!(sp.text(&airing(long), Field::SubTitle, long).unwrap(), short, "a bar's width never tells the title's length");
+        assert!(short.starts_with('▆') && !short.contains("Trojan"));
     }
 
     #[test]
@@ -472,27 +447,27 @@ mod tests {
         let ep5 = Subject::Episode { series_norm: "severance", season: 2, episode: 5 };
         crate::spoiler::ui::reveal_key(RevealKey::of(&ep5).unwrap());
         let sp = Spoilers::with_guard(severance(), 0, true);
-        assert_eq!(sp.text(&ep5, Field::EpisodeTitle, "Trojan's Horse").as_deref(), Some("Trojan's Horse"));
+        assert_eq!(sp.text(&ep5, Field::Plot, "Mark escapes").as_deref(), Some("Mark escapes"));
         let ep6 = Subject::Episode { series_norm: "severance", season: 2, episode: 6 };
-        assert_ne!(sp.text(&ep6, Field::EpisodeTitle, "Attila").as_deref(), Some("Attila"));
+        assert_ne!(sp.text(&ep6, Field::Plot, "Helly lies").as_deref(), Some("Helly lies"));
         crate::spoiler::ui::hide_all();
         let sp = Spoilers::with_guard(severance(), 0, true);
-        assert_ne!(sp.text(&ep5, Field::EpisodeTitle, "Trojan's Horse").as_deref(), Some("Trojan's Horse"));
+        assert_ne!(sp.text(&ep5, Field::Plot, "Mark escapes").as_deref(), Some("Mark escapes"));
     }
 
     #[test]
-    fn a_click_on_a_bar_reveals_the_item_and_a_click_on_the_eye_hides_it() {
+    fn a_click_on_a_hidden_block_reveals_the_item_and_a_click_on_the_eye_hides_it() {
         crate::spoiler::ui::hide_all();
         let ep5 = Subject::Episode { series_norm: "severance", season: 2, episode: 5 };
         let mut harness = egui_kittest::Harness::new_ui(|ui| {
             let sp = Spoilers::with_guard(severance(), 0, true);
-            field(ui, &Theme::fallback(), &sp, &ep5, Field::EpisodeTitle, "Trojan's Horse", 16.0, ui.visuals().text_color());
+            field(ui, &Theme::fallback(), &sp, &ep5, Field::Plot, "Mark escapes", 16.0, ui.visuals().text_color());
         });
         harness.run();
         harness.get_by_label("Hidden by spoiler guard (Severance)").click();
         harness.run();
         assert!(crate::spoiler::ui::reveals().covers(&ep5));
-        harness.get_by_label("Trojan's Horse");
+        harness.get_by_label("Mark escapes");
         harness.get_by_label("Hide spoilers again").click();
         harness.run();
         assert!(crate::spoiler::ui::reveals().is_empty());

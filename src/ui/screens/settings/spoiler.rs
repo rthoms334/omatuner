@@ -42,7 +42,7 @@ pub(super) struct State {
 static TOGGLES: [CfgToggle; 5] = [
     CfgToggle { label: "Spoiler guard", get: |c| c.spoiler.enabled, set: |c, v| c.spoiler.enabled = v },
     CfgToggle {
-        label: "Series I'm part-way through (titles and plots after the next episode)",
+        label: "Series I'm part-way through (plots after the next episode; on TV, titles too)",
         get: |c| c.spoiler.series_auto,
         set: |c, v| c.spoiler.series_auto = v,
     },

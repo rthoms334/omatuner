@@ -33,7 +33,7 @@ Nothing is guarded before an event starts. The guard is display-only. It runs af
   - **Until seen:** active inside a window. A window opens at the event's first airing (a title match) and closes `window_h` after that airing ends, or when the event is seen.
   - **Always:** always active.
   - **Blackout:** active until its end time.
-- **Series.** For a guarded series, episodes after the next-up one lose their title, plot and still. Guide airings with S/E after next-up are guarded the same way. An airing without S/E loses its sub-title and description.
+- **Series.** For a guarded series, episodes after the next-up one lose their plot and still (their titles always show: DESIGN §34.1). Guide airings with S/E after next-up are guarded the same way. An airing without S/E loses its sub-title and description.
   - **Part-way series** are guarded automatically: at least one episode done (or 90 % watched, or seen on TV), activity within 180 days, and another episode in some playlist. Progress is merged across playlists through the episode fingerprint's series key.
   - **Next-up** is the started episode, or the catalogue's next episode after the last one done.
   - **The user's own row:** "don't guard" wins over the automatic rule.

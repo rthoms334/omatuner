@@ -6295,10 +6295,14 @@ Design: `docs/design/spoiler-guard-design.md`. Build notes: `docs/design/score.m
 ### 34.1 What it guards
 On by default but narrow; nothing is guarded before an event starts. Display only: it never
 builds events from explicit content, never lists or counts it, never reveals it.
-* **Series you're part-way through** (automatic): episodes after the next-up one lose title,
-  plot and still; guide airings with S/E after next-up likewise (the grid's slim rows carry the
-  guide's S/E too); an airing without S/E is placed first (§34.5) and loses its sub-title and
-  description when it comes after next-up or when nothing places it.
+* **Series you're part-way through** (automatic): episodes after the next-up one lose their
+  plot and still. Their titles always show (decided: the plot is what spoils, and a bar in a
+  row hid what the row is for), everywhere: watchlists, the series page, Up next, Home, the
+  player, notifications, MPRIS and agents' answers (`guard::Field::EpisodeTitle` is never
+  hidden). Guide airings with S/E after next-up lose their sub-title (the episode title on TV),
+  description and image (the grid's slim rows carry the guide's S/E too); an airing without
+  S/E is placed first (§34.5) and loses its sub-title and description when it comes after
+  next-up or when nothing places it.
 * **Sport you follow**: Following's spoiler-safe Team/Event rules become topics. An airing
   counts as the event only when it parses as a fixture (`parse_fixture`) and has none of the
   rule's "leave out" words ("Women", "U21", "Fan TV"…); highlights and reaction shows are never
@@ -6309,8 +6313,11 @@ builds events from explicit content, never lists or counts it, never reveals it.
   Fixture keys group repeats on later days (one embargo, lifted by watching any airing within
   7 days).
 * Scores in titles are rewritten ("Arsenal v Chelsea 󰈉"), including a trailing "2-1" or
-  "(2-1)" after a fixture; a sub-title becomes a fixed-width bar; descriptions say why and how to
-  show them.
+  "(2-1)" after a fixture; a guide sub-title becomes a fixed-width bar; descriptions say why and
+  how to show them. On the detail pages (the movie page's plot, the series page's own and the
+  plot under its focused episode's row) a hidden plot is a block (`ui::widgets::spoiler::field`):
+  a click or Ctrl+B shows it for that item, and 󰈈 on the shown text hides it again. The block
+  is its own widget, never inside a row, so the click never plays anything.
 
 ### 34.2 Where it applies
 Guide grid cells and tooltips, Live rows, details and upcoming list, search hits (painted text
@@ -6324,7 +6331,8 @@ MCP reply (`guard::reply::guard_json`). Painters cache per programme, minute and
 * **Seen**: live at ≥ 50 % watched or present in the last 10 minutes; catch-up/VOD at ≥ 90 %;
   either picture counts; Ctrl+W marks a guide programme seen (toast "Spoiler guard…" opens the
   menu with Undo).
-* **Reveal**: Ctrl+B on an item (any move hides it again); Ctrl+Shift+B opens the menu; "show
+* **Reveal**: Ctrl+B on an item, or a click on a bar or a hidden plot block (any move hides it
+  again; so does 󰈈); Ctrl+Shift+B opens the menu; "show
   everything for 15 min / 1 h / until restart" with a status chip and ✕. The hint line says
   "Ctrl+B show spoilers" while the guard hides something of the focused item ("Ctrl+B hide
   spoilers" while it is shown). In the player, the banner's programme line ("Severance ·
@@ -6348,7 +6356,8 @@ MCP reply (`guard::reply::guard_json`). Painters cache per programme, minute and
 marks seen; Settings shows such rules as "added by <agent>" and the marks as "marked seen by
 <agent>" (§30.12). `remove` only removes rules an agent added, whichever agent ("that rule is
 yours — remove it in Tuner ▸ Settings ▸ Spoiler guard"). Replies drop guarded fields unless the
-call names the item in `reveal_spoilers`.
+call names the item in `reveal_spoilers`; an on-demand episode keeps its `title` (its `plot`
+goes after next-up), a guide airing loses its `subtitle`.
 
 ### 34.5 Series airings without S/E
 Slim guide rows (grid, now/next, search hits) carry the guide's season and episode, so most

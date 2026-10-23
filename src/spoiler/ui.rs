@@ -544,17 +544,17 @@ mod tests {
         let target = |n: usize| Target::Episode { series, episode: eps[n - 1].id };
         let e5 = Subject::Episode { series_norm: &norm, season: 1, episode: 5 };
         let shown = |t: &mut crate::ui::testing::TestUi| {
-            t.with_ctx(|ctx| Spoilers::of(ctx).text(&e5, Field::EpisodeTitle, "Episode 5").map(|c| c.into_owned()))
+            t.with_ctx(|ctx| Spoilers::of(ctx).text(&e5, Field::Plot, "Episode 5's plot").map(|c| c.into_owned()))
         };
-        assert_ne!(shown(&mut t).as_deref(), Some("Episode 5"));
+        assert_ne!(shown(&mut t).as_deref(), Some("Episode 5's plot"));
         assert!(t.with_ctx(|ctx| on_action(ctx, Action::RevealSpoilers, &target(5))));
-        assert_eq!(shown(&mut t).as_deref(), Some("Episode 5"));
+        assert_eq!(shown(&mut t).as_deref(), Some("Episode 5's plot"));
         // the menu offers to hide it again
         let items = t.with_ctx(|ctx| menu_items(&target(5), ctx, KeyContext::Detail));
         assert!(items.iter().any(|i| i.label == "Hide spoilers"));
         // focus moves on (the key still goes to the screen)
         assert!(!t.with_ctx(|ctx| on_action(ctx, Action::Down, &target(5))));
-        assert_ne!(shown(&mut t).as_deref(), Some("Episode 5"));
+        assert_ne!(shown(&mut t).as_deref(), Some("Episode 5's plot"));
         // the next-up episode hides nothing
         assert!(t.with_ctx(|ctx| on_action(ctx, Action::RevealSpoilers, &target(4))));
         assert_eq!(t.toasts.last().map(|t| t.text.as_str()), Some("Nothing hidden here"));

@@ -366,7 +366,7 @@ pick and to carry on, never publish it.",
             name: "episodes",
             title: "Episodes",
             description: "A series' episodes (season, number, title, plot, length, watched, position), progress merged across its \
-copies; narrow with season or query. spoiler_safe=true drops plots; the spoiler guard hides episodes after the next one.",
+copies; narrow with season or query. spoiler_safe=true drops plots; the spoiler guard hides the plots of episodes after the next one.",
             input_schema: object(
                 json!({
                     "series_ref": text("A series ref."),

@@ -434,4 +434,37 @@ mod tests {
         assert_eq!(first, ids);
         assert!(unloaded_series(&t.db, &lib, &snapshot).is_empty());
     }
+
+    /// A later episode of a guarded series keeps its title in its watchlist row (no bar, no
+    /// 󰈉 painted inside a row a click plays); its plot is what the guard keeps back.
+    #[test]
+    fn a_guarded_episode_row_shows_its_title_while_its_plot_stays_hidden() {
+        use crate::guard::{Field, Subject};
+        let (mut t, _one) = rig();
+        let snapshot = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::named_series(c, src, &[("EN ★ Severance - 2022", "Severance")], 6)?;
+            let list = store::create(c, "Later", None, PlayOrder::Ordered, "app", 1)?;
+            let lib = crate::store::library::load(c)?;
+            let item = ItemRef { source: src, kind: ItemKind::Episode, key: ItemKey("m3u:named-ep0-5".into()) };
+            store::add(c, &lib, list, &[store::new_entry(c, &item)?], Insert::End, 1)?;
+            store::snapshot_with_preferences(c, &lib, false, false, false, Default::default())
+        });
+        let norm = crate::spoiler::series_key("Severance");
+        let mark = crate::spoiler::snapshot::SeriesMark { label: "Severance".into(), next_up: (1, 2), automatic: true, ..Default::default() };
+        let snap = crate::spoiler::snapshot::GuardSnapshot::from_parts(
+            Default::default(),
+            Vec::new(),
+            std::collections::HashMap::from([(norm.clone(), mark)]),
+            Default::default(),
+        );
+        t.services().agent.set_guard(crate::guard::Guard::with_snapshot(snap));
+        let e = &snapshot.lists.iter().find(|l| l.list.name == "Later").unwrap().entries[0];
+        assert_eq!(e.episode, Some((1, 5)));
+        let row = t.with_ctx(|ctx| label(ctx, e));
+        assert_eq!(row, "Severance · S1E5 · Episode 5");
+        let ep5 = Subject::Episode { series_norm: &norm, season: 1, episode: 5 };
+        let plot = t.with_ctx(|ctx| crate::ui::widgets::spoiler::Spoilers::of(ctx).text(&ep5, Field::Plot, "Mark escapes").map(|p| p.into_owned()));
+        assert!(plot.is_some_and(|p| p.contains("Plot hidden") && !p.contains("Mark")));
+    }
 }

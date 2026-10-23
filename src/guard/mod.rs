@@ -39,6 +39,9 @@ pub enum Field {
     SubTitle,
     Description,
     Plot,
+    /// An on-demand episode's title: always shown (DESIGN §34.1 — its plot is what spoils,
+    /// and a bar in a row only hid what the row is for). A guide airing's episode title is its
+    /// `SubTitle`, which stays guarded.
     EpisodeTitle,
     Image,
 }
@@ -134,7 +137,7 @@ pub enum Subject<'a> {
 pub struct Verdict {
     /// The title itself goes (a result verb next to a guarded topic: "Hamilton wins …").
     pub hide_title: bool,
-    /// Sub-title / episode title.
+    /// A guide programme's sub-title (an on-demand episode's title always shows).
     pub hide_sub: bool,
     /// Description / plot.
     pub hide_descr: bool,
@@ -421,17 +424,13 @@ impl Guard {
     }
 }
 
-/// One field under a verdict.
+/// One field under a verdict. An on-demand episode's title always shows, whatever the verdict
+/// (its plot and still are what the guard hides).
 fn apply<'a>(v: &Verdict, f: Field, episode: bool, text: &'a str) -> Guarded<'a> {
     let hidden = || Guarded::Hidden { reason: v.reason.clone() };
     match f {
-        Field::Title if episode => {
-            if v.hide_sub {
-                hidden()
-            } else {
-                Guarded::Shown(Cow::Borrowed(text))
-            }
-        }
+        Field::EpisodeTitle => Guarded::Shown(Cow::Borrowed(text)),
+        Field::Title if episode => Guarded::Shown(Cow::Borrowed(text)),
         Field::Title => {
             if v.hide_title {
                 return hidden();
@@ -443,7 +442,7 @@ fn apply<'a>(v: &Verdict, f: Field, episode: bool, text: &'a str) -> Guarded<'a>
             }
             Guarded::Shown(Cow::Borrowed(text))
         }
-        Field::SubTitle | Field::EpisodeTitle if v.hide_sub => hidden(),
+        Field::SubTitle if v.hide_sub => hidden(),
         Field::Description | Field::Plot if v.hide_descr => hidden(),
         Field::Image if v.obscure_image => hidden(),
         _ => Guarded::Shown(Cow::Borrowed(text)),
@@ -479,16 +478,47 @@ mod tests {
     fn before_the_first_build_it_fails_closed() {
         let g = Guard::live();
         let ep = Subject::Episode { series_norm: "severance", season: 1, episode: 1 };
-        assert!(matches!(g.text(&ep, Field::EpisodeTitle, "Good News About Hell", Policy::Normal, 0), Guarded::Hidden { .. }));
+        assert!(matches!(g.text(&ep, Field::Plot, "Mark is promoted", Policy::Normal, 0), Guarded::Hidden { .. }));
+        assert_eq!(g.text(&ep, Field::EpisodeTitle, "Good News About Hell", Policy::Normal, 0).text(), Some("Good News About Hell"));
         assert_eq!(g.outside_title("Arsenal 2-1 Chelsea", 0), "Arsenal v Chelsea");
         // pausing shows everything, resuming guards again, and both change the generation
         let before = g.generation();
         g.pause(Some(100));
         assert!(g.generation() != before && g.paused_until(50) == Some(100));
-        assert_eq!(g.text(&ep, Field::EpisodeTitle, "Good News About Hell", Policy::Normal, 50).text(), Some("Good News About Hell"));
-        assert!(matches!(g.text(&ep, Field::EpisodeTitle, "x", Policy::Normal, 100), Guarded::Hidden { .. }), "the pause ran out");
+        assert_eq!(g.text(&ep, Field::Plot, "Mark is promoted", Policy::Normal, 50).text(), Some("Mark is promoted"));
+        assert!(matches!(g.text(&ep, Field::Plot, "x", Policy::Normal, 100), Guarded::Hidden { .. }), "the pause ran out");
         g.pause(None);
         g.resume();
         assert!(g.paused_until(0).is_none());
+    }
+
+    /// Severance, next up S2E4: a later on-demand episode keeps its title and loses its plot and
+    /// still; a guide airing of it still loses its sub-title (the episode title on TV).
+    #[test]
+    fn an_episode_title_always_shows_but_its_plot_and_a_guide_airings_sub_title_do_not() {
+        let mut series = std::collections::HashMap::new();
+        let mark = crate::spoiler::snapshot::SeriesMark { label: "Severance".into(), next_up: (2, 4), automatic: true, ..Default::default() };
+        series.insert("severance".to_owned(), mark);
+        let snap = GuardSnapshot::from_parts(Default::default(), Vec::new(), series, std::collections::HashMap::new());
+        let g = Guard::with_snapshot(snap);
+        let ep = Subject::Episode { series_norm: "severance", season: 2, episode: 7 };
+        for p in [Policy::Normal, Policy::SpoilerSafe] {
+            assert_eq!(g.text(&ep, Field::EpisodeTitle, "Chikhai Bardo", p, 0).text(), Some("Chikhai Bardo"));
+            assert_eq!(g.text(&ep, Field::Title, "Chikhai Bardo", p, 0).text(), Some("Chikhai Bardo"));
+            assert!(matches!(g.text(&ep, Field::Plot, "Gemma's story", p, 0), Guarded::Hidden { .. }));
+        }
+        let v = g.judge(&ep, 0);
+        assert!(!v.hide_sub && v.hide_descr && v.obscure_image && v.guarded(), "{v:?}");
+        let cats = vec!["Drama".to_owned()];
+        let airing = Subject::Programme {
+            title: "Severance",
+            sub_title: Some("Chikhai Bardo"),
+            categories: &cats,
+            season_episode: Some((2, 7)),
+            start: 0,
+            is_new: false,
+        };
+        assert!(matches!(g.text(&airing, Field::SubTitle, "Chikhai Bardo", Policy::Normal, 0), Guarded::Hidden { .. }));
+        assert!(matches!(g.text(&airing, Field::Description, "Gemma's story", Policy::Normal, 0), Guarded::Hidden { .. }));
     }
 }

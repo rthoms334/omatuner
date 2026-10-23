@@ -288,7 +288,7 @@ fn always_topics_never_lift_and_blackouts_end_on_time() {
 }
 
 #[test]
-fn series_hide_episodes_after_next_up_across_playlists() {
+fn series_hide_later_episodes_plots_across_playlists() {
     let world = World::new("spoiler-series");
     // S2E3 finished on TV 2's copy, S1 watched on TV a while ago
     w(&world.store, |c| {
@@ -307,7 +307,8 @@ fn series_hide_episodes_after_next_up_across_playlists() {
     assert!(!g.judge(&ep(2, 4), KICK_OFF).guarded(), "the next-up episode shows");
     assert!(!g.judge(&ep(1, 2), KICK_OFF).guarded());
     let v = g.judge(&ep(2, 5), KICK_OFF);
-    assert!(v.hide_sub && v.hide_descr && v.obscure_image);
+    assert!(v.hide_descr && v.obscure_image && !v.hide_sub, "its plot and still go, its title stays");
+    assert_eq!(g.text(&ep(2, 5), Field::EpisodeTitle, "Trojan's Horse", Policy::Normal, KICK_OFF).text(), Some("Trojan's Horse"));
     assert_eq!(v.reason.map(|r| (r.rule, r.kind)), Some(("Severance".into(), ReasonKind::Series)));
     // guide airings: S/E after next-up hidden, without S/E the sub-title and description go
     let drama: Vec<String> = vec!["Drama".into()];
@@ -320,6 +321,7 @@ fn series_hide_episodes_after_next_up_across_playlists() {
         is_new: false,
     };
     assert!(g.judge(&airing(Some((2, 9))), KICK_OFF).hide_sub);
+    assert!(hidden(&g.text(&airing(Some((2, 9))), Field::SubTitle, "Cold Harbor", Policy::Normal, KICK_OFF)), "a guide sub-title stays guarded");
     assert!(!g.judge(&airing(Some((2, 4))), KICK_OFF).guarded());
     assert!(g.judge(&airing(None), KICK_OFF).hide_descr);
     assert_eq!(g.text(&airing(Some((2, 9))), Field::Title, "Severance", Policy::Normal, KICK_OFF).text(), Some("Severance"));
@@ -500,7 +502,7 @@ fn mcp_replies_lose_guarded_text_unless_revealed() {
     tuner::guard::reply::guard_json(&mut safe, &Guard::default(), Policy::SpoilerSafe, &|_| false, t);
     assert!(safe["programmes"][1].get("subtitle").is_none());
     assert_eq!(safe["programmes"][1]["spoiler"]["reason"], "spoiler_safe");
-    // an episode list under a series: titles after next-up go
+    // an episode list under a series: plots after next-up go, titles stay
     w(&world.store, |c| {
         c.execute(
             "INSERT INTO watch_progress(source_id, kind, item_key, position_s, duration_s, finished, updated_at, title, fp)
@@ -512,12 +514,27 @@ fn mcp_replies_lose_guarded_text_unless_revealed() {
     let g = world.guard(&Config::default(), KICK_OFF);
     let mut details = serde_json::json!({"ref": "series:1:sev", "kind": "series", "name": "Severance", "plot": "Office workers",
         "next_episode": {"ref": "episode:1:3", "season": 1, "episode": 3, "title": "In Perpetuity"},
-        "episodes": [{"ref": "episode:1:4", "season": 1, "episode": 4, "title": "The You You Are"}]});
+        "episodes": [{"ref": "episode:1:4", "season": 1, "episode": 4, "title": "The You You Are", "plot": "Mark meets Ms. Casey"}]});
     tuner::guard::reply::guard_json(&mut details, &g, Policy::Normal, &|_| false, t);
     assert_eq!(details["next_episode"]["title"], "In Perpetuity");
     assert_eq!(details["plot"], "Office workers");
-    assert!(details["episodes"][0].get("title").is_none());
+    assert_eq!(details["episodes"][0]["title"], "The You You Are", "an episode's title always shows");
+    assert!(details["episodes"][0].get("plot").is_none());
+    assert_eq!(details["episodes"][0]["spoiler"]["hidden"], serde_json::json!(["plot"]));
     assert_eq!(details["episodes"][0]["spoiler"]["reason"], "series");
+    // spoiler_safe drops every plot but keeps episode titles too
+    let mut safe = serde_json::json!({"ref": "series:1:sev", "kind": "series", "name": "Severance",
+        "episodes": [{"ref": "episode:1:1", "season": 1, "episode": 1, "title": "Good News About Hell", "plot": "Helly joins"}]});
+    tuner::guard::reply::guard_json(&mut safe, &g, Policy::SpoilerSafe, &|_| false, t);
+    assert_eq!(safe["episodes"][0]["title"], "Good News About Hell");
+    assert!(safe["episodes"][0].get("plot").is_none(), "{safe}");
+    // a guide airing of a later episode (live TV) still loses its sub-title: its episode title
+    let mut guide = serde_json::json!({"programmes": [{"ref": "programme:1:bbc2:9", "title": "Severance", "subtitle": "Hide and Seek",
+        "season": 1, "episode": 7, "categories": ["Drama"]}]});
+    tuner::guard::reply::guard_json(&mut guide, &g, Policy::Normal, &|_| false, t);
+    assert_eq!(guide["programmes"][0]["title"], "Severance");
+    assert!(guide["programmes"][0].get("subtitle").is_none(), "{guide}");
+    assert_eq!(guide["programmes"][0]["spoiler"]["hidden"], serde_json::json!(["subtitle"]));
 }
 
 #[test]
