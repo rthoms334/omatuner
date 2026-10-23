@@ -1471,6 +1471,7 @@ mod tests {
                     order.push(Control::Cast);
                 }
                 order.push(Control::Fullscreen);
+                order.push(Control::PopOut);
             }
             order.push(Control::Settings);
             assert_eq!(h.state().s.visible, order);
@@ -1960,7 +1961,11 @@ mod tests {
         assert!(texts.iter().any(|t| t.ends_with("Playing on Living Room")), "{texts:?}");
         assert!(texts.iter().any(|t| t == "Live · about 15 s behind"), "{texts:?}");
         assert!(has_label(&h, "Stop casting") && has_label(&h, "Play here"));
-        assert!(has_label(&h, "Cast to a TV") && texts.contains(&format!("{}  Living Room", glyphs::CAST_CONNECTED)), "{texts:?}");
+        assert!(has_label(&h, "Cast to a TV") && texts.contains(&glyphs::CAST_CONNECTED.to_string()), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == &format!("{}  Living Room", glyphs::CAST_CONNECTED) || t == "Living Room"),
+            "the Cast button has no label: {texts:?}"
+        );
         for gone in ["Audio & subtitles", "Pop out", "Info", "Mute", "Volume"] {
             assert!(!has_label(&h, gone), "{gone} stays hidden while casting");
         }

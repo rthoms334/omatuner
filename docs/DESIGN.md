@@ -2038,9 +2038,9 @@ No results: "No matches — Ctrl+K searches everything, Tab switches sections".
 │ News at Eight                                     20:00 – 21:00    │ 102 BBC Two        │ │
 │ ▕██████████████████░░░░░░░░░░░░░░░▏                34 min left     └────────────────────┘ │
 │ Next  21:00 Drama                                    [HD] [5.1] [CC] [⟲]                  │
-│ Live  󰒮  󰒭  󰕾 ━━━●─┊─ 80 %                              Next  󰗅  Cast  󰊓  ⚙             │
+│ Live  󰒮  󰒭  󰕾 ━━━●─┊─ 80 %                              Next  󰗅  󰄘  󰊓  󰏌  ⚙             │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
-VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · −10 / +10 s · tracks
+VOD bottom: title · S02E05 · [━━━━━━━━●───────── 41:20 / 1:02:13] · tracks
 ```
 The full window shows skip back / play-pause / skip forward only in the picture: thin
 OSD-white icons with soft dark shadows and no backgrounds, 56 pt play/pause and 40 pt
@@ -2058,14 +2058,18 @@ The bottom row keeps the essentials, in order:
 * Left: Back to live (only behind the live edge) · previous/next channel (live) · speaker
   and volume slider.
 * Right: Next in Up next (only with a next item, outside multi-view) · Audio & subtitles
-  (one glyph, no track names, tooltip) · Cast (while casting is on or a cast is running,
-  outside multi-view) · Fullscreen · **⚙ Player settings**.
+  (one glyph, no track names, tooltip) · Cast (glyph only, no label, also while casting — the
+  banner names the TV; while casting is on or a cast is running, outside multi-view) ·
+  Fullscreen · Pop out (glyph, right after Fullscreen; not in the popped-out window nor while
+  casting) · **⚙ Player settings**.
+  The line under a film's seek bar carries only the badges and, when something is hidden, the
+  spoiler hint.
 
 The cog opens a **pop-up rising from the cog**, with these rows and their shortcuts:
 Audio & subtitles › (`A` / `S`), Delay › (`[` / `]`, `z` / `x`), Channels (`c`), Guide (`g`),
-History (`H`), Up next (`u`), Info (`I`), Pop out (`Ctrl+Shift+O`). Channels, Guide and History
-are live-only; Up next requires the feature; Pop out is absent in the popped-out window and
-while casting. Tracks and Delay are absent while casting. Each moved control keeps its former
+History (`H`), Up next (`u`), Info (`I`). Channels, Guide and History
+are live-only; Up next requires the feature. Pop out (`Ctrl+Shift+O`) is on the row, in the
+cog only below 700 pt (like Fullscreen). Tracks and Delay are absent while casting. Each moved control keeps its former
 action. `H` and `I` retain their existing uppercase bindings (`i` still enters OSD focus).
 
 The row's Audio & subtitles button opens the same pop-up directly on its track page: audio
@@ -2106,11 +2110,11 @@ The OSD has two layers (UX review B1):
 * Type: title Display·s, body Title·s, badges Caption·s; `osd_accent` for progress/focus. Below
   700 pt × rem transport stays in the centre (in the row only when popped out). The row retains
   Back to live when behind, live zapping, the speaker (no slider), Next in Up next, Audio &
-  subtitles and the cog. Cast and Fullscreen move into the cog menu. Labels
+  subtitles and the cog. Cast, Fullscreen and Pop out move into the cog menu. Labels
   collapse to glyphs before spacing shrinks; the cog stays at the right edge.
 * **Mouse** (row controls have a hover fill; all controls have a pointing hand and tooltip):
   ← at the left of the top bar leaves the player like `p`; the cog offers Channels
-  (live) and Pop out (not in the popped-out window); volume follows the left-hand buttons — the
+  (live); Pop out is a row button beside Fullscreen; volume follows the left-hand buttons — the
   speaker (glyph by level; click = mute, tooltip "Mute (m)"), a slider 0–130 % with a mark
   at 100 % (click sets, drag scrubs, wheel ±5; moving it while muted unmutes; 112 pt × s wide,
   80 pt × s from 1200 pt down) and the level ("80 %", "Muted"), its room reserved before the

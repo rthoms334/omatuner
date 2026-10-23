@@ -24,8 +24,8 @@ pub(super) enum Control {
     UpNext,
     /// Up next's next item (`n`): while Up next has one and multi-view is off.
     QueueNext,
-    /// Cast to a TV (`C`; DESIGN §40 §3.1): before Fullscreen in the wide layout; while casting
-    /// it shows the connected glyph and the TV's name.
+    /// Cast to a TV (`C`; DESIGN §40 §3.1): before Fullscreen in the wide layout; glyph only,
+    /// the connected glyph while casting (the banner names the TV).
     Cast,
     Fullscreen,
     PopOut,
@@ -114,6 +114,7 @@ impl Control {
                 | Control::Next
                 | Control::SkipBack
                 | Control::SkipForward
+                | Control::Cast
                 | Control::Fullscreen
                 | Control::PopOut
                 | Control::AudioSubtitles
@@ -256,12 +257,10 @@ pub(super) fn clock(seconds: f64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
-/// Control label with the live value (the connected TV).
-pub(super) fn control_text(c: Control, snap: &PlayerSnapshot) -> String {
+/// Control label (the controls without a glyph-only look).
+pub(super) fn control_text(c: Control) -> String {
     match c {
         Control::QueueNext => "Next".into(),
-        // the TV's name while casting, else what the button does
-        Control::Cast => snap.cast.as_ref().map_or_else(|| "Cast".into(), |c| c.name.clone()),
         other => other.label().into(),
     }
 }
@@ -327,6 +326,10 @@ impl PlayerScreen {
         if !narrow {
             v.extend(queue.cast.then_some(C::Cast));
             v.push(C::Fullscreen);
+            // not in the popped-out window (it has its own pop-in strip) nor while casting
+            if !video_only && snap.cast.is_none() {
+                v.push(C::PopOut);
+            }
         }
         v.push(C::Settings);
         v
@@ -753,19 +756,18 @@ impl PlayerScreen {
             }
             y += line;
             let br = self.badges(&p, theme, snap, false, egui::pos2(inner.right(), y + line / 2.0), badge_font.clone(), s);
-            let mut hint = format!("−{} / +{} s", ctx.config.player.skip_small_s, ctx.config.player.skip_small_s);
-            if let Some(h) = &spoiler_hint {
-                hint = format!("{hint}  ·  {h}");
+            // the line under the seek bar: the badges at the right, the spoiler hint alone at the left
+            if let Some(hint) = &spoiler_hint {
+                osd_text(
+                    &p,
+                    egui::pos2(inner.left(), y + line / 2.0),
+                    Align2::LEFT_CENTER,
+                    hint,
+                    small_font.clone(),
+                    with_alpha(t.osd_text, 0.7),
+                    (br.left() - pad - inner.left()).max(0.0),
+                );
             }
-            osd_text(
-                &p,
-                egui::pos2(inner.left(), y + line / 2.0),
-                Align2::LEFT_CENTER,
-                &hint,
-                small_font.clone(),
-                with_alpha(t.osd_text, 0.7),
-                (br.left() - pad - inner.left()).max(0.0),
-            );
             y += line;
         }
 
@@ -853,7 +855,7 @@ impl PlayerScreen {
         let mut gap = pad / 2.0;
         let mut button_pad = pad;
         let text_of = |c: Control, only: bool| {
-            if only || c.glyph_only() { c.glyph(snap).to_owned() } else { format!("{}  {}", c.glyph(snap), control_text(c, snap)) }
+            if only || c.glyph_only() { c.glyph(snap).to_owned() } else { format!("{}  {}", c.glyph(snap), control_text(c)) }
         };
         let width_of = |text: String| p.layout_no_wrap(text, font.clone(), t.osd_text).size().x;
         let slider_w = if narrow { 0.0 } else { (if rect.width() >= 1200.0 * theme.rem() { 112.0 } else { 80.0 }) * s };
@@ -890,8 +892,11 @@ impl PlayerScreen {
                 self.settings_anchor = Some(r);
             }
             let focused = self.settings.is_none() && self.osd_focus && self.row == OsdRow::Buttons && i == self.control;
-            let tip = c.key_tip().unwrap_or(c.label());
-            if osd_button(ui, &p, theme, r, ui.id().with(("osd-control", i)), &text, font.clone(), c.label(), Some(tip), focused).clicked() {
+            let tip = match (c, snap.cast.as_ref()) {
+                (Control::Cast, Some(cast)) => format!("Casting to {} (C)", cast.name),
+                _ => c.key_tip().unwrap_or(c.label()).to_owned(),
+            };
+            if osd_button(ui, &p, theme, r, ui.id().with(("osd-control", i)), &text, font.clone(), c.label(), Some(&tip), focused).clicked() {
                 clicked = Some((i, c));
             }
             x = r.right() + gap;
