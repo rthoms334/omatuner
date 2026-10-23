@@ -129,6 +129,9 @@ pub struct FeatureBackup {
     /// Watchlists, their ranges, skips and restart boundaries (DESIGN §42).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watchlists: Option<serde_json::Value>,
+    /// New episodes' arrivals (Home's state) and mutes, never the ledger (DESIGN §44 §4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_episodes: Option<serde_json::Value>,
 }
 
 impl FeatureBackup {
@@ -139,6 +142,7 @@ impl FeatureBackup {
             && self.spoiler.is_none()
             && self.guide_fix.is_none()
             && self.watchlists.is_none()
+            && self.new_episodes.is_none()
     }
 }
 
@@ -283,6 +287,7 @@ pub fn export(conn: &Connection, opts: BackupOptions, config_toml: Option<String
             guide_fix: crate::store::guide_fix::export(conn)?,
             watchlists: crate::store::watchlist::export(conn)?,
             downloads: crate::store::downloads::export(conn)?,
+            new_episodes: crate::store::new_episodes::export(conn)?,
         },
         config: config_toml,
     })
@@ -351,6 +356,7 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
             crate::store::sources::purge_epg_source(&tx, e.id)?;
         }
         tx.execute_batch("DELETE FROM watchlist_item; DELETE FROM watchlist WHERE is_default=0; UPDATE watchlist SET note=NULL,play_order='any',since=0,last_played_at=NULL WHERE is_default=1; DELETE FROM meta WHERE key IN ('queue:context','queue:context_agent') OR key LIKE 'watchlist:%'; DELETE FROM fav_item; DELETE FROM fav_list WHERE is_default = 0; DELETE FROM history;")?;
+        tx.execute_batch("DELETE FROM newep_arrival; DELETE FROM newep_mute; DELETE FROM meta WHERE key LIKE 'newep:lm_unreliable:%';")?;
     }
 
     // ---- sources
@@ -616,6 +622,9 @@ pub fn restore(conn: &mut Connection, b: &Backup, mode: RestoreMode) -> Result<R
     }
     if let Some(v) = &b.features.guide_fix {
         rows += crate::store::guide_fix::import(&tx, v, &remap)?;
+    }
+    if let Some(v) = &b.features.new_episodes {
+        rows += crate::store::new_episodes::import(&tx, v, &remap)?;
     }
 
     // ---- manual EPG mappings (by guide name)
