@@ -108,8 +108,10 @@ def you(text):
     out()
     out(f" {BLUE}{BOLD}❯{RESET} ", end="")
     time.sleep(0.4)
-    typed(FG + text + RESET)
-    out()
+    # the colour codes go out at once: only the words are typed
+    out(FG, end="")
+    typed(text)
+    out(RESET)
     time.sleep(0.5)
 
 

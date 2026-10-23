@@ -1109,6 +1109,9 @@ pub fn build_with_art(dir: &Path, media: Option<&Path>, media2: Option<&Path>, a
     cfg.agents.checked_version = Some(env!("CARGO_PKG_VERSION").into());
     cfg.follow.news_flash.quiet_from_min = Some(22 * 60);
     cfg.follow.news_flash.quiet_to_min = Some(7 * 60);
+    // nor at the TVs on this computer's network (the first-run pass would name them)
+    cfg.cast.offer_setup = false;
+    cfg.cast.checked_version = Some(env!("CARGO_PKG_VERSION").into());
     cfg.save(&paths.config_file())?;
 
     // images
@@ -1183,6 +1186,7 @@ pub fn build_with_art(dir: &Path, media: Option<&Path>, media2: Option<&Path>, a
     let progs = Arc::new(progs);
     let p2 = progs.clone();
     let follow_cfg = cfg.follow.clone();
+    let newep_cfg = cfg.new_episodes.clone();
     let dl_cfg = cfg.clone();
     let clip = media.map(|m| std::fs::canonicalize(m).unwrap_or_else(|_| m.to_path_buf()));
     store.writer().blocking(move |c| {
@@ -1190,6 +1194,7 @@ pub fn build_with_art(dir: &Path, media: Option<&Path>, media2: Option<&Path>, a
         user_data(c, now, &p2)?;
         follow_rules(c, now, &follow_cfg)?;
         downloads(c, now, &p2, &dl_cfg, clip.as_deref())?;
+        new_episodes(c, now, &newep_cfg)?;
         Ok(())
     })?;
     run(&jobs, &events, JobKind::EvaluateFollows { reason: FollowReason::Rules })?;
@@ -1517,6 +1522,29 @@ fn user_data(c: &mut Connection, now: Timestamp, progs: &[Prog]) -> tuner::error
         let account = AccountInfo { status: AccountStatus::Active, max_connections: Some(1), ..Default::default() };
         tuner::store::sources::set_account(c, SourceId(src), &account)?;
     }
+    Ok(())
+}
+
+/// New episodes (DESIGN §44): two episodes of The Beverly Hillbillies (on the watchlist, so
+/// tracked) arrive after the title was baselined three days ago, through the store's own check:
+/// Home's "New episodes" row, "● New" on the watchlist entry. Announced already (no
+/// notification at launch) and the first-run card answered.
+fn new_episodes(c: &mut Connection, now: Timestamp, cfg: &tuner::config::NewEpisodesConfig) -> tuner::error::Result<()> {
+    use tuner::store::new_episodes as ne;
+    const HELD: &str = "FROM episode WHERE season = 2 AND episode IN (10, 14)
+        AND series_id IN (SELECT id FROM series WHERE name LIKE '%Beverly Hillbillies%')";
+    c.execute_batch(&format!("CREATE TEMP TABLE demo_held AS SELECT * {HELD}; DELETE {HELD};"))?;
+    let lib = tuner::store::library::load(c)?;
+    let baseline = ne::CheckInput { diff: false, ..Default::default() };
+    ne::check(c, &lib, &ne::Opts::from_config(cfg, now - 3 * 86_400), &baseline)?;
+    c.execute_batch("INSERT INTO episode SELECT * FROM demo_held; DROP TABLE demo_held;")?;
+    let lib = tuner::store::library::load(c)?;
+    let report = ne::check(c, &lib, &ne::Opts::from_config(cfg, now - 20 * 3600), &ne::CheckInput { diff: true, ..Default::default() })?;
+    if report.arrivals == 0 {
+        return Err(tuner::error::Error::Other("demo: no new episodes arrived".into()));
+    }
+    ne::mark_notified(c, &report.announce, now - 20 * 3600)?;
+    ne::ack_card(c, now - 2 * 86_400)?;
     Ok(())
 }
 

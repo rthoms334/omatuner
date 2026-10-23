@@ -158,8 +158,8 @@ fn escape_markup(s: &str) -> std::borrow::Cow<'_, str> {
 async fn show(n: &Notification, bus: Option<&str>) -> Result<notify_rust::NotificationHandle> {
     // Tests run real services (jobs, the scheduler) and must never reach the desktop's
     // notification server: only the fake test buses answer them (callers fall back to a toast).
-    if bus.is_none() && crate::platform::off_desktop() {
-        return Err(Error::other("no desktop notifications off the desktop (tests)"));
+    if bus.is_none() && crate::platform::quiet() {
+        return Err(Error::other("no desktop notifications off the desktop (tests, the demo video)"));
     }
     match bus {
         None => n.show_async().await,

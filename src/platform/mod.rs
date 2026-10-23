@@ -36,6 +36,22 @@ pub fn off_desktop() -> bool {
     cfg!(test) || OFF_DESKTOP.load(Ordering::Relaxed) || std::env::var_os("TUNER_NO_DESKTOP").is_some()
 }
 
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// The demo video's recording (`devshot`, DESIGN §23.1): Tuner runs on a virtual output the
+/// user doesn't look at, so it never asks for the keyboard (`hypr::focus_self`), shows no
+/// desktop notifications (they would land on the user's screen, never in the video) and looks
+/// for no TVs on the network (`cast::service`: the video would name them); the pop-out and the
+/// other Hyprland calls on its own window still work.
+pub fn keep_quiet() {
+    QUIET.store(true, Ordering::Relaxed);
+}
+
+/// No focus requests, desktop notifications or TV discovery: [`off_desktop`] or [`keep_quiet`].
+pub fn quiet() -> bool {
+    off_desktop() || QUIET.load(Ordering::Relaxed)
+}
+
 /// Events from platform services to the UI thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlatformEvent {

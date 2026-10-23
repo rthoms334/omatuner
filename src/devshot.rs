@@ -232,6 +232,21 @@ impl Driver {
         if std::mem::replace(&mut self.sized, true) { None } else { self.cfg.size }
     }
 
+    /// Called first in `raw_input_hook`: the window counts as focused while the script runs.
+    /// `scripts/demo-video.sh` records on an output the user doesn't look at, where the window
+    /// never gets the keyboard; egui would otherwise ignore typing into a text field
+    /// (`Response::has_focus` wants a focused window) and the app would act as if out of sight.
+    pub fn hold_focus(&self, raw: &mut egui::RawInput) {
+        if self.phase == Phase::Done {
+            return;
+        }
+        raw.focused = true;
+        raw.events.retain(|e| !matches!(e, egui::Event::WindowFocused(false)));
+        if let Some(v) = raw.viewports.get_mut(&raw.viewport_id) {
+            v.focused = Some(true);
+        }
+    }
+
     /// Called from `raw_input_hook` before key resolution: injects the script's input into
     /// `raw`, saves a delivered screenshot (then closes the window) and returns the app-level
     /// commands that are due. `ready` = the first library snapshot is in; `window` = the logical

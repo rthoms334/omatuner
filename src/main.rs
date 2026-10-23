@@ -108,6 +108,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     startup::log_to(paths.log_file());
     // developer-only screenshot capture (DESIGN §23.1); a typo fails here, not after a minute
     let devshot = tuner::devshot::ShotConfig::from_env().map_err(|e| anyhow::anyhow!("TUNER_SCREENSHOT*: {e}"))?;
+    if devshot.is_some() {
+        // recorded where the user doesn't look: never take their keyboard nor notify them
+        tuner::platform::keep_quiet();
+    }
     let (config, config_err) = match Config::load(&paths.config_file()) {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),

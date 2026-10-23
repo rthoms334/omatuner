@@ -3742,12 +3742,11 @@ explicit test bus.
 ### 23.1 Dev notes: README demo video
 
 `scripts/demo-video.sh [scene…]` records the README's demo video: a silent tour of about 90 s,
-one short scene per feature under a caption, between two title cards. It writes
-`target/demo-video/tuner-demo.mp4` (H.264, 1440 px wide, two-pass to stay under GitHub's 10 MB
-upload limit; the maintainer uploads it in the README editor, which plays user-attachments
-videos inline) and `docs/demo-preview.webp` (a ~12 s looping excerpt, 880 px wide, committed:
-the README's top image, linking to the video). The repository is public, so the video shows
-only made-up or public-domain content:
+one short scene per feature under a caption, between two title cards. It runs unattended and
+off screen (below), and writes both files the README uses, committed: `docs/tuner-demo.mp4`
+(H.264, 1440 px wide, silent, two-pass to stay under 9.5 MB) and `docs/demo-preview.webp` (a
+~12 s looping excerpt, 880 px wide: the README's top image, linking to the video). The
+repository is public, so the video shows only made-up or public-domain content:
 
 * **Demo profile** — `cargo run --example demo_profile -- <dir> [--media <file>] [--media2 <file>] [--art <dir>] [--silent]`:
   three fictional playlists (Northwind, Aurora, Harbor Free; distinct colours) as local M3U
@@ -3763,14 +3762,17 @@ only made-up or public-domain content:
   (Metropolis: English and German copies plus a 4K one). Details go in with
   `store::import::store_movie_details`; favourites, history, progress and reminders (one an
   automatic switch) through `store::user`; Up next (Buster Keaton's three and an episode,
-  `store::queue`); a watchlist; three Following rules (a team, a daily news flash on a
+  `store::queue`); a watchlist; new episodes (two of The Beverly Hillbillies, on the watchlist,
+  held back while `store::new_episodes::check` baselines the title, then put back and found
+  by a second check: Home's row, "● New" on the entry, "2 new episodes" on its page; marked
+  announced, the first-run card answered); three Following rules (a team, a daily news flash on a
   bulletin that isn't due within the next three hours, a listed show; evaluated by
   `EvaluateFollows`); downloads planned by `downloads::planning::new_job` (two series'
   episodes, films, a recording done and one scheduled; finished ones are links to `--media`,
   the others paused, so nothing fetches); two channels no guide lists and a "+1" channel
   (Guide fixes); a one-connection limit on Northwind and Aurora (multi-view takes the second
-  picture's copy from the other playlist); and `[agents]` set so the profile never looks at
-  the agents installed on the computer. Logos (monograms) are rendered with resvg using egui's
+  picture's copy from the other playlist); and `[agents]` and `[cast]` set so the profile
+  never looks at the agents installed on the computer nor offers to set up a TV. Logos (monograms) are rendered with resvg using egui's
   bundled fonts; posters and backdrops come from `--art` (below), else are generated
   (gradient landscapes + title); all go into the profile's image cache under
   `https://img.tuner-demo.invalid/…` URLs, which are never fetched. `demo/refs.env` names
@@ -3791,17 +3793,39 @@ only made-up or public-domain content:
   `mark:`, `wait:`) 0.35 s apart once the first library is in and the window has its size;
   `mark:<label>` appends the label and the wall-clock time in µs to
   `TUNER_SCREENSHOT_MARKS`; `TUNER_SCREENSHOT_AFTER` (default 2 s) waits after the last step.
-  Keys and pointer moves are injected into egui's input, never sent through the compositor.
+  Keys and pointer moves are injected into egui's input, never sent through the compositor,
+  and the window counts as focused while the script runs (`Driver::hold_focus`: it never has
+  the keyboard, and egui ignores typing into a text field of an unfocused window). With
+  `TUNER_SCREENSHOT` set the process keeps quiet (`platform::keep_quiet`): no focus requests
+  (`hypr::focus_self`, which an agent's play or a reminder would make), no desktop
+  notifications and no TV discovery (the video would name the TVs on the network).
+* **Off screen** — the script adds a virtual Hyprland output (`hyprctl output create headless
+  TUNERDEMO`, scale 1.5, at -20000,-20000 so the pointer can't reach it and no monitor of the
+  user's moves) after a workspace rule binding the workspace `tuner-demo` to it as its default
+  (so it never takes a numbered workspace), and removes both on exit, Ctrl+C or an error
+  included: the output goes (after any of the script's windows still on it, which would
+  otherwise move to the user's screen), and the rule is disabled through its Lua handle (the
+  `tuner_demo` global, reused next time). These are runtime changes; the monitor rule naming
+  `TUNERDEMO` stays until the next config reload, harmlessly, and `hyprctl reload` isn't used,
+  since it would also drop the user's own runtime changes. Hyprland 0.56 draws its software
+  cursor on a headless output at the pointer's own coordinates, so the output has a reserved
+  band as tall as the user's monitors above the stage area (the pointer never shows). A lock
+  screen covers every output, the virtual one too: the script won't start while the session
+  is locked (Hyprland lists `LOCK` in a monitor's `solitaryBlockedBy`), the demo windows
+  inhibit idle (window rule) and a scene that ends locked stops the run. The user's active
+  window and workspace are compared before and after, with a warning when they differ.
 * **Recording** — each scene runs Tuner on a fresh copy of the profile (the Following scene
-  continues the agent scene's), started through Hyprland's `exec_cmd` with an opaque-window
-  rule, over a foot window filling the same stage (a dark backdrop, a page of source code for
-  the pop-out, or the agent terminal), on an empty workspace (`tuner-demo`); the pop-out lands
-  inside the stage (`player.popout_last` in the copy's config). `scripts/demo-capture.py`
-  records the stage at 30 fps with grim (wlr-screencopy) into ffmpeg, frame slots filled from
+  continues the agent scene's), started through Hyprland's `exec_cmd` with rules that follow
+  its pid (`workspace = "name:tuner-demo silent"`, `no_initial_focus`, `no_focus`,
+  `idle_inhibit = "always"`, opaque), over a foot window started the same way and filling the
+  same stage (a dark backdrop, a page of source code for the pop-out, or the agent terminal);
+  the pop-out lands inside the stage (`player.popout_last` in the copy's config). A scene
+  stops unless the demo Tuner's window is on `tuner-demo` on the virtual output.
+  `scripts/demo-capture.py` records the stage at 30 fps with grim (wlr-screencopy, on a region
+  checked to lie inside the virtual output's stage area) into ffmpeg, frame slots filled from
   the newest grab, and notes frame 0's wall-clock time; gpu-screen-recorder isn't used, since
   its KMS capture finds no usable card on every machine (Asahi) and its portal capture needs a
-  dialog. The scene is cut between its `mark:in` and `mark:out`. A scene stops unless the
-  focused window is its own demo Tuner, and the script won't start with the screen off.
+  dialog. The scene is cut between its `mark:in` and `mark:out`.
 * **Agent scene** — `scripts/demo-agent.py` is a scripted MCP client in the terminal: it types
   the two requests, then makes the calls an agent would against the running demo Tuner through
   the real `tuner mcp --profile-dir …` (`guide_search` → `play`, then `follow` preview → add
