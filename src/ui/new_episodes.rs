@@ -270,19 +270,25 @@ fn write_undoable(ctx: &UiCtx<'_>, text: String, f: impl FnOnce(&mut rusqlite::C
             Ok(undo) => {
                 invalidate();
                 bus.data_changed(DataScope::NewEpisodes);
-                let mut toast = Toast::info(text);
-                if !undo.is_empty() {
-                    let n = UNDO_NEXT.fetch_add(1, Ordering::Relaxed).max(1);
-                    stash(&UNDOS, n, undo);
-                    toast.action = Some(("Undo".into(), Action::NewEpisodes(NewEpisodesAct::Undo(n))));
-                    toast.ttl_ms = UNDO_TTL_MS;
-                }
-                bus.toast(toast);
+                undo_toast(&bus, text, undo);
             }
             Err(e) => bus.toast(Toast::error(crate::redact::redact(&e.to_string()))),
         }
         Ok(())
     });
+}
+
+/// Toast `text` with an Undo button that puts `undo` back (10 s). Also the agent's, after a
+/// `seen` or `mute` the user asked for.
+pub fn undo_toast(bus: &crate::msg::EventBus, text: String, undo: store::Undo) {
+    let mut toast = Toast::info(text);
+    if !undo.is_empty() {
+        let n = UNDO_NEXT.fetch_add(1, Ordering::Relaxed).max(1);
+        stash(&UNDOS, n, undo);
+        toast.action = Some(("Undo".into(), Action::NewEpisodes(NewEpisodesAct::Undo(n))));
+        toast.ttl_ms = UNDO_TTL_MS;
+    }
+    bus.toast(toast);
 }
 
 fn stash<T>(q: &Mutex<VecDeque<(u16, T)>>, n: u16, v: T) {

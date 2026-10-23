@@ -525,3 +525,45 @@ pub struct Downloads {
     pub season: Option<u32>,
     pub ids: Option<Vec<i64>>,
 }
+
+// New episodes (DESIGN §44 §7). `list` and `tracked` only read; `seen` and `mute` change what the
+// user sees and need their yes (RULES.md).
+tool_actions!(pub enum NewEpisodesAction {
+    List => ("list", false), Tracked => ("tracked", false), Seen => ("seen", true), Mute => ("mute", true)
+});
+
+fn list_action() -> NewEpisodesAction {
+    NewEpisodesAction::List
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewEpisodes {
+    #[serde(default = "list_action")]
+    pub action: NewEpisodesAction,
+    /// list: a time or "7d" / "12h"; default: everything not cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// list: also episodes watched, dismissed or expired in the last 30 days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_cleared: Option<bool>,
+    /// list / tracked: series, 1-50, default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoiler_safe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal_spoilers: Option<Vec<String>>,
+    /// seen / mute: a series ref from list or tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_ref: Option<String>,
+    /// seen: episode refs from list's `new` (at most 50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<Vec<String>>,
+    /// seen: every new episode on Home ("clear my new episodes").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all: Option<bool>,
+    /// mute: true (default) stops alerts for the series, false allows them again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted: Option<bool>,
+}

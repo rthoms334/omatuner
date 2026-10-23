@@ -199,6 +199,7 @@ fn tools_list_has_every_tool() {
             "control",
             // the feature tools (each listed while its feature is on)
             "downloads",
+            "new_episodes",
             "queue",
             "watchlist",
             "follow",
