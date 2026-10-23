@@ -350,12 +350,12 @@ pub fn note(n: u16) -> Option<Note> {
 
 /// The master switch ("New episode alerts" in Settings, "Turn off" on the first-run card).
 /// Off forgets the ledger, so switching it on again starts with a silent baseline (§3.4); the
-/// next playlist refresh or a "Check now" does that.
+/// next playlist refresh or a "Check now" does that. On forgets it too: a check that was
+/// writing as the switch went off (before the edit reached the shared config) may have left
+/// one behind.
 pub fn set_enabled(ctx: &mut UiCtx<'_>, on: bool) {
     ctx.edit_config(move |c| c.new_episodes.enabled = on);
-    if !on {
-        let _ = ctx.services.store.writer().submit_notify(DataScope::NewEpisodes, |c| store::forget_ledger(c).map(drop));
-    }
+    let _ = ctx.services.store.writer().submit_notify(DataScope::NewEpisodes, |c| store::forget_ledger(c).map(drop));
 }
 
 /// Fixtures for the screens' tests: a series on My list whose catalogue then grows.

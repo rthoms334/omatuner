@@ -218,7 +218,7 @@ It shows once on Home after the first baseline (`meta` row `newep:card`), like t
 | **Play** | Plays the series' next episode by `copies::next_episode` (resume the newest unfinished, else the one after the newest watched), through the copy plan, the way Continue watching does. When that is the first new episode, the button says "Play S2E9"; when you're behind, it says "Play S1E6". |
 | **Download** (decided: no automatic download) | Only when you pick it: `DownloadCommand::Add` with every new episode of the series (any copy; the downloads service picks the copy at start, §43 §3). A Keep N rule (§43) works as before and may already have queued them. |
 | **Desktop notifications off** | Arrivals still reach Home, the badges, Settings ▸ Recent and the agent. |
-| **The master switch off** | Nothing is checked, fetched or shown. Switching it on again baselines silently. |
+| **The master switch off** | Nothing is checked, fetched or shown; a check still running when it goes off writes nothing (it reads the switch again inside its write). Switching it off or on forgets the ledger, so switching it on again baselines silently. |
 | **No notification server** | An in-app toast with the same text and Play (or Open). |
 
 ### 3.5 Clearing

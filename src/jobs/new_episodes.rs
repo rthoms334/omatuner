@@ -246,7 +246,8 @@ async fn track(ctx: &JobContext) -> Result<()> {
         return Ok(());
     }
     let opts = Opts::from_config(&cfg.new_episodes, crate::model::now());
-    let r = write(ctx, move |c| store_ne::check(c, &lib, &opts, &CheckInput::default())).await?;
+    let config = ctx.config.clone();
+    let Some(r) = write(ctx, move |c| check_if_on(c, &config, &lib, &opts, &CheckInput::default())).await? else { return Ok(()) };
     if r.baselined > 0 || r.first_run {
         notify(ctx, DataScope::NewEpisodes);
     }
@@ -255,6 +256,22 @@ async fn track(ctx: &JobContext) -> Result<()> {
 }
 
 // ------------------------------------------------------------------ the check
+
+/// [`store_ne::check`] unless the master switch is off by now: read inside the write, so a
+/// check (or a re-track) that was fetching when the switch went off never writes a ledger or
+/// arrivals after the switch's `forget_ledger`. `None`: switched off, nothing written.
+fn check_if_on(
+    c: &mut rusqlite::Connection,
+    config: &crate::config::SharedConfig,
+    lib: &Library,
+    opts: &Opts,
+    input: &CheckInput,
+) -> Result<Option<store_ne::CheckReport>> {
+    if !crate::config::current(config).new_episodes.enabled {
+        return Ok(None);
+    }
+    store_ne::check(c, lib, opts, input).map(Some)
+}
 
 /// One copy to fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,13 +357,17 @@ pub async fn run(
     progress.set(JobPhase::Matching);
     let opts = Opts { now: crate::model::now(), ..opts };
     let input = CheckInput { diff: true, silent: silent.iter().copied().collect(), fallback };
-    let l = lib.clone();
+    let (l, config) = (lib.clone(), ctx.config.clone());
     let report = write(ctx, move |c| {
-        let r = store_ne::check(c, &l, &opts, &input)?;
+        let Some(r) = check_if_on(c, &config, &l, &opts, &input)? else { return Ok(None) };
         store_ne::mark_checked(c, &fetched, opts.now)?;
-        Ok(r)
+        Ok(Some(r))
     })
     .await?;
+    let Some(report) = report else {
+        tracing::debug!(target: "tuner::jobs", "newep: switched off during the check; nothing written");
+        return Ok(());
+    };
     notify(ctx, DataScope::NewEpisodes);
     tracing::info!(
         target: "tuner::jobs",
@@ -659,6 +680,45 @@ mod tests {
         assert_eq!(n.len(), 1);
         assert_eq!((n[0].0.summary.as_str(), n[0].0.body.as_str()), ("New episodes in 6 series", "A, B, C and 3 more"));
         assert_eq!((n[0].0.action.clone(), n[0].1.len()), (NoteAction::Open, 6));
+    }
+
+    /// §3.4: a check that was still fetching when the master switch went off writes nothing
+    /// (the switch's `forget_ledger` stands, so switching on again baselines silently).
+    #[test]
+    fn a_check_finishing_after_the_switch_went_off_writes_nothing() {
+        let store = crate::store::Store::open_temp("new-episodes-switch", None).unwrap();
+        let config: crate::config::SharedConfig = Default::default();
+        store
+            .writer()
+            .blocking(move |c| {
+                c.execute_batch(
+                    "INSERT INTO source(id,name,kind,created_at) VALUES (1,'TV','m3u-url',0);
+                     INSERT INTO series(id,source_id,key,name,clean_name,norm_name,year,provider_order,seen_gen,details_at)
+                       VALUES (1,1,'landman','Landman','Landman','landman',2024,0,1,1);
+                     INSERT INTO episode(series_id,source_id,key,season,episode,title,duration_s,stream) VALUES (1,1,'e1',1,1,'Episode',3000,'{}');",
+                )?;
+                crate::store::titles::refresh_all(c)?;
+                let lib = crate::store::library::load(c)?;
+                let item = ItemRef { source: SourceId(1), kind: ItemKind::Series, key: ItemKey("landman".into()) };
+                let list = crate::store::watchlist::default_list(c)?;
+                let entry = crate::store::watchlist::new_entry(c, &item)?;
+                crate::store::watchlist::add(c, &lib, list, &[entry], crate::watchlist::Insert::End, 0)?;
+                let opts = Opts::from_config(&crate::config::NewEpisodesConfig::default(), 1_800_000_000);
+                let input = CheckInput { diff: true, ..Default::default() };
+                let ledger = |c: &rusqlite::Connection| c.query_row("SELECT count(*) FROM newep_copy", [], |r| r.get::<_, i64>(0));
+                let mut off = (*crate::config::current(&config)).clone();
+                off.new_episodes.enabled = false;
+                *config.write().unwrap() = std::sync::Arc::new(off);
+                assert!(check_if_on(c, &config, &lib, &opts, &input)?.is_none());
+                assert_eq!(ledger(c)?, 0, "switched off: no ledger");
+                let mut on = (*crate::config::current(&config)).clone();
+                on.new_episodes.enabled = true;
+                *config.write().unwrap() = std::sync::Arc::new(on);
+                assert_eq!(check_if_on(c, &config, &lib, &opts, &input)?.map(|r| r.baselined), Some(1));
+                assert_eq!(ledger(c)?, 1);
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// §8.12: Play and the body click send `NewEpisodePlay`, Download `NewEpisodeDownload`.
