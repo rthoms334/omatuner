@@ -42,34 +42,47 @@ impl Why {
 }
 
 /// The seasons a tracked title alerts for (§3.1): a whole-series entry or a binge covers seasons
-/// ≥ 1; a range `S a–b` covers `a..=b`, and also every later season while `b` reaches the
-/// newest season the title had before the arrival (open-ended). Season 0 only when a range
-/// names it. Several entries or reasons give the union.
+/// ≥ 1; a range `S a–b` covers `a..=b`, and also every later season when `b` reached the newest
+/// season the title had when the entry started tracking it (open-ended; decided once, so a
+/// new season keeps alerting after its first episode). Season 0 only when a range names it.
+/// Several entries or reasons give the union.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coverage {
     /// Seasons ≥ 1.
     pub whole: bool,
     /// Season ranges, inclusive.
-    pub ranges: Vec<(u32, u32)>,
+    pub ranges: Vec<SeasonRange>,
+}
+
+/// A list entry's season range and when the entry was added (`watchlist_item.added_at`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeasonRange {
+    pub from: u32,
+    pub to: u32,
+    pub added_at: Timestamp,
 }
 
 impl Coverage {
-    /// Add an entry's range (`None`: the whole series).
-    pub fn add(&mut self, range: Option<(u32, u32)>) {
+    /// Add an entry's range (`None`: the whole series), added to its list at `added_at`.
+    pub fn add(&mut self, range: Option<(u32, u32)>, added_at: Timestamp) {
         match range {
             None => self.whole = true,
-            Some(r) if !self.ranges.contains(&r) => self.ranges.push(r),
-            Some(_) => {}
+            Some((from, to)) => match self.ranges.iter_mut().find(|r| (r.from, r.to) == (from, to)) {
+                // the earlier entry decides: it tracked the title first
+                Some(r) => r.added_at = r.added_at.min(added_at),
+                None => self.ranges.push(SeasonRange { from, to, added_at }),
+            },
         }
     }
 
-    /// Does an arrival in `season` alert? `newest`: the newest season in the title's ledger
-    /// before the arrival (`None`: nothing known yet, so every range is open-ended).
-    pub fn covers(&self, season: u32, newest: Option<u32>) -> bool {
+    /// Does an arrival in `season` alert? `newest_at(t)`: the newest season the title's ledger
+    /// had at `t`, counting its baseline whenever `t` is (`None`: nothing known yet, so the
+    /// range is open-ended).
+    pub fn covers(&self, season: u32, newest_at: impl Fn(Timestamp) -> Option<u32>) -> bool {
         if self.whole && season >= 1 {
             return true;
         }
-        self.ranges.iter().any(|&(a, b)| (a..=b).contains(&season) || (season > b && newest.is_none_or(|n| b >= n)))
+        self.ranges.iter().any(|r| (r.from..=r.to).contains(&season) || (season > r.to && newest_at(r.added_at).is_none_or(|n| r.to >= n)))
     }
 }
 

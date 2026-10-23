@@ -210,28 +210,28 @@ pub fn tracked(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<Trac
     }
     let mut drafts: BTreeMap<u32, Draft> = BTreeMap::new();
     // series entries; episode entries track nothing, nor do placeholders until they attach
-    type EntryRow = (crate::model::WatchlistId, String, SourceId, String, Option<u32>, Option<u32>);
+    type EntryRow = (crate::model::WatchlistId, String, SourceId, String, Option<u32>, Option<u32>, Timestamp);
     let entries: Vec<EntryRow> = conn
         .prepare_cached(
-            "SELECT w.id, w.name, i.source_id, i.item_key, i.season_from, i.season_to FROM watchlist_item i JOIN watchlist w ON w.id = i.list_id
+            "SELECT w.id, w.name, i.source_id, i.item_key, i.season_from, i.season_to, i.added_at FROM watchlist_item i JOIN watchlist w ON w.id = i.list_id
              WHERE i.kind = 'series' AND i.source_id IS NOT NULL ORDER BY w.is_default DESC, w.sort_index, w.id, i.position, i.id",
         )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for (list, name, source, key, from, to) in entries {
+    for (list, name, source, key, from, to, added_at) in entries {
         let Some(idx) = index_of(conn, lib, source, &key)? else { continue };
         let d = draft(&mut drafts, lib, idx);
         let why = Why::List { list, name, from, to };
         if !d.why.contains(&why) {
             d.why.push(why);
         }
-        d.coverage.add(from.zip(to));
+        d.coverage.add(from.zip(to), added_at);
     }
     if opts.binged {
         for (idx, why) in binged(conn, lib, opts)? {
             let d = draft(&mut drafts, lib, idx);
             d.why.push(why);
-            d.coverage.add(None);
+            d.coverage.add(None, opts.now);
         }
     }
     let mut out = Vec::new();
@@ -383,6 +383,19 @@ fn known_of(conn: &Connection, r: &ItemRef) -> Result<BTreeSet<(u32, u32)>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Season → when the ledger of any of these copies first had it.
+fn seasons_first_seen(conn: &Connection, refs: &[ItemRef]) -> Result<BTreeMap<u32, Timestamp>> {
+    let mut stmt = conn.prepare_cached("SELECT season, min(first_seen) FROM newep_known WHERE source_id = ?1 AND series_key = ?2 GROUP BY season")?;
+    let mut out: BTreeMap<u32, Timestamp> = BTreeMap::new();
+    for r in refs {
+        for row in stmt.query_map(params![r.source, r.key.as_str()], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, Timestamp>(1)?)))? {
+            let (season, first) = row?;
+            out.entry(season).and_modify(|f| *f = (*f).min(first)).or_insert(first);
+        }
+    }
+    Ok(out)
+}
+
 fn current_of(conn: &Connection, id: SeriesId) -> Result<BTreeSet<(u32, u32)>> {
     Ok(conn
         .prepare_cached("SELECT DISTINCT season, episode FROM episode WHERE series_id = ?1")?
@@ -437,7 +450,14 @@ fn check_tracked(conn: &Connection, tracked: &[Tracked], opts: &Opts, input: &Ch
             known.push(known_of(conn, r)?);
         }
         let ledger: BTreeSet<(u32, u32)> = known.iter().flatten().copied().collect();
-        let newest = ledger.iter().map(|c| c.0).max();
+        // open-ended ranges look at the seasons the title had when their entry started
+        // tracking it (its baseline at the earliest), not at what arrived since
+        let baselined_at = rows.iter().flatten().filter_map(|r| r.baselined_at).min();
+        let seasons = seasons_first_seen(conn, &t.copies)?;
+        let newest_at = |at: Timestamp| -> Option<u32> {
+            let cutoff = at.max(baselined_at?);
+            seasons.iter().filter(|(_, first)| **first <= cutoff).map(|(s, _)| *s).max()
+        };
         // (season, episode) → the copy it arrived in first
         let mut found: BTreeMap<(u32, u32), usize> = BTreeMap::new();
         for (i, (r, &id)) in t.copies.iter().zip(&t.series).enumerate() {
@@ -492,7 +512,7 @@ fn check_tracked(conn: &Connection, tracked: &[Tracked], opts: &Opts, input: &Ch
         let facts: Vec<CopyFacts> = t.series.iter().filter_map(|&id| copy_facts(conn, id).transpose()).collect::<Result<_>>()?;
         let why = serde_json::to_string(&t.why.iter().map(Why::code).collect::<Vec<_>>()).map_err(Error::other)?;
         for ((season, episode), i) in found {
-            if !t.coverage.covers(season, newest) || t.muted {
+            if !t.coverage.covers(season, &newest_at) || t.muted {
                 continue;
             }
             // already watched or started in any copy (progress moved with a re-key, or watched
@@ -1547,6 +1567,24 @@ mod tests {
             let want = [("Severance", 1, 5), ("Severance", 4, 1), ("The Bear", 4, 1), ("The Mandalorian", 2, 5)];
             assert_eq!(got, want.map(|(t, s, e)| (t.to_owned(), s, e)));
             assert_eq!(tracked(c, &lib, &opts(NOW))?.len(), 3, "the episode entry tracks nothing");
+
+            // open-endedness is decided once: the rest of a new season, and the season after,
+            // alert too; a closed range stays closed
+            eps(c, 1, 4, [2])?;
+            eps(c, 1, 5, [1])?;
+            eps(c, 2, 4, [2])?;
+            eps(c, 2, 5, [1])?;
+            let r = run(c, &lib, NOW + 2 * DAY)?;
+            let mut got: Vec<(String, u32, u32)> = arrivals(c, &r.announce)?.into_iter().map(|a| (a.series_title, a.season, a.episode)).collect();
+            got.sort();
+            assert_eq!(got, [("The Bear", 4, 2), ("The Bear", 5, 1)].map(|(t, s, e)| (t.to_owned(), s, e)));
+
+            // an entry added to a tracked title once S5 exists: its "S1–S4" is closed, whatever
+            // the title had when it was first tracked
+            list(c, &lib, Some("Later"), &mando, Some((1, 4)))?;
+            c.execute("UPDATE watchlist_item SET added_at = ?1 WHERE item_key = 'mando' AND season_to = 4", [NOW + 2 * DAY])?;
+            eps(c, 2, 6, [1])?;
+            assert!(announced(c, &lib, NOW + 3 * DAY)?.is_empty(), "a range closed when added stays closed");
             Ok(())
         })
     }

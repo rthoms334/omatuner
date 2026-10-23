@@ -7260,7 +7260,8 @@ Nothing is set up. The series are those on any watchlist, My list included, and,
 *Also series I've binged*, those with over 60 % of a season ≥ 1 finished and at least three
 finished episodes in it (`[new_episodes] binge_pct`, `store::new_episodes::BINGE_MIN`). A
 whole-series entry covers seasons ≥ 1; a range `S a–b` covers `a..=b` and every later season
-while `b` reaches the newest season the title had. Season 0 alerts only when a range names it.
+when `b` reached the newest season the title had once the entry tracked it (decided once, so a
+new season keeps alerting after its first episode). Season 0 alerts only when a range names it.
 Episode entries and placeholders track nothing. It is on by default; the first run records what
 exists and says nothing, and a card explains it once. Settings ▸ New episodes (after Following)
 holds the master switch, desktop notifications, the binge switch, Check now (at most every ten
