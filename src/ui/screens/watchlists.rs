@@ -658,7 +658,9 @@ impl WatchlistsScreen {
                     egui::vec2(36.0, 36.0) * theme.rem(),
                 );
                 if selected || r.hovered() || ui.rect_contains_pointer(play_rect) {
-                    let response = ui.put(play_rect, egui::Button::new(glyphs::PLAY)).on_hover_text("Play from here (Shift+Enter)");
+                    // `place`, not `put`: `put` moves the layout cursor up to the button's
+                    // bottom, so every row below a hovered one shifted up under the pointer.
+                    let response = ui.place(play_rect, egui::Button::new(glyphs::PLAY)).on_hover_text("Play from here (Shift+Enter)");
                     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, e.playable.is_some(), "Play from here"));
                     if crate::ui::widgets::fresh_click(&response) && e.playable.is_some() {
                         self.cursor = i;
@@ -1272,6 +1274,30 @@ mod tests {
         h.state().t.services().store.writer().blocking(|_| Ok(())).unwrap();
         assert_eq!(h.state().t.db.query_row("SELECT count(*) FROM watch_progress WHERE finished=1", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         assert!(!h.state().t.toasts.iter().any(|t| t.text.starts_with("Marked ")));
+    }
+
+    #[test]
+    fn hovering_an_entry_never_moves_the_rows_below_it() {
+        let (mut t, one) = rig();
+        let list = seed(&mut t, |c| {
+            let src = testkit::source(c, "TV")?;
+            testkit::movies(c, src, 3)?;
+            let lib = crate::store::library::load(c)?;
+            let list = store::create(c, "Saga", None, PlayOrder::Ordered, "app", 1)?;
+            let entries: Vec<_> = (0..3).map(|i| store::new_entry(c, &movie(src, i))).collect::<crate::error::Result<_>>()?;
+            store::add(c, &lib, list, &entries, crate::watchlist::Insert::End, 1)?;
+            Ok(list)
+        });
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1400.0, 800.0));
+        h.state_mut().enter(Route::Watchlists { list: Some(list) });
+        let rows =
+            |h: &H| (0..3).map(|i| h.query_all_by_label_contains(&format!("Drag Movie {i} ")).next().map(|n| n.rect())).collect::<Option<Vec<_>>>();
+        until(&mut h, "entries", |h| rows(h).is_some());
+        let before = rows(&h).unwrap();
+        // The pointer sits low in the middle row, where a shift would put the last row under it.
+        h.hover_at(egui::pos2(before[1].right() + 200.0, before[1].bottom() - 2.0));
+        h.run_steps(3);
+        assert_eq!(rows(&h).unwrap(), before, "the hovered row's play button moved the rows below it");
     }
 
     #[test]
