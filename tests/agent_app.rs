@@ -2053,6 +2053,50 @@ fn watchlist_agent_lists_and_show_count_the_same_episode_units() {
 }
 
 #[test]
+fn watchlist_create_loads_the_episodes_of_a_series_that_never_had_them() {
+    use tuner::jobs::{JobEvent, JobKind};
+    let mut w = World::new(Config::default());
+    w.publish(Visibility::ALL);
+    let series = first_ref(&w.ok("search", json!({"query": "the show", "kinds": ["series"]})), "results");
+    // An Xtream series whose details were never opened: no episodes, no details stamp.
+    let id =
+        w.ui.services()
+            .store
+            .writer()
+            .blocking(|c| {
+                c.execute_batch(
+                    "UPDATE source SET kind='xtream' WHERE id=1; UPDATE series SET details_at=NULL WHERE key='m3u:show';
+                 CREATE TEMP TABLE kept AS SELECT * FROM episode; DELETE FROM episode;",
+                )?;
+                Ok(c.query_row("SELECT id FROM series WHERE key='m3u:show'", [], |r| r.get::<_, i64>(0))?)
+            })
+            .unwrap();
+    w.ui.events.try_iter().for_each(drop);
+    let created = w.ok("watchlist", json!({"action": "create", "name": "Shows", "refs": [series]}));
+    let list = created["list"]["id"].clone();
+    let asked = |w: &World| {
+        w.ui.events.try_iter().any(|e| match e {
+            AppEvent::Job(JobEvent::Updated(s)) => matches!(s.kind, JobKind::LoadSeriesDetails(n) if n.0 == id),
+            AppEvent::Job(JobEvent::Finished { kind, .. }) => matches!(kind, JobKind::LoadSeriesDetails(n) if n.0 == id),
+            _ => false,
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !asked(&w) {
+        assert!(std::time::Instant::now() < deadline, "creating the list never asked for the series' episodes");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The load stores the episodes; the list then counts them without anyone opening the series.
+    w.ui.services()
+        .store
+        .writer()
+        .blocking(|c| Ok(c.execute_batch("INSERT INTO episode SELECT * FROM kept; UPDATE series SET details_at=1;")?))
+        .unwrap();
+    let shown = w.ok("watchlist", json!({"action": "show", "list": list}));
+    assert_eq!((shown["list"]["done"].as_u64(), shown["list"]["total"].as_u64()), (Some(0), Some(3)), "{shown}");
+}
+
+#[test]
 fn watchlists_agent_edits_and_reads_the_same_derived_lists_as_the_app() {
     let mut w = World::new(Config::default());
     w.publish(Visibility::ALL);

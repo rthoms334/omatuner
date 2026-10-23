@@ -26,7 +26,12 @@ struct Cache {
     pending: Option<Loader<WatchlistsSnapshot>>,
     revision: u64,
 }
-thread_local! { static CACHE: RefCell<Cache> = RefCell::default(); }
+thread_local! {
+    static CACHE: RefCell<Cache> = RefCell::default();
+    /// Series whose episodes this session already asked for, so a provider that fails isn't
+    /// asked again on every snapshot.
+    static REQUESTED: RefCell<std::collections::HashSet<crate::model::SeriesId>> = RefCell::default();
+}
 static SNAPSHOTS: AtomicU64 = AtomicU64::new(1);
 static REVISION: AtomicU64 = AtomicU64::new(1);
 static UNDOS: Mutex<Vec<(u16, Undo)>> = Mutex::new(Vec::new());
@@ -74,6 +79,9 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<WatchlistsSnapshot> {
         if let Some(result) = kit::poll(&mut c.pending) {
             match result {
                 Ok(s) => {
+                    for id in unloaded_series(ctx.db, ctx.lib, &s) {
+                        ctx.services.jobs.submit(crate::jobs::JobKind::LoadSeriesDetails(id));
+                    }
                     c.snapshot = Arc::new(s);
                     c.revision = SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -81,6 +89,27 @@ pub fn snapshot(ctx: &UiCtx<'_>) -> Arc<WatchlistsSnapshot> {
             }
         }
         c.snapshot.clone()
+    })
+}
+
+/// Xtream series in the lists whose episodes were never loaded: their progress can't be counted
+/// until the details job runs. Each series is named once per session. Locked entries wait for
+/// the PIN like the rest of their page.
+fn unloaded_series(db: &rusqlite::Connection, lib: &crate::store::library::Library, snapshot: &WatchlistsSnapshot) -> Vec<crate::model::SeriesId> {
+    let items: Vec<ItemRef> = snapshot
+        .lists
+        .iter()
+        .flat_map(|l| &l.entries)
+        .filter(|e| e.entry.kind == ItemKind::Series && e.total_episodes == 0 && !e.locked && e.status != crate::watchlist::EntryStatus::Missing)
+        .filter_map(|e| e.entry.item.clone())
+        .collect();
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let ids = store::series_to_fetch(db, lib, &items).unwrap_or_default();
+    REQUESTED.with(|r| {
+        let mut seen = r.borrow_mut();
+        ids.into_iter().filter(|id| seen.insert(*id)).collect()
     })
 }
 
@@ -369,4 +398,40 @@ fn write_watched(ctx: &UiCtx<'_>, e: EntryState, on: bool, episode: Option<(u32,
         }
         crate::store::copies::watched_items(c, &items, on, now)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ItemKey, SourceId};
+    use crate::ui::screens::home::testkit::{self, rig, seed};
+    use crate::watchlist::{Insert, PlayOrder};
+
+    #[test]
+    fn a_never_loaded_series_is_asked_for_once_per_session() {
+        let (mut t, _one) = rig();
+        let (ids, snapshot) = seed(&mut t, |c| {
+            let mut ids = Vec::new();
+            for name in ["TV", "TV 2"] {
+                let src = testkit::source(c, name)?;
+                testkit::series(c, src, 1, 1, 2)?;
+                c.execute("UPDATE source SET kind='xtream' WHERE id=?1", [src])?;
+                c.execute("UPDATE series SET year=2020, details_at=NULL WHERE source_id=?1", [src])?;
+                crate::store::titles::refresh_source(c, src)?;
+                ids.push(c.query_row("SELECT id FROM series WHERE source_id=?1", [src], |r| r.get::<_, crate::model::SeriesId>(0))?);
+            }
+            c.execute_batch("DELETE FROM episode;")?;
+            let list = store::create(c, "Shows", None, PlayOrder::Ordered, "app", 1)?;
+            let lib = crate::store::library::load(c)?;
+            let item = ItemRef { source: SourceId(1), kind: ItemKind::Series, key: ItemKey("m3u:series000000000".into()) };
+            store::add(c, &lib, list, &[store::new_entry(c, &item)?], Insert::End, 1)?;
+            Ok((ids, store::snapshot_with_preferences(c, &lib, false, false, false, Default::default())?))
+        });
+        // Both stacked copies are named, since progress merges them; a second look names none.
+        let lib = crate::store::library::load(&t.db).unwrap();
+        let mut first = unloaded_series(&t.db, &lib, &snapshot);
+        first.sort();
+        assert_eq!(first, ids);
+        assert!(unloaded_series(&t.db, &lib, &snapshot).is_empty());
+    }
 }

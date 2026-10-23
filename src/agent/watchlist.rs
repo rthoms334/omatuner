@@ -9,7 +9,7 @@ use super::params::{Watchlist, WatchlistAction, WatchlistSelector};
 use super::proto::{AgentRef, ErrorCode, item_ref};
 use super::query::{Fail, Out, Q, clean, parse_ref, text};
 use super::server::Inner;
-use crate::model::{ItemKind, WatchlistItemId};
+use crate::model::{ItemKind, ItemRef, WatchlistItemId};
 use crate::msg::DataScope;
 use crate::queue::{PlayReply, QueueCommand, QueueReply};
 use crate::store::watchlist as store;
@@ -177,6 +177,18 @@ async fn resolve_next(h: &Arc<Inner>, view: ListView) -> Out<Value> {
             .await?;
     }
     h.run(true, move |q| next_out(q, &view)).await
+}
+
+/// Progress counts stored episodes, and an Xtream series has none until its details load. Start
+/// that load as soon as a series joins a list, so "0 of 16" shows without opening the series.
+/// Best effort: a failed read only leaves the on-view fetch to do it.
+async fn fetch_episodes(h: &Arc<Inner>, items: Vec<ItemRef>) {
+    let lib = h.shared.library();
+    if let Ok(ids) = h.run(true, move |q| Ok(store::series_to_fetch(q.conn, &lib, &items)?)).await {
+        for id in ids {
+            h.jobs.submit(crate::jobs::JobKind::LoadSeriesDetails(id));
+        }
+    }
 }
 
 fn position(value: Option<&str>) -> Out<Insert> {
@@ -377,6 +389,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
         let (entries, mut refused) = h.run(true, move |q| additions(q, &p)).await?;
         let lib = h.shared.library();
         let now = crate::model::now();
+        let items: Vec<ItemRef> = entries.iter().filter_map(|e| e.item.clone()).collect();
         let (id, result) = h
             .write(DataScope::Watchlists, move |c| {
                 let tx = c.unchecked_transaction()?;
@@ -387,6 +400,7 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
             })
             .await?;
         refused.extend(result.refused.into_iter().map(|(index, why)| json!({"index": index, "error": clean(&why)})));
+        fetch_episodes(h, items).await;
         let list = h
             .run(true, move |q| {
                 Ok(store::view_with_preferences(q.conn, q.lib, id, q.view.unlocked, true, q.view.hides_explicit, q.cfg.interface.copy_order)?
@@ -447,7 +461,9 @@ pub(super) async fn handle(h: &Arc<Inner>, p: Watchlist, who: &crate::model::Age
             };
             let (entries, mut refused) = h.run(true, move |q| additions(q, &p)).await?;
             let lib = h.shared.library();
+            let items: Vec<ItemRef> = entries.iter().filter_map(|e| e.item.clone()).collect();
             let result = h.write(DataScope::Watchlists, move |c| store::add(c, &lib, list, &entries, at, crate::model::now())).await?;
+            fetch_episodes(h, items).await;
             refused.extend(result.refused.into_iter().map(|(index, why)| json!({"index": index, "error": clean(&why)})));
             tracing::info!("agent: watchlist add #{} → {} added", list.0, result.added.len());
             Ok(json!({"list": list_name, "added": result.added.iter().map(|id| id.0).collect::<Vec<_>>(), "refused": refused}))

@@ -179,6 +179,26 @@ pub fn title_copies(c: &Connection, lib: &Library, item: &ItemRef) -> Result<Vec
     let rows = if movies { &lib.vod.movies } else { &lib.vod.series };
     Ok(lib.vod.stacks(movies).copies(i).iter().map(|&i| copies::vod_ref(&rows[i as usize])).collect())
 }
+/// The Xtream series copies behind `items` whose episodes were never loaded. Progress merges
+/// every copy of a stacked title, so all of them are named, not only the one an entry pins.
+/// Playlist series arrive with their episodes and are never listed.
+pub fn series_to_fetch(c: &Connection, lib: &Library, items: &[ItemRef]) -> Result<Vec<crate::model::SeriesId>> {
+    let mut ids = Vec::new();
+    for item in items.iter().filter(|i| i.kind == ItemKind::Series) {
+        for copy in title_copies(c, lib, item)? {
+            let id: Option<crate::model::SeriesId> = c
+                .query_row("SELECT id FROM series WHERE source_id=?1 AND key=?2", params![copy.source, copy.key.as_str()], |r| r.get(0))
+                .optional()?;
+            if let Some(id) = id
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+    }
+    copies::unloaded_series(c, &ids)
+}
+
 /// Play order for one title, using the same pins, progress and provider-trouble rules as Up
 /// next. Episode coordinates are mapped back onto that order for series entries.
 fn planned_copies(c: &Connection, lib: &Library, item: &ItemRef, unlocked: bool, copy_order: crate::config::CopyOrder) -> Result<Vec<ItemRef>> {
