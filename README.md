@@ -11,17 +11,15 @@ current theme live, corners are square, and the font is JetBrains Mono Nerd Font
 The video is rendered by an embedded libmpv inside a native Rust window (egui), so there is no
 browser or Electron runtime and no separate player window.
 
-<!-- DEMO VIDEO PLACEHOLDER: upload target/demo-video/tuner-demo.mp4 (made by
-     scripts/demo-video.sh) in GitHub's README editor. Put the user-attachments URL it gives in
-     place of DEMO-VIDEO-UPLOAD-URL in the preview's link below, and also on a line of its own
-     under the preview (GitHub plays a bare user-attachments URL inline). -->
 [![Tuner in 90 seconds: live TV and the guide, multi-view, films and series from every playlist
-in one place, downloads, and an AI agent putting the match on](docs/demo-preview.webp)](https://github.com/user-attachments/assets/DEMO-VIDEO-UPLOAD-URL)
+in one place, new episodes, downloads, and an AI agent putting the match on](docs/demo-preview.webp)](docs/tuner-demo.mp4)
+
+▶ [Watch the 90-second tour](docs/tuner-demo.mp4)
 
 - **Watching:** Live TV, with what's on now and next · A guide for every channel · Controls
   that stay out of the way · Two channels side by side · Keep watching while you work
-- **Library:** Every playlist in one place · Series pages, season by season · Watchlists for
-  films and series · Up next lines up what's next
+- **Library:** Every playlist in one place · New episodes of the shows you watch · Series
+  pages, season by season · Watchlists for films and series · Up next lines up what's next
 - **Downloads and recordings:** Record live TV from the guide · Downloads, grouped by series
 - **AI agents:** Ask any AI agent. Tuner puts it on. · Follow teams and shows, with reminders
 
@@ -1859,7 +1857,7 @@ cargo run --example keymap_md                 # regenerate the key tables (READM
 scripts/gen-test-media.sh                     # ffmpeg test media for the player tests
 scripts/gen-big-fixtures.py                   # 100k-channel M3U + 415k-programme XMLTV for benches
 cargo run --example demo_profile -- /tmp/demo # made-up demo profile (then --profile-dir /tmp/demo)
-scripts/demo-video.sh                         # README demo video from it (Hyprland; DESIGN §23.1)
+scripts/demo-video.sh                         # README demo video, off screen (Hyprland; DESIGN §23.1)
 ```
 
 - The architecture, data model and decisions are in [`docs/DESIGN.md`](docs/DESIGN.md).
