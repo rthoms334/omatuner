@@ -1180,7 +1180,9 @@ impl TunerApp {
     /// DataScope → reaction (DESIGN §5.4).
     fn on_data_changed(&mut self, scope: DataScope) {
         crate::ui::watchlists::invalidate();
-        if crate::ui::new_episodes::feeds(scope) {
+        // the player's 10 s saves during a film or episode don't re-read the new-episodes
+        // snapshot (as with the spoiler guard below): the save at stop does
+        if crate::ui::new_episodes::feeds(scope) && !(scope == DataScope::Progress && self.saving_vod_progress()) {
             crate::ui::new_episodes::invalidate();
         }
         match scope {
@@ -1230,11 +1232,7 @@ impl TunerApp {
             DataScope::Progress => {
                 // a finished episode may make a series binged (debounced, off the UI thread)
                 crate::jobs::new_episodes::track_from(&self.services().jobs);
-                let saving = self.services().tiles.handles().iter().any(|h| {
-                    let s = h.snapshot();
-                    s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| !p.kind.is_live())
-                });
-                if !saving {
+                if !self.saving_vod_progress() {
                     self.services().agent.guard().rebuild();
                 }
             }
@@ -1245,6 +1243,15 @@ impl TunerApp {
             // its snapshot and screens read it again (`ui::new_episodes`)
             DataScope::NewEpisodes => {}
         }
+    }
+
+    /// A film or episode plays in some picture: a `DataScope::Progress` now is most likely its
+    /// player's periodic save.
+    fn saving_vod_progress(&self) -> bool {
+        self.services().tiles.handles().iter().any(|h| {
+            let s = h.snapshot();
+            s.state == PlayerState::Playing && s.playable.as_ref().is_some_and(|p| !p.kind.is_live())
+        })
     }
 
     /// Re-read the recently watched channels (one aggregate over the ≤ 500-row history table)

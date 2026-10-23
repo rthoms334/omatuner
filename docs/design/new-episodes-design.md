@@ -318,7 +318,7 @@ CREATE INDEX IF NOT EXISTS newep_arrival_ref  ON newep_arrival(source_id, series
 - **The connection budget.** `get_series_info` is an API call, not a stream: `SharedBudget` isn't involved and nothing takes a lease. A one-connection account keeps playing while the check runs, as it does today when a series page loads during playback. The check still pauses between fetches while `player_busy` (Loading or Zapping), and fetches serially per playlist.
 - **Headless `tuner --refresh`** does nothing here, like the guide check. The app's launch check finds what it changed (cleared `details_at`, new M3U rows).
 - **Notifications with two actions.** `platform::notify` gains `show_with_actions(summary, body, &[("play", "Play S2E9"), ("download", "Download")], on_action)`. The body click stays the default action (Play). New `PlatformEvent::{NewEpisodePlay { series, episode }, NewEpisodeDownload { episodes }, NewEpisodesOpen}`; the UI resolves refs as `ReminderWatch` does.
-- **Reads are never per frame.** The snapshot is rebuilt on `DataScope::{NewEpisodes, Progress, Watchlists, Vod, VodDetails}` and on a library swap. "Watched" clearing is derived when the snapshot is built and written back lazily as `cleared_how = 'watched'`.
+- **Reads are never per frame.** The snapshot is rebuilt on `DataScope::{NewEpisodes, Progress, Watchlists, Vod, VodDetails}` and on a library swap, except for the player's periodic progress saves while a film or episode plays (the save at stop rebuilds it, as with the spoiler guard). It computes "why" only for the titles it shows, without the binge pass over every title. "Watched" clearing is derived when the snapshot is built and written back lazily as `cleared_how = 'watched'`.
 
 ---
 

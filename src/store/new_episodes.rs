@@ -202,6 +202,12 @@ fn muted(conn: &Connection, refs: &[ItemRef]) -> Result<bool> {
 /// The tracked titles (§3.1): watchlist series entries, plus binged titles when `opts.binged`;
 /// guarded titles left out. Muted titles are in, marked.
 pub fn tracked(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<Tracked>> {
+    tracked_in(conn, lib, opts, None)
+}
+
+/// [`tracked`], limited to the titles `only` (by [`Title::key`]) when given: a snapshot needs the
+/// "why" of the few titles with arrivals, not the binge pass over every title.
+fn tracked_in(conn: &Connection, lib: &Library, opts: &Opts, only: Option<&HashSet<u32>>) -> Result<Vec<Tracked>> {
     struct Draft {
         title: Title,
         why: Vec<Why>,
@@ -222,6 +228,9 @@ pub fn tracked(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<Trac
         .collect::<rusqlite::Result<_>>()?;
     for (list, name, source, key, from, to, added_at) in entries {
         let Some(idx) = index_of(conn, lib, source, &key)? else { continue };
+        if only.is_some_and(|o| !o.contains(&Title::key(lib, idx))) {
+            continue;
+        }
         let d = draft(&mut drafts, lib, idx);
         let why = Why::List { list, name, from, to };
         if !d.why.contains(&why) {
@@ -230,7 +239,7 @@ pub fn tracked(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<Trac
         d.coverage.add(from.zip(to), added_at);
     }
     if opts.binged {
-        for (idx, why) in binged(conn, lib, opts)? {
+        for (idx, why) in binged(conn, lib, opts, only)? {
             let d = draft(&mut drafts, lib, idx);
             d.why.push(why);
             d.coverage.add(None, opts.now);
@@ -249,7 +258,7 @@ pub fn tracked(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<Trac
 
 /// The binged titles (§3.1, Q6), by a member index, with the season that makes them binged
 /// (the latest such season).
-fn binged(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<(u32, Why)>> {
+fn binged(conn: &Connection, lib: &Library, opts: &Opts, only: Option<&HashSet<u32>>) -> Result<Vec<(u32, Why)>> {
     // finished episodes in seasons ≥ 1 (part-watched ones don't count; Ctrl+W marks do)
     let rows: Vec<(SeriesId, u32, u32)> = conn
         .prepare_cached(
@@ -262,7 +271,11 @@ fn binged(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<(u32, Why
     let mut finished: BTreeMap<u32, (u32, BTreeMap<u32, BTreeSet<u32>>)> = BTreeMap::new();
     for (id, season, episode) in rows {
         let Some(idx) = lib.vod.index_of(VodKind::Series(id)) else { continue };
-        finished.entry(Title::key(lib, idx)).or_insert_with(|| (idx, BTreeMap::new())).1.entry(season).or_default().insert(episode);
+        let key = Title::key(lib, idx);
+        if only.is_some_and(|o| !o.contains(&key)) {
+            continue;
+        }
+        finished.entry(key).or_insert_with(|| (idx, BTreeMap::new())).1.entry(season).or_default().insert(episode);
     }
     let mut known_stmt = conn.prepare_cached("SELECT DISTINCT episode FROM episode WHERE series_id = ?1 AND season = ?2")?;
     let mut out = Vec::new();
@@ -769,7 +782,12 @@ pub fn snapshot(conn: &Connection, lib: &Library, opts: &Opts) -> Result<NewEpis
             None => by_title.push((key, vec![a])),
         }
     }
-    let tracked = if by_title.is_empty() { Vec::new() } else { tracked(conn, lib, opts)? };
+    let tracked = if by_title.is_empty() {
+        Vec::new()
+    } else {
+        let keys: HashSet<u32> = by_title.iter().map(|(k, _)| *k).collect();
+        tracked_in(conn, lib, opts, Some(&keys))?
+    };
     let opened_dot: Timestamp = crate::store::follow::meta_get(conn, META_WATCHLISTS_OPENED)?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut series = Vec::new();
     let mut list_dot = false;
@@ -1560,6 +1578,7 @@ mod tests {
             assert_eq!(announced(c, &lib, NOW + DAY)?, [(1, 9)], "binged series alert too");
             let t = tracked(c, &lib, &opts(NOW + DAY))?;
             assert_eq!(t[0].why, [Why::Binged { season: 1, finished: 5, known: 8 }], "the arrival didn't lower the ratio");
+            assert_eq!(snapshot(c, &lib, &opts(NOW + DAY))?.series[0].why, t[0].why, "the snapshot's why, for its titles only");
             // muted (Q1), its arrivals aren't recorded; started when it arrived, nor is that one;
             // a dismissed arrival is pruned 90 days on: none of them lowers the ratio, so the
             // abandoned or muted show stays tracked (Q2) and keeps its ledger

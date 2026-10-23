@@ -235,7 +235,7 @@ impl SeriesNews {
 
 /// What Home, Watchlists, the sidebar, the series page, Settings and agents read (rebuilt on
 /// `DataScope::{NewEpisodes, Progress, Watchlists, Vod, VodDetails}` and on a library swap,
-/// never per frame).
+/// never per frame nor for the player's periodic saves during a film or episode).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NewEpisodesSnapshot {
     /// Newest arrival first.
