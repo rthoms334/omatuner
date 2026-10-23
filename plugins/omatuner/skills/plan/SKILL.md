@@ -25,6 +25,13 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout.
    Reminders notify by default; `mode: "switch"` only for the main event or on request (it
    interrupts what plays, opens in the pop-out by default; `open_in` changes that).
 
+## New episodes on demand need no rule
+
+A new episode that appears in a playlist's series catalogue (on demand) is announced by Tuner
+itself for every series on a watchlist or binged: a notification and a Home row, nothing to set
+up. Don't create a `follow` rule for that; `follow` is for airings on live TV. To see what has
+arrived, use the series skill (`new_episodes`).
+
 ## Clashes
 
 Both at 8: if `status.streams` shows two playlists free, offer multi-view (`multiview` `open`);

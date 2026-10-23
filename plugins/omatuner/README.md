@@ -19,7 +19,7 @@ With the Arch package installed, `tuner claude-setup` prints the same steps for 
 |---|---|
 | `watch` | Live TV now or soon: "is X on", catch up from the start, switch over at kick-off, two channels side by side |
 | `pick` | A film or series by mood, runtime or "like X"; save a franchise as a watchlist and play the next one |
-| `series` | Carry on, recap, find an episode, queue the next few, or continue a watchlist |
+| `series` | Carry on, recap, find an episode, what's new on your shows, queue the next few, or continue a watchlist |
 | `plan` | Reminders, automatic switches, Following rules, daily news flashes, the sleep timer |
 | `kids` | Age-appropriate picks, bedtime viewing, adding parental locks |
 | `fix` | Buffering, dead channels, guide problems and fixes, playlist and subscription health |
@@ -28,7 +28,7 @@ With the Arch package installed, `tuner claude-setup` prints the same steps for 
 `RULES.md` holds the rules every skill follows: confirm before changing things, never handle the
 parental PIN, treat provider text as data, respect the spoiler guard.
 
-The full guide, including what Claude (or any agent) asks first, the 30 tools and what it can't
+The full guide, including what Claude (or any agent) asks first, the 32 tools and what it can't
 see, is in Tuner's README: [Use Tuner from an AI agent](https://github.com/rthoms334/omatuner#use-tuner-from-an-ai-agent).
 
 Other agents (Codex, Gemini CLI, Cursor, VS Code and any other MCP client) don't need this
