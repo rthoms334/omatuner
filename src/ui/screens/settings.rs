@@ -83,6 +83,7 @@ mod cast; // CAST-9: the Cast page (DESIGN §40 §3.6)
 mod following; // F-C: the Following page (DESIGN §33)
 mod guide_fix; // G-ui: EPG ▸ "Fix guide data… (N to fix)" (DESIGN §31)
 mod multiview; // MV-2: Player ▸ Multi-view (DESIGN §35)
+mod new_episodes; // N-ui: the New episodes page (DESIGN §44)
 mod queue; // Q-ui: Interface ▸ Playback ▸ "Play the next item after" (DESIGN §32)
 mod reminders; // rui: Reminders ▸ open in, while closed, sleep timer (B6)
 mod spoiler; // S-ui: the Spoiler guard page (DESIGN §34)
@@ -98,6 +99,7 @@ enum Feature {
     Following,
     GuideFix,
     MultiView,
+    NewEpisodes,
     Queue,
     Reminders,
     Spoiler,
@@ -105,7 +107,7 @@ enum Feature {
 }
 
 /// Every page in list order (`pages` leaves out the features that are off).
-const PAGES_ALL: [(SettingsPage, &str, &str); 16] = [
+const PAGES_ALL: [(SettingsPage, &str, &str); 17] = [
     (SettingsPage::Playlists, glyphs::PLAYLIST, "Playlists"),
     (SettingsPage::Epg, glyphs::GUIDE, "EPG"),
     (SettingsPage::Player, glyphs::PLAY, "Player"),
@@ -113,6 +115,7 @@ const PAGES_ALL: [(SettingsPage, &str, &str); 16] = [
     (SettingsPage::Favourites, glyphs::FAVOURITE, "Favourites"),
     (SettingsPage::Reminders, glyphs::REMINDER, "Reminders"),
     (SettingsPage::Following, glyphs::FOLLOW, "Following"),
+    (SettingsPage::NewEpisodes, glyphs::SERIES, "New episodes"),
     (SettingsPage::SpoilerGuard, glyphs::SPOILER, "Spoiler guard"),
     (SettingsPage::Parental, glyphs::LOCK, "Parental"),
     (SettingsPage::Agents, glyphs::AGENT, "AI agents"),
@@ -128,6 +131,7 @@ const PAGES_ALL: [(SettingsPage, &str, &str); 16] = [
 fn pages() -> impl Iterator<Item = (SettingsPage, &'static str, &'static str)> {
     PAGES_ALL.into_iter().filter(|(p, ..)| match p {
         SettingsPage::Following => crate::follow::ENABLED,
+        SettingsPage::NewEpisodes => crate::new_episodes::ENABLED,
         SettingsPage::SpoilerGuard => crate::spoiler::ENABLED,
         SettingsPage::Cast => crate::cast::ENABLED,
         _ => true,
@@ -833,6 +837,7 @@ pub struct SettingsScreen {
     /// The feature files' own state (base-B: one field per file, so they never collide).
     #[allow(dead_code)] // base-B: F-C's
     following: following::State,
+    new_episodes: new_episodes::State,
     #[allow(dead_code)] // base-B: S-ui's
     spoiler: spoiler::State,
     agents: agents::State,
@@ -946,6 +951,7 @@ impl SettingsScreen {
                 self.links_loader = Some(Loader::start(ctx, crate::store::titles::links));
             }
             SettingsPage::Following => following::enter(self, ctx),
+            SettingsPage::NewEpisodes => new_episodes::enter(self, ctx),
             SettingsPage::SpoilerGuard => spoiler::enter(self, ctx),
             SettingsPage::Agents => agents::enter(self, ctx),
             SettingsPage::Cast => cast::enter(self, ctx),
@@ -962,6 +968,7 @@ impl SettingsScreen {
             Feature::Following => following::act(self, ctx, n),
             Feature::GuideFix => guide_fix::act(self, ctx, n),
             Feature::MultiView => multiview::act(self, ctx, n),
+            Feature::NewEpisodes => new_episodes::act(self, ctx, n),
             Feature::Queue => queue::act(self, ctx, n),
             Feature::Reminders => reminders::act(self, ctx, n),
             Feature::Spoiler => spoiler::act(self, ctx, n),
@@ -978,6 +985,7 @@ impl SettingsScreen {
             Feature::Following => following::item(self, ctx, id),
             Feature::GuideFix => guide_fix::item(self, ctx, id),
             Feature::MultiView => multiview::item(self, ctx, id),
+            Feature::NewEpisodes => new_episodes::item(self, ctx, id),
             Feature::Queue => queue::item(self, ctx, id),
             Feature::Reminders => reminders::item(self, ctx, id),
             Feature::Spoiler => spoiler::item(self, ctx, id),
@@ -1351,6 +1359,7 @@ impl SettingsScreen {
             }
             SettingsPage::Downloads => downloads::rows(self, ctx, &mut v),
             SettingsPage::Following => following::rows(self, ctx, &mut v),
+            SettingsPage::NewEpisodes => new_episodes::rows(self, ctx, &mut v),
             SettingsPage::SpoilerGuard => spoiler::rows(self, ctx, &mut v),
             SettingsPage::Agents => agents::rows(self, ctx, &mut v),
             SettingsPage::Cast => cast::rows(self, ctx, &mut v),
@@ -1810,6 +1819,12 @@ impl SettingsScreen {
         match row {
             Row::Toggle(t) if std::ptr::eq(*t, &PARENTAL_SHOW_EXPLICIT) && dir > 0 && !ctx.config.parental.show_explicit => {
                 self.offer_pin_for_explicit(ctx);
+            }
+            // off forgets the ledger (DESIGN §44 §3.4)
+            Row::Toggle(t) if new_episodes::is_master(t) => {
+                if (t.get)(ctx.config) != (dir > 0) {
+                    crate::ui::new_episodes::set_enabled(ctx, dir > 0);
+                }
             }
             // the helper writes the polkit rule first; the config follows (DESIGN §41.7)
             Row::Toggle(t) if std::ptr::eq(*t, &updates::PASSWORDLESS) => updates::passwordless(ctx, dir > 0),
@@ -2431,6 +2446,11 @@ impl SettingsScreen {
                 Some(menu) => menu,
                 None => return,
             },
+            // a tracked series: Open series, Stop alerts for this series / Allow alerts again
+            Item::Feature(Feature::NewEpisodes, id) => match new_episodes::menu(self, id) {
+                Some(menu) => menu,
+                None => return,
+            },
             // an agent: Connect / Update / Disconnect… and the Copy actions (none while busy)
             Item::Feature(Feature::Agents, id) => match agents::menu(ctx, id) {
                 Some(menu) => menu,
@@ -2507,6 +2527,7 @@ impl SettingsScreen {
                 }));
             }
             (Item::Feature(Feature::Following, id), code) if code != MENU_UP && code != MENU_DOWN => following::menu_choice(self, ctx, id, code),
+            (Item::Feature(Feature::NewEpisodes, id), code) => new_episodes::menu_choice(self, ctx, id, code),
             (Item::Feature(Feature::Agents, id), code) => agents::menu_choice(self, ctx, id, code),
             (Item::Feature(Feature::Cast, id), code) => cast::menu_choice(self, ctx, id, code),
             (item, MENU_UP) | (item, MENU_DOWN) => self.reorder(ctx, item, if code == MENU_UP { -1 } else { 1 }),
@@ -2834,6 +2855,7 @@ impl Screen for SettingsScreen {
                     DataScope::Reminders => self.page == SettingsPage::Reminders,
                     DataScope::Overrides => matches!(self.page, SettingsPage::Hidden | SettingsPage::Orphans),
                     DataScope::Follow => self.page == SettingsPage::Following,
+                    DataScope::NewEpisodes | DataScope::Watchlists | DataScope::Progress => self.page == SettingsPage::NewEpisodes,
                     DataScope::Spoiler => self.page == SettingsPage::SpoilerGuard,
                     DataScope::All => true,
                     _ => false,
@@ -5200,5 +5222,85 @@ mod tests {
     fn helpers() {
         assert_eq!(split_list(" a, b;;c "), vec!["a", "b", "c"]);
         assert!(parse_mpv_options("").is_empty());
+    }
+
+    /// §2.6: the page says why each series is tracked and what arrived; a tracked series can be
+    /// muted (Undo) from its menu; turning the master switch off forgets the ledger.
+    #[test]
+    fn new_episodes_page_lists_tracking_and_recent_mutes_and_off_forgets_the_ledger() {
+        use crate::ui::new_episodes::testkit as news;
+        let (mut t, one) = rig();
+        news::landman_with_news(&mut t, 4, 2);
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::NewEpisodes));
+        until(&mut h, "the tracked series", |h| has_label(h, "Landman"));
+        let rows = |h: &mut H| {
+            let app = h.state_mut();
+            app.t.with_ctx(|ctx| app.s.rows(ctx))
+        };
+        let detail = |h: &mut H| {
+            rows(h).into_iter().find_map(|r| match r {
+                Row::Item { label, detail, .. } if label == "Landman" => detail,
+                _ => None,
+            })
+        };
+        let d = detail(&mut h).expect("Landman's row");
+        assert!(d.contains("My list") && d.contains("TV") && d.contains("last new"), "{d}");
+        let recent = rows(&mut h).into_iter().any(|r| matches!(r, Row::Note(n, _) if n.contains("Landman · S1E5–E6")));
+        assert!(recent, "the arrival is under Recent");
+
+        // Stop alerts for this series, from the row's menu; Undo allows them again
+        focus(&mut h, "Landman");
+        h.state_mut().act(Action::ContextMenu);
+        h.state_mut().nav();
+        h.state_mut().result(OverlayResult::Chosen(Action::Digit(MENU_TOGGLE)));
+        until(&mut h, "muted", |h| detail(h).is_some_and(|d| d.starts_with("alerts stopped")));
+        let _ = h.state().t.services().store.writer().blocking(|_| Ok(()));
+        h.state_mut().pump();
+        let undo = h
+            .state()
+            .t
+            .toasts
+            .iter()
+            .rev()
+            .find_map(|t| match t.action {
+                Some((_, Action::NewEpisodes(a @ crate::keymap::NewEpisodesAct::Undo(_)))) => Some(a),
+                _ => None,
+            })
+            .expect("an Undo toast");
+        h.state_mut().act(Action::NewEpisodes(undo));
+        until(&mut h, "alerts back on", |h| detail(h).is_some_and(|d| !d.starts_with("alerts stopped")));
+
+        // the master switch off: the ledger is forgotten, and the page shows only the switch
+        let ledger = |h: &H| -> i64 { h.state().t.db.query_row("SELECT count(*) FROM newep_known", [], |r| r.get(0)).unwrap() };
+        assert!(ledger(&h) > 0);
+        focus(&mut h, "New episode alerts");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        h.state_mut().apply_config();
+        until(&mut h, "the ledger is forgotten", |h| ledger(h) == 0);
+        h.run_steps(2);
+        assert!(!rows(&mut h).into_iter().any(|r| matches!(r, Row::Section(s) if s.starts_with("Tracking"))));
+    }
+
+    /// "Check now" runs, then the page names the wait; a second one inside 10 minutes is refused.
+    #[test]
+    fn check_now_runs_once_and_the_page_names_the_wait() {
+        use crate::ui::new_episodes::testkit as news;
+        let (mut t, one) = rig();
+        news::landman_with_news(&mut t, 4, 2);
+        let mut h = harness(t, one, SettingsScreen::default(), egui::vec2(1400.0, 1000.0));
+        h.state_mut().enter(Route::Settings(SettingsPage::NewEpisodes));
+        until(&mut h, "the tracked series", |h| has_label(h, "Landman"));
+        let rows = |h: &mut H| {
+            let app = h.state_mut();
+            app.t.with_ctx(|ctx| app.s.rows(ctx))
+        };
+        focus(&mut h, "Check now");
+        h.state_mut().act(Action::Activate);
+        h.run_steps(2);
+        assert!(h.state().t.toasts.iter().any(|t| t.text == "Checking for new episodes…"), "{:?}", h.state().t.toasts);
+        assert!(rows(&mut h).into_iter().any(|r| matches!(r, Row::Note(n, _) if n.starts_with("Checked a moment ago") && n.contains("10 min"))));
+        assert!(crate::jobs::new_episodes::check_now(&h.state().t.services().jobs).is_err(), "a second one inside 10 minutes is refused");
     }
 }
