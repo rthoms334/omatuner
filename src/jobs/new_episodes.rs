@@ -18,8 +18,8 @@
 //!   its episodes before any check runs).
 //! * **Fetch.** Only tracked Xtream copies, on the refreshed playlists (every playlist for
 //!   Launch and Check now): those whose `details_at` is NULL (`last_modified` moved, or never
-//!   loaded), then — not at launch — the fallback for providers that never move
-//!   `last_modified`: details older than 7 days, every tracked copy on a playlist marked
+//!   loaded), then — on the refreshed playlists only, every playlist for Check now — the
+//!   fallback for providers that never move `last_modified`: details older than 7 days, every tracked copy on a playlist marked
 //!   unreliable; oldest first, at most [`FETCH_CAP`] per playlist per check, serially, paused
 //!   while the player is Loading or Zapping. API calls only: no stream, no `SharedBudget`
 //!   lease. A failed fetch is retried at the next refresh; a playlist that can't be reached
@@ -121,7 +121,7 @@ fn request_on(ctx: &JobContext, rt: &tokio::runtime::Handle, reason: CheckReason
     let state = ctx.new_episodes.clone();
     let first = {
         let mut p = lock(&state.pending);
-        p.reason = Some(p.reason.map_or(reason, |r| r.max(reason)));
+        p.reason = Some(p.reason.map_or(reason, |r| r.merge(reason)));
         if let Some(s) = source {
             p.sources.insert(s);
             if first_import {
@@ -285,23 +285,30 @@ pub(crate) struct Fetch {
     pub fallback: bool,
 }
 
-/// Which tracked copies to fetch (§5): on `scope`'s playlists (`None`: every playlist), those
-/// whose details went stale through `last_modified` (or never loaded) first, then with
-/// `fallback` those 7 days old or on an unreliable playlist, oldest first; at most
-/// [`FETCH_CAP`] per playlist.
-pub(crate) fn plan_fetches(candidates: &[FetchCandidate], scope: Option<&HashSet<SourceId>>, fallback: bool, now: Timestamp) -> Vec<Fetch> {
+/// Which tracked copies to fetch (§5): on `due`'s playlists (`None`: every playlist), those
+/// whose details went stale through `last_modified` (or never loaded) first, then on
+/// `fallback`'s playlists (`None`: every playlist) those 7 days old or on an unreliable
+/// playlist, oldest first; at most [`FETCH_CAP`] per playlist.
+pub(crate) fn plan_fetches(
+    candidates: &[FetchCandidate],
+    due: Option<&HashSet<SourceId>>,
+    fallback: Option<&HashSet<SourceId>>,
+    now: Timestamp,
+) -> Vec<Fetch> {
     /// A playlist's copies whose `last_modified` moved, and the fallback's with their age.
     type Lists = (Vec<Fetch>, Vec<(Timestamp, Fetch)>);
     let mut per_source: BTreeMap<SourceId, Lists> = BTreeMap::new();
     let mut seen = HashSet::new();
-    for c in candidates.iter().filter(|c| scope.is_none_or(|s| s.contains(&c.source))) {
-        if !seen.insert(c.series) {
+    for c in candidates {
+        let (is_due, is_fallback) = (due.is_none_or(|s| s.contains(&c.source)), fallback.is_none_or(|s| s.contains(&c.source)));
+        if !(is_due || is_fallback) || !seen.insert(c.series) {
             continue;
         }
-        let (due, old) = per_source.entry(c.source).or_default();
+        let (changed, old) = per_source.entry(c.source).or_default();
         match c.details_at {
-            None => due.push(Fetch { series: c.series, source: c.source, fallback: false }),
-            Some(at) if fallback && (c.unreliable || now - at >= super::details::DETAILS_TTL_S) => {
+            None if is_due => changed.push(Fetch { series: c.series, source: c.source, fallback: false }),
+            None => {}
+            Some(at) if is_fallback && (c.unreliable || now - at >= super::details::DETAILS_TTL_S) => {
                 old.push((at, Fetch { series: c.series, source: c.source, fallback: true }));
             }
             Some(_) => {}
@@ -351,8 +358,15 @@ pub async fn run(
     let opts = Opts::from_config(&cfg.new_episodes, crate::model::now());
     let (l, o) = (lib.clone(), opts);
     let candidates = read(ctx, move |c| store_ne::fetch_candidates(c, &l, &o)).await?;
-    let scope: Option<HashSet<SourceId>> = (reason == CheckReason::Refresh).then(|| sources.iter().copied().collect());
-    let plan = plan_fetches(&candidates, scope.as_ref(), reason != CheckReason::Launch, opts.now);
+    // a refresh looks at its playlists; a launch at every playlist's changed copies (plus the
+    // fallback of refreshes merged into it); Check now at everything
+    let refreshed: HashSet<SourceId> = sources.iter().copied().collect();
+    let (due, fallback) = match reason {
+        CheckReason::Refresh => (Some(&refreshed), Some(&refreshed)),
+        CheckReason::Launch => (None, Some(&refreshed)),
+        CheckReason::Manual => (None, None),
+    };
+    let plan = plan_fetches(&candidates, due, fallback, opts.now);
     let (fetched, fallback) = fetch(ctx, &plan, progress, cancel).await?;
     check(cancel)?;
 
@@ -643,12 +657,17 @@ mod tests {
         ];
         let scope: HashSet<SourceId> = [SourceId(1), SourceId(2)].into();
         let ids = |f: Vec<Fetch>| f.iter().map(|f| (f.series.0, f.fallback)).collect::<Vec<_>>();
-        assert_eq!(ids(plan_fetches(&c, Some(&scope), true, NOW)), [(1, false), (3, true), (4, true)]);
-        assert_eq!(ids(plan_fetches(&c, None, false, NOW)), [(1, false), (5, false)], "launch: no fallback, every playlist");
+        assert_eq!(ids(plan_fetches(&c, Some(&scope), Some(&scope), NOW)), [(1, false), (3, true), (4, true)]);
+        assert_eq!(ids(plan_fetches(&c, None, Some(&HashSet::new()), NOW)), [(1, false), (5, false)], "launch: no fallback, every playlist");
+        // a launch merged with a refresh of playlist 2: every playlist's changed copies, and the
+        // refreshed playlist's fallback
+        let two: HashSet<SourceId> = [SourceId(2)].into();
+        assert_eq!(ids(plan_fetches(&c, None, Some(&two), NOW)), [(1, false), (4, true), (5, false)]);
+        assert_eq!(ids(plan_fetches(&c, None, None, NOW)), [(1, false), (3, true), (4, true), (5, false)], "Check now: everything");
         // the cap: changed copies first, then the oldest
         c = (0..50).map(|i| cand(100 + i, 1, Some(NOW - week - i), false)).collect();
         c.push(cand(99, 1, None, false));
-        let planned = plan_fetches(&c, None, true, NOW);
+        let planned = plan_fetches(&c, None, None, NOW);
         assert_eq!(planned.len(), FETCH_CAP);
         assert_eq!((planned[0].series.0, planned[1].series.0), (99, 149));
     }

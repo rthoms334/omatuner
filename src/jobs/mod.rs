@@ -133,7 +133,8 @@ pub enum JobKind {
     /// New episodes' check (DESIGN §44; `jobs::new_episodes`): the tracked set, fetch the
     /// tracked Xtream copies that changed, diff against the ledger, announce. One dedupe key
     /// ("new-episodes"): `sources` (the refreshed playlists) and `silent` (playlists whose first
-    /// import this was: always a silent baseline) merge, and the strongest reason wins.
+    /// import this was: always a silent baseline) merge, and the reasons merge into the broadest
+    /// fetch scope (`CheckReason::merge`).
     CheckNewEpisodes {
         reason: crate::new_episodes::CheckReason,
         sources: Vec<SourceId>,
@@ -187,7 +188,7 @@ impl JobKind {
                     v.dedup();
                     v
                 };
-                JobKind::CheckNewEpisodes { reason: (*a).max(*b), sources: union(sa, sb), silent: union(la, lb) }
+                JobKind::CheckNewEpisodes { reason: a.merge(*b), sources: union(sa, sb), silent: union(la, lb) }
             }
             _ => newer.clone(),
         }
@@ -1080,14 +1081,17 @@ mod tests {
         assert_eq!(mapping.merged_with(&guide), mapping);
         assert_eq!(guide.merged_with(&mapping), mapping);
         // a wave of refreshes makes one new-episode check covering every playlist of it
-        use crate::new_episodes::CheckReason::{Launch, Refresh};
+        use crate::new_episodes::CheckReason::{Launch, Manual, Refresh};
         let check = |reason, sources: &[i64], silent: &[i64]| JobKind::CheckNewEpisodes {
             reason,
             sources: sources.iter().map(|s| SourceId(*s)).collect(),
             silent: silent.iter().map(|s| SourceId(*s)).collect(),
         };
-        assert_eq!(check(Launch, &[], &[]).merged_with(&check(Refresh, &[2], &[2])), check(Refresh, &[2], &[2]));
         assert_eq!(check(Refresh, &[2], &[2]).merged_with(&check(Refresh, &[1, 2], &[])), check(Refresh, &[1, 2], &[2]));
+        // the launch's every-playlist scope survives a refresh merged with it, either way round
+        assert_eq!(check(Launch, &[], &[]).merged_with(&check(Refresh, &[2], &[2])), check(Launch, &[2], &[2]));
+        assert_eq!(check(Refresh, &[2], &[]).merged_with(&check(Launch, &[], &[])), check(Launch, &[2], &[]));
+        assert_eq!(check(Launch, &[2], &[]).merged_with(&check(Manual, &[], &[])), check(Manual, &[2], &[]));
     }
 
     /// The new-episode check's minutes of fetches never hold Following's lane.
