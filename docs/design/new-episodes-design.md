@@ -100,7 +100,7 @@ The two coexist without double alerts: one episode alerts once, through whicheve
 ```
 - **One tile per title** (its copies are one tile, as everywhere on Home, §29.14). The badge counts the new episodes not yet watched or dismissed. The second line is the S/E span ("S2E9–E10", or "S2E9 · S3E1" across seasons). The third line says why it's tracked: a list name (the first, "+1" for more) or "binged". A started new episode shows its progress bar.
 - **Order:** the newest arrival first. At most `RAIL_MAX` (30) tiles.
-- **Enter** opens the series page on the season of the first new episode, with that row selected. **Shift+Enter** plays what the notification's Play would. **Delete** dismisses the tile's new episodes, with Undo. **Ctrl+D** downloads them. **Ctrl+W** is the existing mark-watched. The menu (Shift+F10, right-click) offers Play S2E9 · Download the new episodes · Dismiss · Open series · Stop alerts for this series (if decided, §11 Q1).
+- **Enter** opens the series page on the season of the first new episode, with that row selected. **Shift+Enter** plays what the notification's Play would. **Delete** dismisses the tile's new episodes, with Undo. **Ctrl+D** downloads them. **Ctrl+W** is the existing mark-watched. The menu (Shift+F10, right-click) offers Play S2E9 · Download the new episodes · Dismiss · Open series · Stop alerts for this series (§11 Q1).
 
 ### 2.4 Home, Medium (≈950 pt, icon rail 48)
 ```
@@ -184,9 +184,9 @@ It shows once on Home after the first baseline (`meta` row `newep:card`), like t
 | **Binged** (decided) | A title is tracked when, in at least one season ≥ 1, **more than 60 %** of its episodes are finished. Precisely, for the title's copies `C` (`title_copies`, visible ones only): `Known_s` = the distinct episode numbers of season `s` in any copy's `episode` rows (the union `copies::episodes` / `copies::seasons` use). `Finished_s` = the numbers in `Known_s` where some copy's episode `(s, e)` has `watch_progress.finished = 1` (`copies::episode_progress`: any copy watched → watched). Binged ⇔ ∃ s ≥ 1 with `Known_s` ≠ ∅ and `|Finished_s| / |Known_s| > 0.6`. Part-watched episodes don't count; Ctrl+W marks do. Arrivals still unwatched are left out of `Known_s`, so a new episode never lowers the ratio. |
 | **"Also series I've binged" off** | Only list series are tracked. |
 | **Season ranges** | A whole-series entry covers seasons ≥ 1. A range `S a–b` covers seasons `a..=b`. A range is **open-ended** when `b` reaches the newest season the title had before this arrival (the newest season in the ledger, §4): it then also covers every later season. So "The Bear S1–S3" with S3 as the newest season gets S4. "Mandalorian S1–S2" while S3 exists is closed: only a gap filled inside S1–S2 alerts. A binged title covers seasons ≥ 1. A title covered by several entries or reasons gets the union. |
-| **Specials** | Season 0 never alerts unless a range names season 0 (as watchlists leave specials out, §42 §3). Open question Q10. |
+| **Specials** | Season 0 never alerts unless a range names season 0 (as watchlists leave specials out, §42 §3). |
 | **Becoming tracked** | A title is baselined the moment it becomes tracked: added to a list, attached from a placeholder, or crossing the binge line. Its existing episodes are recorded silently (§3.2, Baseline). |
-| **No longer tracked** | Leaving every list (and not binged) stops tracking. Its ledger rows are deleted, so a later add baselines again and never alerts on what arrived meanwhile. Arrivals already on Home stay until watched or dismissed. Open question Q2. |
+| **No longer tracked** | Leaving every list (and not binged) stops tracking. Its ledger rows are deleted, so a later add baselines again and never alerts on what arrived meanwhile. Arrivals already on Home stay until watched or dismissed. |
 | **Guards** | A title with any locked copy, a concealed copy (`Library::conceals`), an explicit copy (`item_explicit`, in **every** parental state) or no visible copy (hidden titles are absent from `lib.vod`) is never tracked, never counted and never named. |
 
 ### 3.2 What counts as a new episode
@@ -207,7 +207,7 @@ It shows once on Home after the first baseline (`meta` row `newep:card`), like t
 | **Different jobs** | Following watches airings in the guide. New episodes watches the playlists' catalogue. Neither reads the other's triggers. A show can be in both. |
 | **One alert per episode** | When an arrival's `(s, e)` matches a Following ledger row from the last 30 days (`follow_match.event_key` = `core_title(series name)#sNNeMM`, the format of `textmatch::event::event_key`) whose rule reminded, switched or recorded it (state `scheduled`, `adopted` or `aired`), the arrival is recorded **quiet**: it's on Home and in Recent ("quiet: aired on TV"), with no notification and not counted in a summary. A Following **Record** rule's finished recording of that airing counts the same way. |
 | **Seen on TV** | An arrival whose `(series_norm, season, episode)` is in `spoiler_seen` (seen live, on catch-up or marked) is recorded as watched. `spoiler_seen` only holds guarded subjects, so this is best effort. |
-| **The other way round** | Following is unchanged in this feature: a guide airing of an episode announced here, or already watched on demand, still reminds. Open question Q8. |
+| **The other way round** | Following is unchanged in this feature: a guide airing of an episode announced here, or already watched on demand, still reminds. |
 | **Matching titles** | The guide's title and the catalogue's series name are matched by `core_title` over the series' `clean_name`. When they don't match ("Landman (2024)" vs "Landman"), both features alert, about different things (a time; a file). |
 
 ### 3.4 Alerts
@@ -215,7 +215,7 @@ It shows once on Home after the first baseline (`meta` row `newep:card`), like t
 |---|---|
 | **When** | After a refresh: one check per refresh wave (§5), never on a timer of its own. |
 | **Grouping** (decided) | One notification per series ("Landman: 2 new episodes"). If **4 or more** series have arrivals in one check, a single summary instead ("New episodes in 6 series"), whose Open shows Home's row. Quiet arrivals don't count towards the 4. |
-| **Play** | Plays the series' next episode by `copies::next_episode` (resume the newest unfinished, else the one after the newest watched), through the copy plan, the way Continue watching does. When that is the first new episode, the button says "Play S2E9"; when you're behind, it says "Play S1E6". Open question Q4. |
+| **Play** | Plays the series' next episode by `copies::next_episode` (resume the newest unfinished, else the one after the newest watched), through the copy plan, the way Continue watching does. When that is the first new episode, the button says "Play S2E9"; when you're behind, it says "Play S1E6". |
 | **Download** (decided: no automatic download) | Only when you pick it: `DownloadCommand::Add` with every new episode of the series (any copy; the downloads service picks the copy at start, §43 §3). A Keep N rule (§43) works as before and may already have queued them. |
 | **Desktop notifications off** | Arrivals still reach Home, the badges, Settings ▸ Recent and the agent. |
 | **The master switch off** | Nothing is checked, fetched or shown. Switching it on again baselines silently. |
@@ -224,10 +224,10 @@ It shows once on Home after the first baseline (`meta` row `newep:card`), like t
 ### 3.5 Clearing
 | Rule | Decision |
 |---|---|
-| **Home row** (decided) | An arrival leaves the row when it's **finished** in any copy (derived at read time, like watchlists' done) or **dismissed** (Delete on the tile, or the menu; Undo for 10 s). A tile leaves when all its arrivals have. Open question Q3: an expiry. |
+| **Home row** (decided) | An arrival leaves the row when it's **finished** in any copy (derived at read time, like watchlists' done) or **dismissed** (Delete on the tile, or the menu; Undo for 10 s). A tile leaves when all its arrivals have. Expiry after 30 days (Q3). |
 | **Entry chip** (decided: until opened) | Cleared for a series when its series page is opened from anywhere, its watchlist entry is opened, or one of its new episodes is played. |
 | **Sidebar dot** (decided: until opened) | Cleared when the Watchlists screen is opened (`meta` row `newep:watchlists_opened_at`). |
-| **Agent** | Reading the list over MCP clears nothing. Open question Q5. |
+| **Agent** | Reading the list over MCP clears nothing. Q5: a `seen` action clears only when the user asks. |
 
 ---
 
@@ -277,7 +277,7 @@ CREATE INDEX IF NOT EXISTS newep_arrival_open ON newep_arrival(cleared_at, arriv
 CREATE INDEX IF NOT EXISTS newep_arrival_ref  ON newep_arrival(source_id, series_key, season, episode);
 -- meta rows: 'newep:baselined_at', 'newep:card', 'newep:watchlists_opened_at',
 -- 'newep:lm_unreliable:<source id>' (§5, Fallback).
--- If Q1 is decided yes: newep_mute(source_id, series_key, muted_at, fp, orphaned_since).
+-- Q1: newep_mute(source_id, series_key, muted_at, fp, orphaned_since).
 ```
 - **Size.** About 50 tracked titles × 2 copies × 100 episodes ≈ 10k `newep_known` rows. The diff reads `episode` through its `episode_series (series_id, season, episode)` index.
 - **Re-keys.** `newep_arrival` joins `store::user` HOLDERS ("new episode"), so a Home tile survives an M3U → Xtream upgrade (`apply_key_moves`) and lists under Orphans otherwise. `newep_copy` / `newep_known` aren't moved: a re-keyed copy is a new copy and baselines silently, with the frontier rule over its other copies.
@@ -343,7 +343,7 @@ CREATE INDEX IF NOT EXISTS newep_arrival_ref  ON newep_arrival(source_id, series
 - Locked, hidden and explicit series are absent, as everywhere (§30). Spoiler-guarded titles are dropped with `spoiler: {hidden, rule, reason}`; `reveal_spoilers` works as elsewhere.
 - Playing and downloading use the existing tools: `play` with `next_episode.ref`, `downloads add` with the `new[].ref`s (RULES.md confirmations apply).
 - `status` gains `new_episodes: {series, episodes}` (counts of uncleared arrivals).
-- Writes (`seen`, `mute`) wait for Q1 and Q5.
+- Writes (`seen`, `mute`) follow Q1 and Q5.
 
 **Skills**
 - **series:** "anything new on my shows?" / "what's new in Landman?" → `new_episodes list` → name the shows and the next episode for each → offer `play`. "Why am I told about X?" → `tracked`.
@@ -423,8 +423,8 @@ The total is about 2,900 lines including tests. The order is N0, then N-core and
 - The series page marks new episodes with a "New" chip.
 - Locked, explicit and concealed copies exclude the whole title.
 
-**Open**
-| # | Question | Recommendation |
+**Answered (the user, 2026-10-23): every open question as recommended**
+| # | Question | Decision |
 |---|---|---|
 | Q1 | **Per-series mute** ("Stop alerts for this series") from the notification and the series page? | Yes, on the series page, the Home tile menu and Settings ▸ New episodes, with Undo. **Not** on the notification: a third action is too much for a toast, and some servers hide extra actions. A muted title keeps its ledger, so unmuting doesn't replay what arrived meanwhile. |
 | Q2 | Does a series that **falls below the binge threshold**, or **comes off all lists**, keep alerting? | Off a list: stop (unless binged), as §3.1 drafts. Binge: arrivals never lower the ratio (§3.1), so it only falls when you unmark episodes; then stop. A show you abandoned stays tracked; Q1 covers it. |
