@@ -835,6 +835,10 @@ const HOLDERS: &[(&str, &str, &str, &str, &str)] = &[
     // Up next rows still to play (DESIGN §32): re-keyed items reattach, vanished ones list
     // under Orphans (played, skipped and failed rows are pruned by age instead)
     ("queue", "queue_item", "kind", "item_key", " AND state IN ('pending', 'current')"),
+    // New episodes (DESIGN §44): a Home tile survives a re-key; a deleted playlist's arrivals
+    // keep their row without a source (they are not an item of any playlist any more)
+    ("new episode", "newep_arrival", "'series'", "series_key", " AND source_id IS NOT NULL"),
+    ("new-episode mute", "newep_mute", "'series'", "series_key", ""),
 ];
 
 fn holder_name(s: &str) -> &'static str {

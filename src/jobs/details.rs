@@ -23,10 +23,14 @@ use crate::sources::{identity, vod_match};
 use crate::store::import::{ImportEpisode, ImportSeason, MovieDetails, SeriesDetails};
 
 /// Details are re-fetched after this long.
-const DETAILS_TTL_S: i64 = 7 * 86_400;
+pub(crate) const DETAILS_TTL_S: i64 = 7 * 86_400;
 
 fn fresh(loaded_at: Option<Timestamp>, now: Timestamp) -> bool {
-    loaded_at.is_some_and(|t| now - t < DETAILS_TTL_S)
+    fresh_within(loaded_at, now, DETAILS_TTL_S)
+}
+
+fn fresh_within(loaded_at: Option<Timestamp>, now: Timestamp, max_age_s: i64) -> bool {
+    loaded_at.is_some_and(|t| now - t < max_age_s)
 }
 
 /// `None` for M3U sources, also those keeping the login of an earlier upgrade (DESIGN §27.5:
@@ -118,6 +122,18 @@ fn movie_details(info: &XtVodInfo) -> MovieDetails {
 }
 
 pub async fn load_series(ctx: &JobContext, id: SeriesId, progress: &Progress, cancel: &CancellationToken) -> Result<()> {
+    fetch_series(ctx, id, DETAILS_TTL_S, Some(progress), cancel).await.map(drop)
+}
+
+/// New episodes' fetch of a tracked copy (DESIGN §44 §5): [`load_series`]'s parsing and
+/// `store_series_details`, with the caller's freshness (`max_age_s`; 0 = always fetch) and no
+/// progress of its own (the check's job reports). True when it asked the provider; M3U series
+/// (complete at import) are never fetched.
+pub async fn load_series_checked(ctx: &JobContext, id: SeriesId, max_age_s: i64, cancel: &CancellationToken) -> Result<bool> {
+    fetch_series(ctx, id, max_age_s, None, cancel).await
+}
+
+async fn fetch_series(ctx: &JobContext, id: SeriesId, max_age_s: i64, progress: Option<&Progress>, cancel: &CancellationToken) -> Result<bool> {
     let (series, src, old_tmdb, explicit) = read(ctx, move |c| {
         let s = crate::store::vod::series(c, id)?;
         let src = crate::store::sources::get_source(c, s.source_id)?;
@@ -128,28 +144,34 @@ pub async fn load_series(ctx: &JobContext, id: SeriesId, progress: &Progress, ca
     })
     .await?;
     // an explicit title is never named in the jobs overlay or the log (DESIGN §20.3)
-    if !explicit {
-        progress.set_subject(series.display_name());
+    if let Some(p) = progress
+        && !explicit
+    {
+        p.set_subject(series.display_name());
     }
     let now = crate::model::now();
-    let Some(client) = client(ctx, &src) else { return Ok(()) };
-    if fresh(series.details_loaded_at, now) {
-        return Ok(());
+    let Some(client) = client(ctx, &src) else { return Ok(false) };
+    if fresh_within(series.details_loaded_at, now, max_age_s) {
+        return Ok(false);
     }
     let Some(series_id) = provider_id(None, series.provider_id.as_deref()).or_else(|| series.key.0.strip_prefix("xt:series:")?.parse().ok()) else {
-        return Ok(());
+        return Ok(false);
     };
-    progress.set(JobPhase::Connecting);
+    if let Some(p) = progress {
+        p.set(JobPhase::Connecting);
+    }
     let info = client.series_info(series_id, cancel).await?;
     check(cancel)?;
-    progress.set(JobPhase::Finishing);
+    if let Some(p) = progress {
+        p.set(JobPhase::Finishing);
+    }
     let d = series_details(&info);
     let restack = tmdb_changed(old_tmdb, d.tmdb_id);
     ctx.store.writer().submit_notify(DataScope::VodDetails, move |c| crate::store::import::store_series_details(c, id, &d, now)).recv().await?;
     if restack {
         (ctx.submit)(JobKind::RebuildLibrary);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn series_details(info: &XtSeriesInfo) -> SeriesDetails {

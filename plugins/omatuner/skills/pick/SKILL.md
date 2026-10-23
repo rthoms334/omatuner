@@ -2,7 +2,7 @@
 name: pick
 description: Recommend and play a film, series or live show from the user's Tuner library. Moods, "like X", "surprise me", what can I finish in 40 minutes, for two people or the family, what's new, a film in a language, which films of a franchise I have and in what order.
 when_to_use: Use when the user wants Claude to choose something to watch from their own library, or to line several titles up in Tuner's Up next. Use discover for trending or top-10 lists from the web.
-allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__categories mcp__plugin_omatuner_tuner__browse mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__watchlist mcp__plugin_omatuner_tuner__match_titles mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue
+allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__categories mcp__plugin_omatuner_tuner__browse mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__new_episodes mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__watchlist mcp__plugin_omatuner_tuner__match_titles mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue
 ---
 
 # Pick: choose something for me
@@ -16,7 +16,10 @@ First read `${CLAUDE_SKILL_DIR}/../../RULES.md` and follow it throughout.
      `browse` with `group`, or `genre`.
    - Time ("I've got 40 minutes", "under 2 hours") → `max_minutes` (movies). For "what can I
      finish", also `continue_watching` (`remaining_min`).
-   - "Something new" → `added_since` (for example 7 days ago) and `sort: "recent"`.
+   - "What's new" → start with `new_episodes` (new episodes of the user's own shows, with
+     `next_episode` to play), then `browse` with `added_since` (for example 7 days ago) and
+     `sort: "recent"` for the rest of the library. Never call a series "new" from `added_since`
+     alone: the provider's `last_modified` moves for many reasons.
    - A person → `person`; years → `year_from`/`year_to`; quality bar → `min_rating`.
    - Never seen → `unwatched: true`. "Surprise me" → `sort: "random"`.
 2. Build a taste anchor when it helps: "like the last thing I watched" → `history`; "like

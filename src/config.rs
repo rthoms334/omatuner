@@ -54,6 +54,8 @@ pub struct Config {
     pub cast: CastConfig,
     /// Private downloads and recordings (DESIGN §43 §4).
     pub downloads: DownloadsConfig,
+    /// New-episode alerts for the series on your watchlists and the ones you binged (DESIGN §44).
+    pub new_episodes: NewEpisodesConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -533,6 +535,32 @@ pub struct NewsFlashConfig {
 impl Default for NewsFlashConfig {
     fn default() -> Self {
         Self { quiet_from_min: None, quiet_to_min: None, skip_when_fullscreen: true, headlines_min: 5 }
+    }
+}
+
+/// `[new_episodes]` (New episodes, DESIGN §44). On by default (the user asked for it); its
+/// first run is a silent baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NewEpisodesConfig {
+    /// The master switch: off, nothing is checked, fetched or shown; on again, a silent
+    /// baseline.
+    pub enabled: bool,
+    /// Desktop notifications. Off, arrivals still reach Home, the badges, Settings and agents.
+    pub notify: bool,
+    /// Also track series binged without being on a list ("Also series I've binged").
+    pub binged: bool,
+    /// "Binged": more than this share (%) of a season finished, and at least
+    /// `store::new_episodes::BINGE_MIN` episodes of it. Not shown in Settings.
+    pub binge_pct: u32,
+    /// An arrival leaves Home after this many days even unwatched (Q3, `cleared_how =
+    /// 'expired'`). Not shown in Settings.
+    pub home_days: u32,
+}
+
+impl Default for NewEpisodesConfig {
+    fn default() -> Self {
+        Self { enabled: true, notify: true, binged: true, binge_pct: 60, home_days: 30 }
     }
 }
 

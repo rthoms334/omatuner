@@ -28,6 +28,7 @@ pub mod health;
 pub mod library;
 pub mod mcp;
 pub mod multiview;
+pub mod new_episodes;
 pub mod params;
 pub mod proto;
 pub mod query;

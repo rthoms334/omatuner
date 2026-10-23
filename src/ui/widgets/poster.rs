@@ -220,6 +220,20 @@ pub(crate) struct TileDecor<'a> {
     /// Drawn disabled: a locked copy, or a stack whose every copy is locked, while the session
     /// is locked.
     pub dimmed: bool,
+    /// New episodes' tile (DESIGN §44 §2.3): "2 NEW" on the poster, the S/E span instead of the
+    /// meta line and, at Wide, a third line saying why the title is tracked.
+    pub news: Option<NewsDecor<'a>>,
+}
+
+/// What a New episodes tile says besides the title.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NewsDecor<'a> {
+    /// The badge: "2 NEW", "NEW".
+    pub badge: &'a str,
+    /// "S2E9–E10".
+    pub span: &'a str,
+    /// "My list", "binged" (`None`: the Medium and Compact tiles leave it to the tooltip).
+    pub why: Option<&'a str>,
 }
 
 /// The playlists a card names in full (accessible label, status bar): "Northwind", "TV + TV 2",
@@ -344,7 +358,8 @@ pub(crate) fn poster_tile_ex(
 ) -> (egui::Response, bool) {
     let t = &theme.tokens;
     let width = width.max(40.0);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, card_height(theme, width)), egui::Sense::click());
+    let extra = if decor.news.is_some_and(|n| n.why.is_some()) { theme.font(TypeToken::BodySmall) * 1.25 } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, card_height(theme, width) + extra.ceil()), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tile_label(item, &decor)));
     if !ui.is_rect_visible(rect) {
@@ -404,6 +419,15 @@ pub(crate) fn poster_tile_ex(
     if let Some(f) = decor.progress.filter(|f| *f > 0.0 && *f < 1.0 && !decor.watched) {
         let bar = Rect::from_min_max(egui::pos2(poster.left(), poster.bottom() - bar_h), poster.right_bottom());
         super::progress::paint_progress(p, bar, theme, f, true);
+    }
+    // "2 NEW", bottom-left above the progress bar
+    if let Some(n) = decor.news {
+        let g = paint::galley(p, n.badge, paint::font(theme, TypeToken::Caption), t.bg, f32::INFINITY);
+        let size = g.size() + egui::vec2(2.0 * theme.space(SpaceToken::Sm), 2.0 * theme.space(SpaceToken::Xxs));
+        let at = poster.left_bottom() + egui::vec2(theme.space(SpaceToken::Xs), -(bar_h + theme.space(SpaceToken::Xs) + size.y));
+        let r = Rect::from_min_size(at, size);
+        p.rect_filled(r, t.rounding, t.accent);
+        p.galley(r.center() - g.size() / 2.0, g, t.bg);
     }
     // the copy count, bottom-right above the progress bar; a click fans the stack out / folds it
     let mut badge_clicked = false;
@@ -467,9 +491,10 @@ pub(crate) fn poster_tile_ex(
     p.galley(egui::pos2(left, y), g, title_color);
     y += h + theme.space(SpaceToken::Xxs);
     // a fanned-out copy says which version it is; "+1" inside one playlist
-    let mut meta = match decor.copy {
-        Some(c) => c.to_owned(),
-        None => meta_line(item),
+    let mut meta = match (decor.copy, decor.news) {
+        (_, Some(n)) => n.span.to_owned(),
+        (Some(c), None) => c.to_owned(),
+        (None, None) => meta_line(item),
     };
     if let Some(e) = decor.elsewhere {
         meta = if meta.is_empty() { format!("+{}", e.count) } else { format!("{meta} · +{}", e.count) };
@@ -483,6 +508,10 @@ pub(crate) fn poster_tile_ex(
     }
     let font = paint::font(theme, TypeToken::BodySmall);
     let left = rect.left();
+    if let Some(why) = decor.news.and_then(|n| n.why) {
+        let below = y + theme.font(TypeToken::BodySmall) * 1.25;
+        paint::text(p, egui::pos2(left, below), Align2::LEFT_TOP, why, font.clone(), t.text_secondary, (rect.right() - left).max(0.0));
+    }
     if !meta.is_empty() {
         let r = paint::text(p, egui::pos2(left, y), Align2::LEFT_TOP, meta, font, t.text_secondary, (rect.right() - left).max(0.0));
         if let Some(e) = decor.elsewhere {

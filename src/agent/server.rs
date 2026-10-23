@@ -249,6 +249,7 @@ impl Inner {
                 })
             }
             Call::Downloads(p) => super::downloads::handle(&self, p).await,
+            Call::NewEpisodes(p) => super::new_episodes::handle(&self, p, &who).await,
             Call::Watchlist(p) => {
                 let starts = p.action == super::params::WatchlistAction::Play;
                 super::watchlist::handle(&self, p, &who).await.inspect_err(|_| {
@@ -422,6 +423,10 @@ impl Inner {
             let (view, _) = self.view();
             let jobs: Vec<_> = snap.jobs.iter().filter(|j| !view.hides_explicit || !j.explicit()).collect();
             out["downloads"] = serde_json::json!({"running":jobs.iter().filter(|j| j.state.active()).count(),"waiting":jobs.iter().filter(|j| j.state == crate::downloads::State::Waiting).count(),"used_gb":snap.used_bytes as f64 / 1e9});
+        }
+        // how many new episodes wait on Home (counts only, no titles); omitted while loading or off
+        if let Ok(Some(counts)) = self.run(true, super::new_episodes::counts).await {
+            out["new_episodes"] = counts;
         }
         Ok(out)
     }

@@ -6,7 +6,8 @@
 //!   further along, a `rerun` flag is set and the job is submitted again when it finishes —
 //!   a newer request is never dropped.
 //! * Concurrency limits (semaphores): playlist refreshes 2, EPG refreshes 1 (DB-write heavy),
-//!   detail loads 4, everything else 2.
+//!   detail loads 4, Following's evaluation and the guide check 1 ("features"), the new-episode
+//!   check 1 (its own lane), everything else 2.
 //! * Every job gets a `CancellationToken`; downloads/parsers check it at least every 64 KiB /
 //!   1 000 items. Cancelled imports never sweep (see `store::import`).
 //! * Progress: `JobEvent::Updated` at most every 100 ms per job (throttled) through the
@@ -49,6 +50,7 @@ pub mod guide_check;
 pub mod import_epg;
 pub mod import_source;
 pub mod maintenance;
+pub mod new_episodes;
 pub mod probe;
 pub mod scheduler;
 
@@ -128,6 +130,16 @@ pub enum JobKind {
     /// Guide fixes' background check: probes, suggestions, classification cache (DESIGN §31,
     /// B7; `jobs::guide_check`).
     GuideCheck,
+    /// New episodes' check (DESIGN §44; `jobs::new_episodes`): the tracked set, fetch the
+    /// tracked Xtream copies that changed, diff against the ledger, announce. One dedupe key
+    /// ("new-episodes"): `sources` (the refreshed playlists) and `silent` (playlists whose first
+    /// import this was: always a silent baseline) merge, and the reasons merge into the broadest
+    /// fetch scope (`CheckReason::merge`).
+    CheckNewEpisodes {
+        reason: crate::new_episodes::CheckReason,
+        sources: Vec<SourceId>,
+        silent: Vec<SourceId>,
+    },
 }
 
 impl JobKind {
@@ -149,6 +161,7 @@ impl JobKind {
             JobKind::ImportBackup { path, .. } => format!("import-backup:{}", path.display()),
             JobKind::EvaluateFollows { .. } => "follows".into(),
             JobKind::GuideCheck => "guide-check".into(),
+            JobKind::CheckNewEpisodes { .. } => "new-episodes".into(),
         }
     }
 
@@ -166,6 +179,16 @@ impl JobKind {
             (JobKind::EvaluateFollows { reason: a }, JobKind::EvaluateFollows { reason: b }) => {
                 use crate::follow::FollowReason::{Daily, Guide};
                 JobKind::EvaluateFollows { reason: if matches!(b, Guide | Daily) { *a } else { *b } }
+            }
+            // one check covers every playlist refreshed meanwhile
+            (JobKind::CheckNewEpisodes { reason: a, sources: sa, silent: la }, JobKind::CheckNewEpisodes { reason: b, sources: sb, silent: lb }) => {
+                let union = |x: &[SourceId], y: &[SourceId]| {
+                    let mut v: Vec<SourceId> = x.iter().chain(y).copied().collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v
+                };
+                JobKind::CheckNewEpisodes { reason: a.merge(*b), sources: union(sa, sb), silent: union(la, lb) }
             }
             _ => newer.clone(),
         }
@@ -354,6 +377,9 @@ pub enum JobEvent {
 /// Submits a follow-up job (returns its id). Installed by [`JobManager::new`].
 pub type JobSubmitter = Arc<dyn Fn(JobKind) -> JobId + Send + Sync>;
 
+/// The kinds of the jobs queued or running now. Installed by [`JobManager::new`].
+pub type JobLister = Arc<dyn Fn() -> Vec<JobKind> + Send + Sync>;
+
 /// Shared dependencies handed to every job.
 #[derive(Clone)]
 pub struct JobContext {
@@ -377,6 +403,12 @@ pub struct JobContext {
     pub headless: bool,
     /// The guide check's debounce and whether it is running (`guide_check::request`).
     pub guide_check: Arc<guide_check::CheckState>,
+    /// What is queued or running (the new-episode check waits for refreshes and library builds
+    /// before it is submitted).
+    pub active: JobLister,
+    /// New episodes' debounces, held notifications and whether a check runs
+    /// (`new_episodes::request`).
+    pub new_episodes: Arc<new_episodes::CheckState>,
 }
 
 impl JobContext {
@@ -394,6 +426,8 @@ impl JobContext {
             shared: None,
             headless: false,
             guide_check: Arc::default(),
+            active: Arc::new(Vec::new),
+            new_episodes: Arc::default(),
         }
     }
 
@@ -577,6 +611,7 @@ fn label_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::ImportBackup { .. } => "Restoring backup".into(),
         JobKind::EvaluateFollows { .. } => "Checking what you follow".into(),
         JobKind::GuideCheck => "Matching channels to the guide".into(),
+        JobKind::CheckNewEpisodes { .. } => "Checking for new episodes".into(),
     }
 }
 
@@ -598,6 +633,7 @@ fn failure_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::ImportBackup { .. } => "Couldn't restore the backup".into(),
         JobKind::EvaluateFollows { .. } => "Couldn't check what you follow".into(),
         JobKind::GuideCheck => "Couldn't check the guide data".into(),
+        JobKind::CheckNewEpisodes { .. } => "Couldn't check for new episodes".into(),
     }
 }
 
@@ -663,6 +699,9 @@ struct Limits {
     /// Following's evaluation and the guide check: one at a time (B7), after the import that
     /// submitted them.
     features: Arc<Semaphore>,
+    /// The new-episode check, one at a time in a lane of its own: its serial fetches and its
+    /// pauses while the player is busy take minutes, which must not hold up Following.
+    new_episodes: Arc<Semaphore>,
 }
 
 impl Limits {
@@ -673,6 +712,7 @@ impl Limits {
             details: Arc::new(Semaphore::new(4)),
             other: Arc::new(Semaphore::new(2)),
             features: Arc::new(Semaphore::new(1)),
+            new_episodes: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -682,6 +722,7 @@ impl Limits {
             JobKind::RefreshEpg { .. } | JobKind::RematchEpg => self.epg.clone(),
             JobKind::LoadMovieDetails(_) | JobKind::LoadSeriesDetails(_) => self.details.clone(),
             JobKind::EvaluateFollows { .. } | JobKind::GuideCheck => self.features.clone(),
+            JobKind::CheckNewEpisodes { .. } => self.new_episodes.clone(),
             _ => self.other.clone(),
         }
     }
@@ -692,15 +733,23 @@ impl JobManager {
     /// `ctx.submit` (a weak reference back to this manager — no reference cycle).
     pub fn new(mut ctx: JobContext, rt: tokio::runtime::Handle) -> Self {
         let inner = Arc::new_cyclic(|weak: &std::sync::Weak<ManagerInner>| {
-            let weak = weak.clone();
-            ctx.submit = Arc::new(move |kind| match weak.upgrade() {
+            let w = weak.clone();
+            ctx.submit = Arc::new(move |kind| match w.upgrade() {
                 Some(inner) => JobManager { inner }.submit(kind),
                 None => JobId(0),
+            });
+            let w = weak.clone();
+            ctx.active = Arc::new(move || match w.upgrade() {
+                Some(inner) => lock(&inner.jobs).by_id.values().map(|e| e.kind.clone()).collect(),
+                None => Vec::new(),
             });
             ManagerInner { ctx, rt, jobs: Mutex::default(), next_id: AtomicU64::new(1), limits: Limits::new(), closing: AtomicBool::new(false) }
         });
         if crate::guide_fix::ENABLED && !inner.ctx.headless && inner.ctx.shared.is_some() {
             inner.rt.spawn(guide_check::after_first_publish(Arc::downgrade(&inner)));
+        }
+        if crate::new_episodes::ENABLED && !inner.ctx.headless && inner.ctx.shared.is_some() {
+            inner.rt.spawn(new_episodes::after_first_publish(Arc::downgrade(&inner)));
         }
         Self { inner }
     }
@@ -951,6 +1000,10 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
             guide_check::run(ctx, progress, cancel).await?;
             Ok(JobOutcome::Nothing)
         }
+        JobKind::CheckNewEpisodes { reason, sources, silent } => {
+            new_episodes::run(ctx, *reason, sources, silent, progress, cancel).await?;
+            Ok(JobOutcome::Nothing)
+        }
     }
 }
 
@@ -1027,6 +1080,29 @@ mod tests {
         let (mapping, guide) = (JobKind::EvaluateFollows { reason: Mapping }, JobKind::EvaluateFollows { reason: Guide });
         assert_eq!(mapping.merged_with(&guide), mapping);
         assert_eq!(guide.merged_with(&mapping), mapping);
+        // a wave of refreshes makes one new-episode check covering every playlist of it
+        use crate::new_episodes::CheckReason::{Launch, Manual, Refresh};
+        let check = |reason, sources: &[i64], silent: &[i64]| JobKind::CheckNewEpisodes {
+            reason,
+            sources: sources.iter().map(|s| SourceId(*s)).collect(),
+            silent: silent.iter().map(|s| SourceId(*s)).collect(),
+        };
+        assert_eq!(check(Refresh, &[2], &[2]).merged_with(&check(Refresh, &[1, 2], &[])), check(Refresh, &[1, 2], &[2]));
+        // the launch's every-playlist scope survives a refresh merged with it, either way round
+        assert_eq!(check(Launch, &[], &[]).merged_with(&check(Refresh, &[2], &[2])), check(Launch, &[2], &[2]));
+        assert_eq!(check(Refresh, &[2], &[]).merged_with(&check(Launch, &[], &[])), check(Launch, &[2], &[]));
+        assert_eq!(check(Launch, &[2], &[]).merged_with(&check(Manual, &[], &[])), check(Manual, &[2], &[]));
+    }
+
+    /// The new-episode check's minutes of fetches never hold Following's lane.
+    #[test]
+    fn the_new_episode_check_has_a_lane_of_its_own() {
+        let limits = Limits::new();
+        let check = JobKind::CheckNewEpisodes { reason: crate::new_episodes::CheckReason::Refresh, sources: Vec::new(), silent: Vec::new() };
+        let follows = JobKind::EvaluateFollows { reason: crate::follow::FollowReason::Guide };
+        assert!(!Arc::ptr_eq(&limits.for_kind(&check), &limits.for_kind(&follows)));
+        assert!(Arc::ptr_eq(&limits.for_kind(&JobKind::GuideCheck), &limits.for_kind(&follows)));
+        assert_eq!(limits.for_kind(&check).available_permits(), 1, "one check at a time");
     }
 
     fn status(id: u64) -> JobStatus {

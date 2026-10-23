@@ -155,6 +155,22 @@ impl KeyContext {
     }
 }
 
+/// What a new-episodes toast button or menu entry asks for. The numbers name a stashed note or
+/// undo (`ui::new_episodes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NewEpisodesAct {
+    /// The toast's Play: its note's series.
+    Play(u16),
+    /// The toast's Download: its note's episodes.
+    Download(u16),
+    /// The summary toast's Open: Home's New episodes row.
+    Open,
+    /// The toast's Undo after a dismiss or a mute.
+    Undo(u16),
+    /// "Stop alerts for this series" / "Allow alerts again" in a menu.
+    StopAlerts,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     // ---- navigation
@@ -257,6 +273,8 @@ pub enum Action {
     /// The Open button of Following's summary toast (never bound to a key): Settings ▸
     /// Following.
     OpenFollowing,
+    /// A new-episodes toast button or menu choice (never bound to a key; DESIGN §44).
+    NewEpisodes(NewEpisodesAct),
     // ---- guide
     GuidePrevDay,
     GuideNextDay,
@@ -1201,6 +1219,7 @@ pub fn feature_on(a: Action) -> bool {
         A::GoDownloads | A::Download => crate::downloads::ENABLED,
         A::QueueAdd | A::QueuePlayNext | A::GoQueue | A::QueuePanel | A::QueueNext | A::QueuePrev => crate::queue::ENABLED,
         A::FollowProgramme | A::UndoFollow(_) | A::OpenFollowing => crate::follow::ENABLED,
+        A::NewEpisodes(_) => crate::new_episodes::ENABLED,
         A::RevealSpoilers | A::SpoilerMenu => crate::spoiler::ENABLED,
         A::AcceptFix | A::ShiftLater | A::ShiftEarlier | A::UndoGuideFix(_) => crate::guide_fix::ENABLED,
         A::NextPicture

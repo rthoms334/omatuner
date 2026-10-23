@@ -44,6 +44,8 @@ const DETAILS: u8 = 220;
 #[derive(Default)]
 pub struct WatchlistsScreen {
     snapshot: Arc<WatchlistsSnapshot>,
+    /// New episodes of the series on the lists (the entry chips and the lists pane's mark).
+    news: Arc<crate::new_episodes::NewEpisodesSnapshot>,
     selected: Option<WatchlistId>,
     /// Pane navigation can select a different list without changing the opening route.
     route_list: Option<WatchlistId>,
@@ -90,6 +92,7 @@ impl WatchlistsScreen {
     fn sync(&mut self, ctx: &UiCtx<'_>) {
         let focused = self.shown().get(self.cursor).map(|e| e.entry.id);
         self.snapshot = shared::snapshot(ctx);
+        self.news = crate::ui::new_episodes::snapshot(ctx);
         if let Some(index) = focused.and_then(|id| self.shown().iter().position(|e| e.entry.id == id)) {
             self.cursor = index;
         }
@@ -456,6 +459,8 @@ impl WatchlistsScreen {
             let title = if v.finished() { format!("✓ {} (done)", v.list.name) } else { v.list.name.clone() };
             let head = format!("{title} · {}", v.progress_label());
             let selected = self.selected == Some(v.list.id);
+            // The mark leads the second line, so eliding a long name never hides it.
+            let next = if crate::ui::new_episodes::list_has_news(&self.news, &v.entries) { format!("● New · {next}") } else { next };
             let row = ui.horizontal(|ui| {
                 let (grip, drag) = ui.allocate_exact_size(
                     egui::vec2(24.0 * ctx.theme.rem(), 38.0 * ctx.theme.rem()),
@@ -668,6 +673,19 @@ impl WatchlistsScreen {
                         play = Some(e.entry.id);
                     }
                 }
+                // "● New · S2E9–E10" until the entry (or its series page) is opened
+                let mut title_right = play_rect.left() - 8.0;
+                if let Some(span) = crate::ui::new_episodes::entry_chip(&self.news, &e.entry) {
+                    let text = if ctx.layout == LayoutClass::Compact { "● New".to_owned() } else { format!("● New · {span}") };
+                    let chip = ui.painter().text(
+                        egui::pos2(title_right, rect.top() + height * 0.3),
+                        egui::Align2::RIGHT_CENTER,
+                        text,
+                        egui::FontId::proportional(theme.font(TypeToken::BodySmall)),
+                        t.accent,
+                    );
+                    title_right = chip.left() - 8.0;
+                }
                 let x = grip.right() + 4.0;
                 crate::ui::video_host::osd_text(
                     ui.painter(),
@@ -676,7 +694,7 @@ impl WatchlistsScreen {
                     &title,
                     egui::FontId::proportional(theme.font(TypeToken::Body)),
                     color,
-                    play_rect.left() - x - 8.0,
+                    title_right - x,
                 );
                 let mut detail = if e.status == EntryStatus::Missing {
                     "Not in your playlists".into()
@@ -760,6 +778,8 @@ impl Screen for WatchlistsScreen {
     }
     fn on_enter(&mut self, ctx: &mut UiCtx<'_>, route: &Route) {
         let Route::Watchlists { list: target } = route else { return };
+        // opening the screen clears the sidebar's New episodes dot (DESIGN §44 §3.5)
+        crate::ui::new_episodes::watchlists_opened(ctx);
         self.route_list = *target;
         self.sync(ctx);
         if let Some((route_list, list, entry)) = self.return_to.take()
@@ -959,11 +979,12 @@ impl Screen for WatchlistsScreen {
             ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| self.entries_ui(ui, ctx));
             ui.advance_cursor_after_rect(rect);
         } else {
-            let selected = self.view().map(|v| v.list.name.clone()).unwrap_or_else(|| "Watchlists".into());
+            let mark = |v: &ListView| if crate::ui::new_episodes::list_has_news(&self.news, &v.entries) { " ●" } else { "" };
+            let selected = self.view().map(|v| format!("{}{}", v.list.name, mark(v))).unwrap_or_else(|| "Watchlists".into());
             let mut selected_id = None;
             let switcher = egui::ComboBox::from_id_salt("watchlist-switcher").selected_text(selected).show_ui(ui, |ui| {
                 for list in &self.snapshot.lists {
-                    if ui.selectable_label(self.selected == Some(list.list.id), &list.list.name).clicked() {
+                    if ui.selectable_label(self.selected == Some(list.list.id), format!("{}{}", list.list.name, mark(list))).clicked() {
                         selected_id = Some(list.list.id);
                     }
                 }
@@ -1478,5 +1499,38 @@ mod tests {
             h.state_mut().act(Action::FocusNext);
             assert!(!h.state().s.lists_focus);
         }
+    }
+
+    /// §8 UI: "● New · S1E5–E6" on the entry and the lists pane until the series page opens;
+    /// the sidebar's dot goes when the Watchlists screen opens.
+    #[test]
+    fn new_episode_chip_and_sidebar_dot_clear_when_the_screen_and_the_series_page_open() {
+        use crate::ui::new_episodes::{snapshot, testkit as news};
+        let (mut t, one) = rig();
+        let series = news::landman_with_news(&mut t, 4, 2);
+        let item = seed(&mut t, move |c| news::series_ref(c, series));
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1400.0, 900.0));
+        // not opened yet: the sidebar shows its dot
+        until(&mut h, "the dot", |h| h.state_mut().t.with_ctx(|ctx| snapshot(ctx).list_dot));
+        h.state_mut().enter(Route::Watchlists { list: None });
+        until(&mut h, "the entry chip", |h| testkit::painted(h).iter().any(|s| s == "● New · S1E5–E6"));
+        assert!(testkit::has_label_containing(&h, "● New"), "the lists pane marks the list");
+        until(&mut h, "the dot goes with opening the screen", |h| !h.state_mut().t.with_ctx(|ctx| snapshot(ctx).list_dot));
+        assert!(testkit::painted(&h).iter().any(|s| s == "● New · S1E5–E6"), "the chip stays until the entry is opened");
+
+        // the series page (from the entry, or from anywhere) clears the chip, and marks the rows
+        let (t, one) = h.into_state().into_parts();
+        let mut detail = harness(t, one, super::super::series_detail::SeriesDetailScreen::default(), egui::vec2(1200.0, 900.0));
+        detail.state_mut().enter(Route::SeriesDetail(series));
+        until(&mut detail, "the page's new episodes", |h| testkit::has_label_containing(h, "2 new episodes since"));
+        assert!(testkit::painted(&detail).iter().filter(|s| *s == "NEW").count() >= 2, "{:?}", testkit::painted(&detail));
+        until(&mut detail, "the chip is cleared", |h| {
+            h.state_mut().t.with_ctx(|ctx| snapshot(ctx).of(&item).is_some_and(|n| !n.unopened() && n.new.len() == 2))
+        });
+        let (t, one) = detail.into_state().into_parts();
+        let mut h = harness(t, one, WatchlistsScreen::default(), egui::vec2(1400.0, 900.0));
+        h.state_mut().enter(Route::Watchlists { list: None });
+        h.run_steps(3);
+        assert!(testkit::painted(&h).iter().all(|s| !s.starts_with("● New")), "no chip once opened: {:?}", testkit::painted(&h));
     }
 }

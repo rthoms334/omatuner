@@ -12,6 +12,8 @@
 //! * Action "watch" (or a click on the notification body) → `PlatformEvent::ReminderWatch`
 //!   (UI resolves the channel by ItemRef, plays it and calls `hypr::focus_self`).
 //! * No notification server → the same text as an in-app toast.
+//! * Other notes with actions: Following's summary ([`notify_with_open`]), cast alerts
+//!   ([`notify_cast`]), new episodes' Play + Download ([`show_with_actions`], DESIGN §44).
 //!
 //! Timing uses the wall clock and never sleeps longer than a minute, so suspend/resume and
 //! clock changes are picked up. A reminder is about `start + offset_s`; a notification goes out
@@ -123,7 +125,7 @@ fn build(summary: &str, body: &str, urgency_critical: bool, actions: &[(&str, &s
     let mut n = Notification::new();
     n.appname(crate::APP_NAME)
         .summary(&crate::redact::redact(summary))
-        .body(&crate::redact::redact(body))
+        .body(&escape_markup(&crate::redact::redact(body)))
         .icon(crate::APP_ID)
         .hint(Hint::DesktopEntry(crate::APP_ID.into()))
         .urgency(if urgency_critical { Urgency::Critical } else { Urgency::Normal });
@@ -131,6 +133,26 @@ fn build(summary: &str, body: &str, urgency_critical: bool, actions: &[(&str, &s
         n.action(id, label);
     }
     n
+}
+
+/// A body as plain text: servers render the body's markup (`body-markup`: mako, dunst, GNOME
+/// read Pango / HTML-ish tags), and bodies carry provider text (programme, episode, channel and
+/// playlist names) that may hold `&`, `<` or a tag of its own. The summary is plain text by the
+/// specification; servers escape it themselves.
+fn escape_markup(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['&', '<', '>']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 async fn show(n: &Notification, bus: Option<&str>) -> Result<notify_rust::NotificationHandle> {
@@ -466,8 +488,29 @@ impl Notifier for DesktopNotifier {
 /// notification server answered (in [`NOTIFY_TIMEOUT`]): the caller falls back to a toast.
 /// Must run inside a tokio runtime (the wait for the action is spawned on it).
 async fn show_with_action(bus: Option<String>, summary: &str, body: &str, action: (&str, &str), on_action: Box<dyn FnOnce() + Send>) -> bool {
-    let (id, label) = action;
-    let n = build(summary, body, false, &[("default", label), (id, label)]);
+    show_with_actions_at(bus, summary, body, &[action], Box::new(move |_| on_action())).await
+}
+
+/// A notification with several actions (`(id, label)`, the first also on a click on its body):
+/// `on_action` runs at most once, with the id the user picked (a body click gives the first
+/// one's), within [`ACTION_WAIT`]. New episodes' "Play S2E9" + "Download" (DESIGN §44 §2.2);
+/// a server that shows no buttons still delivers the body click. False when no notification
+/// server answered (in [`NOTIFY_TIMEOUT`]): the caller falls back to a toast. Must run inside
+/// a tokio runtime.
+pub async fn show_with_actions(summary: &str, body: &str, actions: &[(&str, &str)], on_action: Box<dyn FnOnce(&str) + Send>) -> bool {
+    show_with_actions_at(None, summary, body, actions, on_action).await
+}
+
+async fn show_with_actions_at(
+    bus: Option<String>,
+    summary: &str,
+    body: &str,
+    actions: &[(&str, &str)],
+    on_action: Box<dyn FnOnce(&str) + Send>,
+) -> bool {
+    let Some(&(first, first_label)) = actions.first() else { return false };
+    let all: Vec<(&str, &str)> = std::iter::once(("default", first_label)).chain(actions.iter().copied()).collect();
+    let n = build(summary, body, false, &all);
     // zbus calls have no timeout of their own: a wedged notification server must not stall
     // the caller (it falls back to a toast).
     let handle = match tokio::time::timeout(NOTIFY_TIMEOUT, show(&n, bus.as_deref())).await {
@@ -481,11 +524,13 @@ async fn show_with_action(bus: Option<String>, summary: &str, body: &str, action
             return false;
         }
     };
-    let id = id.to_owned();
+    let first = first.to_owned();
+    let ids: Vec<String> = actions.iter().map(|(id, _)| (*id).to_owned()).collect();
     tokio::spawn(async move {
         let wait = handle.wait_for_action_async(|response| match response {
-            NotificationResponse::Default => on_action(),
-            NotificationResponse::Action(a) if *a == id || a == "default" => on_action(),
+            NotificationResponse::Default => on_action(&first),
+            NotificationResponse::Action(a) if a == "default" => on_action(&first),
+            NotificationResponse::Action(a) if ids.iter().any(|id| id == a) => on_action(a),
             _ => {}
         });
         let _ = tokio::time::timeout(ACTION_WAIT, wait).await;
@@ -1446,8 +1491,10 @@ mod tests {
         // a stream made inside the task lost the Notify whenever the task started late (a loaded
         // run: no reply, `show` timed out, "assertion failed: shown")
         let mut stream = zbus::MessageStream::from(&c);
+        // ActionInvoked is a broadcast: servers of tests running at once number their
+        // notifications apart, or one test's action answers another's notification
+        let mut next_id = 4_000_000u32 + suffix.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b))) % 1000 * 1000;
         tokio::spawn(async move {
-            let mut next_id = 4_000_000u32;
             while let Some(Ok(msg)) = stream.next().await {
                 let h = msg.header();
                 if h.message_type() != zbus::message::Type::MethodCall || h.member().map(|m| m.as_str()) != Some("Notify") {
@@ -1481,6 +1528,17 @@ mod tests {
             }
         });
         (conn, calls)
+    }
+
+    /// Bodies reach the server as plain text whatever provider text they carry: a stray `&`
+    /// or a tag in a name never turns into markup (or a body the server can't parse). The
+    /// summary is plain text by the spec and goes as it is.
+    #[test]
+    fn bodies_are_sent_without_markup() {
+        let n = build("Tom & Jerry: new episode", "S1E2 · <b>Cats</b> & Dogs · on TV <i>HD</i>", false, &[]);
+        assert_eq!(n.summary, "Tom & Jerry: new episode");
+        assert_eq!(n.body, "S1E2 · &lt;b&gt;Cats&lt;/b&gt; &amp; Dogs · on TV &lt;i&gt;HD&lt;/i&gt;");
+        assert_eq!(build("News", "Starts in 2 min on BBC One", false, &[]).body, "Starts in 2 min on BBC One");
     }
 
     #[test]
@@ -1547,6 +1605,33 @@ mod tests {
         assert_eq!(calls[0].2, vec!["default", "Open", "open", "Open"]);
     }
 
+    /// New episodes' notification (DESIGN §44 §8.12): Play first (also the body click), then
+    /// Download; picking one runs the callback with its id.
+    #[test]
+    fn a_notification_with_two_actions_says_which_was_picked() {
+        if !session_bus_available() {
+            eprintln!("skipped: no session bus");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        for (action, want) in [("download", "download"), ("default", "play")] {
+            let suffix = format!("tuner_newep_{action}_{}", std::process::id());
+            let (_conn, calls) = rt.block_on(fake_server(&suffix, Some(action)));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let shown = rt.block_on(show_with_actions_at(
+                Some(suffix.clone()),
+                "Landman: 2 new episodes",
+                "S2E9, S2E10 · on TV",
+                &[("play", "Play S2E9"), ("download", "Download")],
+                Box::new(move |id| tx.send(id.to_owned()).unwrap()),
+            ));
+            assert!(shown);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)).expect("action delivered"), want);
+            let calls = calls.lock().unwrap().clone();
+            assert_eq!(calls[0].2, vec!["default", "Play S2E9", "play", "Play S2E9", "download", "Download"]);
+        }
+    }
+
     /// Unit tests never reach the desktop's notification server (they run real jobs): the
     /// session target answers "not shown" at once, so callers toast instead.
     #[test]
@@ -1554,6 +1639,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         assert!(!notify("Following: 1 new", "", false));
         assert!(!rt.block_on(notify_with_open("Following: 1 new", "", Box::new(|| {}))));
+        assert!(!rt.block_on(show_with_actions("Landman: new episode", "", &[("play", "Play S2E9")], Box::new(|_| {}))));
     }
 
     #[test]

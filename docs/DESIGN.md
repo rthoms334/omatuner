@@ -325,7 +325,7 @@ the running job never saw). Follow-ups go through
 `JobContext::submit` (refresh → provider EPG → RebuildLibrary; restore → refresh each source;
 AddSource → RefreshSource). `JobContext::player_busy` (set by the app from each snapshot) makes
 the scheduler skip ticks while a stream is Loading/Zapping. Semaphores: playlists 2, EPG 1,
-details 4, other 2. Heavy CPU **and every SQLite read** run in `spawn_blocking` with their own
+details 4, features 1 (Following, guide check), new episodes 1, other 2. Heavy CPU **and every SQLite read** run in `spawn_blocking` with their own
 reader (never on the 3 async workers). Progress (`JobPhase`: Queued, Connecting,
 Downloading{done,total}, Parsing{items}, Writing{done,total}, Matching, Indexing, Finishing) is
 throttled to 10 Hz per job. Cancellation via `CancellationToken` checked every 64 KiB / 1 000
@@ -7247,3 +7247,79 @@ with visible titles passed through the spoiler guard, but no filenames or stream
 Episode results carry series, season, episode and episode title. List includes Keep N rules;
 `series` with `scope=keep,n=0` removes one. Plugin rules and skills cover confirmations,
 recording plans, Keep N and failure recovery.
+
+## 44. New episodes
+
+Design: `docs/design/new-episodes-design.md`; its §11 records the approved decisions.
+
+### 44.1 What it tells you and where
+When a new episode of a series you care about appears in a playlist's series catalogue (on
+demand, not live TV), Tuner tells you once: a desktop notification, a *New episodes* row on
+Home, a *New* chip on the series in Watchlists and a dot on the sidebar's Watchlists item.
+Nothing is set up. The series are those on any watchlist, My list included, and, with Settings'
+*Also series I've binged*, those with over 60 % of a season ≥ 1 finished and at least three
+finished episodes in it (`[new_episodes] binge_pct`, `store::new_episodes::BINGE_MIN`). A
+whole-series entry covers seasons ≥ 1; a range `S a–b` covers `a..=b` and every later season
+when `b` reached the newest season the title had once the entry tracked it (decided once, so a
+new season keeps alerting after its first episode). Season 0 alerts only when a range names it.
+Episode entries and placeholders track nothing. It is on by default; the first run records what
+exists and says nothing, and a card explains it once. Settings ▸ New episodes (after Following)
+holds the master switch, desktop notifications, the binge switch, Check now (at most every ten
+minutes), the tracked series with why, and the last 30 days.
+
+Every arrival alerts. One notification per series (“Landman: 2 new episodes”) with **Play**
+(the next unwatched episode through `copies::next_episode`, named on the button, never skipping
+what you haven't seen) and **Download**; four or more series in one check make a single summary
+whose Open shows Home's row. There is no automatic download. Notifications are held while Tuner
+plays a film or episode full screen and in the news flash's quiet hours, then sent; Home updates
+at once. A server without actions or without a notification service falls back to an in-app toast
+with the same text. Names in a notification lose their links, and every notification body is
+sent escaped (servers render body markup). A row tile leaves when its episodes are finished in any copy, dismissed
+(Delete, with a ten-second Undo) or older than 30 days. The chip goes when the series page or
+entry is opened or an episode played; the dot when the Watchlists screen opens. Mute (“Stop
+alerts for this series”) is on the series page, the tile menu and Settings, with Undo, and not on
+the notification; a muted title keeps its ledger so unmuting never replays.
+
+### 44.2 What counts as new
+The unit is the title (its stack of copies) plus season and episode, never an episode key.
+Migration 0018 keeps a ledger per tracked copy (`newep_copy`, `newep_known`) of every
+coordinate it ever had; an arrival is a covered coordinate in no copy's ledger. A title is
+baselined silently when it becomes tracked, a copy is first seen, the feature is switched back
+on, or a playlist's first import brought it; a new copy of a tracked title alerts only beyond
+the title's frontier. One episode alerts once whatever the copies, an episode a provider drops
+and restores (or a copy that leaves the library and comes back) never alerts twice, and one already finished or started in any copy is recorded,
+not alerted. The guard's `spoiler_seen` events record an arrival as watched. An arrival Following
+already reminded about, switched to or recorded in the last 30 days is quiet (“aired on TV”):
+on Home and in Recent, no notification. Locked, concealed and explicit copies exclude the whole
+title in every parental state; hidden titles are absent from the library.
+
+### 44.3 Checking
+`JobKind::CheckNewEpisodes` runs after a playlist refresh (debounced, once no refresh or library
+build is queued, so a wave of refreshes is one check), at launch for what a headless
+`tuner --refresh` changed, and for Check now; it is never on a timer of its own, so an episode
+can arrive a day late. M3U playlists replace their episodes at import and are diffed at once.
+Xtream playlists fetch `get_series_info` for tracked copies only: those whose `details_at` was
+cleared by a moved `last_modified`, then those older than seven days, oldest first, and every
+tracked copy of a playlist marked `newep:lm_unreliable:<id>` (a provider that never moved
+`last_modified` yet had an arrival), at most 40 per playlist per check, one at a time, paused
+while the player is Loading or Zapping. These are API calls: no stream opens and no connection
+lease is taken. The check has a job lane of its own, so its fetches never delay Following's
+evaluation or the guide check, and its notifications go out after the job ends. A failed fetch waits for the next refresh. Watchlist and progress changes re-track
+60 seconds later without the network, so a title is baselined before the refresh that brings its
+next episode. Backups carry the arrivals and mutes, never the ledger: a restore re-baselines.
+INFO logs hold counts and playlist ids only.
+
+### 44.4 Agents
+The `new_episodes` MCP tool (`action` defaults to `list`): `list` (`since`, `include_cleared`,
+`limit`, `spoiler_safe`, `reveal_spoilers`) returns per series its refs, title, year, why
+(`list:My list`, `binged (S4: 7 of 8)`), playlists, `new` episodes (`ref`, season, episode,
+`title`, `arrived_at`, `state` new / opened, or watched / dismissed / expired with
+`include_cleared`; `quiet`, `downloaded`) and `next_episode` (`ref`, `resume_at_s`); `tracked`
+answers “why am I told about X?”; `seen` (`series_ref`, `refs` or `all`) takes episodes off Home
+and the badges and `mute` (`series_ref`, `muted`) stops or restores alerts. Reading never
+clears; `seen` never touches watched state; both writes follow RULES.md §15, run only when the
+user asks, and show an Undo toast in Tuner. Check now is not exposed. Locked, hidden, concealed
+and explicit series are absent, and episode titles go through the reply's spoiler guard
+(series names are cleaned of links like every provider text). `status.new_episodes` carries the
+counts. Plugin skills (series, pick, plan) and RULES.md describe it; the tool works with any
+MCP client.

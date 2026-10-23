@@ -228,6 +228,31 @@ impl SeriesDetailScreen {
         next.and_then(|id| d.episodes.iter().find(|e| e.id == id)).or(d.episodes.first()).cloned()
     }
 
+    /// "Stop alerts for this series" / "Allow alerts again" (DESIGN §44 §11 Q1), with Undo.
+    fn toggle_alerts(&self, ctx: &UiCtx<'_>) {
+        if let Some((item, d)) = self.series_ref().zip(self.data.as_ref()) {
+            let muted = crate::ui::new_episodes::is_muted(ctx, &item);
+            crate::ui::new_episodes::mute(ctx, &item, d.series.display_name(), !muted);
+        }
+    }
+
+    /// The menu offers alerts for a series that has them: new episodes now, a list, or a mute
+    /// to take back.
+    fn alerts_entry(&self, ctx: &UiCtx<'_>) -> Option<MenuItem> {
+        let item = self.series_ref().filter(|_| crate::ui::new_episodes::on(ctx))?;
+        let muted = crate::ui::new_episodes::is_muted(ctx, &item);
+        if !muted && crate::ui::new_episodes::snapshot(ctx).of(&item).is_none() && crate::ui::watchlists::membership_line(ctx, &item).is_none() {
+            return None;
+        }
+        Some(MenuItem {
+            icon: if muted { glyphs::CHECK } else { glyphs::HIDDEN },
+            label: if muted { "Allow alerts again" } else { "Stop alerts for this series" }.into(),
+            action: Action::NewEpisodes(crate::keymap::NewEpisodesAct::StopAlerts),
+            enabled: true,
+            shortcut: None,
+        })
+    }
+
     fn series_ref(&self) -> Option<ItemRef> {
         self.data.as_ref().map(|d| ItemRef { source: d.series.source_id, kind: ItemKind::Series, key: d.series.key.clone() })
     }
@@ -544,6 +569,10 @@ impl Screen for SeriesDetailScreen {
             self.episode_pending = None;
         }
         self.id = Some(*id);
+        // opening the page clears the title's Watchlists chip (DESIGN §44 §3.5)
+        if let Some(v) = ctx.lib.vod.find(VodKind::Series(*id)) {
+            crate::ui::new_episodes::mark_opened(ctx, &crate::store::copies::vod_ref(v));
+        }
         if let Some((season, episode)) = episode {
             self.episode_pending = Some((season, episode));
             self.section = Section::Episodes;
@@ -724,6 +753,7 @@ impl Screen for SeriesDetailScreen {
                 if self.in_continue_watching() {
                     items.push(mi(glyphs::CLOSE, "Remove from Continue watching", Action::Remove, Some("Delete")));
                 }
+                items.extend(self.alerts_entry(ctx));
                 items.extend([
                     mi(glyphs::FAVOURITE, "Save to / remove from My list", Action::ToggleFavourite, Some("Ctrl+F")),
                     mi(glyphs::FAV_LIST, "Watchlists…", Action::AddToList, Some("Ctrl+Shift+F")),
@@ -765,6 +795,7 @@ impl Screen for SeriesDetailScreen {
         match result {
             OverlayResult::Chosen(Action::PlayFrom) => self.copies.play_from_menu(ctx),
             OverlayResult::Chosen(Action::Remove) => self.remove_continue(ctx),
+            OverlayResult::Chosen(Action::NewEpisodes(crate::keymap::NewEpisodesAct::StopAlerts)) => self.toggle_alerts(ctx),
             OverlayResult::Chosen(Action::Digit(super::copies::SAME_TITLE)) => {
                 if let Some((item, d)) = self.series_ref().zip(self.data.as_ref()) {
                     let name = d.series.display_name().to_owned();
@@ -913,6 +944,8 @@ impl Screen for SeriesDetailScreen {
         let playing = playing_ep.is_some_and(|id| data.episodes.iter().any(|e| e.id == id));
         let fav = if self.copies.combined() { self.copies.any_favourite(ctx) } else { self.series_ref().is_some_and(|i| ctx.favs.is_fav(&i)) };
         let next = self.next_episode();
+        let news = self.series_ref().and_then(|i| crate::ui::new_episodes::snapshot(ctx).of(&i).cloned());
+        let new_eps: std::collections::HashSet<(u32, u32)> = news.iter().flat_map(|n| n.new.iter().map(|e| (e.season, e.episode))).collect();
         let shown = self.shown_progress().cloned().unwrap_or_default();
         let fetching = self.fetch.busy().then(|| self.fetch.progress());
         // a combined page resumes from whichever copy is furthest along (`shown`)
@@ -1009,6 +1042,9 @@ impl Screen for SeriesDetailScreen {
                     if let Some(line) = crate::ui::watchlists::membership_line(ctx, &item) {
                         ui.label(line);
                     }
+                }
+                if let Some(n) = &news {
+                    ui.label(egui::RichText::new(crate::ui::new_episodes::since_line(n)).color(ctx.theme.tokens.accent));
                 }
             });
             if scroll && let Some(rect) = button_rect {
@@ -1127,8 +1163,16 @@ impl Screen for SeriesDetailScreen {
                 let watched = p.is_some_and(|p| p.finished);
                 let cursor = section == Section::Episodes && i == ep_idx;
                 let selected = section != Section::Episodes && i == ep_idx;
-                let resp =
-                    rows::episode_row(ui, theme, e, p.and_then(fraction), watched, playing_ep == Some(e.id), RowState::from_flags(cursor, selected));
+                let resp = rows::episode_row(
+                    ui,
+                    theme,
+                    e,
+                    p.and_then(fraction),
+                    watched,
+                    playing_ep == Some(e.id),
+                    new_eps.contains(&(e.season, e.episode)),
+                    RowState::from_flags(cursor, selected),
+                );
                 // Selection changes (playback / season) reveal the episode even when
                 // focus stays on buttons or copies; cursor moves reveal only the cursor.
                 if cursor && scroll || i == ep_idx && target == Some(ScrollTarget::SelectedEpisode) {

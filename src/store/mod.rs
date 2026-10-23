@@ -38,6 +38,7 @@ pub mod import;
 pub mod library;
 pub mod live;
 pub mod migrations;
+pub mod new_episodes;
 pub mod queue;
 pub mod retime;
 pub mod sources;

@@ -1,8 +1,8 @@
 ---
 name: series
 description: Continue, recap or find episodes of a series in Tuner. "Carry on with X", "next episode", "where am I in X", "previously on", "recap season 1 before season 2", "which episode is the one where…", "which shows have I stalled on", "next 3 then stop", "marathon season 2".
-when_to_use: Use for anything about a TV series in the user's Tuner library: progress, the next episode, recaps, finding an episode, or queueing episodes. For when a new episode airs on live TV, use plan.
-allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__episodes mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue mcp__plugin_omatuner_tuner__watchlist mcp__plugin_omatuner_tuner__sleep_timer mcp__plugin_omatuner_tuner__spoiler_guard
+when_to_use: Use for anything about a TV series in the user's Tuner library: progress, the next episode, recaps, finding an episode, or queueing episodes. What's new in the user's shows (new episodes in a playlist) is here. For when a new episode airs on live TV, use plan.
+allowed-tools: Read mcp__plugin_omatuner_tuner__status mcp__plugin_omatuner_tuner__search mcp__plugin_omatuner_tuner__details mcp__plugin_omatuner_tuner__episodes mcp__plugin_omatuner_tuner__new_episodes mcp__plugin_omatuner_tuner__continue_watching mcp__plugin_omatuner_tuner__history mcp__plugin_omatuner_tuner__play mcp__plugin_omatuner_tuner__queue mcp__plugin_omatuner_tuner__watchlist mcp__plugin_omatuner_tuner__sleep_timer mcp__plugin_omatuner_tuner__spoiler_guard
 ---
 
 # Series: carry on, recap, find an episode
@@ -26,6 +26,21 @@ then `watchlist next`; name the episode and resume point before `status` → `wa
 `id`. A series range stays within its seasons. Playing carries on through the list unless
 the user says “just the one” (`just_one: true`). “Where am I in Star Wars” reads `show`.
 Ask which list when the name is ambiguous; never skip a locked entry without saying why.
+
+## What's new on my shows
+
+"Anything new on my shows?", "what's new in Landman?": `new_episodes` (`list`). Tuner tracks the
+series on the user's watchlists and the ones they binged, and tells them itself (a notification,
+a New episodes row on Home); this is the same list. Name each show with its new episodes ("Landman:
+S2E9 and S2E10") and `next_episode`, the one to play: it can be an earlier unwatched episode, so
+say "S1E6 is next" rather than naming the newest. Offer `play` with `next_episode.ref`, or
+`downloads add` with the `new[].ref`s (RULES.md §14). The list is spoiler-guarded like
+`episodes`: an episode title may be hidden, so give numbers only. "Why am I told about X?" /
+"which shows do you watch for?": `new_episodes tracked` (`why` says the list or "binged"; `muted`
+shows are silenced). Reading never clears anything, and "what's new" is not "seen": call `seen`
+only when the user asks to clear them ("clear my new episodes"), `mute` only when they ask to stop
+alerts for one show (RULES.md §15). If `enabled` is false, say the user switched New episodes off
+in Tuner (Settings ▸ New episodes).
 
 ## Recap
 

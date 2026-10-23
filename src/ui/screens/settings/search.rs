@@ -85,6 +85,7 @@ fn words(page: SettingsPage, title: &str) -> Vec<&'static str> {
         SettingsPage::Favourites => vec!["favorites", "saved", "lists"],
         SettingsPage::Reminders => vec!["notify", "notification", "alarm"],
         SettingsPage::Following => vec!["rules", "automatic", "teams"],
+        SettingsPage::NewEpisodes => vec!["episodes", "alerts", "notifications", "binge"],
         SettingsPage::SpoilerGuard => vec!["spoilers", "scores", "results"],
         SettingsPage::Parental => vec!["pin", "lock", "kids"],
         SettingsPage::Agents => vec!["claude", "mcp", "codex"],
@@ -221,6 +222,9 @@ impl SettingsScreen {
         if crate::follow::ENABLED {
             following::enter(self, ctx);
         }
+        if crate::new_episodes::ENABLED {
+            new_episodes::enter(self, ctx);
+        }
         if crate::spoiler::ENABLED {
             spoiler::enter(self, ctx);
         }
@@ -236,6 +240,7 @@ impl SettingsScreen {
             && self.links_loader.is_none()
             && self.orphans_loader.is_none()
             && following::search_ready(self)
+            && new_episodes::search_ready(self)
     }
 
     pub(super) fn set_filter(&mut self, ctx: &UiCtx<'_>, query: String) {

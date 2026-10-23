@@ -595,7 +595,9 @@ pub fn episode_title(e: &Episode) -> std::borrow::Cow<'_, str> {
 }
 
 /// `E05  Title · 42 min` with watched check / progress bar; `playing` puts the accent 󰐊
-/// marker left of the title, like channel rows (DESIGN §13.0).
+/// marker left of the title, like channel rows (DESIGN §13.0). `new`: a "New" chip right of
+/// the title (a new episode of a series you follow, DESIGN §44).
+#[allow(clippy::too_many_arguments)]
 pub fn episode_row(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -603,6 +605,7 @@ pub fn episode_row(
     progress: Option<f32>,
     watched: bool,
     playing: bool,
+    new: bool,
     state: RowState,
 ) -> egui::Response {
     let t = &theme.tokens;
@@ -645,6 +648,11 @@ pub fn episode_row(
             f32::INFINITY,
         );
         right = r.left() - theme.space(SpaceToken::Md);
+    }
+    if new {
+        let r =
+            paint::text(painter, egui::pos2(right, y), Align2::RIGHT_CENTER, "NEW", paint::font(theme, TypeToken::Caption), t.accent, f32::INFINITY);
+        right = r.left() - gap;
     }
     let item = crate::model::ItemRef { source: e.source_id, kind: crate::model::ItemKind::Episode, key: e.key.clone() };
     if let Some(label) = crate::ui::downloads::cached_badge(ui.ctx(), &item) {

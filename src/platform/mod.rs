@@ -63,6 +63,19 @@ pub enum PlatformEvent {
     /// window wasn't on a visible workspace): raise Tuner (`hypr::focus_self`) onto the player,
     /// where the casting card has the actions (Allow on firewall, Play here…). CAST-9.
     ShowPlayer,
+    /// **Play** on a new-episode notification, or a click on its body (DESIGN §44 §2.2): play
+    /// `episode` — the series' next unwatched one (`copies::next_episode`) — through the copy
+    /// plan of `series`, the way Continue watching does. The notification raised the window.
+    NewEpisodePlay { series: ItemRef, episode: ItemRef },
+    /// **Download** on a new-episode notification: queue these episodes in Downloads
+    /// (`DownloadCommand::Add`, any copy).
+    NewEpisodeDownload { episodes: Vec<ItemRef> },
+    /// **Open** on the "New episodes in 6 series" summary: Home with its New episodes row
+    /// focused. The notification raised the window.
+    NewEpisodesOpen,
+    /// No notification server answered: the same note as an in-app toast with its Play (or
+    /// Open); Download stays on the Home tile.
+    NewEpisodesToast(crate::new_episodes::Note),
 }
 
 /// glibc malloc arenas the process may create (default: 8 per core).

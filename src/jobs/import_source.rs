@@ -523,6 +523,8 @@ async fn import_m3u(
     (ctx.submit)(JobKind::RebuildLibrary);
     // new or changed channels: Guide fixes' suggestions (debounced, the app only)
     crate::jobs::guide_check::request(ctx);
+    // new episodes of tracked series (after the library build; a first import is silent)
+    crate::jobs::new_episodes::request(ctx, crate::new_episodes::CheckReason::Refresh, Some(id), src.status.last_refresh.is_none() || switched);
     Ok(RefreshResult { summary, not_modified: false, epg_urls: parsed.tvg_urls, upgraded: false })
 }
 
@@ -1131,6 +1133,7 @@ async fn refresh_xtream(
         vod_done.extend([ItemKind::Movie, ItemKind::Series]);
     }
 
+    let series_done = vod_done.contains(&ItemKind::Series);
     let summary = match (live, vod_done.is_empty()) {
         (None, true) => {
             if let Some(u) = upgrade {
@@ -1168,6 +1171,11 @@ async fn refresh_xtream(
     (ctx.submit)(JobKind::RebuildLibrary);
     crate::jobs::guide_check::request(ctx);
     let upgraded = committed_here(&upgrade);
+    // new episodes of tracked series, once the series finished (a first import, or the one that
+    // re-keyed an upgraded playlist, is silent)
+    if series_done {
+        crate::jobs::new_episodes::request(ctx, crate::new_episodes::CheckReason::Refresh, Some(id), src.status.last_refresh.is_none() || upgraded);
+    }
     if upgraded {
         tracing::info!("{} now uses its Xtream login ({})", src.name, crate::redact::redact_url(&creds.server));
     }
