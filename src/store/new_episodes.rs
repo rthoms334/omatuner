@@ -4,8 +4,9 @@
 //!   series) is tracked when a `series` entry of any watchlist holds one of its copies (its
 //!   season range is the coverage), or — with "Also series I've binged" — when more than
 //!   `binge_pct` of a season ≥ 1 is finished across its copies with at least [`BINGE_MIN`]
-//!   finished episodes in it (Q6). Arrivals still unwatched (and, for a tracked title, episodes
-//!   its ledger doesn't know yet) don't count as known, so a new episode never lowers the ratio.
+//!   finished episodes in it (Q6). For a tracked title only the episodes its baseline had (and
+//!   finished ones) count as known, so nothing that arrived since — announced, muted, started,
+//!   pruned — ever lowers the ratio.
 //!   A locked, concealed or explicit copy excludes the whole title (failing closed); hidden
 //!   copies aren't in the library.
 //! * **The ledger** (`newep_copy`, `newep_known`): per tracked copy, every (season, episode) it
@@ -270,12 +271,12 @@ fn binged(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<(u32, Why
             continue;
         }
         let t = Title::of(lib, idx);
-        let unwatched_arrivals = arrival_coords(conn, &t.refs)?;
-        // a tracked title's episodes not in its ledger yet are about to be arrivals
-        let mut ledger: HashSet<(u32, u32)> = HashSet::new();
-        for r in &t.refs {
-            ledger.extend(known_of(conn, r)?);
-        }
+        let arrived = arrival_coords(conn, &t.refs)?;
+        // a tracked title's episodes count only when its baseline had them: whatever came
+        // later (announced, muted, started when it arrived, about to arrive, its arrival row
+        // pruned long ago) never lowers the ratio unless it's finished
+        let (ledger, baselined_at) = ledger_since(conn, &t.refs)?;
+        let in_baseline = |c: (u32, u32)| ledger.is_empty() || baselined_at.is_some_and(|b| ledger.get(&c).is_some_and(|first| *first <= b));
         let mut best = None;
         for (&season, f) in seasons.iter().filter(|(_, f)| f.len() >= BINGE_MIN) {
             let mut known: BTreeSet<u32> = BTreeSet::new();
@@ -284,8 +285,7 @@ fn binged(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<(u32, Why
                     known.insert(e?);
                 }
             }
-            // an arrival not watched yet (or about to be one) never lowers the ratio
-            known.retain(|e| f.contains(e) || (!unwatched_arrivals.contains(&(season, *e)) && (ledger.is_empty() || ledger.contains(&(season, *e)))));
+            known.retain(|e| f.contains(e) || (!arrived.contains(&(season, *e)) && in_baseline((season, *e))));
             if f.len() * 100 > opts.binge_pct as usize * known.len() {
                 best = Some(Why::Binged { season, finished: f.len() as u32, known: known.len() as u32 });
             }
@@ -295,6 +295,27 @@ fn binged(conn: &Connection, lib: &Library, opts: &Opts) -> Result<Vec<(u32, Why
         }
     }
     Ok(out)
+}
+
+/// A title's ledger: (season, episode) → when it was first seen.
+type Ledger = HashMap<(u32, u32), Timestamp>;
+
+/// The ledger of these copies (coordinate → when first seen) and the title's baseline (its
+/// earliest copy's).
+fn ledger_since(conn: &Connection, refs: &[ItemRef]) -> Result<(Ledger, Option<Timestamp>)> {
+    let mut stmt = conn.prepare_cached("SELECT season, episode, first_seen FROM newep_known WHERE source_id = ?1 AND series_key = ?2")?;
+    let mut ledger = Ledger::new();
+    let mut baselined_at: Option<Timestamp> = None;
+    for r in refs {
+        for row in stmt.query_map(params![r.source, r.key.as_str()], |r| Ok(((r.get(0)?, r.get(1)?), r.get::<_, Timestamp>(2)?)))? {
+            let (c, first) = row?;
+            ledger.entry(c).and_modify(|f| *f = (*f).min(first)).or_insert(first);
+        }
+        if let Some(at) = copy_row(conn, r)?.and_then(|row| row.baselined_at) {
+            baselined_at = Some(baselined_at.map_or(at, |b| b.min(at)));
+        }
+    }
+    Ok((ledger, baselined_at))
 }
 
 /// The coordinates of every arrival recorded for these copies.
@@ -1530,7 +1551,7 @@ mod tests {
             });
         }
         with_db(|c| {
-            series(c, 1, 1, "slow", "Slow Horses", 2022)?;
+            let slow = series(c, 1, 1, "slow", "Slow Horses", 2022)?;
             eps(c, 1, 1, 1..=8)?;
             (1..=5).try_for_each(|e| watch(c, 1, 1, e, true))?;
             let lib = lib(c)?;
@@ -1539,6 +1560,24 @@ mod tests {
             assert_eq!(announced(c, &lib, NOW + DAY)?, [(1, 9)], "binged series alert too");
             let t = tracked(c, &lib, &opts(NOW + DAY))?;
             assert_eq!(t[0].why, [Why::Binged { season: 1, finished: 5, known: 8 }], "the arrival didn't lower the ratio");
+            // muted (Q1), its arrivals aren't recorded; started when it arrived, nor is that one;
+            // a dismissed arrival is pruned 90 days on: none of them lowers the ratio, so the
+            // abandoned or muted show stays tracked (Q2) and keeps its ledger
+            let e9: Vec<ArrivalId> =
+                c.prepare("SELECT id FROM newep_arrival WHERE episode = 9")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            assert_eq!(dismiss(c, &e9, NOW + DAY)?.dismissed.len(), 1);
+            eps(c, 1, 1, [10])?;
+            watch(c, 1, 1, 10, false)?;
+            run(c, &lib, NOW + 2 * DAY)?;
+            mute(c, &lib, &slow, true, NOW + 2 * DAY)?;
+            eps(c, 1, 1, [11, 12])?;
+            let later = NOW + 100 * DAY;
+            assert_eq!(run(c, &lib, later)?.arrivals, 0);
+            assert_eq!(c.query_row("SELECT count(*) FROM newep_arrival", [], |r| r.get::<_, i64>(0))?, 0, "pruned");
+            let t = tracked(c, &lib, &opts(later))?;
+            assert_eq!(t.len(), 1, "still tracked");
+            assert!(t[0].muted);
+            assert_eq!(t[0].why, [Why::Binged { season: 1, finished: 5, known: 8 }]);
             Ok(())
         });
     }
