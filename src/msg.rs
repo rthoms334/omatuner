@@ -42,6 +42,9 @@ pub enum DataScope {
     /// The guide check's results (suggestions, probes) changed (DESIGN §31): light, no library
     /// rebuild.
     GuideIssues,
+    /// New episodes' arrivals or their states changed (DESIGN §44): rebuild its snapshot (Home's
+    /// row, the Watchlists chips and dot), no library rebuild.
+    NewEpisodes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

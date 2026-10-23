@@ -59,6 +59,9 @@ pub mod downloads;
 pub mod update;
 pub mod watchlist;
 
+// new-episode alerts (DESIGN §44)
+pub mod new_episodes;
+
 /// Application id: binary name, Wayland `app_id` (= Hyprland `class`), MPRIS bus suffix,
 /// `.desktop` basename, XDG directory name.
 pub const APP_ID: &str = "tuner";

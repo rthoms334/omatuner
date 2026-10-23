@@ -34,6 +34,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0015_watchlists", include_str!("migrations/0015_watchlists.sql")),
     ("0016_downloads", include_str!("migrations/0016_downloads.sql")),
     ("0017_failing_since", include_str!("migrations/0017_failing_since.sql")),
+    ("0018_new_episodes", include_str!("migrations/0018_new_episodes.sql")),
 ];
 
 /// Current schema version after all migrations.
@@ -514,7 +515,8 @@ mod tests {
                 "0014_cast",
                 "0015_watchlists",
                 "0016_downloads",
-                "0017_failing_since"
+                "0017_failing_since",
+                "0018_new_episodes"
             ]
         );
         for (t, col) in [
@@ -550,6 +552,9 @@ mod tests {
             ("spoiler_rule", "agent"),
             ("spoiler_seen", "agent"),
             ("guide_fix_log", "agent"),
+            ("newep_copy", "frontier"),
+            ("newep_arrival", "cleared_how"),
+            ("newep_mute", "muted_at"),
         ] {
             assert!(has_column(&c, t, col).unwrap(), "{t}.{col}");
         }
@@ -953,7 +958,7 @@ mod tests {
     #[test]
     fn user_data_tables_carry_fingerprints() {
         let c = fresh();
-        for t in ["fav_item", "item_override", "watch_progress", "reminder", "channel_epg_map", "title_link"] {
+        for t in ["fav_item", "item_override", "watch_progress", "reminder", "channel_epg_map", "title_link", "newep_arrival", "newep_mute"] {
             for col in ["fp", "orphaned_since"] {
                 let n: i64 = c.query_row(&format!("SELECT count(*) FROM pragma_table_info('{t}') WHERE name='{col}'"), [], |r| r.get(0)).unwrap();
                 assert_eq!(n, 1, "{t}.{col}");

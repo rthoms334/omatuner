@@ -970,6 +970,11 @@ impl TunerApp {
                 PlatformEvent::PopOut(ev) => self.on_popout_event(ev, egui_ctx),
                 // a cast alert's Show (DESIGN §40 §3.8): the notification raised the window
                 PlatformEvent::ShowPlayer => self.on_show_player(egui_ctx),
+                // new-episode notifications and their toast (DESIGN §44 §2.2; N-ui)
+                PlatformEvent::NewEpisodePlay { .. }
+                | PlatformEvent::NewEpisodeDownload { .. }
+                | PlatformEvent::NewEpisodesOpen
+                | PlatformEvent::NewEpisodesToast(_) => {}
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)
             AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
@@ -1229,6 +1234,8 @@ impl TunerApp {
             // raises `Reminders` too)
             DataScope::Spoiler | DataScope::Follow => self.services().agent.guard().rebuild(),
             DataScope::GuideIssues => {}
+            // its snapshot and screens (N-ui)
+            DataScope::NewEpisodes => {}
         }
     }
 

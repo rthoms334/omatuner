@@ -60,6 +60,8 @@ row_id!(/// `spoiler_rule.id` (spoiler guard, DESIGN §34; batch base).
     SpoilerRuleId);
 row_id!(/// `guide_fix_log.id` (Guide fixes, DESIGN §31; one logged batch that Undo reverts).
     GuideFixLogId);
+row_id!(/// `newep_arrival.id` (New episodes, DESIGN §44): one title episode found new.
+    ArrivalId);
 
 /// A picture of the player (multi-view, DESIGN §35): A is the player that always exists, B the
 /// second one multi-view starts lazily. The names never change through swaps and layouts

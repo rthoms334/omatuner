@@ -128,6 +128,15 @@ pub enum JobKind {
     /// Guide fixes' background check: probes, suggestions, classification cache (DESIGN §31,
     /// B7; `jobs::guide_check`).
     GuideCheck,
+    /// New episodes' check (DESIGN §44; `jobs::new_episodes`): the tracked set, fetch the
+    /// tracked Xtream copies that changed, diff against the ledger, announce. One dedupe key
+    /// ("new-episodes"): `sources` (the refreshed playlists) and `silent` (playlists whose first
+    /// import this was: always a silent baseline) merge, and the strongest reason wins.
+    CheckNewEpisodes {
+        reason: crate::new_episodes::CheckReason,
+        sources: Vec<SourceId>,
+        silent: Vec<SourceId>,
+    },
 }
 
 impl JobKind {
@@ -149,6 +158,7 @@ impl JobKind {
             JobKind::ImportBackup { path, .. } => format!("import-backup:{}", path.display()),
             JobKind::EvaluateFollows { .. } => "follows".into(),
             JobKind::GuideCheck => "guide-check".into(),
+            JobKind::CheckNewEpisodes { .. } => "new-episodes".into(),
         }
     }
 
@@ -166,6 +176,16 @@ impl JobKind {
             (JobKind::EvaluateFollows { reason: a }, JobKind::EvaluateFollows { reason: b }) => {
                 use crate::follow::FollowReason::{Daily, Guide};
                 JobKind::EvaluateFollows { reason: if matches!(b, Guide | Daily) { *a } else { *b } }
+            }
+            // one check covers every playlist refreshed meanwhile
+            (JobKind::CheckNewEpisodes { reason: a, sources: sa, silent: la }, JobKind::CheckNewEpisodes { reason: b, sources: sb, silent: lb }) => {
+                let union = |x: &[SourceId], y: &[SourceId]| {
+                    let mut v: Vec<SourceId> = x.iter().chain(y).copied().collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v
+                };
+                JobKind::CheckNewEpisodes { reason: (*a).max(*b), sources: union(sa, sb), silent: union(la, lb) }
             }
             _ => newer.clone(),
         }
@@ -577,6 +597,7 @@ fn label_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::ImportBackup { .. } => "Restoring backup".into(),
         JobKind::EvaluateFollows { .. } => "Checking what you follow".into(),
         JobKind::GuideCheck => "Matching channels to the guide".into(),
+        JobKind::CheckNewEpisodes { .. } => "Checking for new episodes".into(),
     }
 }
 
@@ -598,6 +619,7 @@ fn failure_for(kind: &JobKind, subject: Option<&str>) -> String {
         JobKind::ImportBackup { .. } => "Couldn't restore the backup".into(),
         JobKind::EvaluateFollows { .. } => "Couldn't check what you follow".into(),
         JobKind::GuideCheck => "Couldn't check the guide data".into(),
+        JobKind::CheckNewEpisodes { .. } => "Couldn't check for new episodes".into(),
     }
 }
 
@@ -660,8 +682,8 @@ struct Limits {
     epg: Arc<Semaphore>,
     details: Arc<Semaphore>,
     other: Arc<Semaphore>,
-    /// Following's evaluation and the guide check: one at a time (B7), after the import that
-    /// submitted them.
+    /// Following's evaluation, the guide check and the new-episode check: one at a time (B7),
+    /// after the import that submitted them.
     features: Arc<Semaphore>,
 }
 
@@ -681,7 +703,7 @@ impl Limits {
             JobKind::RefreshSource { .. } | JobKind::AddSource(_) | JobKind::ProbeSource(_) => self.playlists.clone(),
             JobKind::RefreshEpg { .. } | JobKind::RematchEpg => self.epg.clone(),
             JobKind::LoadMovieDetails(_) | JobKind::LoadSeriesDetails(_) => self.details.clone(),
-            JobKind::EvaluateFollows { .. } | JobKind::GuideCheck => self.features.clone(),
+            JobKind::EvaluateFollows { .. } | JobKind::GuideCheck | JobKind::CheckNewEpisodes { .. } => self.features.clone(),
             _ => self.other.clone(),
         }
     }
@@ -951,6 +973,8 @@ async fn execute(ctx: &JobContext, kind: &JobKind, progress: &Progress, cancel: 
             guide_check::run(ctx, progress, cancel).await?;
             Ok(JobOutcome::Nothing)
         }
+        // N-core
+        JobKind::CheckNewEpisodes { .. } => Ok(JobOutcome::Nothing),
     }
 }
 
