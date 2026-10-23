@@ -426,10 +426,12 @@ fn sidebar_rail_and_compact_glyph_strip() {
             let (mut search, mut play_on_clicked) = (false, false);
             let play_on = Some(tuner::ui::widgets::sidebar::PlayOn { tv: None, key: "Alt+T" });
             let clicked = if s.strip {
-                ui.horizontal(|ui| sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, None, None, play_on, &mut search, &mut play_on_clicked))
-                    .inner
+                ui.horizontal(|ui| {
+                    sidebar(ui, &s.theme, ScreenId::MovieDetail, false, true, None, None, false, play_on, &mut search, &mut play_on_clicked)
+                })
+                .inner
             } else {
-                sidebar(ui, &s.theme, ScreenId::Live, false, false, None, None, None, &mut search, &mut play_on_clicked)
+                sidebar(ui, &s.theme, ScreenId::Live, false, false, None, None, false, None, &mut search, &mut play_on_clicked)
             };
             s.clicked = s.clicked.or(clicked);
             s.search |= search;
@@ -976,7 +978,7 @@ fn data_rows_render_with_real_services() {
         );
         rows::group_row(ui, &theme, &group, RowState::Selected);
         rows::programme_row(ui, &theme, &nn.now.clone().unwrap(), now, true, true, RowState::Idle);
-        rows::episode_row(ui, &theme, &ep, Some(0.4), false, false, RowState::Idle);
+        rows::episode_row(ui, &theme, &ep, Some(0.4), false, false, false, RowState::Idle);
         tuner::ui::widgets::badge::live_badge(ui, &theme);
         tuner::ui::widgets::progress::busy_bar(ui, &theme, 3.0);
         tuner::ui::widgets::text_field::search_header(ui, &theme, "", "Search channels", Some("󰍉"));

@@ -971,10 +971,11 @@ impl TunerApp {
                 // a cast alert's Show (DESIGN §40 §3.8): the notification raised the window
                 PlatformEvent::ShowPlayer => self.on_show_player(egui_ctx),
                 // new-episode notifications and their toast (DESIGN §44 §2.2; N-ui)
-                PlatformEvent::NewEpisodePlay { .. }
-                | PlatformEvent::NewEpisodeDownload { .. }
-                | PlatformEvent::NewEpisodesOpen
-                | PlatformEvent::NewEpisodesToast(_) => {}
+                PlatformEvent::NewEpisodePlay { series, .. } => self.with_ctx(|ctx, _, _| crate::ui::new_episodes::play(ctx, series)),
+                PlatformEvent::NewEpisodeDownload { episodes } => self.with_ctx(|ctx, _, _| crate::ui::new_episodes::download(ctx, episodes)),
+                PlatformEvent::NewEpisodesOpen => self.open_new_episodes(egui_ctx),
+                // no notification server answered: the same text as a toast with Play or Open
+                PlatformEvent::NewEpisodesToast(note) => self.toast(crate::ui::new_episodes::toast(note.clone())),
             },
             // the first copy of a title failed before its first frame (DESIGN §29.15)
             AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
@@ -1179,6 +1180,9 @@ impl TunerApp {
     /// DataScope → reaction (DESIGN §5.4).
     fn on_data_changed(&mut self, scope: DataScope) {
         crate::ui::watchlists::invalidate();
+        if crate::ui::new_episodes::feeds(scope) {
+            crate::ui::new_episodes::invalidate();
+        }
         match scope {
             DataScope::Watchlists => {
                 // a series added to or removed from a list: tracked (baselined) or not any more
@@ -1238,7 +1242,7 @@ impl TunerApp {
             // raises `Reminders` too)
             DataScope::Spoiler | DataScope::Follow => self.services().agent.guard().rebuild(),
             DataScope::GuideIssues => {}
-            // its snapshot and screens (N-ui)
+            // its snapshot and screens read it again (`ui::new_episodes`)
             DataScope::NewEpisodes => {}
         }
     }
@@ -2203,6 +2207,37 @@ impl TunerApp {
         self.nav.push(NavRequest::Switch(Route::Settings(crate::ui::SettingsPage::Following)));
     }
 
+    /// Open on the new-episodes summary (its toast, or its desktop notification, which raised
+    /// the window already): Home with the New episodes row under the cursor.
+    fn open_new_episodes(&mut self, egui_ctx: &egui::Context) {
+        if self.popout.is_out() || self.video_only {
+            self.toggle_popout(egui_ctx);
+        }
+        self.with_ctx(|ctx, _, _| crate::ui::new_episodes::show_row(ctx));
+    }
+
+    /// A new-episodes toast button: Play and Download act on the note the toast stashed.
+    fn on_new_episodes_act(&mut self, act: crate::keymap::NewEpisodesAct, egui_ctx: &egui::Context) {
+        use crate::keymap::NewEpisodesAct as A;
+        use crate::new_episodes::NoteAction;
+        match act {
+            A::Play(n) => match crate::ui::new_episodes::note(n) {
+                Some(crate::new_episodes::Note { action: NoteAction::Play { series, .. }, .. }) => {
+                    self.with_ctx(|ctx, _, _| crate::ui::new_episodes::play(ctx, &series));
+                }
+                _ => self.toast(Toast::info("That notice has expired")),
+            },
+            A::Download(n) => match crate::ui::new_episodes::note(n) {
+                Some(note) => self.with_ctx(|ctx, _, _| crate::ui::new_episodes::download(ctx, &note.download)),
+                None => self.toast(Toast::info("That notice has expired")),
+            },
+            A::Open => self.open_new_episodes(egui_ctx),
+            A::Undo(n) => crate::ui::new_episodes::undo(self.services(), n),
+            // a menu choice: the screen that opened the menu acts on it
+            A::StopAlerts => {}
+        }
+    }
+
     /// The countdown's Cancel (or Delete in the pop-out): the row goes, a `SwitchNow` on its
     /// way is ignored.
     fn cancel_switch(&mut self, id: crate::model::ReminderId) {
@@ -2322,6 +2357,7 @@ impl TunerApp {
                 self.toast(Toast::info("Rule removed"));
             }
             Action::OpenFollowing if crate::follow::ENABLED => self.open_following(egui_ctx),
+            Action::NewEpisodes(act) if crate::new_episodes::ENABLED => self.on_new_episodes_act(act, egui_ctx),
             Action::UndoGuideFix(log @ Some(_)) if crate::guide_fix::ENABLED => {
                 let opts = crate::store::guide_fix::GuideOpts::from_config(&self.services().config());
                 let _ = crate::guide_fix::ui::submit_undo(self.services(), log, opts, crate::model::now());
@@ -2936,6 +2972,8 @@ impl TunerApp {
                     .count()
             })
             .filter(|n| *n > 0);
+        // New episodes' dot: a list series has an arrival since Watchlists was last opened
+        let new_dot = self.with_ctx(|ctx, _, _| crate::ui::new_episodes::snapshot(ctx).list_dot);
         let frame = egui::Frame::NONE.fill(theme.palette.dark_background);
         let clicked = if side_w > 0.0 {
             egui::Panel::left("sidebar")
@@ -2952,6 +2990,7 @@ impl TunerApp {
                         has_vod,
                         up_next,
                         downloads,
+                        new_dot,
                         play_on,
                         &mut search_clicked,
                         &mut play_on_clicked,
@@ -2975,6 +3014,7 @@ impl TunerApp {
                             has_vod,
                             up_next,
                             downloads,
+                            new_dot,
                             play_on,
                             &mut search_clicked,
                             &mut play_on_clicked,
@@ -5492,6 +5532,49 @@ mod tests {
             failure: None,
         }));
         assert!(rig.app.favs.is_fav(&channel_ref(0)), "the older library's favourites don't win");
+    }
+
+    /// §2.2 without a notification server: the same text as a toast, with Open (a summary) or
+    /// Play and Download (one series); Open shows Home with the New episodes row.
+    #[test]
+    fn new_episode_toasts_carry_open_or_play_and_download() {
+        use crate::new_episodes::{Note, NoteAction};
+        let mut rig = Rig::new();
+        let ctx = rig.ctx.clone();
+        let item = |kind, key: &str| crate::model::ItemRef { source: crate::model::SourceId(1), kind, key: crate::model::ItemKey(key.into()) };
+        let summary = Note {
+            summary: "New episodes in 6 series".into(),
+            body: "Landman, Slow Horses and 4 more".into(),
+            action: NoteAction::Open,
+            download: vec![],
+        };
+        rig.event(AppEvent::Platform(PlatformEvent::NewEpisodesToast(summary)));
+        let toast = rig.log().toasts.last().cloned().expect("the summary toast");
+        assert_eq!(toast.text, "New episodes in 6 series — Landman, Slow Horses and 4 more");
+        assert_eq!(toast.action, Some(("Open".into(), Action::NewEpisodes(crate::keymap::NewEpisodesAct::Open))));
+        assert_eq!(toast.also, None, "a summary offers no Download");
+        rig.app.routes = vec![Route::Home, Route::Settings(crate::ui::SettingsPage::Playlists)];
+        rig.app.global_action(toast.action.unwrap().1, &[], &ctx);
+        rig.frame_with(vec![]);
+        assert_eq!(rig.route(), &Route::Home);
+
+        let play = Note {
+            summary: "Landman: 2 new episodes".into(),
+            body: "S2E9, S2E10 · on TV".into(),
+            action: NoteAction::Play {
+                label: "Play S2E9".into(),
+                series: item(crate::model::ItemKind::Series, "landman"),
+                episode: item(crate::model::ItemKind::Episode, "landman-2-9"),
+            },
+            download: vec![item(crate::model::ItemKind::Episode, "landman-2-9"), item(crate::model::ItemKind::Episode, "landman-2-10")],
+        };
+        rig.event(AppEvent::Platform(PlatformEvent::NewEpisodesToast(play)));
+        let toast = rig.log().toasts.last().cloned().expect("the series toast");
+        assert!(matches!(toast.action, Some((ref l, Action::NewEpisodes(crate::keymap::NewEpisodesAct::Play(_)))) if l == "Play S2E9"), "{toast:?}");
+        assert!(
+            matches!(toast.also, Some((ref l, Action::NewEpisodes(crate::keymap::NewEpisodesAct::Download(_)))) if l == "Download")
+                == crate::downloads::ENABLED
+        );
     }
 
     /// Following's summary: the in-app toast carries Open, and Open — on the toast, or on the

@@ -92,13 +92,14 @@ struct Row<'a> {
 /// One entry: `size` rect, glyph (+ label when `expanded`), tooltip otherwise; `count` (Up
 /// next's items to go) right-aligned when expanded, on the glyph's corner otherwise. Returns
 /// clicked.
-fn entry(ui: &mut egui::Ui, theme: &Theme, it: &Row<'_>, size: egui::Vec2, expanded: bool, selected: bool, count: Option<usize>) -> bool {
+fn entry(ui: &mut egui::Ui, theme: &Theme, it: &Row<'_>, size: egui::Vec2, expanded: bool, selected: bool, count: Option<usize>, dot: bool) -> bool {
     let t = &theme.tokens;
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let label = match (&it.name, count) {
         (Some(name), _) => name.clone(),
         (None, Some(n)) => format!("{} {n}", it.label),
+        (None, None) if dot => format!("{} (new)", it.label),
         (None, None) => it.label.to_owned(),
     };
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, &label));
@@ -118,6 +119,9 @@ fn entry(ui: &mut egui::Ui, theme: &Theme, it: &Row<'_>, size: egui::Vec2, expan
             ui.painter().text(rect.left_center() + egui::vec2(pad, 0.0), Align2::LEFT_CENTER, it.glyph, icon_font, color);
             let x = pad + theme.font(TypeToken::IconLarge) + theme.space(SpaceToken::ControlGap);
             let mut right = rect.right() - pad;
+            if dot {
+                right -= paint_dot(ui, theme, egui::pos2(right, rect.center().y), Align2::RIGHT_CENTER) + theme.space(SpaceToken::Md);
+            }
             if let Some(n) = count {
                 let r = paint::text(
                     ui.painter(),
@@ -141,6 +145,9 @@ fn entry(ui: &mut egui::Ui, theme: &Theme, it: &Row<'_>, size: egui::Vec2, expan
             );
         } else {
             let g = ui.painter().text(rect.center(), Align2::CENTER_CENTER, it.glyph, icon_font, color);
+            if dot {
+                paint_dot(ui, theme, g.right_top(), Align2::LEFT_TOP);
+            }
             if let Some(n) = count {
                 ui.painter().text(g.right_top(), Align2::LEFT_TOP, n.to_string(), paint::font(theme, TypeToken::Caption), count_color);
             }
@@ -150,8 +157,17 @@ fn entry(ui: &mut egui::Ui, theme: &Theme, it: &Row<'_>, size: egui::Vec2, expan
     resp.clicked()
 }
 
+/// The "New" dot (Watchlists while a list series has news): an accent disc; returns its width.
+fn paint_dot(ui: &egui::Ui, theme: &Theme, at: egui::Pos2, anchor: Align2) -> f32 {
+    let d = (theme.font(TypeToken::Caption) * 0.6).round().max(5.0);
+    let r = anchor.anchor_size(at, egui::vec2(d, d));
+    ui.painter().circle_filled(r.center(), d / 2.0, theme.tokens.accent);
+    d
+}
+
 /// Draw; returns the clicked item. `search_clicked` is set when the search entry is clicked,
-/// `play_on_clicked` when the Play on control (shown for `Some`) is.
+/// `play_on_clicked` when the Play on control (shown for `Some`) is. `new_dot`: New episodes'
+/// dot on Watchlists.
 #[allow(clippy::too_many_arguments)]
 pub fn sidebar(
     ui: &mut egui::Ui,
@@ -161,6 +177,7 @@ pub fn sidebar(
     has_vod: bool,
     up_next: Option<usize>,
     downloads: Option<usize>,
+    new_dot: bool,
     play_on: Option<PlayOn<'_>>,
     search_clicked: &mut bool,
     play_on_clicked: &mut bool,
@@ -192,7 +209,8 @@ pub fn sidebar(
         let count = up_next
             .filter(|_| matches!(e, Entry::Screen(it) if it.id == ScreenId::Queue))
             .or(downloads.filter(|_| matches!(e, Entry::Screen(it) if it.id == ScreenId::Downloads)));
-        if entry(ui, theme, &row, size, expanded && !strip, selected, count) {
+        let dot = new_dot && matches!(e, Entry::Screen(it) if it.id == ScreenId::Watchlists);
+        if entry(ui, theme, &row, size, expanded && !strip, selected, count, dot) {
             match e {
                 Entry::Screen(it) => clicked = Some(it.id),
                 Entry::Search => *search_clicked = true,

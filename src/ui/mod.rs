@@ -23,6 +23,7 @@ pub mod epg_grid;
 pub mod item_menu;
 pub mod layout;
 pub mod multiview;
+pub mod new_episodes;
 pub mod overlays;
 pub mod parental;
 pub mod popout;
@@ -98,6 +99,8 @@ pub enum SettingsPage {
     Agents,
     /// Casting to TVs (DESIGN §40; listed once `cast::ENABLED`).
     Cast,
+    /// New episodes of the series you follow (DESIGN §44; listed once `new_episodes::ENABLED`).
+    NewEpisodes,
 }
 
 /// Where the onboarding card starts (the same card is reused by Settings ▸ Playlists ▸ Add,
