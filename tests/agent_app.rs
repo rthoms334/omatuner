@@ -1652,7 +1652,7 @@ mod casting {
             bedroom: device("Bedroom", ReceiverKind::AirPlayTv, Pairing::Required, 51),
             study: {
                 let mut mac = device("Study", ReceiverKind::AppleTv, Pairing::Paired(PairVariant::Hkp3), 52);
-                mac.usability = Usability::Mac;
+                mac.usability = Usability::CurrentUser;
                 mac
             },
         };

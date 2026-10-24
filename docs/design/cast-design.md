@@ -1,4 +1,4 @@
-# Casting design for Tuner (AirPlay to Apple TV first; Google Cast and DLNA later)
+# Casting design for Tuner (AirPlay to Apple TV first; Macs, Google Cast and DLNA in Appendix E)
 
 > Revision 2, 2026-10-12. This revision applies the user's decisions:
 > - no hardware spike: the client is built on proven open-source implementations (§7.0);
@@ -1767,7 +1767,7 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 ## 12. Agent and MCP (`src/agent/`, plugin skills)
 
 **`cast_devices` (new, read-only, query bucket)**
-- Returns `{devices: [{ref: "device:<32 hex>", name, kind: apple_tv|airplay_tv|chromecast|dlna, paired, available, casting}]}`.
+- Returns `{devices: [{ref: "device:<32 hex>", name, kind: apple_tv|airplay_tv|mac|chromecast|dlna, paired, available, casting}]}`.
 - Reads the registry, which includes paired devices from the store. It never starts a scan.
 - Refs are opaque (DESIGN §30.3), and no addresses are returned.
 
@@ -2548,3 +2548,101 @@ The user asked for the film's real length on the TV and scrubbing anywhere with 
 - **Positions (§7.3):** an item's first fetch past its playlist's start places the estimate there.
 - **Probing:** films and catch-up are always probed (the file's start and length).
 - **Tests (§14.2)** and **the TV checklist (§18 item 8, 8b)**.
+
+---
+
+## Appendix E. Revision 5 (2026-10-24): Macs, Google Cast and DLNA
+
+The user asked for the three receivers the README listed as unsupported. Phase 2 (Google Cast)
+and Phase 3 (DLNA) of §15.3 are built in their essentials, and Macs, "never" in §1, are cast to
+after all. None was checked on real hardware: each step follows the senders that work against
+real devices (named below), and fakes from the same sources test the clients (§14). §18 items
+19–21 are the real-device checks.
+
+**Macs (AirPlay; `airplay/pair.rs`, `airplay/session.rs`, `airplay/features.rs`).**
+- Why §1 said never: pyatv marks `Mac\d+,\d+` unsupported and a Mac answers `/pair-pin-start`
+  with 403. A Mac takes no PIN pairing at all: it takes **transient pairing** (pyatv
+  `hap_transient.py`, pair_ap `pair_homekit.c` `PAIR_CLIENT_HOMEKIT_TRANSIENT`, owntone
+  `airplay.c`; the receiver side in airplay2-receiver `hap.py`):
+  - `/pair-setup` with `X-Apple-HKP: 4`; M1 `{Method 0, State 1, Flags 0x10}`; SRP-6a (3072,
+    SHA-512) as user `Pair-Setup` with PIN `3939`; M3; M4's proof checked. No M5/M6, no
+    pair-verify, no pin-start (pyatv sends one and so fails against a Mac).
+  - The session keys derive from the SRP session key `K` (64 bytes) exactly as from
+    pair-verify's shared secret (`Control-Salt`…, `Events-Salt`… swapped): `SessionKeys.shared`
+    is now bytes of either length.
+  - Nothing is stored: `Credentials.peer` is `None` and each session pairs again.
+- Classification: a `Mac…` model (`Mac14,7`, and the family names before it: `MacBookPro18,3`,
+  `MacBookAir10,1`, `iMac21,1`, `Macmini9,1`, `MacPro7,1`; pyatv PR 2113) with the play queue
+  (bit 33) is `ReceiverKind::Mac`, never "pairing required" whatever its flags (a Mac sets 0x200).
+  Greyed: `act=2` ("Current User", pyatv commit 54ff39ea: no third-party sender can meet it) as
+  `Usability::CurrentUser`, and status flag 0x80 (a password) as `Usability::Password` — a
+  password entry (owntone uses it as the SRP password) is left for later. `Usability::Mac` is
+  gone; each greyed state has its label and setting hint (`Usability::label`/`hint`).
+- The session is the Apple TV's (profile `AppleTv`: `/info`'s `psi`, the play queue, surround).
+  **Open question:** no source shows the `/command` play queue working on a Mac; its features
+  (bits 0, 33, and 49 on newer macOS) advertise it. §18 item 19 settles it.
+
+**Google Cast (`googlecast/`).** As §15.3 planned: in-tree CASTV2 over `tokio-rustls` with a
+verifier that takes any certificate (every device's is self-signed; pychromecast, go-chromecast
+do the same) but checks the handshake signatures, and a hand-coded 7-field `CastMessage`
+(`proto.rs`, the length-prefixed protobuf). Message shapes from pychromecast, go-chromecast and
+node-castv2-client; enum values from the CAF receiver typings.
+- Connect: `CONNECT` to `receiver-0`, `LAUNCH` `CC1AD845`, a `RECEIVER_STATUS` naming its
+  `transportId`/`sessionId` (20 s), `CONNECT` to the transport. PING every 5 s; 20 s of silence
+  ends the connection.
+- `LOAD` (`contentType` `application/vnd.apple.mpegurl`, `streamType` LIVE/BUFFERED,
+  `hlsSegmentFormat`/`hlsVideoSegmentFormat` `ts`/`mpeg2_ts` or `fmp4`/`fmp4`: `LoadReq.fmp4` is
+  new) is load and replace alike; its answer is the `MEDIA_STATUS` with its `requestId`, a
+  replaced item's `INTERRUPTED` is ignored (its media session is remembered as stale).
+- Events: LOADING/BUFFERING → `Loading` (then `Buffering`), PLAYING, PAUSED, IDLE+FINISHED →
+  `Ended`, CANCELLED → `StoppedOnTv`, ERROR → `Lost(ReceiverFailed)`; the app missing from a
+  `RECEIVER_STATUS` or its transport's `CLOSE` → `StoppedOnTv` once something played. Positions:
+  `GET_STATUS` every 10 s for VOD, every `currentTime` reported. Volume: `SET_VOLUME` (so
+  `CastView.volume`). Stop: the receiver's `STOP`.
+- Discovery: `_googlecast._tcp` on the same mdns-sd daemon; TXT `id` (the stable id, dashes and
+  case folded), `fn`, `md`, `ca` (bit 0 video out: speakers and groups aren't listed). Add by
+  address: `http://<ip>:8008/setup/eureka_info`.
+- Relay profiles (`plan::profile_for`, by `md`, via the new `LoadSpec.model`): "Chromecast"
+  (gens 1–3) and Google's smart displays: H.264 ≤ 4.1, no HEVC, deinterlaced (§4.2); everything
+  else: H.264 ≤ 5.1 and HEVC (in fMP4: the Default Media Receiver takes HEVC only there). Stereo.
+  CORS was already on every response; OPTIONS stays the uniform 404 (§9.1), since the receiver's
+  HLS requests are simple GETs that need no preflight (§18 item 20 would show one).
+
+**DLNA (`dlna/`).** As §15.3 planned, with one change to discovery.
+- Discovery under ufw: `NOTIFY` on 239.255.255.250:1900 (a shared socket, `socket2`; ufw's
+  `before.rules` admit it), the multicast M-SEARCH, and **a unicast M-SEARCH to every address of
+  this computer's private subnet** (≤ 510, paced 4 ms, once per browse): their answers match the
+  request's conntrack entry, so no UDP rule is needed (§15.3 had planned a fixed source port in
+  the firewall rule, which would have changed the root helper). The description (≤ 256 KiB,
+  from the host that answered, control URLs on that host over HTTP only) gives the name, maker,
+  model, `UDN` (the stable id) and the AVTransport/RenderingControl control URLs, kept with the
+  device in memory (`Device.dlna`; a remembered renderer is found again by the browse before a
+  cast).
+- Control: SOAP over reqwest (no proxy, 5 s), VLC's minimal DIDL-Lite (`object.item.videoItem`,
+  `protocolInfo` `http-get:*:video/mpeg:DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0170…`).
+  Load: `Stop` if something plays, `SetAVTransportURI`, `Play`. `GetTransportInfo` every second
+  (states as events; `STOPPED` after playing is `Ended` once the relay sent the whole item, else
+  `StoppedOnTv`; three misses `Lost`); `GetMediaInfo` every 5 s (another URI: another sender);
+  `GetPositionInfo` every 2 s for VOD, with the time played standing in for a `RelTime` stuck at 0.
+- Output: **not L1** as §4.2 planned but the relay's L2/L3 TS segments **back to back** as one
+  stream: `RelayConfig.stream` makes the URL `/c/<tok>/stream.ts`, served by the LAN server under
+  the same token and peer rules: 200 without a length (chunked), `transferMode.dlna.org:
+  Streaming`, `contentFeatures.dlna.org`; HEAD starts nothing; `Range` is ignored. Each segment
+  sent is a `SegmentFetched`; the last is `RelayEvent::StreamEnded`. A seek is a view under a
+  new token (the old stream ends). So DLNA gets the plan, the conversions, the escalation and the
+  one provider connection unchanged; the profile copies H.264, HEVC and MPEG-2, never
+  deinterlaces (the TV does), is TS only (HEVC in TS) and never full length. Stream connections
+  may idle 10 minutes (a paused TV stops reading).
+- **Open questions:** whether every TV takes the chunked stream (some Samsungs are said to want
+  close-delimited) and VLC's DIDL; §18 item 21.
+
+**Merging (§6).** One address, several protocols: one row in `Registry::list`, the one used
+before, else paired, else Apple/Cast, DLNA, third-party AirPlay.
+
+**Elsewhere.** `ReceiverKind::Mac` (`mac` for agents); the agent's cast gate takes any
+selectable device; the first-run card offers AirPlay TVs only (a Mac, Cast and DLNA have nothing
+to set up); `Cargo.toml` names `rustls`, `tokio-rustls` and `socket2` directly (already built:
+no new crate in `Cargo.lock`). Tests: `tests/cast_googlecast.rs` (fake device over TLS with a
+fixture certificate), `tests/cast_dlna.rs` (fake renderer), Mac cases in
+`tests/cast_airplay.rs` (the fake takes transient pairing), the stream in `tests/cast_relay.rs`,
+and unit tests for each parser.

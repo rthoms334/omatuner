@@ -8,7 +8,7 @@
 //!                        │   Living Room TV                        │
 //!                        │   Hisense 85E75LE · Pair first          │
 //!                        │   OT Macbook Air                        │  ← greyed, not selectable
-//!                        │   Mac · Can't cast to Macs              │
+//!                        │   MacBook Air · Only its own user       │
 //!                        │ ━━━━━━━━━━━━━━━━━━━━━━━  Searching…     │
 //!                        │   Add by address…                       │
 //!                        │   Firewall help…                        │
@@ -28,11 +28,13 @@
 //! * "This computer" while casting: **Play here** (`StopCasting { play_here: true }`); while
 //!   not casting it is where you already are;
 //! * "Add by address…": a one-line IPv4 field in its place (`[TextInput, Modal]`; Enter probes
-//!   `GET /info` on port 7000, Esc leaves the field).
+//!   `GET /info` on port 7000, then a Cast device's `eureka_info`, then a unicast M-SEARCH; Esc
+//!   leaves the field).
 //!
-//! While casting the cursor starts on "This computer", so stopping is `C` then Enter. A Mac or
-//! a TV set to "Same Home only" is listed greyed and the cursor skips it. In multi-view the
-//! panel is one line: "Leave multi-view to cast". Esc, ✕ or a click outside closes.
+//! While casting the cursor starts on "This computer", so stopping is `C` then Enter. A Mac that
+//! allows only its own user or asks a password, or a TV set to "Same Home only", is listed greyed
+//! and the cursor skips it. In multi-view the panel is one line: "Leave multi-view to cast". Esc,
+//! ✕ or a click outside closes.
 //!
 //! The same panel serves two more purposes ([`For`]):
 //! * **"Cast to…" an item** (`OverlayRequest::CastItem`, DESIGN §40 §3.1): headed with the item,
@@ -49,7 +51,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, FontId, Rect};
 
 use super::{Overlay, OverlayOutcome};
-use crate::cast::{Device, Pairing, Usability};
+use crate::cast::{Device, Pairing};
 use crate::keymap::{Action, KeyContext};
 use crate::model::{CastErrorKind, DeviceId};
 use crate::player::PlayerCommand;
@@ -364,15 +366,11 @@ fn pick(row: &Row) -> Pick {
 /// 4K (3rd generation) · Paired"; [`Device::make`]). Never an address, and every string is the
 /// sanitized one; the OS version lives in Settings only.
 fn device_line(d: &Device) -> String {
-    let kind = match d.usability {
-        Usability::Mac => "Mac".to_owned(),
-        _ => d.make(),
-    };
+    let kind = d.make();
     let mut parts = vec![kind.as_str()];
-    match d.usability {
-        Usability::Mac => parts.push("Can't cast to Macs"),
-        Usability::HomeOnly => parts.push("Same Home only"),
-        Usability::Usable => match d.pairing {
+    match d.usability.label() {
+        Some(why) => parts.push(why),
+        None => match d.pairing {
             Pairing::Required => parts.push("Pair first"),
             Pairing::Paired(_) => parts.push("Paired"),
             Pairing::NotNeeded => {}
@@ -386,11 +384,7 @@ fn device_line(d: &Device) -> String {
 
 /// What a greyed row's tooltip says about the setting that would let it through.
 fn device_hint(d: &Device) -> Option<&'static str> {
-    match d.usability {
-        Usability::Usable => None,
-        Usability::Mac => Some("Tuner can't cast to a Mac."),
-        Usability::HomeOnly => Some("On the Apple TV: Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network."),
-    }
+    d.usability.hint()
 }
 
 /// Why "Add by address…" found no TV (fixed sentences: nothing the device said).
@@ -756,6 +750,8 @@ impl Look<'_> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::cast::Usability;
+
     use egui_kittest::kittest::Queryable;
 
     use super::*;
@@ -785,7 +781,11 @@ mod tests {
                 manufacturer: Some("Hisense".into()),
                 ..tv(2, "Living Room TV", ReceiverKind::AirPlayTv, Pairing::Required)
             },
-            Device { usability: Usability::Mac, ..tv(3, "OT Macbook Air", ReceiverKind::AppleTv, Pairing::Required) },
+            Device {
+                usability: Usability::CurrentUser,
+                model: Some("MacBookAir10,1".into()),
+                ..tv(3, "OT Macbook Air", ReceiverKind::Mac, Pairing::NotNeeded)
+            },
         ]
     }
 
@@ -810,7 +810,20 @@ mod tests {
         let ds = devices();
         assert_eq!(device_line(&ds[0]), "Apple TV 4K (3rd generation) · Paired");
         assert_eq!(device_line(&ds[1]), "Hisense 85E75LE · Pair first");
-        assert_eq!(device_line(&ds[2]), "Mac · Can't cast to Macs");
+        assert_eq!(device_line(&ds[2]), "MacBook Air · Only its own user");
+        assert!(device_hint(&ds[2]).is_some_and(|h| h.contains("Allow AirPlay for")));
+        let open_mac = Device { usability: Usability::Usable, model: Some("Mac14,7".into()), ..ds[2].clone() };
+        assert_eq!(device_line(&open_mac), "Mac", "a Mac needs no pairing");
+        let chromecast = Device { model: Some("Chromecast".into()), ..tv(8, "Bedroom TV", ReceiverKind::Chromecast, Pairing::NotNeeded) };
+        assert_eq!(device_line(&chromecast), "Chromecast");
+        let sony = Device { model: Some("BRAVIA 4K VH2".into()), ..chromecast.clone() };
+        assert_eq!(device_line(&sony), "BRAVIA 4K VH2 (Google Cast)");
+        let lg = Device {
+            model: Some("OLED55C1".into()),
+            manufacturer: Some("LG Electronics".into()),
+            ..tv(9, "Kitchen", ReceiverKind::Dlna, Pairing::NotNeeded)
+        };
+        assert_eq!(device_line(&lg), "LG Electronics OLED55C1 (DLNA)");
         let unnamed = tv(7, "Den TV", ReceiverKind::AirPlayTv, Pairing::Required);
         assert_eq!(device_line(&unnamed), "AirPlay TV · Pair first", "remembered, not announced this run");
         let home = Device { usability: Usability::HomeOnly, ..tv(4, "Bedroom", ReceiverKind::AppleTv, Pairing::Required) };
@@ -841,7 +854,7 @@ mod tests {
         let [paired, unpaired, mac]: [Device; 3] = devices().try_into().unwrap();
         assert_eq!(pick(&row(paired.clone())), Pick::CastTo(id(1)));
         assert_eq!(pick(&row(unpaired)), Pick::Pair(id(2)));
-        assert_eq!(pick(&row(mac)), Pick::Nothing, "a Mac is greyed out");
+        assert_eq!(pick(&row(mac)), Pick::Nothing, "a Mac that allows only its own user is greyed out");
         assert_eq!(pick(&Row::Device { device: Box::new(paired), current: true }), Pick::Close);
         assert_eq!(pick(&Row::Here { here: false }), Pick::PlayHere, "This computer while casting");
         assert_eq!(pick(&Row::Here { here: true }), Pick::Close);
@@ -853,7 +866,7 @@ mod tests {
         let rows = rows_of(devices(), None, true, false, Duration::ZERO);
         assert_eq!(CastPicker::best(&rows, false, None), 1, "the first TV (most recent first)");
         assert_eq!(CastPicker::best(&rows, false, Some(&id(2).to_string())), 2, "cast.default_device");
-        assert_eq!(CastPicker::best(&rows, false, Some(&id(3).to_string())), 1, "a Mac can't be the default");
+        assert_eq!(CastPicker::best(&rows, false, Some(&id(3).to_string())), 1, "a greyed Mac can't be the default");
         assert_eq!(CastPicker::best(&rows, true, None), 0, "C then Enter stops casting");
         assert_eq!(CastPicker::best(&rows_of(Vec::new(), None, true, true, Duration::ZERO), false, None), 0);
     }
@@ -871,7 +884,7 @@ mod tests {
         assert!(height > 100.0 && height < 700.0, "{height} px tall in a 1400 px window");
     }
 
-    /// The panel lists the TVs with their state lines and starts discovery; ↓ skips the Mac;
+    /// The panel lists the TVs with their state lines and starts discovery; ↓ skips the greyed Mac;
     /// an unpaired TV opens the PIN overlay; "Firewall help…" opens the firewall card.
     #[test]
     fn the_picker_lists_tvs_browses_and_opens_pairing_or_firewall_help() {
@@ -884,7 +897,7 @@ mod tests {
             "Apple TV 4K (3rd generation) · Paired",
             "Living Room TV",
             "Hisense 85E75LE · Pair first",
-            "Mac · Can't cast to Macs",
+            "MacBook Air · Only its own user",
         ] {
             assert!(texts.iter().any(|t| t == want), "{want}: {texts:?}");
         }
@@ -897,7 +910,7 @@ mod tests {
         assert_eq!(h.state_mut().act(Action::Activate), "Close");
         assert_eq!(h.state_mut().nav(), vec![NavRequest::Open(OverlayRequest::CastPair { device: id(2), then_cast: true })]);
         drop(h);
-        // ↓ again skips the Mac and lands on "Add by address…"
+        // ↓ again skips the greyed Mac and lands on "Add by address…"
         let (mut h, _fake) = picker(devices());
         h.run_steps(2);
         h.state_mut().act(Action::Down);

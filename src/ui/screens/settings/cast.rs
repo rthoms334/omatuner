@@ -45,7 +45,7 @@
 
 use super::*;
 use crate::cast::firewall::FirewallState;
-use crate::cast::{CastHandle, Device, DeviceId, Pairing, ReceiverKind, TestState, Usability};
+use crate::cast::{CastHandle, Device, DeviceId, Pairing, ReceiverKind, TestState};
 use crate::config::{CastConvert, CastInterlaced};
 use crate::ui::overlays::cast_firewall::{allow_shows, command_lines, other_networks, state_text};
 use crate::ui::overlays::cast_offer::error_sentence;
@@ -155,17 +155,20 @@ fn test_device(cfg: &Config, devices: &[Device]) -> Option<DeviceId> {
 /// 85E75LE · Not paired" ([`Device::make`]).
 fn detail(d: &Device, cfg: &Config, now: crate::model::Timestamp) -> String {
     let mut parts: Vec<String> = vec![d.make()];
-    match d.usability {
-        Usability::Mac => parts.push("Mac · Can't cast to Macs".into()),
-        Usability::HomeOnly => parts.push("Same Home only".into()),
-        Usability::Usable => match d.pairing {
+    match d.usability.label() {
+        Some(why) => parts.push(why.into()),
+        None => match d.pairing {
             Pairing::Paired(_) => parts.push("Paired".into()),
             Pairing::Required => parts.push("Not paired".into()),
             Pairing::NotNeeded => {}
         },
     }
     if let Some(v) = &d.os_version {
-        parts.push(if d.kind == ReceiverKind::AppleTv { format!("tvOS {v}") } else { v.clone() });
+        parts.push(match d.kind {
+            ReceiverKind::AppleTv => format!("tvOS {v}"),
+            ReceiverKind::Mac => format!("macOS {v}"),
+            _ => v.clone(),
+        });
     }
     if let Some(at) = d.last_used {
         parts.push(format!("used {}", super::super::live::age_label(now, at)));

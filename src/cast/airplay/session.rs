@@ -33,7 +33,7 @@ use super::bplist::Value;
 use super::events::{self, Event};
 use super::features::{self, AirPlayInfo, ReceiverIds};
 use super::hap::FrameCipher;
-use super::pair::{PairVerify, SessionKeys};
+use super::pair::{self, PairTransient, PairVerify, SessionKeys};
 use super::queue::{self, Spelling};
 use super::rtsp::{self, Connection, Request, Response};
 use super::trace::Trace;
@@ -411,7 +411,7 @@ impl Session {
         };
         let stream_id = queue::int(stream.get("streamID")).unwrap_or(1);
 
-        let info = receiver_info(&ap, creds.peer.variant);
+        let info = receiver_info(&ap, creds.peer.as_ref().map(|p| p.variant));
         let session_id = conn.session_id();
         let session =
             Self { control: Some(Control::spawn(conn, raw_tx)), events, uri, session_id, stream_id, profile, spelling: Spelling::new(profile) };
@@ -466,16 +466,49 @@ impl Session {
 /// with the M4 status checked). Replies: an empty 200 → `PairingRefused` (the "Anyone on the Same
 /// Network" hint); an id or signature mismatch or an error TLV → `PairingLost`; 470 →
 /// `PairingRefused`; refused or timed out → `Unreachable`.
+/// Pair-verify with the stored pairing, or without one transient pair-setup (a Mac's receiver,
+/// DESIGN §40 Appendix E: no `/pair-pin-start`, which a Mac answers with 403).
 async fn verify(conn: &mut Connection, creds: &Credentials) -> Result<SessionKeys, CastErrorKind> {
-    let mut pv = PairVerify::new(&creds.identity, &creds.peer, &super::random_bytes::<32>());
-    let m2 = verify_step(conn, creds, pv.m1()).await?;
+    let Some(peer) = &creds.peer else { return transient(conn).await };
+    let mut pv = PairVerify::new(&creds.identity, peer, &super::random_bytes::<32>());
+    let m2 = verify_step(conn, creds, peer.variant, pv.m1()).await?;
     let m3 = pv.m3(&m2).map_err(verify_error)?;
-    let m4 = verify_step(conn, creds, m3).await?;
+    let m4 = verify_step(conn, creds, peer.variant, m3).await?;
     pv.finish(&m4).map_err(verify_error)
 }
 
-async fn verify_step(conn: &mut Connection, creds: &Credentials, body: Vec<u8>) -> Result<Vec<u8>, CastErrorKind> {
-    let req = super::pairing_request("/pair-verify", creds.peer.variant, &creds.identity).body(body);
+async fn transient(conn: &mut Connection) -> Result<SessionKeys, CastErrorKind> {
+    let mut pt = PairTransient::new();
+    let m2 = transient_step(conn, pt.m1()).await?;
+    let m3 = pt.m3(&m2).map_err(transient_error)?;
+    let m4 = transient_step(conn, m3).await?;
+    pt.finish(&m4).map_err(transient_error)
+}
+
+async fn transient_step(conn: &mut Connection, body: Vec<u8>) -> Result<Vec<u8>, CastErrorKind> {
+    let req = pair::transient_headers().into_iter().fold(Request::http("POST", "/pair-setup"), |r, (k, v)| r.header(k, v)).body(body);
+    let resp = conn.exchange(req).await.map_err(unreachable)?;
+    match resp.status {
+        _ if resp.ok() => Ok(resp.body),
+        s => {
+            // 470 / 403: the receiver takes no transient pairing (a password, "Current User")
+            tracing::info!("cast: transient pair-setup answered {s}");
+            Err(CastErrorKind::PairingRefused)
+        }
+    }
+}
+
+/// A transient pairing the receiver doesn't take (an authentication error: it wants a password).
+fn transient_error(e: PairError) -> CastErrorKind {
+    match e {
+        PairError::Unreachable | PairError::Expired => CastErrorKind::Unreachable,
+        PairError::Backoff { .. } | PairError::Refused { .. } | PairError::WrongPin => CastErrorKind::PairingRefused,
+        PairError::NotSupported | PairError::Failed => CastErrorKind::PairingRefused,
+    }
+}
+
+async fn verify_step(conn: &mut Connection, creds: &Credentials, variant: PairVariant, body: Vec<u8>) -> Result<Vec<u8>, CastErrorKind> {
+    let req = super::pairing_request("/pair-verify", variant, &creds.identity).body(body);
     let resp = conn.exchange(req).await.map_err(unreachable)?;
     match resp.status {
         _ if resp.ok() => Ok(resp.body),
@@ -518,9 +551,9 @@ fn clean(s: &Option<String>) -> Option<String> {
 /// What the session learned (device strings sanitized: they are shown in Settings and logged).
 /// The Apple TV's `/info` carries only the build ("(23L773)"); the registry joins it with the TXT
 /// version (`merge_os_version`) and the session logs the joined line (DESIGN §40 §7.6).
-pub fn receiver_info(ap: &AirPlayInfo, variant: PairVariant) -> ReceiverInfo {
+pub fn receiver_info(ap: &AirPlayInfo, variant: Option<PairVariant>) -> ReceiverInfo {
     let os_version = crate::cast::os_version_text(clean(&ap.os_version), clean(&ap.os_build));
-    ReceiverInfo { model: clean(&ap.model), os_version, source_version: clean(&ap.source_version), pairing: Some(variant) }
+    ReceiverInfo { model: clean(&ap.model), os_version, source_version: clean(&ap.source_version), pairing: variant }
 }
 
 #[cfg(test)]

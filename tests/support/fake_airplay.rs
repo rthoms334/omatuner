@@ -245,6 +245,11 @@ pub struct FakeConfig {
     pub pins: Vec<&'static str>,
     /// The TV's long-term identity.
     pub accessory: Accessory,
+    /// A Mac's AirPlay Receiver: `/pair-setup` with `Flags 0x10` (transient, `X-Apple-HKP: 4`,
+    /// PIN 3939) pairs without pin-start and turns encryption on after M4, keyed by the SRP
+    /// session key; `transient_pin` is what it takes (a password-protected Mac's password).
+    pub transient: bool,
+    pub transient_pin: &'static str,
 }
 
 impl FakeConfig {
@@ -272,6 +277,8 @@ impl FakeConfig {
             slow_delay: Duration::from_secs(2),
             pins: vec!["1111", "2222", "3333", "4444"],
             accessory: Accessory { id: "8C4E7A1D-35B2-4F60-9E0A-7D2B6C1F0A55".into(), seed: [0x5a; 32] },
+            transient: false,
+            transient_pin: "3939",
         }
     }
 }
@@ -678,7 +685,7 @@ impl FakeAirPlay {
         let mut st = self.inner.lock();
         st.controllers.push(PeerCredentials { peer_id: identity.pairing_id.clone(), peer_ltpk: ed25519_public(identity.seed.expose()), variant });
         let peer = PeerCredentials { peer_id: st.accessory.id.clone(), peer_ltpk: ed25519_public(&st.accessory.seed), variant };
-        Credentials { identity: identity.clone(), peer }
+        Credentials { identity: identity.clone(), peer: Some(peer) }
     }
 
     /// The TV was reset (or re-paired elsewhere): a new long-term key, and it forgets every
@@ -1025,15 +1032,26 @@ struct Conn {
     setup: Option<SetupArm>,
     verify: Option<PairVerifyServer>,
     verified: bool,
-    /// The pair-verify shared secret (the event channel's keys derive from it).
-    shared: Option<[u8; 32]>,
+    /// The pair-verify shared secret, or a transient pairing's SRP key (the event channel's keys
+    /// derive from it).
+    shared: Option<Vec<u8>>,
     info_before_verify: bool,
+    /// A transient pair-setup under way (a Mac).
+    transient: Option<PairSetupServer>,
 }
 
 async fn serve_control(inner: Arc<Inner>, id: usize, stream: TcpStream) {
     let (mut rd, mut wr) = stream.into_split();
-    let mut conn =
-        Conn { id, close: inner.shutdown.child_token(), setup: None, verify: None, verified: false, shared: None, info_before_verify: false };
+    let mut conn = Conn {
+        id,
+        close: inner.shutdown.child_token(),
+        setup: None,
+        verify: None,
+        verified: false,
+        shared: None,
+        info_before_verify: false,
+        transient: None,
+    };
     let mut cipher: Option<FakeCipher> = None;
     let mut raw = Vec::new();
     let mut plain = Vec::new();
@@ -1248,6 +1266,9 @@ fn arm(inner: &Arc<Inner>, conn: &mut Conn) {
 fn pair_setup(inner: &Arc<Inner>, conn: &mut Conn, req: &Message) -> Reply {
     let Ok(tlv) = tlv8::decode(&req.body) else { return Reply::status(400) };
     let state_no = tlv.get(tag::STATE).and_then(|v| v.first().copied());
+    if tlv.get(tag::FLAGS) == Some(&[0x10][..]) || conn.transient.is_some() {
+        return transient_setup(inner, conn, req, state_no);
+    }
     let Some(arm_now) = conn.setup.as_mut() else {
         // No code shown on this connection.
         return Reply::status(470);
@@ -1363,6 +1384,36 @@ fn build_m6(acc: &Accessory, k: &[u8], forge: bool, tlv17: bool) -> Vec<u8> {
     encode_tlv(&[(tag::STATE, vec![6]), (tag::ENCRYPTED_DATA, sealed)])
 }
 
+/// A Mac's transient pair-setup (pair_ap `pair_homekit.c`, airplay2-receiver `hap.py`): M1 → M2,
+/// M3 → M4, then encryption on, keyed by `K`. Anything but a transient-capable fake answers 470.
+fn transient_setup(inner: &Arc<Inner>, conn: &mut Conn, req: &Message, state_no: Option<u8>) -> Reply {
+    if !inner.cfg.transient || req.header("X-Apple-HKP") != Some("4") {
+        return Reply::status(470);
+    }
+    match state_no {
+        Some(1) => {
+            let server = PairSetupServer::new(&inner.cfg.accessory, inner.cfg.transient_pin, &[0x21; 16], &[0x31; 32]);
+            let server = conn.transient.insert(server);
+            Reply::tlv(server.handle(&req.body))
+        }
+        Some(3) => {
+            let Some(mut server) = conn.transient.take() else { return Reply::status(400) };
+            let m4 = server.handle(&req.body);
+            let mut reply = Reply::tlv(m4);
+            if let Some(keys) = server.transient_keys() {
+                let shared = keys.shared.expose();
+                let read = hkdf32(shared, b"Control-Salt", b"Control-Write-Encryption-Key");
+                let write = hkdf32(shared, b"Control-Salt", b"Control-Read-Encryption-Key");
+                reply.after = After::Encrypt(Box::new(FakeCipher::new(&write, &read)));
+                conn.verified = true;
+                conn.shared = Some(shared.clone());
+            }
+            reply
+        }
+        _ => Reply::status(400),
+    }
+}
+
 fn pair_verify(inner: &Arc<Inner>, conn: &mut Conn, req: &Message) -> Reply {
     match inner.cfg.allow_access {
         AllowAccess::HomeOnly => return Reply::status(200),
@@ -1404,7 +1455,7 @@ fn pair_verify(inner: &Arc<Inner>, conn: &mut Conn, req: &Message) -> Reply {
                 reply.after = After::Encrypt(Box::new(FakeCipher::new(&write, &read)));
                 conn.verified = true;
                 conn.verify = None;
-                conn.shared = Some(*shared);
+                conn.shared = Some(shared.clone());
             }
             reply
         }
@@ -1436,7 +1487,7 @@ fn setup(inner: &Arc<Inner>, conn: &mut Conn, req: &Message) -> Reply {
     }
     // The base SETUP: a new session (it takes over from any other sender).
     let ntp = text(&body, "timingProtocol") == Some("NTP");
-    let Some(shared) = conn.shared else { return Reply::status(403) };
+    let Some(shared) = conn.shared.clone() else { return Reply::status(403) };
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind event port");
     std_listener.set_nonblocking(true).expect("nonblocking event listener");
     let port = std_listener.local_addr().expect("event port").port();
@@ -1790,7 +1841,7 @@ impl Playlist {
 async fn serve_events(
     inner: Arc<Inner>,
     listener: tokio::net::TcpListener,
-    shared: [u8; 32],
+    shared: Vec<u8>,
     mut rx: mpsc::UnboundedReceiver<EventOut>,
     close: CancellationToken,
 ) {

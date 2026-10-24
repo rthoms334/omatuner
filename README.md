@@ -55,8 +55,9 @@ and [Artemis I Launch (Press Site)](https://images.nasa.gov/details/Artemis%20I%
   provider's guide). You can add several playlists, each with its own colour and glyph badge.
   A new playlist gets a colour no other playlist uses, and Settings ▸ Playlists offers to fix
   two playlists that share a colour.
-- **Casting:** send live TV, catch-up, films and episodes to an Apple TV on your network
-  (AirPlay): *Cast to…* on any channel, card, programme or episode (`C` or `Alt+C`), `C` in the
+- **Casting:** send live TV, catch-up, films and episodes to a TV on your network: an Apple TV,
+  an AirPlay TV or a Mac (AirPlay), a Chromecast, Google TV or TV with Cast built in (Google
+  Cast), or a DLNA TV: *Cast to…* on any channel, card, programme or episode (`C` or `Alt+C`), `C` in the
   player for what you are watching, or set **Play on** (top of the sidebar) to the TV and everything you play goes
   there. Tuner fetches the stream itself and serves the TV a plain picture, so your playlists'
   addresses and logins never leave this computer. See [Casting to a TV](#casting-to-a-tv).
@@ -1243,9 +1244,24 @@ Three ways, for live TV, catch-up, films and episodes alike:
 The window can stay on another workspace, or be closed to the mini player; nothing pops out or
 comes forward. Tuner is the source of the picture, so it has to keep running.
 
-**What it casts to.** An Apple TV 4K (tvOS 26 and 27) over AirPlay, and third-party TVs with
-AirPlay video (Hisense, Samsung, LG), listed beside it and set up the same way. Macs, Chromecast
-and DLNA TVs are not supported yet.
+**What it casts to.** Every receiver is listed in the same picker, and the same three ways
+work for all of them:
+
+| Receiver | How | Setup | Volume keys |
+|---|---|---|---|
+| Apple TV 4K (tvOS 26 and 27) | AirPlay | A 4-digit code, once | TV remote |
+| TVs with AirPlay video (Hisense, Samsung, LG) | AirPlay | A 4-digit code, once | TV remote |
+| Mac (macOS 12 or later, AirPlay Receiver on) | AirPlay | None | The Mac |
+| Chromecast, Chromecast with Google TV, Google TV Streamer, TVs with Cast built in (Sony, TCL, Philips, Hisense…) | Google Cast | None | Tuner's |
+| DLNA TVs and players (older Samsung, LG, Sony, Panasonic and Philips TVs, Kodi, AV receivers) | DLNA (UPnP AV) | None | Tuner's |
+
+One TV that speaks several of these (an LG with AirPlay and DLNA, a Sony with Cast and DLNA) is
+listed once: as the way you used before, else the one you paired, else Google Cast, then DLNA,
+then AirPlay. Speakers and Cast groups without a screen aren't listed.
+
+Macs, Google Cast and DLNA haven't been checked on real hardware yet (the Apple TV and the
+Hisense have): they are built from the protocols as working open-source senders use them and
+tested against stand-ins: please report what yours does (an issue with the log helps).
 
 ### Pairing
 
@@ -1258,10 +1274,19 @@ Tuner offers to set up a TV it finds on its first start (a card with *Set up*, *
 *Don't ask again*); Settings ▸ Cast does the same any time: *Pair*, *Pair again*, *Make
 default*, *Forget…*, *Search again*, *Add by address*.
 
+**No code:** a Mac, a Google Cast device and a DLNA TV need no pairing; pick it and it plays.
+A Mac takes casts when its AirPlay Receiver allows them (System Settings ▸ General ▸ AirDrop &
+Handoff): **AirPlay Receiver** on, *Allow AirPlay for* **Anyone on the Same Network** (or
+**Everyone**), and **Require Password** off. A Mac set to *Current User*, or asking for a
+password, is listed greyed with that hint.
+
+**Add by address** tries the address as an AirPlay receiver, then as a Google Cast device,
+then as a DLNA TV.
+
 ### The firewall button
 
-The TV connects back to Tuner, on TCP port 47800 (Settings ▸ Cast ▸ Port), from your local
-network. Omarchy's `ufw` drops that by default, so the first cast fails after about 10 seconds
+The TV (whatever kind) connects back to Tuner, on TCP port 47800 (Settings ▸ Cast ▸ Port), from
+your local network. Omarchy's `ufw` drops that by default, so the first cast fails after about 10 seconds
 with "your firewall is blocking it". Press **Allow on firewall** (on the casting card, the setup
 card or Settings ▸ Cast ▸ Network): Omarchy's password dialog appears and Tuner adds one `ufw`
 rule for that port, this network interface and your local subnet, tagged `omatuner cast`. The
@@ -1273,6 +1298,12 @@ firewalld. The button needs `polkit` and `ufw`; without them only the command is
 listens on the network when no cast is running. Nothing a TV sees contains your provider's
 address or login: it gets an address on this computer with a random one-time token, and only
 the TV may use it.
+
+**DLNA TVs are found without opening anything else.** A DLNA TV answers a search with a packet
+the firewall would drop, so Tuner listens for the TVs' own announcements (which ufw lets
+through), and while the picker or Settings ▸ Cast searches it asks each address of your local
+network directly (a few hundred small packets, once per search), whose answers ufw lets
+through. A TV that still doesn't show: *Add by address*.
 
 *Test on TV* (Settings ▸ Cast, and the last step of the setup) plays a 15-second test card
 through the whole path, without using a provider connection, so it proves pairing, the firewall
@@ -1289,7 +1320,8 @@ sound and any surround track get there, the segments and their target duration, 
 model, how far behind live it runs, and whether its position is reported by the TV or
 estimated. Pause, resume, seek (films, episodes and catch-up) and zapping work as
 usual and reach the TV; everything you start while casting plays on the TV, including Up next,
-reminders that switch channel and what an agent plays. Volume is the TV remote's job. Closing
+reminders that switch channel and what an agent plays. Volume is the TV remote's job on AirPlay;
+Tuner's volume keys set a Google Cast or DLNA TV's volume. Closing
 Tuner asks first, because it would stop the picture. Failures are told in one sentence: in the
 card when the player is on screen, as a toast when the window is visible, and as a desktop
 notification with *Show* when Tuner is on another workspace.
@@ -1297,13 +1329,23 @@ notification with *Show* when Tuner is on another workspace.
 ### Limits
 
 - **Live TV runs about 15-25 seconds behind** and a channel change takes 6-12 seconds.
+- **What each TV is sent.** An Apple TV, an AirPlay TV, a Mac and a Google Cast device get HLS;
+  a DLNA TV gets one continuous MPEG-TS stream (DLNA TVs rarely play HLS), so its own remote
+  can pause but not scrub: seek from Tuner, which starts the stream again from there. A film
+  reaches a DLNA TV as it is made, never whole (below).
+- **Formats per receiver.** A Chromecast of the first three generations takes H.264 up to
+  1080p30 (level 4.1) and no HEVC: anything else is converted, interlaced pictures too. A
+  Chromecast Ultra, a Chromecast with Google TV, a Google TV Streamer and TVs with Cast built in
+  take HEVC as it is. A DLNA TV gets H.264, HEVC and MPEG-2 as they are (it deinterlaces
+  itself); a TV that can't play one is converted for that item next time, as on AirPlay.
 - **Formats the TV can't play are converted** on this computer (CPU only): MPEG-2, VC-1 and
   interlaced pictures (Apple requires deinterlacing), and audio other than AAC stereo. A slow
   computer may not keep up with a 1080i channel: *Convert this channel* and Settings ▸ Cast ▸
   *Convert what the TV can't play* / *Interlaced channels* are the controls. Surround sound
   (5.1 and 7.1 films and channels) reaches an Apple TV as surround beside a stereo track, which
   the TV picks for stereo speakers (AC-3, E-AC-3 and AAC 5.1 as they are, anything else as
-  Dolby Digital 5.1); other AirPlay TVs get stereo. Subtitles and teletext are dropped.
+  Dolby Digital 5.1), and so does a Mac; every other receiver gets stereo. Subtitles and
+  teletext are dropped.
   Encrypted (DRM) streams can't be cast.
 - **Films, episodes and catch-up reach the TV whole** when they can: the TV shows the real
   length, and its remote scrubs anywhere (each part is prepared when the TV asks for it, so a
@@ -1323,7 +1365,8 @@ notification with *Show* when Tuner is on another workspace.
 - **Keeping awake:** casting holds a sleep inhibitor so the laptop doesn't suspend (Settings ▸
   Cast ▸ *Keep this computer awake while casting*); closing the lid still suspends.
 - **Developer variables:** `TUNER_CAST_TRACE=1` writes a redacted transcript of the AirPlay
-  session under `~/.local/state/tuner/cast-trace/`.
+  session under `~/.local/state/tuner/cast-trace/` (AirPlay only; for Google Cast and DLNA the
+  log with `RUST_LOG=tuner=info,tuner::cast=debug` says what the TV answered).
 
 Agents can cast too: see [Use Tuner from an AI agent](#use-tuner-from-an-ai-agent).
 
@@ -1818,7 +1861,9 @@ is; otherwise the timers come back the next time Tuner starts.
 - **Casting fails with "your firewall is blocking it":** press *Allow on firewall* (see
   [Casting to a TV](#casting-to-a-tv)). "No TVs found": the TV must be on and on the same
   network; *Add by address* takes its IPv4 address. "Needs pairing" again after a tvOS update:
-  recheck Allow Access, then pair again.
+  recheck Allow Access, then pair again. A Mac that's greyed: see its hint (AirPlay Receiver
+  settings). A Chromecast that shows its home screen and stops: the format (Tuner converts it
+  next time). A DLNA TV that shows "unsupported file": the same, or try *Convert this channel*.
 
 ## Privacy
 
@@ -1839,7 +1884,9 @@ is; otherwise the timers come back the next time Tuner starts.
 - **Casting** opens a listener on your local network only while a cast runs, on the address the
   TV reaches (never all interfaces), answering only that TV with a one-time token; the TV never
   sees your provider's address or login. Pairing keys for your TVs are stored in the database
-  (0600) and left out of backups. Casting's only root code is the firewall helper, and only when
+  (0600) and left out of backups. A Google Cast device's certificate is self-signed, so Tuner
+  encrypts that connection without checking who answers, as every Cast sender does; it carries
+  only the one-time address. DLNA control is plain HTTP on your network, carrying the same. Casting's only root code is the firewall helper, and only when
   you press *Allow on firewall*.
 - **Updates:** one request to `api.github.com` at start and every 6 hours (no account, no
   token), and the package download from GitHub when there is a new version. See

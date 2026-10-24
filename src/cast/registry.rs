@@ -7,8 +7,10 @@
 //! frame (`CastApi::devices`), for the agent's `cast_devices` and for the first-run card's
 //! offer. A remembered TV that this run hasn't seen yet is listed as not available; a sighting
 //! makes it available and refreshes its address, name and versions (a TV that updated to tvOS
-//! 27 overnight shows 27 in Settings ▸ Cast). Phase 2 merges one physical TV's protocols into
-//! one row (Apple → AirPlay; others → Cast > DLNA > third-party AirPlay).
+//! 27 overnight shows 27 in Settings ▸ Cast). One physical TV that speaks several protocols (an
+//! LG with AirPlay and DLNA, a Sony with Cast and DLNA) is listed once: the devices at one
+//! address are one TV, shown as the one used before, else the one paired, else by protocol
+//! (Cast > DLNA > third-party AirPlay; DESIGN §40 §6 "Merging").
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -46,11 +48,23 @@ impl std::fmt::Debug for Registry {
     }
 }
 
+/// Which of one TV's devices is its row (lowest first): one used before, then one paired, then
+/// Apple's own receivers and Google Cast, DLNA, a third-party AirPlay TV.
+fn merge_rank(d: &Device) -> (bool, bool, u8) {
+    let protocol = match d.kind {
+        ReceiverKind::AppleTv | ReceiverKind::Mac | ReceiverKind::Chromecast => 0,
+        ReceiverKind::Dlna => 1,
+        ReceiverKind::AirPlayTv => 2,
+    };
+    (d.last_used.is_none(), !matches!(d.pairing, Pairing::Paired(_)), protocol)
+}
+
 /// The kind of a stored device (the table keeps the model, not the kind): an Apple TV by its
 /// model (VioletRelay's detection, §7.7), any other AirPlay receiver is a third-party TV.
 fn stored_kind(protocol: Protocol, model: Option<&str>) -> ReceiverKind {
     match protocol {
         Protocol::AirPlay if model.is_some_and(|m| m.starts_with("AppleTV")) => ReceiverKind::AppleTv,
+        Protocol::AirPlay if model.is_some_and(crate::cast::airplay::features::is_mac_model) => ReceiverKind::Mac,
         Protocol::AirPlay => ReceiverKind::AirPlayTv,
         Protocol::GoogleCast => ReceiverKind::Chromecast,
         Protocol::Dlna => ReceiverKind::Dlna,
@@ -75,7 +89,9 @@ impl Registry {
             let mut device = Device::new(row.id, &row.name, kind, row.protocol);
             device.model = row.model;
             device.os_version = row.os_version;
-            device.pairing = pairing.unwrap_or(Pairing::Required);
+            // only AirPlay pairs (and a Mac pairs transiently, each session)
+            let needs_pin = row.protocol == Protocol::AirPlay && kind != ReceiverKind::Mac;
+            device.pairing = pairing.unwrap_or(if needs_pin { Pairing::Required } else { Pairing::NotNeeded });
             device.available = false;
             device.last_used = row.last_used;
             device.addr = row.last_addr;
@@ -107,6 +123,9 @@ impl Registry {
         if !s.ids.is_empty() {
             d.ids = s.ids;
         }
+        if s.dlna.is_some() {
+            d.dlna = s.dlna;
+        }
         if !matches!(d.pairing, Pairing::Paired(_)) {
             d.pairing = if s.pairing_required { Pairing::Required } else { Pairing::NotNeeded };
         }
@@ -124,10 +143,17 @@ impl Registry {
         }
     }
 
-    /// The list the picker, Settings and the agent show, Apple TVs and third-party AirPlay TVs
-    /// alike: most recently used first, then the ones on the network, then by name.
+    /// The list the picker, Settings and the agent show, every kind alike: most recently used
+    /// first, then the ones on the network, then by name; one row per TV (module docs).
     pub fn list(&self) -> Vec<Device> {
         let mut out: Vec<Device> = self.entries.values().map(|e| e.device.clone()).collect();
+        // the row kept for a TV with several protocols sorts first among them
+        out.sort_by_key(merge_rank);
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|d| match d.addr.filter(|_| d.available) {
+            Some(a) => seen.insert(a.ip()),
+            None => true,
+        });
         out.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(b.available.cmp(&a.available)).then_with(|| a.name.cmp(&b.name)).then(a.id.cmp(&b.id)));
         out
     }
@@ -205,7 +231,14 @@ impl Registry {
     pub fn offer(&self) -> Option<SetupOffer> {
         self.list()
             .into_iter()
-            .find(|d| d.available && d.protocol == Protocol::AirPlay && d.usability == Usability::Usable && !matches!(d.pairing, Pairing::Paired(_)))
+            .find(|d| {
+                // a Mac pairs by itself each time: nothing to set up
+                d.available
+                    && d.protocol == Protocol::AirPlay
+                    && d.kind != ReceiverKind::Mac
+                    && d.usability == Usability::Usable
+                    && !matches!(d.pairing, Pairing::Paired(_))
+            })
             .map(|d| SetupOffer { device: d.id, name: d.name, kind: d.kind })
     }
 
@@ -234,9 +267,50 @@ mod tests {
             pairing_required: true,
             usability: Usability::Usable,
             manual: false,
-            addr: "192.168.1.5:7000".parse().unwrap(),
+            // one address per TV (a shared one is one TV with several protocols)
+            addr: std::net::SocketAddr::from(([192, 168, 1, stable.bytes().fold(0u8, |a, b| a.wrapping_add(b))], 7000)),
             ids: Default::default(),
+            dlna: None,
         }
+    }
+
+    /// One TV seen over AirPlay (a Hisense, third-party) and DLNA at one address is one row:
+    /// DLNA's, until the AirPlay one is paired or used; a Google Cast device beats DLNA; another
+    /// TV isn't touched, nor a TV that isn't on the network.
+    #[test]
+    fn one_tv_with_several_protocols_is_one_row() {
+        let at = |s: Sighting, ip: [u8; 4]| Sighting { addr: std::net::SocketAddr::from((ip, 7000)), ..s };
+        let airplay = at(sighting("pi-lg", "Kitchen TV", ReceiverKind::AirPlayTv), [192, 168, 1, 40]);
+        let dlna = Sighting {
+            id: DeviceId::derive("dlna", "uuid:lg"),
+            key: "dlna:uuid:lg".into(),
+            kind: ReceiverKind::Dlna,
+            protocol: Protocol::Dlna,
+            pairing_required: false,
+            ..at(sighting("x", "[LG] webOS TV", ReceiverKind::AirPlayTv), [192, 168, 1, 40])
+        };
+        let cast = Sighting {
+            id: DeviceId::derive("googlecast", "abc"),
+            kind: ReceiverKind::Chromecast,
+            protocol: Protocol::GoogleCast,
+            ..at(sighting("y", "Kitchen TV (Cast)", ReceiverKind::AirPlayTv), [192, 168, 1, 40])
+        };
+        let other = at(sighting("pi-den", "Den", ReceiverKind::AppleTv), [192, 168, 1, 41]);
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        for s in [airplay.clone(), dlna.clone(), other.clone()] {
+            r.found(s, t0);
+        }
+        let ids = |r: &Registry| r.list().into_iter().map(|d| d.id).collect::<Vec<_>>();
+        assert_eq!(ids(&r), [other.id, dlna.id], "DLNA over a third-party AirPlay TV");
+        r.paired(airplay.id, PeerCredentials { peer_id: "lg".into(), peer_ltpk: [1; 32], variant: PairVariant::Hkp3 });
+        assert_eq!(ids(&r), [other.id, airplay.id], "a paired AirPlay TV keeps its row");
+        r.found(cast.clone(), t0);
+        assert_eq!(ids(&r), [other.id, airplay.id], "paired still wins");
+        r.used(cast.id, 5);
+        assert_eq!(ids(&r), [cast.id, other.id], "the one used before, listed first");
+        r.gone(&cast.key);
+        assert_eq!(ids(&r).len(), 3, "a TV not on the network merges with nothing");
     }
 
     /// A paired TV from the store stays paired when discovery finds it again, becomes available

@@ -1768,7 +1768,7 @@ Use a profile with a playlist and at least one favourite channel.
   start, Alt+2. **Expect:** the first favourites list with channels opens; the guide shows it
   too. Remove every favourite channel, quit and start again: All channels.
 
-## 30. Casting to the Apple TV (DESIGN §40; cast design §18)
+## 30. Casting to the Apple TV, a Mac, Google Cast and DLNA (DESIGN §40; cast design §18, Appendix E)
 
 Run these once against the real Apple TV ("Living Room", 192.168.1.5) on the release build, in
 the **default profile** (pairing and the firewall rule belong to this computer). Casting ships
@@ -1915,6 +1915,41 @@ behind `cast::ENABLED` (`src/cast/mod.rs`); the build under test has it on.
     copied or as AC-3 5.1), the segments and their target duration, how far behind live, and
     for the film where its position comes from. A moved channel says the probe was skipped.
     The programme banner shows now / next and the progress as during local play.
+
+- [ ] **19. A Mac** (cast design Appendix E; never run on real hardware before this):
+  - **Do:** on a Mac (macOS 12 or later): System Settings ▸ General ▸ AirDrop & Handoff ▸
+    AirPlay Receiver on, *Allow AirPlay for* **Current User**; open the picker. Then **Anyone on
+    the Same Network**, Require Password off; cast a live channel, then a film; pause, seek,
+    Play here. Then turn Require Password on.
+  - **Expect:** with Current User the Mac is greyed, "Only its own user", with the setting hint;
+    with Anyone it casts with no code (the log: `pairing=transient`, a transient pair-setup with
+    `X-Apple-HKP: 4`, no pin-start, no pair-verify), full screen on the Mac, surround on a 5.1
+    film, positions on the card. With a password it is greyed, "Password required". If it
+    connects but plays nothing, keep a `TUNER_CAST_TRACE=1` transcript: the play queue on a Mac
+    is the open question.
+- [ ] **20. A Chromecast or Google TV** (Google Cast; Appendix E):
+  - **Do:** with a Chromecast (any) or a Chromecast with Google TV / TV with Cast built in on the
+    network, open the picker; cast a live channel, zap twice, cast an HEVC film, seek, pause,
+    change Tuner's volume, stop from the TV's remote; then cast again and press Home on the
+    remote.
+  - **Expect:** listed with its model ("Chromecast", or "<model> (Google Cast)"), no code, no
+    speakers or groups. The Default Media Receiver starts and plays within ~15 s; a zap is a new
+    LOAD on the same app (no relaunch); a first-generation Chromecast gets HEVC and 1080p50
+    converted, a Google TV copies them; Tuner's volume moves the TV's; the remote's stop and
+    Home end casting quietly (*Play here* / *Cast again*). If the TV plays nothing, the log
+    (`RUST_LOG=tuner=info,tuner::cast=debug`) has its LOAD answer.
+- [ ] **21. A DLNA TV** (DLNA; Appendix E):
+  - **Do:** with a DLNA TV (a Samsung or LG from before AirPlay, Kodi with UPnP renderer on) on
+    the network and ufw on, open the picker (wait up to 10 s); cast a live channel for 10
+    minutes, zap, pause for 2 minutes and resume, cast a film, seek in Tuner, let a short
+    catch-up programme play to its end, change Tuner's volume, stop from the TV's remote.
+  - **Expect:** found with ufw on and no new rule (its announcement, or the subnet sweep), named
+    "<maker> <model> (DLNA)", one row for a TV that also speaks AirPlay or Cast. The TV plays
+    the stream (`stream.ts`, `video/mpeg`) within ~15 s; zaps and seeks start it again; the
+    pause holds and resumes (a live pause beyond ~80 s resumes at the live point); the
+    programme's end is *Ended* and Up next follows; the volume follows; the remote's stop ends
+    casting quietly. Note the TV's model and whether it took the chunked stream; a TV that
+    refuses it (or the DIDL) is the open question.
 
 ## 31. Updates: a real update from vN to vN+1 (DESIGN §41)
 

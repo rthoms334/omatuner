@@ -1,7 +1,7 @@
-//! Casting to TVs (DESIGN §40): AirPlay to the Apple TV first, Google Cast (Phase 2) and DLNA
-//! (Phase 3) as further [`receiver::Backend`]s. The skeleton (CAST-0) froze this file, the value
-//! types in `model::cast`, the player contract in `player::remote`, and the APIs of `airplay`,
-//! `relay` and `firewall`; the work items fill the bodies.
+//! Casting to TVs (DESIGN §40): AirPlay (Apple TVs, third-party AirPlay TVs, Macs), Google Cast
+//! and DLNA, each a [`receiver::Backend`] on the one relay. The skeleton (CAST-0) froze this
+//! file, the value types in `model::cast`, the player contract in `player::remote`, and the APIs
+//! of `airplay`, `relay` and `firewall`; the work items fill the bodies.
 //!
 //! ```text
 //!  UI / agent ──CastHandle (devices, pairing, firewall, test on TV; polled per frame)──┐
@@ -9,6 +9,7 @@
 //!     ▲ RemoteEvent (crossbeam)   │ RemoteCmd (tokio mpsc)
 //!     └──────── session task (one per cast): receiver::Backend + relay::RelaySession
 //!                 ├─ AirPlay client: :7000 control connection, event channel, feedback
+//!                 ├─ (or) Google Cast client: TLS :8009 / DLNA client: SOAP polls
 //!                 └─ relay: loopback upstream proxy → ffprobe / ffmpeg → LAN server :47800
 //! ```
 //! OWNERS (DESIGN §40 §15.2):
@@ -21,6 +22,9 @@
 //! * CAST-6: `service.rs` (implements [`CastApi`] and `player::remote::CastConnector`),
 //!   `session.rs`, `discovery.rs`, `registry.rs`, `inhibit.rs`, `store::cast`.
 //! * CAST-7: `firewall/{ufw,allow}.rs` and the bodies in `firewall/mod.rs`.
+//! * Revision 5 (cast design Appendix E): `googlecast/`, `dlna/`, the Mac's transient pairing in
+//!   `airplay/`, and their seams (the `Backend` variants, `LoadReq::fmp4`, `RelayConfig::stream`,
+//!   `LoadSpec::model`, the relay's `stream.ts`).
 //!
 //! Rules: the TV never gets a provider URL (Tuner always relays); casting never moves Tuner's
 //! window; device text is data (sanitized, never in error copy); no address leaves this module
@@ -28,7 +32,9 @@
 
 pub mod airplay;
 pub mod discovery;
+pub mod dlna;
 pub mod firewall;
+pub mod googlecast;
 pub mod inhibit;
 pub mod receiver;
 pub mod registry;
@@ -64,9 +70,7 @@ pub fn on(cfg: &crate::config::Config) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     AirPlay,
-    /// Phase 2.
     GoogleCast,
-    /// Phase 3.
     Dlna,
 }
 
@@ -118,10 +122,39 @@ pub enum Pairing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Usability {
     Usable,
-    /// A Mac receiver: "Mac · Can't cast to Macs".
-    Mac,
+    /// A Mac whose AirPlay Receiver allows only its own user (`act=2`, "Current User"): no other
+    /// sender can cast to it. "Only this Mac's user", with the setting hint.
+    CurrentUser,
+    /// A Mac whose AirPlay Receiver asks for a password (status flag 0x80): Tuner has no
+    /// password entry yet. "Password required", with the setting hint.
+    Password,
     /// `acl=1` (Allow Access: Home only): "Same Home only", with the setting hint.
     HomeOnly,
+}
+
+impl Usability {
+    /// Why a greyed device can't be chosen (the picker's and Settings' second line); `None` when
+    /// it can.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Usability::Usable => None,
+            Usability::CurrentUser => Some("Only its own user"),
+            Usability::Password => Some("Password required"),
+            Usability::HomeOnly => Some("Same Home only"),
+        }
+    }
+
+    /// The setting that would let a greyed device through (the picker's tooltip).
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            Usability::Usable => None,
+            Usability::CurrentUser => {
+                Some("On the Mac: System Settings ▸ General ▸ AirDrop & Handoff ▸ Allow AirPlay for ▸ Anyone on the Same Network.")
+            }
+            Usability::Password => Some("On the Mac: System Settings ▸ General ▸ AirDrop & Handoff ▸ turn off Require Password."),
+            Usability::HomeOnly => Some("On the Apple TV: Settings ▸ AirPlay and HomeKit ▸ Allow Access ▸ Anyone on the Same Network."),
+        }
+    }
 }
 
 /// One receiver as the UI and the agent see it: no address (DESIGN §40 §6). Device strings are
@@ -151,6 +184,8 @@ pub struct Device {
     /// Its TXT identifiers (a third-party TV's `channelID` and `ClockPorts` key, §7.7), from this
     /// run's discovery. Private to the crate, like the address.
     pub(crate) ids: airplay::features::ReceiverIds,
+    /// A DLNA renderer's control URLs, from this run's discovery (crate only, like the address).
+    pub(crate) dlna: Option<dlna::Control>,
 }
 
 impl Device {
@@ -171,6 +206,7 @@ impl Device {
             last_used: None,
             addr: None,
             ids: airplay::features::ReceiverIds::default(),
+            dlna: None,
         }
     }
 
@@ -207,10 +243,38 @@ impl Device {
                 (None, Some(model)) => format!("AirPlay TV {model}"),
                 (None, None) => "AirPlay TV".to_owned(),
             },
-            ReceiverKind::Chromecast => "Chromecast".to_owned(),
-            ReceiverKind::Dlna => "DLNA TV".to_owned(),
+            ReceiverKind::Mac => self.model.as_deref().and_then(mac_name).unwrap_or("Mac").to_owned(),
+            ReceiverKind::Chromecast => match self.model.as_deref() {
+                // a Chromecast says so; a TV with Cast built in is named by its model
+                Some(m) if m.to_lowercase().contains("chromecast") || m.starts_with("Google") => m.to_owned(),
+                Some(m) => format!("{m} (Google Cast)"),
+                None => "Google Cast".to_owned(),
+            },
+            ReceiverKind::Dlna => match (self.manufacturer.as_deref(), self.model.as_deref()) {
+                (Some(m), Some(model)) if model.to_lowercase().starts_with(&m.to_lowercase()) => format!("{model} (DLNA)"),
+                (Some(m), Some(model)) => format!("{m} {model} (DLNA)"),
+                (Some(m), None) => format!("{m} (DLNA)"),
+                (None, Some(model)) => format!("{model} (DLNA)"),
+                (None, None) => "DLNA TV".to_owned(),
+            },
         }
     }
+}
+
+/// A Mac's family from its model identifier ("MacBookPro18,3" → "MacBook Pro"); `None` for the
+/// newer "Mac14,7" style, which names no family (it is then just "Mac").
+fn mac_name(model: &str) -> Option<&'static str> {
+    let family = model.split(|c: char| c.is_ascii_digit()).next()?;
+    Some(match family {
+        "MacBookPro" => "MacBook Pro",
+        "MacBookAir" => "MacBook Air",
+        "MacBook" => "MacBook",
+        "iMac" => "iMac",
+        "iMacPro" => "iMac Pro",
+        "Macmini" => "Mac mini",
+        "MacPro" => "Mac Pro",
+        _ => return None,
+    })
 }
 
 /// The Apple TV models by identifier (Apple's own names); `None` for one Tuner doesn't know
@@ -269,6 +333,23 @@ pub struct Identity {
     pub sender_mac: [u8; 6],
 }
 
+impl Identity {
+    /// A throwaway identity for a session that stores no pairing (a Mac's transient pairing,
+    /// before any TV was ever paired): random, locally administered MAC; never written.
+    pub fn ephemeral() -> Self {
+        let mut seed = [0u8; 32];
+        let mut id = [0u8; 16];
+        let mut mac = [0u8; 6];
+        for buf in [&mut seed[..], &mut id[..], &mut mac[..]] {
+            aws_lc_rs::rand::fill(buf).expect("the system random number generator");
+        }
+        mac[0] = (mac[0] | 0x02) & 0xfe;
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        let pairing_id = format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
+        Self { pairing_id, seed: Secret::new(seed), sender_mac: mac }
+    }
+}
+
 /// What pairing with one TV stored (`cast_device.peer_id`, `peer_ltpk`, `pair_kind`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerCredentials {
@@ -279,11 +360,14 @@ pub struct PeerCredentials {
     pub variant: PairVariant,
 }
 
-/// Everything a session needs to verify with a paired TV.
+/// Everything a session needs to verify with a TV.
 #[derive(Debug, Clone)]
 pub struct Credentials {
     pub identity: Identity,
-    pub peer: PeerCredentials,
+    /// The stored pairing (pair-verify); `None`: none is needed — a Mac pairs transiently each
+    /// session (DESIGN §40 Appendix E), and Google Cast and DLNA have no pairing (`identity` is
+    /// then unused).
+    pub peer: Option<PeerCredentials>,
 }
 
 /// Why pairing stopped (DESIGN §40 §3.2: each has its own copy in the PIN overlay).

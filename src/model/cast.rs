@@ -101,9 +101,12 @@ pub enum ReceiverKind {
     AppleTv,
     /// A third-party AirPlay TV (Hisense, Samsung, LG): the third-party profile (DESIGN §40 §7.7).
     AirPlayTv,
-    /// Phase 2.
+    /// A Mac's AirPlay Receiver (macOS 12+): the Apple TV's play queue after transient pairing
+    /// (no PIN; DESIGN §40 Appendix E).
+    Mac,
+    /// A Chromecast, Google TV or TV with Cast built in (Google Cast, the Default Media Receiver).
     Chromecast,
-    /// Phase 3.
+    /// A DLNA / UPnP AV MediaRenderer (one continuous MPEG-TS stream).
     Dlna,
 }
 

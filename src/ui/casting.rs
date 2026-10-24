@@ -385,7 +385,7 @@ mod tests {
         let paired = tv(1, Pairing::Paired(PairVariant::Hkp3));
         let open = tv(2, Pairing::NotNeeded);
         let unpaired = tv(3, Pairing::Required);
-        let mac = Device { usability: Usability::Mac, ..tv(4, Pairing::NotNeeded) };
+        let mac = Device { usability: Usability::CurrentUser, ..tv(4, Pairing::NotNeeded) };
         let away = Device { available: false, ..tv(5, Pairing::Paired(PairVariant::Hkp5)) };
         let all = [paired, open, unpaired, mac, away];
         let ids: Vec<u8> = ready(&all).iter().map(|d| d.id.as_bytes()[0]).collect();
