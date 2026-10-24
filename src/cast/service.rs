@@ -97,9 +97,11 @@ pub struct CastDeps {
 
 impl CastDeps {
     /// Production: mDNS and the real receiver, relay and firewall; off the desktop (tests,
-    /// `TUNER_NO_DESKTOP`) nothing that touches the LAN, `systemctl` or `pkexec`.
+    /// `TUNER_NO_DESKTOP`) and in the demo video's recording (`platform::quiet`: its window
+    /// would show the TVs on this computer's network) nothing that touches the LAN,
+    /// `systemctl` or `pkexec`.
     pub fn new(store: Store, config: SharedConfig, paths: AppPaths) -> Self {
-        let (discovery, links): (Arc<dyn Discovery>, Arc<dyn Links>) = if crate::platform::off_desktop() {
+        let (discovery, links): (Arc<dyn Discovery>, Arc<dyn Links>) = if crate::platform::quiet() {
             (Arc::new(NullDiscovery), Arc::new(NullLinks))
         } else {
             (Arc::new(MdnsDiscovery), Arc::new(RealLinks::default()))

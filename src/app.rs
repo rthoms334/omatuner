@@ -3052,6 +3052,10 @@ impl TunerApp {
 
 impl eframe::App for TunerApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // the screenshot script's window counts as focused (recorded off screen, DESIGN §23.1)
+        if let Some(d) = &self.devshot {
+            d.hold_focus(raw);
+        }
         // before the screenshot script injects its clicks: those are never dropped
         self.click_guard.filter(ctx, raw);
         if let Some(mut d) = self.devshot.take() {

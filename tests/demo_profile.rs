@@ -1,7 +1,8 @@
-//! The screenshot demo profile (`examples/demo_profile.rs`) builds through the real import
-//! jobs and gives the app what the README shots need: three playlists, stacks across and
-//! inside playlists, country-tagged categories, a guide, quality badges, user data and the v0.2
-//! features (Up next, Following, reminders, Guide fixes, multi-view's connection limits).
+//! The demo profile (`examples/demo_profile.rs`, the README's demo video) builds through the
+//! real import jobs and gives the app what the video shows: three playlists, stacks across and
+//! inside playlists, country-tagged categories, a guide with a match on now, quality badges,
+//! user data, Up next, Following, reminders, downloads, Guide fixes and multi-view's
+//! connection limits.
 
 #[path = "../examples/demo_profile.rs"]
 #[allow(dead_code)]
@@ -21,9 +22,9 @@ fn demo_profile_builds_a_library_with_stacks() {
     assert_eq!(lib.eligible(ItemKind::Movie).len(), 2, "Harbor Free has no movies");
     assert!(s.channels >= 55 && s.programmes > 1000, "{}", s);
 
-    // "The Keeper of Wren Point": EN + FR in Northwind, 4K EN in Aurora → one stack of three
+    // Metropolis: EN + DE in Northwind, 4K EN in Aurora → one stack of three
     let movies = &lib.vod.movies;
-    let keeper = movies.iter().position(|m| m.name.contains("Keeper of Wren Point")).expect("movie") as u32;
+    let keeper = movies.iter().position(|m| m.name.contains("Metropolis")).expect("movie") as u32;
     let stack = lib.vod.stacks(true).stack_of(keeper).expect("stacked");
     assert_eq!(lib.vod.stacks(true).members(stack).len(), 3);
     assert!(lib.vod.stacks(false).len() >= 2, "series stack too");
@@ -58,11 +59,17 @@ fn demo_profile_builds_a_library_with_stacks() {
     let soon = tuner::model::now() + 3600;
     assert_eq!(n(&format!("SELECT count(*) FROM reminder WHERE start - CASE WHEN lead_s > 0 THEN lead_s ELSE 0 END < {soon}")), 0);
 
-    // Up next: the trilogy (three titles, not one stack) and an episode, the first film played
+    // Up next: Keaton's three (three titles, not one stack) and an episode, the first film played
     let rows = tuner::store::queue::load(&c).unwrap();
     assert_eq!(rows.len(), 4);
     assert_eq!(rows.iter().filter(|r| r.state == tuner::queue::RowState::Played).count(), 1);
-    let trilogy: Vec<u32> = movies.iter().enumerate().filter(|(_, m)| m.name.contains("Starling Bay")).map(|(i, _)| i as u32).collect();
+    let trilogy: Vec<u32> = movies
+        .iter()
+        .enumerate()
+        // smart names drop a title's last full stop ("Sherlock Jr")
+        .filter(|(_, m)| demo::UP_NEXT.iter().any(|t| m.name.starts_with(t.trim_end_matches('.'))))
+        .map(|(i, _)| i as u32)
+        .collect();
     let stacks: std::collections::HashSet<_> = trilogy.iter().map(|i| lib.vod.stacks(true).stack_of(*i).map_or(u32::MAX - i, |s| s.0)).collect();
     assert_eq!(stacks.len(), 3, "the three films are separate titles");
 
@@ -80,6 +87,24 @@ fn demo_profile_builds_a_library_with_stacks() {
     let m3u = std::fs::read_to_string(profile.join("demo/northwind.m3u")).unwrap();
     let url_after = |name: &str| m3u.lines().skip_while(|l| !l.contains(&format!(",{name}"))).nth(1).unwrap().to_string();
     assert!(url_after("Polar Nature").ends_with("/earth.mp4") && url_after("Lumen Docs").ends_with("/launch.mp4"));
+
+    // downloads: two series' episodes, films, a recording and a scheduled one, nothing running
+    assert_eq!(n("SELECT count(*) FROM download"), 10);
+    assert_eq!(n("SELECT count(*) FROM download WHERE state = 'done'"), 7);
+    assert_eq!(n("SELECT count(*) FROM download WHERE state IN ('running', 'waiting')"), 0);
+    assert_eq!(n("SELECT count(DISTINCT json_extract(fp, '$.download_series_key')) FROM download WHERE kind = 'episode'"), 2);
+    assert_eq!(n("SELECT count(*) FROM download WHERE kind IN ('live', 'catchup')"), 2);
+
+    // the agent's match is on now
+    let now = tuner::model::now();
+    let live: i64 = c
+        .query_row(
+            "SELECT count(*) FROM programme WHERE title = ?1 AND start <= ?2 AND stop > ?2 + 3600",
+            rusqlite::params![demo::LIVE_MATCH.1, now],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(live >= 1, "the live match is on for at least an hour");
 
     let refs = std::fs::read_to_string(profile.join("demo/refs.env")).unwrap();
     assert!(refs.contains("NORTHWIND_ID=") && refs.contains("PLAY_DOCS='"), "{refs}");

@@ -257,7 +257,7 @@ Every row is one work package's territory (§24.2 is the authoritative ownership
 | `theme/**`, `fonts.rs` | WP-01 | Theme parsing/tokens/egui mapping (implemented core), live reload, fonts + fallbacks + RTL helper. |
 | `ui/scope.rs`, `ui/widgets/scope_bar.rs`, `ui/overlays/playlists.rs` | §29 | Which playlist a screen shows: eligibility, the stored scope, look-alikes and free colours; the scope bar / button / stripe; the Alt+P picker and a tab's menu. |
 | `agent/**` (`proto`, `shared`, `server`, `tools`, `client`, `mcp`) | §30 | Agent control: IPC v2 protocol, the running app's handler, the `tuner mcp` stdio MCP server and its tools. |
-| `devshot.rs`, `examples/demo_profile.rs`, `scripts/screenshots.sh` | dev tooling | README screenshots: env-only capture driver, made-up demo profile, capture script (§23.1). |
+| `devshot.rs`, `examples/demo_profile.rs`, `scripts/demo-video.sh` (+ `demo-capture.py`, `demo-agent.py`) | dev tooling | README demo video: env-only scripting driver, demo profile, recording script (§23.1). |
 
 Cross-module contracts worth repeating:
 * `UiCtx` (ui/mod.rs) is the only thing screens get; config changes go through
@@ -2570,8 +2570,8 @@ Type), `PlaylistFile(path)` (drag & drop / `tuner file.m3u`; Details with the na
     drag (moves > 6 px) is delivered at once, so scrollbars, sliders, the reorder grips,
     multi-view swaps and the pop-out's window move work in an unfocused window too; one held
     still for > 0.8 s does nothing (it isn't a click). Pointer motion always passes, so hover
-    keeps pointing. The developer screenshot
-    driver's injected clicks come after the guard and are never dropped.
+    keeps pointing. The developer scripting driver's (`devshot`)
+    injected clicks come after the guard and are never dropped.
   * Clickable widgets show the pointing hand; Settings pages light on hover while the keyboard
     cursor is in the page's content (never a second cursor); the onboarding choices move the
     focus with real pointer motion, like menus; below Wide one click on a Movies / Series
@@ -3739,49 +3739,115 @@ tests, any process that built a `TestUi` — it calls `platform::keep_off_deskto
 `TUNER_NO_DESKTOP` set) makes `hypr::focus_self` a no-op and lets notifications reach only an
 explicit test bus.
 
-### 23.1 Dev notes: README screenshots
+### 23.1 Dev notes: README demo video
 
-`scripts/screenshots.sh [shot…]` regenerates `docs/screenshots/*.png`. The repository is
-public, so every image shows made-up content only:
+`scripts/demo-video.sh [scene…]` records the README's demo video: a silent tour of about 90 s,
+one short scene per feature under a caption, between two title cards. It runs unattended and
+off screen (below), and writes both files the README uses, committed: `docs/tuner-demo.mp4`
+(H.264, 1440 px wide, silent, two-pass to stay under 9.5 MB) and `docs/demo-preview.webp` (a
+~12 s looping excerpt, 880 px wide: the README's top image, linking to the video). The
+repository is public, so the video shows only made-up or public-domain content:
 
-* **Demo profile** — `cargo run --example demo_profile -- <dir> [--media <file>] [--media2 <file>] [--silent]`:
+* **Demo profile** — `cargo run --example demo_profile -- <dir> [--media <file>] [--media2 <file>] [--art <dir>] [--silent]`:
   three fictional playlists (Northwind, Aurora, Harbor Free; distinct colours) as local M3U
-  files imported by the real `RefreshSource` job, ~60 channels with quality badges in
+  files imported by the real `RefreshSource` job, ~60 made-up channels with quality badges in
   country-tagged categories (`UK | News`, `FR | Cinéma`…), a guide from an XMLTV file
   (`RefreshEpg`) covering yesterday 06:00 to three days ahead (with fixed football fixtures
-  tomorrow and the day after), movies and series whose titles repeat across (and inside)
-  playlists so "All playlists" stacks them, details written with
-  `store::import::store_movie_details`, and favourites, history, progress and reminders (one an
-  automatic switch) through `store::user`. For the v0.2 shots: Up next (a film trilogy and an
-  episode, `store::queue`), three Following rules (a team, a daily news flash on a bulletin
-  that isn't due within the next three hours, a listed show; evaluated by `EvaluateFollows`),
-  two channels no guide lists and a "+1" channel (Guide fixes), and a one-connection limit on
-  Northwind and Aurora (multi-view takes the second picture's copy from the other playlist). Logos (monograms) and posters/backdrops (gradient landscapes + title)
-  are rendered with resvg using egui's bundled fonts and written into the profile's image
-  cache under `https://img.tuner-demo.invalid/…` URLs, which are never fetched. Content is
-  seeded; only the guide follows today's date. `demo/refs.env` names playlist ids and `--play`
-  references for the script. `tests/demo_profile.rs` builds it and checks the library.
-* **Capture** (`src/devshot.rs`, environment only, nothing in `--help`):
-  `TUNER_SCREENSHOT=<png>` captures the window with `ViewportCommand::Screenshot` and exits;
-  `TUNER_SCREENSHOT_SIZE=WxH` first floats, sizes and centres the window over Hyprland IPC
-  (`platform::popout::Hypr::float_centred`, found by pid); `TUNER_SCREENSHOT_SCRIPT` runs
-  steps (`view:`, `play:`, `key:` — a plain printable key also sends its `Text`, as a
-  keyboard does —, `text:`, `move:`, `click:`, `size:`, `categories:`, `wait:`) 0.35 s apart once the first library is in and the window has its size;
-  `TUNER_SCREENSHOT_AFTER` (default 2 s) waits after the last step. The PNG is scaled to the
-  window's logical size, so the monitor scale doesn't change the result.
+  tomorrow and the day after, and `LIVE_MATCH`, on from the last half hour but one when the
+  profile is built, for the agent scene). The films and series are real US public-domain
+  titles (`MOVIES`: pre-1931 releases and films whose copyright wasn't renewed or that carried
+  no notice; `SERIES`: episodes whose copyright wasn't renewed, checked against the Copyright
+  Office's renewal records) with their year, length, genre, director and leads; the plots are
+  written for the demo. They repeat across (and inside) playlists so "All playlists" stacks them
+  (Metropolis: English and German copies plus a 4K one). Details go in with
+  `store::import::store_movie_details`; favourites, history, progress and reminders (one an
+  automatic switch) through `store::user`; Up next (Buster Keaton's three and an episode,
+  `store::queue`); a watchlist; new episodes (two of The Beverly Hillbillies, on the watchlist,
+  held back while `store::new_episodes::check` baselines the title, then put back and found
+  by a second check: Home's row, "● New" on the entry, "2 new episodes" on its page; marked
+  announced, the first-run card answered); three Following rules (a team, a daily news flash on a
+  bulletin that isn't due within the next three hours, a listed show; evaluated by
+  `EvaluateFollows`); downloads planned by `downloads::planning::new_job` (two series'
+  episodes, films, a recording done and one scheduled; finished ones are links to `--media`,
+  the others paused, so nothing fetches); two channels no guide lists and a "+1" channel
+  (Guide fixes); a one-connection limit on Northwind and Aurora (multi-view takes the second
+  picture's copy from the other playlist); and `[agents]` and `[cast]` set so the profile
+  never looks at the agents installed on the computer nor offers to set up a TV. Logos (monograms) are rendered with resvg using egui's
+  bundled fonts; posters and backdrops come from `--art` (below), else are generated
+  (gradient landscapes + title); all go into the profile's image cache under
+  `https://img.tuner-demo.invalid/…` URLs, which are never fetched. `demo/refs.env` names
+  playlist ids and `--play` references for the script. `tests/demo_profile.rs` builds it and
+  checks the library.
+* **Artwork** — `docs/demo-media.tsv` lists every file the video uses with its source page,
+  licence and sha256: posters and stills from Wikimedia Commons, each marked public domain on
+  Commons, and the NASA clips. The script downloads them into `target/demo-video/media/`
+  (sha256-checked; a changed or missing file is left out and that title keeps a generated
+  poster; never committed) and cuts posters to 400×600 (a landscape one sits on a blurred copy
+  of itself) and stills to 1280×720 backdrops (a title without one gets its poster, blurred).
+* **Scripting** (`src/devshot.rs`, environment only, nothing in `--help`):
+  `TUNER_SCREENSHOT=<png>` captures the window with `ViewportCommand::Screenshot` at the end
+  and exits; `TUNER_SCREENSHOT_SIZE=WxH` first floats, sizes and centres the window over
+  Hyprland IPC (`platform::popout::Hypr::float_centred`, found by pid);
+  `TUNER_SCREENSHOT_SCRIPT` runs steps (`view:`, `play:`, `key:` — a plain printable key also
+  sends its `Text`, as a keyboard does —, `text:`, `move:`, `click:`, `size:`, `categories:`,
+  `mark:`, `wait:`) 0.35 s apart once the first library is in and the window has its size;
+  `mark:<label>` appends the label and the wall-clock time in µs to
+  `TUNER_SCREENSHOT_MARKS`; `TUNER_SCREENSHOT_AFTER` (default 2 s) waits after the last step.
+  Keys and pointer moves are injected into egui's input, never sent through the compositor,
+  and the window counts as focused while the script runs (`Driver::hold_focus`: it never has
+  the keyboard, and egui ignores typing into a text field of an unfocused window). With
+  `TUNER_SCREENSHOT` set the process keeps quiet (`platform::keep_quiet`): no focus requests
+  (`hypr::focus_self`, which an agent's play or a reminder would make), no desktop
+  notifications and no TV discovery (the video would name the TVs on the network).
+* **Off screen** — the script adds a virtual Hyprland output (`hyprctl output create headless
+  TUNERDEMO`, scale 1.5, at -20000,-20000 so the pointer can't reach it and no monitor of the
+  user's moves) after a workspace rule binding the workspace `tuner-demo` to it as its default
+  (so it never takes a numbered workspace), and removes both on exit, Ctrl+C or an error
+  included: the output goes (after any of the script's windows still on it, which would
+  otherwise move to the user's screen), and the rule is disabled through its Lua handle (the
+  `tuner_demo` global, reused next time). These are runtime changes; the monitor rule naming
+  `TUNERDEMO` stays until the next config reload, harmlessly, and `hyprctl reload` isn't used,
+  since it would also drop the user's own runtime changes. Hyprland 0.56 draws its software
+  cursor on a headless output at the pointer's own coordinates, so the output has a reserved
+  band as tall as the user's monitors above the stage area (the pointer never shows). A lock
+  screen covers every output, the virtual one too: the script won't start while the session
+  is locked (Hyprland lists `LOCK` in a monitor's `solitaryBlockedBy`), the demo windows
+  inhibit idle (window rule) and a scene that ends locked stops the run. The user's active
+  window and workspace are compared before and after, with a warning when they differ.
+* **Recording** — each scene runs Tuner on a fresh copy of the profile (the Following scene
+  continues the agent scene's), started through Hyprland's `exec_cmd` with rules that follow
+  its pid (`workspace = "name:tuner-demo silent"`, `no_initial_focus`, `no_focus`,
+  `idle_inhibit = "always"`, opaque), over a foot window started the same way and filling the
+  same stage (a dark backdrop, a page of source code for the pop-out, or the agent terminal);
+  the pop-out lands inside the stage (`player.popout_last` in the copy's config). A scene
+  stops unless the demo Tuner's window is on `tuner-demo` on the virtual output.
+  `scripts/demo-capture.py` records the stage at 30 fps with grim (wlr-screencopy, on a region
+  checked to lie inside the virtual output's stage area) into ffmpeg, frame slots filled from
+  the newest grab, and notes frame 0's wall-clock time; gpu-screen-recorder isn't used, since
+  its KMS capture finds no usable card on every machine (Asahi) and its portal capture needs a
+  dialog. The scene is cut between its `mark:in` and `mark:out`.
+* **Agent scene** — `scripts/demo-agent.py` is a scripted MCP client in the terminal: it types
+  the two requests, then makes the calls an agent would against the running demo Tuner through
+  the real `tuner mcp --profile-dir …` (`guide_search` → `play`, then `follow` preview → add
+  after a typed "yes"). Every result shown comes from those calls; only the request text and
+  the one-line replies around the results are scripted. Its client name is generic (Tuner says
+  "your agent"): any MCP client works the same way.
+* **Assembly** — ffmpeg puts each cut under a 120 px caption band (section label in
+  JetBrains Mono, caption in Adwaita Sans, both fading in) and adds the title cards. The
+  captions are the README's feature list.
 * **Fixed theme** — `TUNER_THEME_DIR=<dir>` loads that Omarchy theme directory instead of the
   live one (no `~/.config/omarchy/shell.toml`, rounding 0, no theme watcher). The script uses
-  the bundled fixtures `tests/fixtures/theme/tokyo-night` (dark) and `catppuccin-latte`
-  (light). Fonts still come from fontconfig (Omarchy: JetBrainsMono Nerd Font).
+  the bundled fixture `tests/fixtures/theme/tokyo-night`. Fonts still come from fontconfig
+  (Omarchy: JetBrainsMono Nerd Font).
 * **Video** — public-domain NASA footage (NASA Image and Video Library), no people, captions
   or overlays: 8 s of *Earth Views from the International Space Station* (0:49.3–0:57.3,
   clouds over the limb between two cross-fades) on most channels, and 9.5 s of *Artemis I
   Launch (Press Site)* (0:53–1:02.5, SLS clearing the towers) on the channels in the demo
   profile's `SECOND_CLIP` (`--media2`; Lumen Docs, so multi-view's two pictures differ). The
-  script downloads both 1280×720 sources into `target/screenshots/media/` (sha256-checked,
-  never committed), cuts them with a silent audio track (the Earth Views soundtrack isn't
-  used), and mpv loops them (`loop-file=inf`, `ao=null` with `--silent`). Without a download
-  that channel's clip is an ffmpeg test pattern.
+  script downloads both 1280×720 sources (sha256-checked, never committed), cuts them with a
+  silent audio track (the Earth Views soundtrack isn't used), and mpv loops them
+  (`loop-file=inf`, `ao=null` with `--silent`). Without a download that channel's clip is an
+  ffmpeg test pattern.
 
 ---
 
