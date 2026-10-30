@@ -49,10 +49,14 @@
 //!   provider's error status, `ProviderText` for prose where the stream should be (the
 //!   provider-message trap), and exactly one `UpstreamClosed` per feed ([`Feed::close`]), which
 //!   releases picture A's connection lease.
+//! * **A local file** (a download: its `Playable.url` is a path) is served by the proxy itself at
+//!   `/u/<tok>/f`, by `Range` as a provider serves a film, and the feed reads that as its upstream:
+//!   the tapes, the full-length index and ffmpeg's seeks work on it unchanged.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -171,12 +175,15 @@ impl Proxy {
     pub fn feed(&self, ctx: FeedCtx, url: &Secret<String>, headers: &HttpHeaders, user_agent: &str) -> Arc<Feed> {
         let token = Token::mint();
         let base = format!("http://{}/u/{}", self.addr, token.expose());
+        let file = local_file(url.expose());
+        let url = if file.is_some() { Secret::new(format!("{base}/f")) } else { url.clone() };
         let feed = Arc::new(Feed {
             ctx,
             client: self.client.clone(),
             net: self.net.clone(),
             closing: CancellationToken::new(),
-            url: url.clone(),
+            url,
+            file,
             headers: request_headers(headers, user_agent),
             base: Secret::new(base),
             kind: Mutex::new(Kind::Pending),
@@ -496,6 +503,8 @@ pub struct Feed {
     /// being read, gives up at once.
     closing: CancellationToken,
     url: Secret<String>,
+    /// A download's file, which `url` (the proxy's `/u/<tok>/f`) serves (module docs).
+    file: Option<PathBuf>,
     headers: HeaderMap,
     /// `http://127.0.0.1:P/u/<tok>`: the loopback URL (a bearer token while the session lives).
     base: Secret<String>,
@@ -1251,9 +1260,11 @@ async fn handle(State(feeds): State<Arc<Mutex<Grants<Arc<Feed>>>>>, req: Request
     let path = req.uri().path();
     let Some(rest) = path.strip_prefix("/u/") else { return not_found() };
     let (tok, key) = match rest.split_once('/') {
-        None => (rest, Key::Main),
+        None => (rest, Some(Key::Main)),
+        // a download's own bytes, which its feed reads as its upstream
+        Some((tok, "f")) => (tok, None),
         Some((tok, r)) => match r.strip_prefix("r/").and_then(|n| n.split_once('.').map_or(n, |(n, _)| n).parse::<u32>().ok()) {
-            Some(n) => (tok, Key::Res(n)),
+            Some(n) => (tok, Some(Key::Res(n))),
             None => return not_found(),
         },
     };
@@ -1262,6 +1273,12 @@ async fn handle(State(feeds): State<Arc<Mutex<Grants<Arc<Feed>>>>>, req: Request
         return not_found();
     }
     let range = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let Some(key) = key else {
+        return match &feed.file {
+            Some(file) => serve_file(file, range.as_deref()).await,
+            None => not_found(),
+        };
+    };
     let optional = req.headers().contains_key(OPTIONAL_HEADER);
     let epoch = feed.new_reader();
     let hls = feed.is_hls();
@@ -1277,6 +1294,65 @@ async fn handle(State(feeds): State<Arc<Mutex<Grants<Arc<Feed>>>>>, req: Request
         (false, Key::Res(_)) => not_found(),
         _ => serve_bytes(feed, key, range.as_deref(), epoch, optional).await,
     }
+}
+
+/// The file a `Playable.url` names when it is a path (a download), not a URL.
+fn local_file(url: &str) -> Option<PathBuf> {
+    if url.starts_with("file:") {
+        return url::Url::parse(url).ok()?.to_file_path().ok();
+    }
+    let path = Path::new(url);
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// A download's bytes by `Range`, as a provider serves a film (206, `Content-Range`), so its feed
+/// knows the length and that it seeks.
+async fn serve_file(path: &Path, range: Option<&str>) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let Ok(mut file) = tokio::fs::File::open(path).await else { return not_found() };
+    let Ok(total) = file.metadata().await.map(|m| m.len()) else { return not_found() };
+    let (from, last, partial) = match range.map(|r| parse_range(r, total)) {
+        Some(Range::Bytes(a, b)) => (a, b, true),
+        Some(Range::Unsatisfiable) => {
+            let mut resp = status(StatusCode::RANGE_NOT_SATISFIABLE);
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                resp.headers_mut().insert(header::CONTENT_RANGE, v);
+            }
+            return resp;
+        }
+        _ => (0, total.saturating_sub(1), false),
+    };
+    if from > 0 && file.seek(io::SeekFrom::Start(from)).await.is_err() {
+        return status(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let len = if total == 0 { 0 } else { last + 1 - from };
+    let body = Body::from_stream(futures_util::stream::unfold((file, len), |(mut file, left)| async move {
+        if left == 0 {
+            return None;
+        }
+        let mut buf = vec![0; usize::try_from(left).unwrap_or(READ_CHUNK).min(READ_CHUNK)];
+        match file.read(&mut buf).await {
+            // the file got shorter while it was read
+            Ok(0) => Some((Err(io::Error::from(io::ErrorKind::UnexpectedEof)), (file, 0))),
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), (file, left - n as u64)))
+            }
+            Err(e) => Some((Err(e), (file, 0))),
+        }
+    }));
+    let mut resp = Response::new(body);
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    if partial {
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes {from}-{last}/{total}")) {
+            resp.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+    }
+    resp
 }
 
 /// A stream or an HLS resource from its tape(s), from the requested offset on (`optional`: see
@@ -1463,6 +1539,40 @@ async fn next_chunk(s: &mut ReadState) -> io::Result<Option<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A download's path (or `file:` URL) is served by the proxy itself, by `Range`, so a
+    /// download casts as a film does; anything else is the provider's.
+    #[tokio::test]
+    async fn a_download_is_read_through_the_proxy_by_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("film.mkv");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let file_url = url::Url::from_file_path(&path).unwrap().to_string();
+        assert_eq!(local_file(&file_url).as_deref(), Some(path.as_path()));
+        assert_eq!(local_file("http://provider.example/movie/u/p/1.mkv"), None);
+        assert_eq!(local_file("relative/film.mkv"), None);
+
+        let proxy = Proxy::start().await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ctx = FeedCtx { generation: Arc::new(AtomicU64::new(1)), tx, label: "cast session test".into() };
+        let feed = proxy.feed(ctx, &Secret::new(path.to_string_lossy().into_owned()), &HttpHeaders::default(), "TunerTest/1.0");
+        feed.open(Pick::default()).await;
+        assert!(!feed.failed() && !feed.is_hls());
+        assert!(matches!(rx.try_recv(), Ok(RelayEvent::UpstreamOpened { generation: 1 })));
+        assert_eq!(feed.sized(), Some(data.len() as u64), "a sized file that seeks: the full-length index applies");
+
+        let client = reqwest::Client::new();
+        let whole = client.get(feed.loopback_url().expose()).send().await.unwrap().bytes().await.unwrap();
+        assert_eq!(&whole[..], &data[..]);
+        let tail = client.get(feed.loopback_url().expose()).header(header::RANGE, "bytes=150000-").send().await.unwrap();
+        assert_eq!(tail.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&tail.bytes().await.unwrap()[..], &data[150_000..]);
+        let past = client.get(format!("{}/f", feed.loopback_url().expose())).header(header::RANGE, "bytes=999999-").send().await.unwrap();
+        assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        feed.close(false).await;
+        proxy.shutdown();
+    }
 
     const MASTER: &str = "#EXTM3U\n#EXT-X-VERSION:4\n\
         #EXT-X-STREAM-INF:BANDWIDTH=80000000,RESOLUTION=3840x2160,CODECS=\"vp09.00.50.08,mp4a.40.2\"\nuhd/vp9.m3u8\n\

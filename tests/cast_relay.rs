@@ -1243,6 +1243,34 @@ async fn a_film_reaches_the_tv_whole_and_any_segment_is_made_on_demand_as_the_sa
     }
 }
 
+/// A download (its URL a path on disk) casts as a provider's film does: whole, indexed, from
+/// where it resumes, any segment on demand (the path once went out as a request and failed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_download_reaches_the_tv_whole_from_its_file() {
+    let Some(media) = media() else { return };
+    for (file, length) in [("vod.mp4", 30.0), ("vod.mkv", 30.0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut relay = RelaySession::start(config(&dir, LOOPBACK)).await.unwrap();
+        let mut p = (*playable(PlayableKind::Movie, media.join(file).to_string_lossy().into_owned(), HttpHeaders::default())).clone();
+        p.from_download = true;
+        p.start_at = Some(25.0);
+        let prepared = relay.load(spec(1, Arc::new(p), None)).await.unwrap_or_else(|e| panic!("{file}: {e:?}"));
+        let tv = tv();
+        let text = tv.get(prepared.load.url.expose()).send().await.unwrap().text().await.unwrap();
+        assert!(text.contains("#EXT-X-PLAYLIST-TYPE:VOD\n") && text.ends_with("#EXT-X-ENDLIST\n"), "{file}:\n{text}");
+        assert_eq!(ext_x_start(&text), Some(25.0), "{file}:\n{text}");
+        let segs = vod_segments(&text);
+        let total: f64 = segs.iter().map(|s| s.1).sum();
+        assert!((total - length).abs() < 0.1, "{file}: the film's length, {total}");
+        for (_, _, name) in [&segs[0], segs.last().unwrap()] {
+            let resp = tv.get(format!("{}{name}", base_of(&prepared))).send().await.unwrap();
+            assert_eq!(resp.status(), 200, "{file}: {name}");
+            assert!(!resp.bytes().await.unwrap().is_empty(), "{file}: {name}");
+        }
+        relay.stop(false).await;
+    }
+}
+
 /// A TV that ignores `EXT-X-START` (§8.5): one that fetches where it is told keeps whole
 /// playlists; one whose first segment under a resumed playlist is the film's first is reported
 /// once (`StartIgnored`, with where it should have started), and from then on the session's

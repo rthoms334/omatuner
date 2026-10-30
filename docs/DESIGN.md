@@ -7293,6 +7293,8 @@ overnight window.
 when the window closes and resume when it opens. Recordings consume none of the shared rate
 budget. Downloads and Settings list Keep N rules under “Kept topped up”, with Delete and Undo.
 Forgetting a downloaded film or episode offers to delete its file too, after Confirm.
+A finished download casts to a TV as a provider's film does: the cast relay's loopback proxy
+serves its file by `Range` (`/u/<tok>/f`), and the relay indexes and segments it unchanged.
 
 ### 43.2 Recording and account clashes
 Live HLS adopts the existing rewind store when possible and keeps its segments, keys and
