@@ -3744,8 +3744,9 @@ explicit test bus.
 `scripts/demo-video.sh [scene…]` records the README's demo video: a silent tour of about 90 s,
 one short scene per feature under a caption, between two title cards. It runs unattended and
 off screen (below), and writes both files the README uses, committed: `docs/tuner-demo.mp4`
-(H.264, 1440 px wide, silent, two-pass to stay under 9.5 MB) and `docs/demo-preview.webp` (a
-~12 s looping excerpt, 880 px wide: the README's top image, linking to the video). The
+(H.264 at the stage's own 1920 px, CRF 16, BT.709 tagged, silent) and `docs/demo-preview.webp`
+(the whole video as a looping animated WebP, 1200 px at 12 fps: GitHub plays no committed MP4
+inline, so this is the README's top image, linking to the MP4). The
 repository is public, so the video shows only made-up or public-domain content:
 
 * **Demo profile** — `cargo run --example demo_profile -- <dir> [--media <file>] [--media2 <file>] [--art <dir>] [--silent]`:

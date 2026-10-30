@@ -14,7 +14,7 @@ browser or Electron runtime and no separate player window.
 [![Tuner in 90 seconds: live TV and the guide, multi-view, films and series from every playlist
 in one place, new episodes, downloads, and an AI agent putting the match on](docs/demo-preview.webp)](docs/tuner-demo.mp4)
 
-▶ [Watch the 90-second tour](docs/tuner-demo.mp4)
+▶ [The same tour in full quality (MP4)](docs/tuner-demo.mp4)
 
 - **Watching:** Live TV, with what's on now and next · A guide for every channel · Controls
   that stay out of the way · Two channels side by side · Keep watching while you work
