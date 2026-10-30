@@ -99,6 +99,8 @@ on_tvos_26_and_27!(
     a_failed_replace_restarts_the_session,
     stop_closes_everything,
     third_party_profile,
+    a_mac_pairs_transiently_and_plays,
+    a_mac_wanting_a_password_is_refused,
 );
 
 // ---------------------------------------------------------------------------------------------
@@ -159,7 +161,7 @@ impl Media {
     }
 
     fn req(&self) -> LoadReq {
-        LoadReq { url: Secret::new(self.url()), live: !self.endlist, offset_s: 0.0 }
+        LoadReq { url: Secret::new(self.url()), live: !self.endlist, offset_s: 0.0, fmp4: false }
     }
 }
 
@@ -382,7 +384,7 @@ async fn ladders_to_hkp5(tvos: Tvos) {
     assert_eq!(last.hkp.as_deref(), Some("5"));
     assert_eq!(last.acl.as_deref(), Some(SCREEN_CAPTURE_ACL));
 
-    let creds = Credentials { identity: me, peer };
+    let creds = Credentials { identity: me, peer: Some(peer) };
     let connected = within("connect", Client::connect(fake.addr(), &creds, Profile::AppleTv, &ReceiverIds::default())).await;
     assert!(connected.is_ok(), "verify with HKP 5: {:?}\n{}", connected.err(), fake.dump());
     let verify: Vec<Request> = fake.requests().into_iter().filter(|r| r.uri == "/pair-verify").collect();
@@ -1175,7 +1177,7 @@ async fn interop_our_client_pairs_and_verifies_with_pyatv() {
         within("pair-setup", pairing.finish(&pin)).await.expect("paired with pyatv")
     };
     assert_eq!(peer.peer_id, ready["identifier"].as_str().expect("identifier"));
-    let creds = Credentials { identity: identity(), peer };
+    let creds = Credentials { identity: identity(), peer: Some(peer) };
     let _ = within("connect", Client::connect(addr, &creds, Profile::AppleTv, &ReceiverIds::default())).await;
     next_json(&mut lines, "verified", |v| v["event"] == "verified").await;
     let next = next_json(&mut lines, "an encrypted request", |v| v["event"] == "request" && v["encrypted"] == true).await;
@@ -1202,4 +1204,34 @@ async fn interop_pyatv_pairs_and_verifies_with_the_fake() {
     let info = fake.requests().into_iter().any(|r| r.uri == "/info" && r.encrypted && r.status == 200);
     assert!(info, "an encrypted GET /info\n{}", fake.dump());
     assert!(fake.violations().is_empty(), "{:?}", fake.violations());
+}
+
+/// A Mac's receiver (DESIGN §40 Appendix E): no pin-start (a Mac answers it with 403) and no
+/// pair-verify, but a transient pair-setup (`X-Apple-HKP: 4`, M1 with `Flags 0x10`, PIN 3939,
+/// only M1–M4) whose SRP key turns encryption on; then the Apple TV's session and play queue as
+/// they are, and nothing stored.
+async fn a_mac_pairs_transiently_and_plays(tvos: Tvos) {
+    let fake = FakeAirPlay::start(FakeConfig { transient: true, pin_start_status: 403, ..FakeConfig::new(tvos) });
+    let media = Media::new("tokM1", 3, false);
+    let creds = Credentials { identity: identity(), peer: None };
+    let mut client = match within("Client::connect", Client::connect(fake.addr(), &creds, Profile::AppleTv, &ReceiverIds::default())).await {
+        Ok(c) => c,
+        Err(e) => panic!("connect: {e:?}\n{}", fake.dump()),
+    };
+    assert_eq!(client.info().pairing, None, "nothing paired, nothing stored");
+    play(&fake, &mut client, &media).await;
+    let reqs = fake.requests();
+    let pairing: Vec<&Request> = reqs.iter().filter(|r| r.uri.starts_with("/pair")).collect();
+    assert_eq!(pairing.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(), ["/pair-setup", "/pair-setup"], "M1 and M3 only");
+    assert!(pairing.iter().all(|r| r.header("X-Apple-HKP") == Some("4")), "\n{}", fake.dump());
+    assert!(reqs.iter().any(|r| r.uri == "/command"), "the play queue, as on an Apple TV");
+}
+
+/// A Mac that asks for a password takes no 3939: its M4 is an authentication error, which ends
+/// the connect as a refused pairing (the picker greys such a Mac before it gets here).
+async fn a_mac_wanting_a_password_is_refused(tvos: Tvos) {
+    let fake = FakeAirPlay::start(FakeConfig { transient: true, transient_pin: "hunter2", ..FakeConfig::new(tvos) });
+    let creds = Credentials { identity: identity(), peer: None };
+    let r = within("Client::connect", Client::connect(fake.addr(), &creds, Profile::AppleTv, &ReceiverIds::default())).await;
+    assert_eq!(r.err(), Some(CastErrorKind::PairingRefused));
 }

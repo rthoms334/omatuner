@@ -12,7 +12,7 @@ use super::proto::{
 use super::query::{Fail, Out, Q, channel_ref, clean, parse_ref, when};
 use super::{AgentCommand, AgentPlay, PlayTarget};
 use crate::cast::firewall::{Detection, FirewallState};
-use crate::cast::{Device, Pairing, Protocol};
+use crate::cast::{Device, Pairing};
 use crate::jobs::JobKind;
 use crate::model::{
     CastErrorKind, CastPhase, DeviceId, ItemKind, MediaRef, OpenIn, PlayableKind, ReceiverKind, Reminder, ReminderId, ReminderState, VodKind,
@@ -145,6 +145,7 @@ pub fn kind_name(k: ReceiverKind) -> &'static str {
     match k {
         ReceiverKind::AppleTv => "apple_tv",
         ReceiverKind::AirPlayTv => "airplay_tv",
+        ReceiverKind::Mac => "mac",
         ReceiverKind::Chromecast => "chromecast",
         ReceiverKind::Dlna => "dlna",
     }
@@ -182,9 +183,9 @@ pub enum CastGate {
 pub const REASON_MULTIVIEW: &str = "multiview-on";
 
 /// Whether a cast to `d` can start now, before the item is looked at (DESIGN §40 §12): multi-view
-/// is off, the TV is one Phase 1 casts to (an Apple-made or third-party AirPlay TV that isn't a
-/// Mac, nor "Same Home only"), it is paired, Tuner has seen it, and the firewall isn't known to
-/// block the port *for this TV*.
+/// is off, the TV is one Tuner can choose (not greyed: a Mac that allows only its own user or asks
+/// a password, an Apple TV set to "Same Home only"), it is paired when it pairs, Tuner has seen
+/// it, and the firewall isn't known to block the port *for this TV*.
 ///
 /// `firewall` counts only when it was made toward `d`'s own address and found the network
 /// toward it ([`Detection::state_for`]): ufw rules are scoped by source (`from 192.168.1.0/24`),
@@ -197,10 +198,9 @@ pub fn cast_gate(d: &Device, multiview: bool, firewall: Option<&Detection>) -> C
         std::net::IpAddr::V6(_) => None,
     });
     let firewall = firewall.zip(toward).and_then(|(f, tv)| f.state_for(tv));
-    let phase_one = d.protocol == Protocol::AirPlay && matches!(d.kind, ReceiverKind::AppleTv | ReceiverKind::AirPlayTv);
     if multiview {
         CastGate::Refused(REASON_MULTIVIEW)
-    } else if !phase_one || !d.selectable() {
+    } else if !d.selectable() {
         CastGate::Refused(CastErrorKind::Unsupported.reason())
     } else if d.pairing == Pairing::Required {
         CastGate::PairingRequired
@@ -847,6 +847,7 @@ pub fn error_kind(k: PlayerErrorKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cast::Protocol;
 
     /// DESIGN §30.13's order: an explicit `full_window` (fullscreen), the PIN, the rest of
     /// `open_in`, then no Hyprland, then the setting — which, unasked, plays in a window on
@@ -930,9 +931,11 @@ mod tests {
         let allowed = det(FirewallState::Allowed { ours: true }, LIVING_ROOM);
         let unknown = det(FirewallState::Unknown { why: UnknownWhy::Nftables }, LIVING_ROOM);
         let shadowed = det(FirewallState::Blocked { shadowed: true }, LIVING_ROOM);
-        let mac = Device { usability: Usability::Mac, ..paired.clone() };
+        let mac = Device { usability: Usability::CurrentUser, ..paired.clone() };
         let home_only = Device { usability: Usability::HomeOnly, ..paired.clone() };
-        let chromecast = Device { kind: ReceiverKind::Chromecast, protocol: Protocol::GoogleCast, ..paired.clone() };
+        let chromecast = Device { kind: ReceiverKind::Chromecast, protocol: Protocol::GoogleCast, pairing: Pairing::NotNeeded, ..paired.clone() };
+        let dlna = Device { kind: ReceiverKind::Dlna, protocol: Protocol::Dlna, pairing: Pairing::NotNeeded, ..paired.clone() };
+        let open_mac = Device { kind: ReceiverKind::Mac, pairing: Pairing::NotNeeded, ..paired.clone() };
         let unseen = Device { available: false, ..paired.clone() };
         let unpaired = Device { pairing: Pairing::Required, ..unseen.clone() };
         let cases = [
@@ -943,7 +946,9 @@ mod tests {
             (&paired, true, blocked, CastGate::Refused("multiview-on")),
             (&mac, false, None, CastGate::Refused("cast-unsupported")),
             (&home_only, false, None, CastGate::Refused("cast-unsupported")),
-            (&chromecast, false, None, CastGate::Refused("cast-unsupported")),
+            (&chromecast, false, None, CastGate::Go),
+            (&dlna, false, None, CastGate::Go),
+            (&open_mac, false, None, CastGate::Go),
             (&unpaired, false, blocked, CastGate::PairingRequired),
             (&unseen, false, blocked, CastGate::Refused("cast-unreachable")),
             (&paired, false, blocked, CastGate::Refused("cast-firewall")),

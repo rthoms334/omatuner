@@ -2,8 +2,10 @@
 //! What a receiver is, from its mDNS TXT record or `GET /info` (DESIGN §40 §6, §7.6). OWNER:
 //! CAST-1. `features`/`ft` as `lo,hi` 32-bit words; `flags`/`sf` (TXT 0x18644 and `/info`
 //! statusFlags 0x118644 both decode). Video-capable: bit 0 or bit 49 (pyatv's gate). Pairing
-//! required: `flags & (0x200 | 0x8)` (never 0x8 alone). A Mac (`act=2`, `^Mac\d+,\d+$`): listed,
-//! greyed. `acl=1`: "Same Home only". A non-`AppleTV` model with bit 33: a third-party TV. Versions
+//! required: `flags & (0x200 | 0x8)` (never 0x8 alone). A Mac (a `Mac…` model): transient
+//! pairing, never a PIN, whatever its flags say (a Mac sets 0x200 and answers pin-start with
+//! 403); greyed when it allows only its own user (`act=2`) or asks for a password (0x80).
+//! `acl=1`: "Same Home only". A non-`AppleTV` model with bit 33: a third-party TV. Versions
 //! (`osvers`, `srcvers`, `osBuildVersion`, `sourceVersion`) are for logs, `diagnose` and Settings
 //! only. Every string is device data: sanitized by the caller (`cast::sanitize_name`).
 //!
@@ -14,8 +16,9 @@
 //! `statusFlags` as an integer. Unparseable values read as 0, so a receiver with garbage
 //! features is simply not a video receiver (pyatv raises instead).
 //!
-//! The order of [`classify`]: not video-capable → not listed; a Mac (`act=2` or a `Mac` model)
-//! → greyed "Can't cast to Macs"; an Apple TV (`model` starting `AppleTV`) → usable; any other
+//! The order of [`classify`]: not video-capable → not listed; a Mac (a `Mac` model, with the play
+//! queue, bit 33) → `ReceiverKind::Mac`, no PIN, greyed for `act=2` ("Current User") or a
+//! password; an Apple TV (`model` starting `AppleTV`) → usable; any other
 //! model → a third-party TV (`ReceiverKind::AirPlayTv`, cast with the third-party profile),
 //! listed only with features bit 33 (the play queue). `acl=1` greys an otherwise usable receiver
 //! as "Same Home only".
@@ -34,6 +37,8 @@ pub const VIDEO_V2: u64 = 1 << 49;
 pub const FLAG_PIN_REQUIRED: u64 = 0x8;
 /// Status flag: pairing is required (pyatv `LEGACY_PAIRING_BIT`).
 pub const FLAG_PAIRING: u64 = 0x200;
+/// Status flag: a password is required (pyatv `PASSWORD_BIT`).
+pub const FLAG_PASSWORD: u64 = 0x80;
 
 /// The fields Tuner reads (raw device strings; sanitize before showing).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -184,10 +189,15 @@ pub fn from_info(plist: &bplist::Value) -> AirPlayInfo {
     }
 }
 
-/// pyatv `UNSUPPORTED_MODELS`: `^Mac\d+,\d+$`.
-fn is_mac_model(model: &str) -> bool {
+/// A Mac's model identifier: `Mac14,7` (pyatv `UNSUPPORTED_MODELS`) and the family names before
+/// it (`MacBookPro18,3`, `MacBookAir10,1`, `iMac21,1`, `Macmini9,1`, `MacPro7,1`; pyatv PR 2113).
+pub fn is_mac_model(model: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    model.strip_prefix("Mac").and_then(|rest| rest.split_once(',')).is_some_and(|(major, minor)| digits(major) && digits(minor))
+    ["MacBookPro", "MacBookAir", "MacBook", "iMacPro", "iMac", "Macmini", "MacPro", "Mac"]
+        .iter()
+        .find_map(|family| model.strip_prefix(family))
+        .and_then(|rest| rest.split_once(','))
+        .is_some_and(|(major, minor)| digits(major) && digits(minor))
 }
 
 /// `None`: not a video receiver (not listed).
@@ -197,21 +207,28 @@ pub fn classify(info: &AirPlayInfo) -> Option<Classified> {
     }
     let pairing_required = info.flags & (FLAG_PAIRING | FLAG_PIN_REQUIRED) != 0;
     let model = info.model.as_deref().unwrap_or_default();
-    let mac = info.act == Some(2) || is_mac_model(model);
-    let kind = if mac || model.starts_with("AppleTV") {
+    if is_mac_model(model) {
+        // the play queue is what Tuner drives; a Mac pairs transiently (no PIN) each session
+        if info.features & VIDEO_PLAY_QUEUE == 0 {
+            return None;
+        }
+        let usability = if info.act == Some(2) {
+            Usability::CurrentUser
+        } else if info.flags & FLAG_PASSWORD != 0 {
+            Usability::Password
+        } else {
+            Usability::Usable
+        };
+        return Some(Classified { kind: ReceiverKind::Mac, pairing_required: false, usability });
+    }
+    let kind = if model.starts_with("AppleTV") {
         ReceiverKind::AppleTv
     } else if info.features & VIDEO_PLAY_QUEUE != 0 {
         ReceiverKind::AirPlayTv
     } else {
         return None;
     };
-    let usability = if mac {
-        Usability::Mac
-    } else if info.acl == Some(1) {
-        Usability::HomeOnly
-    } else {
-        Usability::Usable
-    };
+    let usability = if info.acl == Some(1) { Usability::HomeOnly } else { Usability::Usable };
     Some(Classified { kind, pairing_required, usability })
 }
 
@@ -277,12 +294,22 @@ mod tests {
         // 0x8 alone still means pairing; neither bit: not needed
         assert!(classify(&base).unwrap().pairing_required);
         assert!(!classify(&AirPlayInfo { flags: 0x4, ..base.clone() }).unwrap().pairing_required);
-        let mac = AirPlayInfo { model: Some("Mac14,7".into()), ..base.clone() };
-        assert_eq!(classify(&mac).unwrap().usability, Usability::Mac);
-        let act2 = AirPlayInfo { act: Some(2), ..base.clone() };
-        assert_eq!(classify(&act2).unwrap().usability, Usability::Mac);
         assert_eq!(classify(&AirPlayInfo { acl: Some(1), ..base.clone() }).unwrap().usability, Usability::HomeOnly);
-        assert!(!is_mac_model("MacBookPro18,1") && !is_mac_model("Mac14,") && is_mac_model("Mac15,12"));
+        assert!(is_mac_model("MacBookPro18,1") && !is_mac_model("Mac14,") && is_mac_model("Mac15,12"));
+        assert!(is_mac_model("MacBookAir10,1") && is_mac_model("iMac21,1") && is_mac_model("Macmini9,1") && is_mac_model("MacPro7,1"));
+        assert!(!is_mac_model("MacBookPro") && !is_mac_model("Macintosh") && !is_mac_model("AppleTV14,1"));
+
+        // a MacBook Pro's real record (`act=2 acl=0 flags=0x204`, features 0x4A7FCFD5,0xB8154FDE): a
+        // Mac whatever 0x200 says, no PIN, greyed while it allows only its own user
+        let macbook = from_txt(&txt("model=MacBookPro17,1\nact=2\nacl=0\nflags=0x204\nfeatures=0x4A7FCFD5,0xB8154FDE\npi=x\n"));
+        let c = classify(&macbook).unwrap();
+        assert_eq!((c.kind, c.pairing_required, c.usability), (ReceiverKind::Mac, false, Usability::CurrentUser));
+        let anyone = AirPlayInfo { act: Some(0), ..macbook.clone() };
+        assert_eq!(classify(&anyone).unwrap().usability, Usability::Usable, "Anyone on the Same Network");
+        let password = AirPlayInfo { act: Some(0), flags: 0x284, ..macbook.clone() };
+        assert_eq!(classify(&password).unwrap().usability, Usability::Password);
+        let no_queue = AirPlayInfo { features: macbook.features & !VIDEO_PLAY_QUEUE, ..macbook.clone() };
+        assert_eq!(classify(&no_queue), None, "a Mac without the play queue isn't listed");
         // a HomePod (audio only) and a third-party TV without the play queue: not listed
         assert_eq!(classify(&AirPlayInfo { model: Some("AudioAccessory5,1".into()), features: 1 << 9, ..Default::default() }), None);
         assert_eq!(classify(&AirPlayInfo { model: Some("43A5FE".into()), features: VIDEO_V2, ..Default::default() }), None);

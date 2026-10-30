@@ -18,8 +18,11 @@
 //!       the stereo one (rules 2.5, 9.6: separate audio streams; fMP4 segments for every
 //!       rendition): AC-3, E-AC-3 and AAC ≤ 5.1 copied; anything else AC-3 5.1 448k
 //! ```
-//! L1 (byte relay) is Phase 2, and only AirPlay receivers have a profile in Phase 1 (Google Cast
-//! and DLNA plan as `Refuse(Unsupported)` until their phases add one).
+//! Google Cast and DLNA have profiles of their own (DESIGN §40 Appendix E): a Cast device by its
+//! model (a Chromecast of the first three generations takes H.264 up to level 4.1 and no HEVC,
+//! and gets interlaced pictures deinterlaced; an Ultra, a Google TV or a TV with Cast built in
+//! takes HEVC), a DLNA renderer anything a TV decodes from MPEG-TS (H.264, HEVC and MPEG-2, in TS
+//! segments only: they reach it back to back as one stream).
 
 use super::super::{CastErrorKind, CastHints, CastLevel, ReceiverKind};
 use crate::config::{CastConvert, CastInterlaced};
@@ -43,21 +46,48 @@ pub struct Profile {
     /// Interlaced input must be deinterlaced (AirPlay: Apple HLS rule 1.14 "All interlaced
     /// source content MUST be deinterlaced").
     pub deinterlace: bool,
+    /// fMP4 segments play (HEVC goes in them, Apple rule 1.5); `false`: everything in MPEG-TS
+    /// (a DLNA renderer's one stream).
+    pub fmp4: bool,
+    /// A film can reach it as a whole VOD playlist (§8.5); `false`: a growing one.
+    pub full_length: bool,
 }
 
-/// The Apple TV: H.264 and HEVC, surround.
-pub const APPLE_TV: Profile = Profile { video: &["h264", "hevc"], h264_max_level: None, deinterlace: true, surround: true };
+/// The Apple TV: H.264 and HEVC, surround. A Mac's receiver plays the same (AVPlayer).
+pub const APPLE_TV: Profile =
+    Profile { video: &["h264", "hevc"], h264_max_level: None, deinterlace: true, surround: true, fmp4: true, full_length: true };
 /// Third-party AirPlay TVs (VioletRelay plays the same HLS on the Hisense): as the Apple TV, in
 /// stereo.
 pub const AIRPLAY_TV: Profile = Profile { surround: false, ..APPLE_TV };
+/// A Chromecast of the first three generations (`md` "Chromecast"): H.264 up to High@4.1 (Google's
+/// media page: 1080p30 on gen 1 and 2, 4.2 on gen 3), no HEVC, deinterlaced (DESIGN §40 §4.2).
+pub const CHROMECAST: Profile =
+    Profile { video: &["h264"], h264_max_level: Some(41), deinterlace: true, surround: false, fmp4: true, full_length: true };
+/// A Chromecast Ultra, a Chromecast with Google TV, a Google TV Streamer, a TV with Cast built in:
+/// H.264 and HEVC (in fMP4 segments: the Default Media Receiver plays HEVC only there), up to
+/// level 5.1.
+pub const CAST_HEVC: Profile = Profile { video: &["h264", "hevc"], h264_max_level: Some(51), deinterlace: false, ..CHROMECAST };
+/// A DLNA renderer: what TVs decode from MPEG-TS, as it is (a TV deinterlaces itself), all in TS.
+pub const DLNA: Profile =
+    Profile { video: &["h264", "hevc", "mpeg2video"], h264_max_level: None, deinterlace: false, surround: false, fmp4: false, full_length: false };
 
-/// The receiver's profile; `None` before its phase (Google Cast: 2, DLNA: 3).
+/// The receiver's profile by kind alone (a Cast device of unknown model: the HEVC tier).
 pub fn profile(receiver: ReceiverKind) -> Option<Profile> {
-    match receiver {
-        ReceiverKind::AppleTv => Some(APPLE_TV),
-        ReceiverKind::AirPlayTv => Some(AIRPLAY_TV),
-        ReceiverKind::Chromecast | ReceiverKind::Dlna => None,
-    }
+    profile_for(receiver, None)
+}
+
+/// The receiver's profile; a Cast device's by its model (`md`): only "Chromecast" itself (the
+/// first three generations) and Google's smart displays lack HEVC.
+pub fn profile_for(receiver: ReceiverKind, model: Option<&str>) -> Option<Profile> {
+    Some(match receiver {
+        ReceiverKind::AppleTv | ReceiverKind::Mac => APPLE_TV,
+        ReceiverKind::AirPlayTv => AIRPLAY_TV,
+        ReceiverKind::Chromecast => match model.map(str::trim) {
+            Some("Chromecast" | "Google Home Hub" | "Google Nest Hub" | "Google Nest Hub Max") => CHROMECAST,
+            _ => CAST_HEVC,
+        },
+        ReceiverKind::Dlna => DLNA,
+    })
 }
 
 /// What is known about the input (DESIGN §40 §8.2: the hints, else the probe).
@@ -108,7 +138,12 @@ impl Facts {
 /// and the scan type are known, and the sound isn't surround for a receiver that takes it (the
 /// surround rendition needs what only the probe tells: layout, profile, language, frame rate).
 pub fn hints_suffice(h: &CastHints, receiver: ReceiverKind) -> bool {
-    let surround = profile(receiver).is_some_and(|p| p.surround) && h.channels.is_some_and(|c| c > 2);
+    hints_suffice_for(h, profile(receiver))
+}
+
+/// [`hints_suffice`] for a profile already chosen.
+pub fn hints_suffice_for(h: &CastHints, profile: Option<Profile>) -> bool {
+    let surround = profile.is_some_and(|p| p.surround) && h.channels.is_some_and(|c| c > 2);
     h.vcodec.is_some() && h.acodec.is_some() && h.channels.is_some() && h.interlaced.is_some() && !surround
 }
 
@@ -203,10 +238,15 @@ pub struct Plan {
 /// The ladder (module docs). `Err` is the refusal: `Unsupported` (DRM, no profile, converting
 /// off) or `NeedsFfmpeg` (converting is needed and allowed but an encoder is missing).
 pub fn plan(receiver: ReceiverKind, facts: &Facts, opt: Options) -> Result<Plan, CastErrorKind> {
+    plan_for(profile(receiver), facts, opt)
+}
+
+/// [`plan`] for a profile already chosen ([`profile_for`]; `None`: refused).
+pub fn plan_for(profile: Option<Profile>, facts: &Facts, opt: Options) -> Result<Plan, CastErrorKind> {
     if facts.encrypted {
         return Err(CastErrorKind::Unsupported);
     }
-    let profile = profile(receiver).ok_or(CastErrorKind::Unsupported)?;
+    let profile = profile.ok_or(CastErrorKind::Unsupported)?;
     let surround = surround(profile, facts, opt);
     let audio = if surround.is_some() { Audio::Aac } else { audio(facts) };
     // the renditions are demuxed, and an audio rendition is fMP4 (rule 2.1): so is the video
@@ -253,7 +293,7 @@ pub fn plan(receiver: ReceiverKind, facts: &Facts, opt: Options) -> Result<Plan,
     {
         return convert(true);
     }
-    let segments = if vcodec == "hevc" { Segments::Fmp4 } else { renditions };
+    let segments = if vcodec == "hevc" && profile.fmp4 { Segments::Fmp4 } else { renditions };
     Ok(Plan { level: CastLevel::Repackaged, video: Video::Copy, audio, segments, surround })
 }
 
@@ -358,6 +398,38 @@ mod tests {
         segments: Segments::Ts,
         surround: None,
     };
+
+    /// The Google Cast and DLNA columns of §4.2 (DESIGN §40 Appendix E): a first-generation
+    /// Chromecast converts HEVC, H.264 above 4.1 and interlaced pictures; an Ultra or Google TV
+    /// copies HEVC in fMP4; a DLNA renderer copies what a TV decodes, HEVC included, in TS.
+    #[test]
+    fn the_ladder_for_cast_and_dlna() {
+        let old = profile_for(ReceiverKind::Chromecast, Some("Chromecast"));
+        let gtv = profile_for(ReceiverKind::Chromecast, Some("Chromecast HD"));
+        let tv = profile_for(ReceiverKind::Chromecast, Some("BRAVIA 4K VH2"));
+        let dlna = profile_for(ReceiverKind::Dlna, Some("QE55Q60R"));
+        assert_eq!((old, gtv, tv, dlna), (Some(CHROMECAST), Some(CAST_HEVC), Some(CAST_HEVC), Some(DLNA)));
+        assert_eq!(profile_for(ReceiverKind::Mac, Some("MacBookPro18,3")), Some(APPLE_TV));
+        let hevc = facts(Some("hevc"), Some("aac"), 2, false);
+        let h264 = facts(Some("h264"), Some("aac"), 2, false);
+        let l2 = |segments| Ok(Plan { level: CastLevel::Repackaged, video: Video::Copy, audio: Audio::Copy, segments, surround: None });
+        assert_eq!(plan_for(old, &hevc, AUTO), Ok(L3(false, Audio::Copy)), "no HEVC before the Ultra");
+        assert_eq!(plan_for(gtv, &hevc, AUTO), l2(Segments::Fmp4));
+        assert_eq!(plan_for(dlna, &hevc, AUTO), l2(Segments::Ts), "a stream is TS throughout");
+        let high = Facts { level: Some(42), ..h264.clone() };
+        assert_eq!(plan_for(old, &high, AUTO), Ok(L3(false, Audio::Copy)), "1080p50 is above gen 1/2's 4.1");
+        assert_eq!(plan_for(tv, &high, AUTO), Ok(L2_TS(Audio::Copy)));
+        let interlaced = facts(Some("h264"), Some("mp2"), 2, true);
+        assert_eq!(plan_for(old, &interlaced, AUTO), Ok(L3(true, Audio::Aac)));
+        assert_eq!(plan_for(tv, &interlaced, AUTO), Ok(L2_TS(Audio::Aac)));
+        assert_eq!(plan_for(dlna, &interlaced, AUTO), Ok(L2_TS(Audio::Aac)), "the TV deinterlaces");
+        let mpeg2 = facts(Some("mpeg2video"), Some("mp2"), 2, true);
+        assert_eq!(plan_for(dlna, &mpeg2, AUTO), Ok(L2_TS(Audio::Aac)), "MPEG-2 as it is");
+        assert_eq!(plan_for(gtv, &mpeg2, AUTO), Ok(L3(false, Audio::Aac)));
+        // no surround rendition outside the Apple TV and the Mac
+        assert_eq!(plan_for(dlna, &facts(Some("h264"), Some("ac3"), 6, false), AUTO), Ok(L2_TS(Audio::Aac)));
+        const { assert!(!DLNA.full_length && CAST_HEVC.full_length) };
+    }
 
     /// Every Apple TV row of §4.2 and every rung of §8.3.
     #[test]
@@ -465,8 +537,7 @@ mod tests {
     #[test]
     fn later_phases_have_no_profile_yet() {
         let f = facts(Some("h264"), Some("aac"), 2, false);
-        assert_eq!(plan(ReceiverKind::Chromecast, &f, AUTO), Err(CastErrorKind::Unsupported));
-        assert_eq!(plan(ReceiverKind::Dlna, &f, AUTO), Err(CastErrorKind::Unsupported));
+        assert_eq!(plan_for(None, &f, AUTO), Err(CastErrorKind::Unsupported));
     }
 
     #[test]

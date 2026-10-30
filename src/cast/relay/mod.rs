@@ -76,6 +76,9 @@ pub struct RelayConfig {
     pub vod_dir: PathBuf,
     /// The User-Agent for providers whose playlist sets none.
     pub user_agent: String,
+    /// The TV gets one continuous MPEG-TS stream (`/c/<tok>/stream.ts`: the segments back to
+    /// back) instead of a playlist: a DLNA renderer (DESIGN §40 Appendix E).
+    pub stream: bool,
 }
 
 /// One load generation.
@@ -87,6 +90,9 @@ pub struct LoadSpec {
     pub hints: CastHints,
     /// The receiver's profile (what it plays without converting).
     pub receiver: ReceiverKind,
+    /// Its model (`AppleTV14,1`, `Chromecast`, `Chromecast Ultra`): a Cast device's codecs
+    /// depend on it ([`plan::profile_for`]).
+    pub model: Option<String>,
     /// Force a level: the user's "Convert this channel", a cached hint, or the session's one-step
     /// escalation (L2 → L3).
     pub force: Option<CastLevel>,
@@ -155,6 +161,10 @@ pub enum RelayEvent {
         generation: u64,
         from_s: f64,
         upto_s: f64,
+    },
+    /// A DLNA renderer's stream sent the item's last segment: its next stop is the item's end.
+    StreamEnded {
+        generation: u64,
     },
     /// The playlist guard tripped twice: mark the item irregular (→ L3 next time).
     Irregular {
@@ -270,6 +280,12 @@ const PIN_WAIT: Duration = Duration::from_secs(3);
 /// the proxy).
 const INDEX_BUDGET: Duration = Duration::from_secs(15);
 
+/// The URL the TV is given for a generation under `token`: its playlist, or for a DLNA renderer
+/// the continuous stream.
+fn lan_url(addr: std::net::SocketAddr, token: &Token, stream: bool) -> String {
+    format!("http://{addr}/c/{}/{}", token.expose(), if stream { server::STREAM_FILE } else { "index.m3u8" })
+}
+
 /// How a launch failed (before the TV was given anything).
 enum Fail {
     /// The provider failed: its events (`Http` / `ProviderText`, then `UpstreamClosed`) tell.
@@ -349,7 +365,8 @@ impl RelaySession {
         let _ = aws_lc_rs::rand::SecureRandom::fill(&aws_lc_rs::rand::SystemRandom::new(), &mut id);
         let sid = format!("{:02x}{:02x}", id[0], id[1]);
         let label: Arc<str> = format!("cast session {sid}").into();
-        let lan = server::LanServer::bind(cfg.bind, cfg.port, cfg.peer, tx.clone(), label.clone()).await.map_err(|e| {
+        let idle = if cfg.stream { server::STREAM_IDLE } else { server::IDLE };
+        let lan = server::LanServer::bind(cfg.bind, cfg.port, cfg.peer, idle, tx.clone(), label.clone()).await.map_err(|e| {
             // no address at WARN (§9.3): the port says enough
             tracing::warn!("{label}: can't listen on port {} toward the TV: {e}", cfg.port);
             CastErrorKind::Unreachable
@@ -409,7 +426,8 @@ impl RelaySession {
         let offset_s = if live { 0.0 } else { p.start_at.filter(|s| *s > 0.0).unwrap_or(0.0) };
         let generation = Arc::new(AtomicU64::new(spec.generation));
         let ctx = upstream::FeedCtx { generation: generation.clone(), tx: self.tx.clone(), label: self.label.clone() };
-        let pick = upstream::Pick { profile: plan::profile(spec.receiver), height: spec.hints.height };
+        let profile = plan::profile_for(spec.receiver, spec.model.as_deref());
+        let pick = upstream::Pick { profile, height: spec.hints.height };
         let proxy = self.proxy.as_ref().ok_or(CastErrorKind::Unreachable)?;
         let feed = proxy.feed(ctx, &p.url, &p.headers, &self.cfg.user_agent);
         self.pending.feed = Some(feed.clone());
@@ -425,7 +443,7 @@ impl RelaySession {
         let floor = self.pin.as_ref().filter(|(m, _)| *m == p.media).map(|(_, t)| *t);
         // films and catch-up are always probed: a full-length playlist needs the file's start and
         // length (§8.5)
-        if !plan::hints_suffice(&spec.hints, spec.receiver) || !live {
+        if !plan::hints_suffice_for(&spec.hints, profile) || !live {
             match self.probe(&caps, &feed, &loopback, spec.generation).await {
                 Ok(pr) => probed = Some(pr),
                 Err(kind) => {
@@ -440,7 +458,7 @@ impl RelaySession {
             let mut facts = probed.as_ref().map_or_else(|| plan::Facts::from_hints(&spec.hints), |pr| pr.facts(&spec.hints));
             facts.encrypted |= feed.encrypted();
             let opts = plan::Options { convert: self.cfg.convert, interlaced: self.cfg.interlaced, force: spec.force, can_convert: caps.l3, stereo };
-            let plan = match plan::plan(spec.receiver, &facts, opts) {
+            let plan = match plan::plan_for(profile, &facts, opts) {
                 Ok(plan) => plan,
                 Err(kind) => {
                     tracing::info!("{}: {:?} can't go to the TV: {kind:?}", self.label, facts.vcodec);
@@ -462,7 +480,8 @@ impl RelaySession {
                 (Video::Copy, Some("hevc")) => Some(Codec::Hevc),
                 _ => None,
             };
-            let full = if live {
+            // a stream (DLNA) has no playlist to be whole in: a film is served as it is made
+            let full = if live || self.cfg.stream || !profile.is_some_and(|p| p.full_length) {
                 None
             } else {
                 let slot = &mut maps[usize::from(plan.video == Video::Copy)];
@@ -548,7 +567,7 @@ impl RelaySession {
                 // the same facts and settings without the force: would it copy the picture?
                 as_is: plan.level == CastLevel::Converted
                     && opts.force == Some(CastLevel::Converted)
-                    && plan::plan(spec.receiver, &facts, plan::Options { force: None, ..opts }).is_ok_and(|p| p.level != CastLevel::Converted),
+                    && plan::plan_for(profile, &facts, plan::Options { force: None, ..opts }).is_ok_and(|p| p.level != CastLevel::Converted),
             };
             let launched = match full {
                 Some(map) => {
@@ -803,7 +822,7 @@ impl RelaySession {
             }
             let token = Token::mint();
             let lan = self.lan.as_ref().ok_or(Fail::Kind(CastErrorKind::Unreachable))?;
-            let url = format!("http://{}/c/{}/index.m3u8", lan.addr(), token.expose());
+            let url = lan_url(lan.addr(), &token, self.cfg.stream);
             lan.grant_only(token, out.clone(), None);
             let Some((stop, monitor)) = self.pending.pipeline.take() else { return Err(Fail::Exited) };
             // handed over: the pipeline, its feed and its directory are `current`'s now
@@ -829,7 +848,7 @@ impl RelaySession {
                 let _ = self.tx.send(RelayEvent::UpstreamEof { generation: l.generation.load(Ordering::Relaxed) });
                 feed.close(false).await;
             }
-            let load = LoadReq { url: Secret::new(url), live: l.live, offset_s };
+            let load = LoadReq { url: Secret::new(url), live: l.live, offset_s, fmp4: l.fmp4 };
             return Ok(Prepared { load, level: l.level, behind_live_s, surround: l.surround.is_some(), as_is: l.as_is });
         }
         Err(Fail::Exited)
@@ -963,7 +982,7 @@ impl RelaySession {
         let lan = self.lan.as_ref().ok_or(Fail::Kind(CastErrorKind::Unreachable))?;
         let (view_first, start, offset_s) = start_of(&od, lan.start_ignored(), l.offset_s, out.renditions.len());
         let token = Token::mint();
-        let url = format!("http://{}/c/{}/index.m3u8", lan.addr(), token.expose());
+        let url = lan_url(lan.addr(), &token, self.cfg.stream);
         lan.grant(token, out.clone(), view_first, start);
         let Some((stop, monitor)) = self.pending.pipeline.take() else { return Err(Fail::Exited) };
         // handed over: the pipeline, its feed and its directory are `current`'s now
@@ -984,7 +1003,7 @@ impl RelaySession {
         // what the TV is fed (§11.3), as a growing playlist's launch reports it: the whole map
         let info = Box::new(plan::pinned(l.info, od.map.target(), Some(od.map.len())));
         let _ = self.tx.send(RelayEvent::Probed { generation: l.generation.load(Ordering::Relaxed), info });
-        let load = LoadReq { url: Secret::new(url), live: false, offset_s };
+        let load = LoadReq { url: Secret::new(url), live: false, offset_s, fmp4: l.fmp4 };
         Ok(Prepared { load, level: l.level, behind_live_s: None, surround: l.surround.is_some(), as_is: l.as_is })
     }
 
@@ -1007,10 +1026,10 @@ impl RelaySession {
             let (view_first, start, offset_s) = start_of(&od, lan.start_ignored(), at, p.out.renditions.len());
             p.generation.store(generation, Ordering::Relaxed);
             let token = Token::mint();
-            let url = format!("http://{}/c/{}/index.m3u8", lan.addr(), token.expose());
+            let url = lan_url(lan.addr(), &token, self.cfg.stream);
             tracing::debug!("{}: the whole item from {at:.1} s", self.label);
             lan.grant(token, p.out.clone(), view_first, start);
-            let load = LoadReq { url: Secret::new(url), live: false, offset_s };
+            let load = LoadReq { url: Secret::new(url), live: false, offset_s, fmp4: p.out.fmp4 };
             return Ok(Some(Prepared { load, level: p.level, behind_live_s: None, surround: p.out.renditions.len() > 1, as_is: p.as_is }));
         }
         let rel = at_s - p.offset_s;
@@ -1036,10 +1055,10 @@ impl RelaySession {
         p.generation.store(generation, Ordering::Relaxed);
         let lan = self.lan.as_ref().ok_or(CastErrorKind::Unreachable)?;
         let token = Token::mint();
-        let url = format!("http://{}/c/{}/index.m3u8", lan.addr(), token.expose());
+        let url = lan_url(lan.addr(), &token, self.cfg.stream);
         tracing::debug!("{}: view from segment {} ({start:.1} s)", self.label, firsts[0]);
         lan.grant_only(token, p.out.clone(), Some(firsts));
-        let load = LoadReq { url: Secret::new(url), live: false, offset_s: p.offset_s + start };
+        let load = LoadReq { url: Secret::new(url), live: false, offset_s: p.offset_s + start, fmp4: p.out.fmp4 };
         Ok(Some(Prepared { load, level: p.level, behind_live_s: None, surround: p.out.renditions.len() > 1, as_is: p.as_is }))
     }
 

@@ -118,6 +118,7 @@ fn sighting(id: DeviceId, name: &str) -> Sighting {
         manual: false,
         addr: TV_ADDR.parse().unwrap(),
         ids: Default::default(),
+        dlna: None,
     }
 }
 

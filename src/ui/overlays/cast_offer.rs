@@ -55,6 +55,7 @@ pub(crate) fn kind_label(kind: ReceiverKind) -> &'static str {
     match kind {
         ReceiverKind::AppleTv => "Apple TV",
         ReceiverKind::AirPlayTv => "AirPlay TV",
+        ReceiverKind::Mac => "Mac",
         ReceiverKind::Chromecast => "Chromecast",
         ReceiverKind::Dlna => "DLNA TV",
     }

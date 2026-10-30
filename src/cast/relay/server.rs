@@ -40,6 +40,17 @@ use super::{RelayEvent, renditions, vod};
 pub const MAX_CONNECTIONS: usize = 8;
 /// A connection with no traffic this long is closed (§9.1).
 pub const IDLE: Duration = Duration::from_secs(30);
+/// A DLNA renderer's stream connection may sit unread this long (a paused TV stops reading; a
+/// live pause beyond the window reloads anyway, §11.3).
+pub const STREAM_IDLE: Duration = Duration::from_secs(600);
+/// The continuous MPEG-TS stream a DLNA renderer is given (DESIGN §40 Appendix E).
+pub const STREAM_FILE: &str = "stream.ts";
+/// A live stream starts this many segments before the newest (about as far behind as a
+/// player's HLS hold-back).
+const STREAM_LIVE_BACK: u64 = 2;
+/// How often the stream looks for ffmpeg's next segment, and how long it waits for one.
+const STREAM_POLL: Duration = Duration::from_millis(200);
+const STREAM_STARVED: Duration = Duration::from_secs(30);
 
 /// What a served name is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +60,8 @@ pub enum File {
     Init(Option<u8>),
     /// `s<n>.ts` / `s<n>.m4s`: sequence number `n`.
     Segment(u64),
+    /// `stream.ts`: the TS segments back to back (a DLNA renderer).
+    Stream,
 }
 
 impl File {
@@ -59,15 +72,17 @@ impl File {
             File::Init(None) => "init.mp4".into(),
             File::Init(Some(n)) => format!("init_{n}.mp4"),
             File::Segment(n) => format!("s{n}.{}", if fmp4 { "m4s" } else { "ts" }),
+            File::Stream => STREAM_FILE.into(),
         }
     }
 }
 
-/// `^(index\.m3u8|init(_\d)?\.mp4|s\d{1,7}\.(ts|m4s))$` (§9.1), by hand.
+/// `^(index\.m3u8|init(_\d)?\.mp4|s\d{1,7}\.(ts|m4s)|stream\.ts)$` (§9.1), by hand.
 pub fn served_file(name: &str) -> Option<File> {
     match name {
         "index.m3u8" => return Some(File::Playlist),
         "init.mp4" => return Some(File::Init(None)),
+        STREAM_FILE => return Some(File::Stream),
         _ => {}
     }
     if let Some(n) = name.strip_prefix("init_").and_then(|r| r.strip_suffix(".mp4")) {
@@ -237,13 +252,21 @@ pub struct LanServer {
 
 impl LanServer {
     /// Bind `bind:port` (port 0: any, for tests) and serve `peer` only.
-    pub async fn bind(bind: Ipv4Addr, port: u16, peer: Ipv4Addr, tx: mpsc::UnboundedSender<RelayEvent>, label: Arc<str>) -> io::Result<Self> {
+    /// `idle`: [`IDLE`], or [`STREAM_IDLE`] for a DLNA renderer's stream.
+    pub async fn bind(
+        bind: Ipv4Addr,
+        port: u16,
+        peer: Ipv4Addr,
+        idle: Duration,
+        tx: mpsc::UnboundedSender<RelayEvent>,
+        label: Arc<str>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(SocketAddr::from((bind, port))).await?;
         let addr = listener.local_addr()?;
         let kill = CancellationToken::new();
         let shared = Arc::new(Shared { peer, grants: Mutex::new(Grants::default()), tx, label, start_ignored: AtomicBool::new(false) });
         let app = axum::Router::new().fallback(handle).with_state(shared.clone());
-        let capped = Capped::new(listener, MAX_CONNECTIONS, peer, kill.clone());
+        let capped = Capped::new(listener, MAX_CONNECTIONS, peer, kill.clone()).idle(idle);
         let stop = kill.clone();
         tokio::spawn(async move {
             let serve = axum::serve(capped, app.into_make_service_with_connect_info::<Peer>()).with_graceful_shutdown(stop.cancelled_owned());
@@ -379,6 +402,13 @@ async fn handle(State(srv): State<Arc<Shared>>, ConnectInfo(Peer(from)): Connect
             r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             r
         }
+        File::Stream => {
+            // TS segments only, a growing or live playlist: a stream has no whole-item form
+            if out.full.is_some() || out.fmp4 || rend.is_none() {
+                return not_found();
+            }
+            stream_response(head, srv.clone(), tok.to_owned(), out, view_first.and_then(|v| v.first().copied()))
+        }
         File::Init(_) | File::Segment(_) => {
             let Some((index, rend)) = rend else { return not_found() };
             // a full-length item's segments are made when asked for (§8.5)
@@ -446,6 +476,100 @@ const START_SLACK_S: f64 = 0.5;
 /// resume 10 s in starting at 0).
 fn start_ignored(map: &vod::Map, at: f64, n: u64) -> bool {
     n < map.segment_at((at - START_SLACK_S).max(0.0))
+}
+
+/// The continuous stream (a DLNA renderer): 200 without a length (chunked), the DLNA headers, and
+/// for a GET the TS segments ffmpeg writes, back to back, from `view_first` (a view), else for
+/// live a little behind the newest, else the first. Each segment sent is a `SegmentFetched`
+/// (the watchdog's and the position estimate's evidence, the VOD cap's mark). The body ends when
+/// the item is fully produced and sent (`StreamEnded`), when its token is revoked (a zap, a
+/// seek), or when ffmpeg writes nothing for [`STREAM_STARVED`]. A HEAD (renderers probe first)
+/// starts nothing. `Range` and `TimeSeekRange.dlna.org` are ignored: the stream can't seek
+/// (`DLNA.ORG_OP=00`).
+fn stream_response(head: bool, srv: Arc<Shared>, tok: String, out: Arc<Output>, view_first: Option<u64>) -> Response {
+    let body = if head {
+        Body::empty()
+    } else {
+        let st = StreamState { srv, tok, out, next: view_first, started: false, waited: Duration::ZERO };
+        Body::from_stream(futures_util::stream::unfold(st, |mut st| async move { st.next_chunk().await.map(|b| (Ok::<_, io::Error>(b), st)) }))
+    };
+    let mut r = Response::new(body);
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(crate::cast::dlna::soap::STREAM_MIME));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    h.insert("transferMode.dlna.org", HeaderValue::from_static("Streaming"));
+    h.insert("contentFeatures.dlna.org", HeaderValue::from_static(crate::cast::dlna::soap::CONTENT_FEATURES));
+    h.insert("realTimeInfo.dlna.org", HeaderValue::from_static("DLNA.ORG_TLAG=*"));
+    r
+}
+
+/// Where a stream is.
+struct StreamState {
+    srv: Arc<Shared>,
+    tok: String,
+    out: Arc<Output>,
+    /// The next segment to send (`None` until the first is chosen).
+    next: Option<u64>,
+    started: bool,
+    /// How long it has waited for the next segment.
+    waited: Duration,
+}
+
+impl StreamState {
+    /// The next segment's bytes; `None` ends the body.
+    async fn next_chunk(&mut self) -> Option<bytes::Bytes> {
+        let rend = self.out.main();
+        let generation = self.out.generation();
+        loop {
+            {
+                let mut grants = self.srv.grants.lock().unwrap_or_else(|e| e.into_inner());
+                let g = grants.find_mut(&self.tok)?;
+                g.last_fetch = Some(Instant::now());
+            }
+            let text = tokio::fs::read_to_string(rend.dir.join("index.m3u8")).await.ok();
+            let pl = text.map(|t| rend.serve_playlist(&t, None, false).0).unwrap_or_default();
+            let live = !pl.header.iter().any(|t| t == "#EXT-X-PLAYLIST-TYPE:EVENT" || t == "#EXT-X-PLAYLIST-TYPE:VOD");
+            let listed: Vec<u64> = pl.segments.iter().filter(|s| s.file().is_some()).map(|s| s.seq).collect();
+            if self.next.is_none()
+                && let (Some(first), Some(last)) = (listed.first(), listed.last())
+            {
+                self.next = Some(if live { last.saturating_sub(STREAM_LIVE_BACK).max(*first) } else { *first });
+            }
+            if let Some(want) = self.next {
+                // fell out of a live window (a renderer paused for long): on from the oldest left
+                let seq = match listed.first() {
+                    Some(first) if *first > want => *first,
+                    _ => want,
+                };
+                if listed.contains(&seq) {
+                    let data = tokio::fs::read(rend.dir.join(File::Segment(seq).name(false))).await.ok();
+                    if let Some(data) = data {
+                        self.next = Some(seq + 1);
+                        self.waited = Duration::ZERO;
+                        rend.fetched.fetch_max(seq + 1, Ordering::Relaxed);
+                        if !std::mem::replace(&mut self.started, true) {
+                            let _ = self.srv.tx.send(RelayEvent::PlaylistFetched { generation });
+                        }
+                        let span = rend.guard.lock().unwrap_or_else(|e| e.into_inner()).span(seq, 0);
+                        if let Some((from_s, upto_s)) = span {
+                            let _ = self.srv.tx.send(RelayEvent::SegmentFetched { generation, from_s, upto_s });
+                        }
+                        return Some(data.into());
+                    }
+                }
+                if pl.endlist && listed.last().is_some_and(|last| seq > *last) {
+                    let _ = self.srv.tx.send(RelayEvent::StreamEnded { generation });
+                    return None;
+                }
+            }
+            if self.waited >= STREAM_STARVED {
+                tracing::debug!("{}: the stream waited too long for the next segment", self.srv.label);
+                return None;
+            }
+            tokio::time::sleep(STREAM_POLL).await;
+            self.waited += STREAM_POLL;
+        }
+    }
 }
 
 /// The grant's first playlist fetch (the firewall watchdog's evidence).
@@ -561,11 +685,17 @@ pub struct Capped {
     permits: Arc<Semaphore>,
     peer: Ipv4Addr,
     kill: CancellationToken,
+    idle: Duration,
 }
 
 impl Capped {
     pub fn new(inner: TcpListener, n: usize, peer: Ipv4Addr, kill: CancellationToken) -> Self {
-        Self { inner, permits: Arc::new(Semaphore::new(n)), peer, kill }
+        Self { inner, permits: Arc::new(Semaphore::new(n)), peer, kill, idle: IDLE }
+    }
+
+    /// Close connections idle this long instead of [`IDLE`].
+    pub fn idle(self, idle: Duration) -> Self {
+        Self { idle, ..self }
     }
 }
 
@@ -584,7 +714,7 @@ impl Listener for Capped {
                     // the receiver's connection waits here (accepted) while all its slots are busy
                     let permit = self.permits.clone().acquire_owned().await.expect("the semaphore is never closed");
                     let _ = io.set_nodelay(true);
-                    return (Conn::new(io, permit, &self.kill), addr);
+                    return (Conn::new(io, permit, &self.kill, self.idle), addr);
                 }
                 Err(e) => {
                     tracing::debug!("cast: accept: {e}");
@@ -606,15 +736,16 @@ pub struct Conn {
     _permit: OwnedSemaphorePermit,
     kill: Pin<Box<WaitForCancellationFutureOwned>>,
     idle: Pin<Box<Sleep>>,
+    idle_for: Duration,
 }
 
 impl Conn {
-    fn new(io: TcpStream, permit: OwnedSemaphorePermit, kill: &CancellationToken) -> Self {
-        Self { io, _permit: permit, kill: Box::pin(kill.clone().cancelled_owned()), idle: Box::pin(tokio::time::sleep(IDLE)) }
+    fn new(io: TcpStream, permit: OwnedSemaphorePermit, kill: &CancellationToken, idle_for: Duration) -> Self {
+        Self { io, _permit: permit, kill: Box::pin(kill.clone().cancelled_owned()), idle: Box::pin(tokio::time::sleep(idle_for)), idle_for }
     }
 
     fn touch(&mut self) {
-        self.idle.as_mut().reset(tokio::time::Instant::now() + IDLE);
+        self.idle.as_mut().reset(tokio::time::Instant::now() + self.idle_for);
     }
 
     /// Killed, or idle too long (checked when the socket has nothing to do).
