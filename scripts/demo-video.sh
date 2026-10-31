@@ -11,8 +11,9 @@
 #               after the profile is built)
 #
 # Outputs, both committed (the README shows the preview at the top, linking to the video):
-#   docs/tuner-demo.mp4       H.264, 1440 px wide, silent, under 9.5 MB
-#   docs/demo-preview.webp    the looping preview (~12 s, 880 px wide)
+#   docs/tuner-demo.mp4       H.264, 1920 px wide (the stage's own pixels), silent, CRF 16
+#   docs/demo-preview.webp    the whole video as a looping animated WebP (1200 px wide, 12 fps):
+#                             GitHub plays no committed MP4 inline, so this is the README's demo
 #
 # NOTHING HAPPENS ON YOUR SCREEN, and there is nothing to answer: the script adds a virtual
 # Hyprland output ("TUNERDEMO", headless, scale 1.5, placed far from your monitors so the
@@ -56,14 +57,17 @@ segs=$work/segments
 mp4=$root/docs/tuner-demo.mp4
 webp=$root/docs/demo-preview.webp
 stage_w=1280 stage_h=800   # the recorded window, logical px
-out_w=1440 app_h=900 band=120   # the video: a caption band above the window, scaled to 1440 wide
+out_w=1920 app_h=1200 band=160  # the video: a caption band above the window, at the stage's pixels
 out_h=$((app_h + band))
 fps=30
-mp4_budget_kb=9500              # committed: keep the repository light (GitHub plays up to 10 MB)
+mp4_crf=16                      # text stays sharp; the MP4 is the full-quality copy behind the preview
+prev_w=1200 prev_fps=12 prev_q=80   # the README's animated preview
+# H.264 colour: BT.709, tagged, so players don't guess (an untagged file is decoded either way)
+color=(-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv)
 dark=$root/tests/fixtures/theme/tokyo-night
 bg='0x16161e' fg='0xc0caf5' dim='0x7f88b5' accent='0x7aa2f7'   # Tokyo Night
-# The virtual output: 1360 logical px wide at scale 1.5 (the stage is 1920×1200 pixels, scaled
-# down to the video's 1440: sharper than recording at 1440). Its stage area is 878 high, below a
+# The virtual output: 1360 logical px wide at scale 1.5 (the stage is 1920×1200 pixels, the
+# video's own: scaling the UI's small text down blurs it). Its stage area is 878 high, below a
 # bar like Omarchy's (26 px), on even logical coordinates (whole pixels at 1.5), and below a
 # reserved band as tall as your monitors: Hyprland 0.56 draws its software cursor on a headless
 # output at the pointer's own coordinates, so the pointer would show (and move) in the video
@@ -113,14 +117,6 @@ scenes=(
   "following|AI agents|Follow teams and shows, with reminders"
   "end||"
 )
-# The README preview: name|from s|seconds of the assembled segments, looped.
-preview=(
-  "live|0.2|2.6"
-  "multiview|0.4|2.2"
-  "movies|1.0|2.4"
-  "agent|1.0|5.5"
-)
-
 # Each scene's Tuner script (src/devshot.rs): steps 0.35 s apart once the library is in. The
 # recording keeps what lies between `mark:in` and `mark:out`; the leading wait lets the recorder
 # start. $PLAY_* and playlist ids come from the profile's demo/refs.env.
@@ -407,7 +403,7 @@ EOF
   [[ -s $dir/raw.mp4 && -s $dir/raw.mp4.ts && -s $dir/marks ]] || { echo "demo-video.sh: $name: no recording (see $dir/*.log)" >&2; return 1; }
 }
 
-# Cut <scene>'s recording to its marks, 1440×900 at $fps: $runs/<name>/cut.mp4.
+# Cut <scene>'s recording to its marks, 1920×1200 at $fps: $runs/<name>/cut.mp4.
 cut_scene() {
   local dir=$runs/$1 span
   span=$(python3 - "$dir/raw.mp4.ts" "$dir/marks" <<'EOF'
@@ -422,7 +418,7 @@ EOF
   ) || { echo "demo-video.sh: $1: $span" >&2; return 1; }
   read -r ss len <<<"$span"
   ffmpeg -nostdin -v error -y -ss "$ss" -t "$len" -i "$dir/raw.mp4" \
-    -vf "scale=$out_w:$app_h:flags=lanczos,setsar=1" -an -c:v libx264 -preset veryfast -crf 12 -pix_fmt yuv420p "$dir/cut.mp4"
+    -vf "scale=$out_w:$app_h:flags=lanczos,setsar=1" -an -c:v libx264 -preset veryfast -crf 10 -pix_fmt yuv420p "${color[@]}" "$dir/cut.mp4"
 }
 
 # ----------------------------------------------------------------------------------- assembly
@@ -435,11 +431,11 @@ card() {
   local out=$1 len=$2 tdir; tdir=$(mktemp -d "$work/card.XXXX")
   printf '%s' "$3" >"$tdir/t"; printf '%s' "$4" >"$tdir/a"; printf '%s' "$5" >"$tdir/b"
   ffmpeg -nostdin -v error -y -f lavfi -i "gradients=s=${out_w}x${out_h}:r=$fps:d=$len:c0=0x1a1b26:c1=0x101018:x0=0:y0=0:x1=$out_w:y1=$out_h:speed=0.004" \
-    -vf "drawtext=fontfile=$sans:textfile=$tdir/t:fontsize=132:fontcolor=$fg:borderw=2:bordercolor=$fg:x=(w-text_w)/2:y='$(slide 'h/2-150' 0.2)':alpha='$(fade_in 0.2)',
-         drawtext=fontfile=$sans:textfile=$tdir/a:fontsize=40:fontcolor=$fg:x=(w-text_w)/2:y='$(slide 'h/2+30' 0.6)':alpha='$(fade_in 0.6)',
-         drawtext=fontfile=$mono:textfile=$tdir/b:fontsize=24:fontcolor=$dim:x=(w-text_w)/2:y='$(slide 'h/2+100' 0.9)':alpha='$(fade_in 0.9)',
-         fade=t=out:st=$(python3 -c "print($len-0.45)"):d=0.45:color=$bg,format=yuv420p" \
-    -c:v libx264 -preset veryfast -crf 12 "$out"
+    -vf "drawtext=fontfile=$sans:textfile=$tdir/t:fontsize=176:fontcolor=$fg:borderw=2:bordercolor=$fg:x=(w-text_w)/2:y='$(slide 'h/2-200' 0.2)':alpha='$(fade_in 0.2)',
+         drawtext=fontfile=$sans:textfile=$tdir/a:fontsize=54:fontcolor=$fg:x=(w-text_w)/2:y='$(slide 'h/2+40' 0.6)':alpha='$(fade_in 0.6)',
+         drawtext=fontfile=$mono:textfile=$tdir/b:fontsize=32:fontcolor=$dim:x=(w-text_w)/2:y='$(slide 'h/2+134' 0.9)':alpha='$(fade_in 0.9)',
+         fade=t=out:st=$(python3 -c "print($len-0.45)"):d=0.45:color=$bg,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" \
+    -c:v libx264 -preset veryfast -crf 10 "${color[@]}" "$out"
   rm -rf "$tdir"
 }
 
@@ -449,9 +445,9 @@ feature() {
   printf '%s' "${3^^}" >"$tdir/s"; printf '%s' "$4" >"$tdir/c"
   ffmpeg -nostdin -v error -y -i "$dir/cut.mp4" \
     -filter_complex "[0:v]pad=$out_w:$out_h:0:$band:color=$bg,
-      drawtext=fontfile=$mono:textfile=$tdir/s:fontsize=20:fontcolor=$accent:x=(w-text_w)/2:y='$(slide 24 0.05)':alpha='$(fade_in 0.05)',
-      drawtext=fontfile=$sans:textfile=$tdir/c:fontsize=42:fontcolor=$fg:borderw=1:bordercolor=$fg:x=(w-text_w)/2:y='$(slide 54 0.15)':alpha='$(fade_in 0.15)',
-      format=yuv420p[v]" -map "[v]" -c:v libx264 -preset veryfast -crf 12 "$out"
+      drawtext=fontfile=$mono:textfile=$tdir/s:fontsize=27:fontcolor=$accent:x=(w-text_w)/2:y='$(slide 32 0.05)':alpha='$(fade_in 0.05)',
+      drawtext=fontfile=$sans:textfile=$tdir/c:fontsize=56:fontcolor=$fg:borderw=1:bordercolor=$fg:x=(w-text_w)/2:y='$(slide 72 0.15)':alpha='$(fade_in 0.15)',
+      format=yuv420p[v]" -map "[v]" -c:v libx264 -preset veryfast -crf 10 "${color[@]}" "$out"
   rm -rf "$tdir"
 }
 
@@ -475,27 +471,13 @@ assemble() {
   local whole=$segs/whole.mp4
   ffmpeg -nostdin -v error -y -f concat -safe 0 -i "$list" -c copy "$whole"
   local secs; secs=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$whole")
-  # two-pass x264 to fit the upload limit: bitrate = budget / length
-  local kbps; kbps=$(python3 -c "print(int($mp4_budget_kb * 8 / $secs * 0.97))")
-  echo "assemble: $(printf '%.1f' "$secs") s, ${kbps} kb/s"
-  (cd "$segs" && ffmpeg -nostdin -v error -y -i "$whole" -c:v libx264 -preset slow -b:v "${kbps}k" -pass 1 -an -f null /dev/null &&
-    ffmpeg -nostdin -v error -y -i "$whole" -c:v libx264 -preset slow -b:v "${kbps}k" -maxrate "$((kbps * 3))k" -bufsize "$((kbps * 4))k" \
-      -pass 2 -pix_fmt yuv420p -movflags +faststart -an "$mp4")
-  # the preview: a few moments of the features, captions and all
-  local inputs=() filters="" i=0 item
-  for item in "${preview[@]}"; do
-    IFS='|' read -r name from secs <<<"$item"
-    local seg; seg=$(compgen -G "$segs/*-$name.mp4" | head -1 || true)
-    [[ -n $seg ]] || { echo "assemble: preview: $name missing" >&2; continue; }
-    inputs+=(-ss "$from" -t "$secs" -i "$seg")
-    filters+="[$i:v]setpts=PTS-STARTPTS,fps=12,scale=880:-2:flags=lanczos[p$i];"
-    i=$((i + 1))
-  done
-  if ((i)); then
-    local concat=""; for ((k = 0; k < i; k++)); do concat+="[p$k]"; done
-    ffmpeg -nostdin -v error -y "${inputs[@]}" -filter_complex "${filters}${concat}concat=n=$i:v=1:a=0[v]" -map "[v]" \
-      -c:v libwebp_anim -lossless 0 -q:v 62 -compression_level 6 -preset picture -loop 0 -an "$webp"
-  fi
+  echo "assemble: $(printf '%.1f' "$secs") s"
+  ffmpeg -nostdin -v error -y -i "$whole" -c:v libx264 -preset slow -tune animation -crf "$mp4_crf" \
+    -pix_fmt yuv420p "${color[@]}" -movflags +faststart -an "$mp4"
+  # the preview: the whole video, as the README shows it
+  ffmpeg -nostdin -v error -y -i "$whole" \
+    -vf "fps=$prev_fps,scale=$prev_w:-2:flags=lanczos:in_color_matrix=bt709:in_range=tv,format=bgra" \
+    -c:v libwebp_anim -lossless 0 -q:v "$prev_q" -compression_level 6 -preset picture -loop 0 -an "$webp"
   printf 'video:   %s (%s)\npreview: %s (%s)\n' "$mp4" "$(du -h "$mp4" | cut -f1)" "$webp" "$(du -h "$webp" | cut -f1)"
 }
 

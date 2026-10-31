@@ -15,7 +15,7 @@ Why not gpu-screen-recorder: on some machines (Asahi Linux, for one) its KMS cap
 usable DRM card, and its portal capture asks the user to pick a screen in a dialog.
 
 usage: demo-capture.py --region "<x>,<y> <w>x<h>" --scale <output scale> --out <file.mp4>
-       [--fps 30] [--width 1440]
+       [--fps 30] [--width 1920]
 Standard library only.
 """
 
@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--scale", required=True, help="the output's scale (grim -s): its own pixels")
     ap.add_argument("--out", required=True)
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--width", type=int, default=1440)
+    ap.add_argument("--width", type=int, default=1920)
     a = ap.parse_args()
 
     stop = False
@@ -53,8 +53,9 @@ def main():
     w, h = map(int, first.split(b"\n")[1].split())
     ff = subprocess.Popen(
         ["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "image2pipe", "-c:v", "ppm", "-framerate", str(a.fps), "-i", "-",
-         "-vf", f"scale={a.width}:-2:flags=lanczos,setsar=1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "14",
-         "-pix_fmt", "yuv420p", a.out],
+         "-vf", f"scale={a.width}:-2:flags=lanczos:out_color_matrix=bt709:out_range=tv,setsar=1", "-c:v", "libx264",
+         "-preset", "veryfast", "-crf", "10", "-pix_fmt", "yuv420p",
+         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", a.out],
         stdin=subprocess.PIPE,
     )
     slot = 1 / a.fps
