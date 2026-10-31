@@ -40,6 +40,7 @@ fn config(dir: &tempfile::TempDir, peer: Ipv4Addr) -> RelayConfig {
         live_dir: dir.path().join("live"),
         vod_dir: dir.path().join("vod"),
         user_agent: "TunerTest/1.0".into(),
+        stream: false,
     }
 }
 
@@ -66,7 +67,7 @@ fn playable(kind: PlayableKind, url: String, headers: HttpHeaders) -> Arc<Playab
 }
 
 fn spec(generation: u64, playable: Arc<Playable>, force: Option<CastLevel>) -> LoadSpec {
-    LoadSpec { generation, playable, hints: CastHints::default(), receiver: ReceiverKind::AppleTv, force, stereo: false }
+    LoadSpec { generation, playable, hints: CastHints::default(), receiver: ReceiverKind::AppleTv, model: None, force, stereo: false }
 }
 
 /// Events until `want` matches one (returned with everything before it), or panic at `within`.
@@ -1517,5 +1518,56 @@ async fn a_refused_index_read_falls_back_without_failing_the_feed() {
     let events = queued(&mut relay);
     // (the 20 s film is all read in its first burst: its end closes the feed, as any film's)
     assert!(!events.iter().any(|e| matches!(e, RelayEvent::Http { .. } | RelayEvent::ProviderText { .. } | RelayEvent::Failed { .. })), "{events:?}");
+    relay.stop(false).await;
+}
+
+/// A DLNA renderer's stream (DESIGN §40 Appendix E): the URL is `stream.ts`; a HEAD answers the
+/// DLNA headers and starts nothing; a GET is the film's TS segments back to back from its start
+/// (no length: chunked), each a `SegmentFetched`, then `StreamEnded`; a view (a seek) is a new
+/// token whose stream starts at its segment, and the old token's stream is gone. The film is
+/// never full length here: a stream has no playlist to be whole in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dlna_renderer_gets_one_continuous_stream() {
+    let Some(media) = media() else { return };
+    let server = TestServer::start(media, Faults::default());
+    let dir = tempfile::tempdir().unwrap();
+    let mut relay = RelaySession::start(RelayConfig { stream: true, ..config(&dir, LOOPBACK) }).await.unwrap();
+    let p = playable(PlayableKind::Movie, server.url("/vod.mp4"), HttpHeaders::default());
+    let prepared = relay.load(LoadSpec { receiver: ReceiverKind::Dlna, ..spec(1, p, None) }).await.unwrap();
+    let url = prepared.load.url.expose().clone();
+    assert!(url.ends_with("/stream.ts") && !prepared.load.fmp4, "{url}");
+    let tv = tv();
+
+    let head = tv.head(&url).send().await.unwrap();
+    assert_eq!(head.status(), 200);
+    let h = head.headers();
+    assert_eq!(h["content-type"], "video/mpeg");
+    assert_eq!(h["transfermode.dlna.org"], "Streaming");
+    assert!(h["contentfeatures.dlna.org"].to_str().unwrap().starts_with("DLNA.ORG_OP=00;"));
+    assert!(h.get("content-length").is_none() || h["content-length"] == "0");
+
+    let r = tv.get(&url).header("Range", "bytes=0-").send().await.unwrap();
+    assert_eq!(r.status(), 200, "a Range is ignored: the stream can't seek");
+    assert!(r.headers().get("content-length").is_none(), "no length: it is made as it goes");
+    let body = tokio::time::timeout(Duration::from_secs(60), r.bytes()).await.expect("the whole film in time").unwrap();
+    assert_eq!(body[0], 0x47);
+    assert_eq!(body.len() % 188, 0, "whole TS packets");
+    let packets = body.len() / 188;
+    assert!((0..packets).all(|i| body[i * 188] == 0x47), "in sync throughout");
+    let seen = until(&mut relay, Duration::from_secs(10), |e| matches!(e, RelayEvent::StreamEnded { generation: 1 })).await;
+    let spans: Vec<(f64, f64)> =
+        seen.iter().filter_map(|e| if let RelayEvent::SegmentFetched { from_s, upto_s, .. } = e { Some((*from_s, *upto_s)) } else { None }).collect();
+    assert!(spans.len() >= 3 && spans[0].0 == 0.0, "{spans:?}");
+    assert!(spans.windows(2).all(|w| (w[1].0 - w[0].1).abs() < 0.01), "back to back: {spans:?}");
+    assert!(spans.last().unwrap().1 > 25.0, "the whole 30 s film: {spans:?}");
+
+    // a seek: a view under a new token, from the segment holding 12 s
+    let view = relay.view(2, 12.0).await.unwrap().expect("inside what's produced");
+    assert!(view.load.url.expose().ends_with("/stream.ts"));
+    assert_eq!(tv.get(&url).send().await.unwrap().status(), 404, "the old token is revoked");
+    let from = view.load.offset_s;
+    assert!(from > 0.0 && from <= 12.0, "{from}");
+    let part = tv.get(view.load.url.expose()).send().await.unwrap().bytes().await.unwrap();
+    assert!(!part.is_empty() && part.len() < body.len() && part[0] == 0x47, "{} of {}", part.len(), body.len());
     relay.stop(false).await;
 }

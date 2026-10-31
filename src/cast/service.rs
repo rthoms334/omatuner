@@ -49,7 +49,7 @@ use super::relay::RelayConfig;
 use super::session::{Ctl, Links, NullLinks, RealLinks, Session, Timings};
 use super::{
     CastActivity, CastApi, CastDiagnose, CastErrorKind, CastHandle, CastPhase, CastView, Credentials, Device, DeviceId, FirewallJob, Identity,
-    PairError, PairJob, PairState, PairVariant, Pairing, PassOutcome, PeerCredentials, Pin, ReceiverKind, TestState, Usability,
+    PairError, PairJob, PairState, PairVariant, Pairing, PassOutcome, PeerCredentials, Pin, Protocol, ReceiverKind, TestState, Usability,
 };
 use crate::config::{Config, SharedConfig};
 use crate::error::Result;
@@ -454,9 +454,22 @@ impl Shared {
         lock(&self.registry).addr(id)
     }
 
+    /// A DLNA renderer's control URLs as the registry has them now (found by the refresh before
+    /// the cast), else from probing `ip` again: they live in memory only, so a renderer added by
+    /// address needs its description read again after a restart.
+    pub(crate) async fn dlna_control(&self, id: DeviceId, ip: Ipv4Addr) -> Option<super::dlna::Control> {
+        if let Some(c) = lock(&self.registry).get(id).and_then(|d| d.dlna.clone()) {
+            return Some(c);
+        }
+        let s = self.discovery.probe(ip).await.ok().filter(|s| s.id == id)?;
+        let control = s.dlna.clone();
+        self.seen(Seen::Found(s));
+        control
+    }
+
     /// The relay's settings for a session toward `peer` (read live: a change applies at the
     /// next session).
-    pub(crate) fn relay_config(&self, bind: Ipv4Addr, peer: Ipv4Addr) -> RelayConfig {
+    pub(crate) fn relay_config(&self, bind: Ipv4Addr, peer: Ipv4Addr, protocol: Protocol) -> RelayConfig {
         let cfg = self.config();
         RelayConfig {
             bind,
@@ -468,6 +481,7 @@ impl Shared {
             live_dir: self.paths.cast_live_dir(),
             vod_dir: self.paths.cast_vod_dir(),
             user_agent: cfg.player.user_agent.clone(),
+            stream: protocol == Protocol::Dlna,
         }
     }
 
@@ -637,9 +651,14 @@ impl Shared {
         if !device.selectable() {
             return Err(CastErrorKind::Unsupported);
         }
+        // a Mac pairs transiently each session; Google Cast and DLNA have no pairing
+        if device.protocol != Protocol::AirPlay || device.kind == ReceiverKind::Mac {
+            let identity = lock(&self.identity).clone().unwrap_or_else(Identity::ephemeral);
+            return Ok((device, Credentials { identity, peer: None }));
+        }
         let peer = peer.ok_or(CastErrorKind::PairingRequired)?;
         let identity = lock(&self.identity).clone().ok_or(CastErrorKind::PairingRequired)?;
-        Ok((device, Credentials { identity, peer }))
+        Ok((device, Credentials { identity, peer: Some(peer) }))
     }
 }
 
@@ -971,10 +990,20 @@ impl CastApi for Api {
         }
     }
 
-    /// The AirPlay client's own (one session at a time), while a session runs.
+    /// The AirPlay client's own (one session at a time), while a session runs; a Cast device's
+    /// are always its own clock's; a DLNA renderer's may be either (its `RelTime`, or the time
+    /// played when it keeps saying 0), so none is claimed.
     fn position_source(&self) -> Option<super::PositionSource> {
         let running = lock(&self.0.live).as_ref().is_some_and(|l| !l.task.is_finished());
-        running.then(super::airplay::position_source).flatten()
+        if !running {
+            return None;
+        }
+        let device = lock(&self.0.last).device;
+        match device.and_then(|id| lock(&self.0.registry).get(id).map(|d| d.protocol)) {
+            Some(Protocol::GoogleCast) => Some(super::PositionSource::Reported),
+            Some(Protocol::Dlna) => None,
+            Some(Protocol::AirPlay) | None => super::airplay::position_source(),
+        }
     }
 
     /// A session counts from `open` until its task let go of the TV (a stopped one may still be
@@ -1042,7 +1071,7 @@ impl CastApi for Api {
             behind_live_s: None,
             can_seek: true,
             // AirPlay has no verified volume path ("Use the TV remote for volume")
-            volume: !matches!(device.kind, ReceiverKind::AppleTv | ReceiverKind::AirPlayTv),
+            volume: !matches!(device.kind, ReceiverKind::AppleTv | ReceiverKind::AirPlayTv | ReceiverKind::Mac),
         };
         tracing::info!("cast session {}: starting", id.short());
         let session = Session::new(shared.clone(), device, creds, Arc::new(move |ev| drop(ev_tx.send(ev))));

@@ -67,7 +67,7 @@ use super::inhibit::SleepInhibitor;
 use super::receiver::{Backend, LoadReq, ReceiverEvent, ReceiverInfo};
 use super::relay::{LoadSpec, Prepared, RelayConfig, RelayEvent, RelaySession};
 use super::service::Shared;
-use super::{CastErrorKind, CastHints, CastLevel, CastPhase, Credentials, Device, ReceiverKind, airplay};
+use super::{CastErrorKind, CastHints, CastLevel, CastPhase, Credentials, Device, Protocol, ReceiverKind, airplay};
 use crate::model::{Playable, PlayableKind};
 use crate::player::PlayerErrorKind;
 use crate::player::remote::{RemoteCmd, RemoteEvent};
@@ -323,7 +323,7 @@ impl FakeRelay {
     fn prepared(&self, live: bool, offset_s: f64, level: CastLevel, surround: bool) -> Prepared {
         let n = self.state.lock().unwrap_or_else(|e| e.into_inner()).calls.len();
         Prepared {
-            load: LoadReq { url: Secret::new(format!("http://192.0.2.1:47800/c/fake{n}/index.m3u8")), live, offset_s },
+            load: LoadReq { url: Secret::new(format!("http://192.0.2.1:47800/c/fake{n}/index.m3u8")), live, offset_s, fmp4: false },
             level,
             behind_live_s: live.then_some(15),
             surround,
@@ -662,11 +662,14 @@ impl Session {
         // IPv4 only in Phase 1
         let IpAddr::V4(peer) = addr.ip() else { return Err(CastErrorKind::Unreachable) };
         self.device = self.device.clone().at(addr);
+        if self.device.protocol == Protocol::Dlna {
+            self.device.dlna = self.shared.dlna_control(self.device.id, peer).await;
+        }
         if self.relay.is_none() {
             let bind = local_toward(peer).ok_or(CastErrorKind::Unreachable)?;
             // detection re-runs at each session start (§9.4); the watchdog asks again
             self.shared.refresh_firewall(Some(peer));
-            let relay = self.shared.links.relay(self.shared.relay_config(bind, peer)).await?;
+            let relay = self.shared.links.relay(self.shared.relay_config(bind, peer, self.device.protocol)).await?;
             self.relay = Some(relay);
         }
         if self.backend.is_none() {
@@ -814,8 +817,15 @@ impl Session {
         let relay = self.relay.as_mut().expect("connected");
         let prepared = match &job.source {
             Source::Item { playable, .. } => {
-                let spec =
-                    LoadSpec { generation: job.generation, playable: playable.clone(), hints, receiver: self.device.kind, force, stereo: job.stereo };
+                let spec = LoadSpec {
+                    generation: job.generation,
+                    playable: playable.clone(),
+                    hints,
+                    receiver: self.device.kind,
+                    model: self.device.model.clone(),
+                    force,
+                    stereo: job.stereo,
+                };
                 relay.load(spec).await
             }
             Source::TestCard => relay.test_card(job.generation).await,
@@ -1172,6 +1182,7 @@ impl Session {
                 }
             }
             RelayEvent::Irregular { .. }
+            | RelayEvent::StreamEnded { .. }
             | RelayEvent::TargetOverflow { .. }
             | RelayEvent::StartIgnored { .. }
             | RelayEvent::Unindexed { .. }
@@ -1208,6 +1219,15 @@ impl Session {
                     && let Some(b) = self.backend.as_mut()
                 {
                     b.fetched(from_s, upto_s).await;
+                }
+                None
+            }
+            RelayEvent::StreamEnded { generation } => {
+                // a DLNA renderer has all of the item: its next stop is the end, not the remote
+                if self.cur.as_ref().is_some_and(|c| c.generation == generation)
+                    && let Some(b) = self.backend.as_mut()
+                {
+                    b.stream_ended();
                 }
                 None
             }
@@ -1461,17 +1481,28 @@ async fn sleep_until(t: Option<Instant>) {
 }
 
 /// The one INFO line per session, without addresses (DESIGN §40 §7.6):
-/// `cast: AppleTV14,1 tvOS 26.6 (23L773) AirPlay 960.13.1 pairing=hkp3 timing=ptp`.
+/// `cast: AppleTV14,1 tvOS 26.6 (23L773) AirPlay 960.13.1 pairing=hkp3 timing=ptp`, a Mac's with
+/// `pairing=transient`; `cast: Chromecast Google Cast`, `cast: QE55Q60R DLNA`.
 fn log_receiver(device: &Device, info: &ReceiverInfo) {
     let or = |s: &Option<String>| s.clone().unwrap_or_else(|| "?".into());
-    let os = if device.kind == ReceiverKind::AppleTv { "tvOS" } else { "OS" };
-    let pairing = info.pairing.map_or("?", |p| p.as_str());
-    tracing::info!(
-        "cast: {} {os} {} AirPlay {} pairing={pairing} timing=ptp",
-        or(&info.model.clone().or_else(|| device.model.clone())),
-        or(&info.os_version),
-        or(&info.source_version)
-    );
+    let model = or(&info.model.clone().or_else(|| device.model.clone()));
+    match device.protocol {
+        Protocol::GoogleCast => tracing::info!("cast: {model} Google Cast"),
+        Protocol::Dlna => tracing::info!("cast: {model} DLNA"),
+        Protocol::AirPlay => {
+            let os = match device.kind {
+                ReceiverKind::AppleTv => "tvOS",
+                ReceiverKind::Mac => "macOS",
+                _ => "OS",
+            };
+            let pairing = match (info.pairing, device.kind) {
+                (Some(p), _) => p.as_str(),
+                (None, ReceiverKind::Mac) => "transient",
+                (None, _) => "?",
+            };
+            tracing::info!("cast: {model} {os} {} AirPlay {} pairing={pairing} timing=ptp", or(&info.os_version), or(&info.source_version));
+        }
+    }
 }
 
 /// Test on TV (§3.5, §8.5): the relay's test card through a session of its own; the verdict is

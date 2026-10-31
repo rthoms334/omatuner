@@ -6829,8 +6829,9 @@ connection, as the local player would), repackages it with `ffmpeg` into HLS and
 the TV over the LAN; the TV never sees a provider address or login. Phase 1 casts to an Apple TV
 4K (tvOS 26.x and 27, pairing mandatory) over AirPlay 2 video, in native Rust with no helper
 process. Third-party AirPlay TVs (the Hisense) are listed and offered like the Apple TV and cast
-with VioletRelay's third-party profile; there is no experimental tier. Chromecast, DLNA
-and Roku are later phases (cast design §15.3). The whole feature sits behind the compile-time
+with VioletRelay's third-party profile; there is no experimental tier. Macs (transient
+pairing), Google Cast (CASTV2, the Default Media Receiver) and DLNA renderers (one continuous
+MPEG-TS stream) are receivers too (cast design Appendix E); Roku is a later phase (§15.3). The whole feature sits behind the compile-time
 switch `cast::ENABLED` (`src/cast/mod.rs`; the key table's `feature_on`, the service start, the
 OSD and menu items, the Settings page, the cards and the agent's tools all read it) and the
 user's `[cast] enabled`.

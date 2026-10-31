@@ -250,8 +250,9 @@ impl PairSetup {
 
 /// The keys a verified session derives from.
 pub struct SessionKeys {
-    /// The X25519 shared secret.
-    pub shared: Secret<[u8; 32]>,
+    /// The X25519 shared secret (pair-verify), or the SRP session key `K` (64 bytes, transient
+    /// pair-setup).
+    pub shared: Secret<Vec<u8>>,
 }
 
 impl SessionKeys {
@@ -329,7 +330,70 @@ impl PairVerify {
         if tlv.get(tag::ERROR).is_some() || !state_ok {
             return Err(PairError::Failed);
         }
-        Ok(SessionKeys { shared })
+        Ok(SessionKeys { shared: Secret::new(shared.expose().to_vec()) })
+    }
+}
+
+/// The PIN of transient pairing (pyatv `TRANSIENT_PIN`, pair_ap `pair_homekit.c`).
+pub const TRANSIENT_PIN: &str = "3939";
+/// M1's `Flags` for transient pairing (`PairingFlagsTransient`).
+pub const FLAG_TRANSIENT: u8 = 0x10;
+
+/// The headers of a transient `/pair-setup` (`X-Apple-HKP: 4`; pyatv `_AIRPLAY_HEADERS`, owntone
+/// `airplay.c`).
+pub fn transient_headers() -> Vec<(&'static str, String)> {
+    vec![("X-Apple-HKP", "4".to_owned()), ("Content-Type", CONTENT_TYPE.to_owned()), ("User-Agent", USER_AGENT.to_owned())]
+}
+
+/// Transient pair-setup (a Mac's AirPlay Receiver; DESIGN §40 Appendix E): M1 `{Method 0, State
+/// 1, Flags 0x10}`, M3 with the SRP proof for [`TRANSIENT_PIN`] as user `Pair-Setup`, and M4's
+/// server proof checked. There is no M5/M6 and no pair-verify: the session's keys come from the
+/// SRP session key `K` itself (pyatv `hap_transient.py`, pair_ap `pair_homekit.c`
+/// `PAIR_CLIENT_HOMEKIT_TRANSIENT`; the receiver side in airplay2-receiver `hap.py`). Nothing is
+/// stored: each session pairs again.
+pub struct PairTransient {
+    srp: SrpClient,
+    proof: Option<ClientProof>,
+}
+
+impl PairTransient {
+    pub fn new() -> Self {
+        let mut a = [0; 32];
+        rand::fill(&mut a).expect("the system RNG");
+        Self { srp: SrpClient::new(&a), proof: None }
+    }
+
+    /// M1 `{Method 0, State 1, Flags 0x10}`.
+    pub fn m1(&mut self) -> Vec<u8> {
+        tlv8::encode(&[(tag::METHOD, &[0]), (tag::STATE, &[1]), (tag::FLAGS, &[FLAG_TRANSIENT])])
+    }
+
+    /// From M2 `{Salt, PublicKey}`: M3 `{State 3, PublicKey, Proof}`.
+    pub fn m3(&mut self, m2: &[u8]) -> Result<Vec<u8>, PairError> {
+        let tlv = decode(m2)?;
+        setup_error(&tlv, false)?;
+        let (Some(salt), Some(b_pub)) = (tlv.get(tag::SALT), tlv.get(tag::PUBLIC_KEY)) else { return Err(PairError::Failed) };
+        let proof = self.srp.process(salt, b_pub, TRANSIENT_PIN).map_err(|_| PairError::Failed)?;
+        let m3 = tlv8::encode(&[(tag::STATE, &[3]), (tag::PUBLIC_KEY, &proof.public_a), (tag::PROOF, &proof.proof)]);
+        self.proof = Some(proof);
+        Ok(m3)
+    }
+
+    /// Check M4's proof (`H(A ‖ M1 ‖ K)`): the session keys, from `K`.
+    pub fn finish(self, m4: &[u8]) -> Result<SessionKeys, PairError> {
+        let proof = self.proof.ok_or(PairError::Failed)?;
+        let tlv = decode(m4)?;
+        // an authentication error here is a receiver that wants a password, not 3939
+        setup_error(&tlv, false)?;
+        let server_proof = tlv.get(tag::PROOF).ok_or(PairError::Failed)?;
+        constant_time::verify_slices_are_equal(server_proof, &proof.expected_server_proof).map_err(|_| PairError::Failed)?;
+        Ok(SessionKeys { shared: proof.session_key })
+    }
+}
+
+impl Default for PairTransient {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -508,7 +572,15 @@ pub mod server {
         /// the controller's write key and writes with its read key.
         pub fn keys(&self) -> Option<SessionKeys> {
             let (_, shared) = self.exchange.as_ref().filter(|_| self.verified)?;
-            Some(SessionKeys { shared: shared.clone() })
+            Some(SessionKeys { shared: Secret::new(shared.expose().to_vec()) })
+        }
+    }
+
+    impl PairSetupServer {
+        /// A transient pair-setup finished (M1 asked with `Flags 0x10`, M3 verified): the
+        /// session keys, from `K` (a Mac's receiver, DESIGN §40 Appendix E).
+        pub fn transient_keys(&self) -> Option<SessionKeys> {
+            self.key.as_ref().map(|k| SessionKeys { shared: k.clone() })
         }
     }
 }

@@ -1030,7 +1030,7 @@ pub struct CastingOut {
     pub device_ref: String,
     /// The TV's name (sanitised).
     pub device: String,
-    /// `apple_tv`, `airplay_tv`, `chromecast` or `dlna` (`act::kind_name`).
+    /// `apple_tv`, `airplay_tv`, `mac`, `chromecast` or `dlna` (`act::kind_name`).
     pub kind: String,
     pub phase: CastPhase,
     /// Live: roughly how far the TV runs behind the live point.
@@ -1054,7 +1054,7 @@ pub struct CastDeviceOut {
     #[serde(rename = "ref")]
     pub device_ref: String,
     pub name: String,
-    /// `apple_tv`, `airplay_tv`, `chromecast` or `dlna` (`act::kind_name`).
+    /// `apple_tv`, `airplay_tv`, `mac`, `chromecast` or `dlna` (`act::kind_name`).
     pub kind: String,
     /// Ready to cast: paired, or a TV that needs no pairing. `false`: pair it in Tuner first.
     pub paired: bool,

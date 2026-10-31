@@ -1,6 +1,6 @@
 //! Receiver dispatch (DESIGN §40 §5.4): one enum over the protocol clients, no `dyn` async trait.
-//! OWNER: CAST-0 (frozen). AirPlay is Phase 1; `GoogleCast` (Phase 2) and `Dlna` (Phase 3) join
-//! as variants with the same methods. [`FakeReceiver`] is the scripted stand-in the session
+//! OWNER: CAST-0 (frozen). AirPlay is Phase 1; `GoogleCast` (Phase 2) and `Dlna` (Phase 3) are
+//! variants with the same methods. [`FakeReceiver`] is the scripted stand-in the session
 //! orchestrator's tests use (CAST-6); the protocol-level fake TV is
 //! `tests/support/fake_airplay.rs` (CAST-3).
 //!
@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use super::airplay;
 use super::{CastErrorKind, Credentials, Device, PairVariant, Protocol, ReceiverKind};
+use super::{airplay, dlna, googlecast};
 use crate::redact::Secret;
 
 /// What to play: the relay's LAN URL (a one-generation bearer token: a `Secret`).
@@ -27,6 +27,8 @@ pub struct LoadReq {
     /// Seconds into the item where this playlist starts (added to reported positions; 0 for a
     /// full-length item's whole playlist).
     pub offset_s: f64,
+    /// fMP4 segments (else MPEG-TS): a Cast receiver is told which (`hlsVideoSegmentFormat`).
+    pub fmp4: bool,
 }
 
 /// What the receiver reports (positions are relative to the current playlist; the session adds
@@ -66,6 +68,8 @@ pub struct ReceiverInfo {
 /// A connected receiver.
 pub enum Backend {
     AirPlay(airplay::Client),
+    GoogleCast(googlecast::Client),
+    Dlna(dlna::Client),
     /// Scripted (session tests).
     #[doc(hidden)]
     Fake(FakeReceiver),
@@ -84,7 +88,11 @@ impl Backend {
                 };
                 airplay::Client::connect(addr, creds, profile, &device.ids).await.map(Backend::AirPlay)
             }
-            Protocol::GoogleCast | Protocol::Dlna => Err(CastErrorKind::Unsupported),
+            Protocol::GoogleCast => googlecast::Client::connect(addr, device.model.clone()).await.map(Backend::GoogleCast),
+            Protocol::Dlna => {
+                let control = device.dlna.clone().ok_or(CastErrorKind::Unreachable)?;
+                dlna::Client::connect(addr, control, device.model.clone()).await.map(Backend::Dlna)
+            }
         }
     }
 
@@ -92,6 +100,8 @@ impl Backend {
     pub async fn load(&mut self, req: &LoadReq) -> Result<(), CastErrorKind> {
         match self {
             Backend::AirPlay(c) => c.load(req).await,
+            Backend::GoogleCast(c) => c.load(req).await,
+            Backend::Dlna(c) => c.load(req).await,
             Backend::Fake(f) => f.call(Call::Load(req.clone())),
         }
     }
@@ -100,6 +110,8 @@ impl Backend {
     pub async fn replace(&mut self, req: &LoadReq) -> Result<(), CastErrorKind> {
         match self {
             Backend::AirPlay(c) => c.replace(req).await,
+            Backend::GoogleCast(c) => c.replace(req).await,
+            Backend::Dlna(c) => c.replace(req).await,
             Backend::Fake(f) => f.call(Call::Replace(req.clone())),
         }
     }
@@ -107,6 +119,8 @@ impl Backend {
     pub async fn set_paused(&mut self, paused: bool) -> Result<(), CastErrorKind> {
         match self {
             Backend::AirPlay(c) => c.set_paused(paused).await,
+            Backend::GoogleCast(c) => c.set_paused(paused).await,
+            Backend::Dlna(c) => c.set_paused(paused).await,
             Backend::Fake(f) => f.call(Call::SetPaused(paused)),
         }
     }
@@ -116,9 +130,18 @@ impl Backend {
     pub async fn fetched(&mut self, from_s: f64, upto_s: f64) {
         match self {
             Backend::AirPlay(c) => c.fetched(from_s, upto_s).await,
+            Backend::GoogleCast(_) => {}
+            Backend::Dlna(c) => c.fetched(from_s, upto_s),
             Backend::Fake(f) => {
                 let _ = f.call(Call::Fetched(from_s, upto_s));
             }
+        }
+    }
+
+    /// The relay's stream reached the item's end (a DLNA renderer: its next stop is `Ended`).
+    pub fn stream_ended(&mut self) {
+        if let Backend::Dlna(c) = self {
+            c.stream_ended();
         }
     }
 
@@ -126,6 +149,8 @@ impl Backend {
     pub async fn set_volume(&mut self, v: f64) -> Option<()> {
         match self {
             Backend::AirPlay(_) => None,
+            Backend::GoogleCast(c) => c.set_volume(v).await,
+            Backend::Dlna(c) => c.set_volume(v).await,
             Backend::Fake(f) => f.call(Call::SetVolume(v)).ok(),
         }
     }
@@ -134,6 +159,8 @@ impl Backend {
     pub async fn position(&mut self) -> Option<f64> {
         match self {
             Backend::AirPlay(c) => c.position().await,
+            Backend::GoogleCast(c) => c.position().await,
+            Backend::Dlna(c) => c.position().await,
             Backend::Fake(f) => f.state().position,
         }
     }
@@ -142,6 +169,8 @@ impl Backend {
     pub async fn next_event(&mut self) -> ReceiverEvent {
         match self {
             Backend::AirPlay(c) => c.next_event().await,
+            Backend::GoogleCast(c) => c.next_event().await,
+            Backend::Dlna(c) => c.next_event().await,
             Backend::Fake(f) => f.events.recv().await.unwrap_or(ReceiverEvent::Lost(CastErrorKind::Unreachable)),
         }
     }
@@ -150,6 +179,8 @@ impl Backend {
     pub async fn stop(&mut self) {
         match self {
             Backend::AirPlay(c) => c.stop().await,
+            Backend::GoogleCast(c) => c.stop().await,
+            Backend::Dlna(c) => c.stop().await,
             Backend::Fake(f) => {
                 let _ = f.call(Call::Stop);
             }
@@ -159,6 +190,8 @@ impl Backend {
     pub fn info(&self) -> ReceiverInfo {
         match self {
             Backend::AirPlay(c) => c.info(),
+            Backend::GoogleCast(c) => c.info(),
+            Backend::Dlna(c) => c.info(),
             Backend::Fake(f) => f.state().info.clone(),
         }
     }
