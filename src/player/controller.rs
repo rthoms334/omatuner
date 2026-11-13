@@ -50,8 +50,8 @@ use super::remote::{RemoteAdapter, RemoteCmd, RemoteEvent, RemoteOutput, TvClock
 use super::state::{Effect, Input, MachineConfig, PlayerMachine};
 use super::tracks::{AspectMode, StreamInfo, parse_track_list, query_stream_info};
 use super::{
-    CopyPlay, LiveBufferRange, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot, PlayerState,
-    RenderClock,
+    CopyPlay, DolbyVision, LiveBufferRange, PlayRequest, PlayerCommand, PlayerDeps, PlayerError, PlayerErrorKind, PlayerEvent, PlayerSnapshot,
+    PlayerState, RenderClock,
 };
 use crate::config::{Config, SubtitleAuto};
 use crate::model::{
@@ -195,6 +195,7 @@ fn create(
         logged: LoggedState { label: state_label(&PlayerState::Idle), who: "nothing".into(), since: Instant::now(), outage: None, provider: None },
         last_health: Instant::now(),
         ffmpeg_reconnects: 0,
+        dv: Default::default(),
         output: Output::Local,
         lease_generation: None,
         local_view: None,
@@ -329,6 +330,8 @@ struct Controller {
     last_health: Instant,
     /// FFmpeg's own reconnects of dropped transfers since the last health line.
     ffmpeg_reconnects: u32,
+    /// Dolby Vision profile 5: the conversion filter and its watch on dropped frames.
+    dv: super::dolby_vision::DvState,
     /// mpv or a TV (DESIGN §40 §5.5).
     output: Output,
     /// Casting: the load generation whose relay upstream the current lease is (`lease_entry`
@@ -425,6 +428,7 @@ impl Controller {
                     self.pending_tick(now);
                     self.waiting_tick();
                     self.video_watchdog(now);
+                    self.dolby_vision_tick(now);
                     self.live_tick();
                     if !self.casting()
                         && (self.machine.state().is_active() || matches!(self.machine.state(), PlayerState::Paused))
@@ -893,6 +897,7 @@ impl Controller {
         self.snap.position = None;
         self.snap.duration = p.duration_hint;
         self.snap.stream_info = None;
+        self.snap.dolby_vision = None;
         self.snap.tracks = Default::default();
         self.file_loaded = false;
         self.subtitle_selected_manually = false;
@@ -1515,6 +1520,7 @@ impl Controller {
         self.local_view = Some(LocalView { sub_delay: s.sub_delay, sub_scale: s.sub_scale, aspect: s.aspect, zoom: s.zoom });
         (s.sub_delay, s.sub_scale, s.aspect, s.zoom) = (d.sub_delay, d.sub_scale, d.aspect, d.zoom);
         (s.stream_info, s.hwdec, s.video_size, s.cache_secs, s.video_suspended) = (None, None, None, None, false);
+        s.dolby_vision = None;
         s.paused = false;
         s.cast = Some(out.view.clone());
         if s.tracks != d.tracks {
@@ -2003,6 +2009,12 @@ impl Controller {
         next.map(|n| (n, copy.get()))
     }
 
+    /// How long since the UI last rendered a frame, `last` being the render clock's stamp.
+    fn render_idle(&self, now: Instant, last: u64) -> Duration {
+        let since_epoch = now.duration_since(self.epoch).as_millis() as u64;
+        Duration::from_millis(since_epoch.saturating_sub(last))
+    }
+
     /// Hidden-window safety net (module docs of `player`).
     fn video_watchdog(&mut self, now: Instant) {
         // The HLS recorder is independent of decoding. A hidden picture at live may
@@ -2020,8 +2032,7 @@ impl Controller {
         if last == 0 || self.snap.video_suspended || self.snap.video_size.is_none() {
             return; // no surface yet / nothing to suspend
         }
-        let since_epoch = now.duration_since(self.epoch).as_millis() as u64;
-        let idle = Duration::from_millis(since_epoch.saturating_sub(last));
+        let idle = self.render_idle(now, last);
         if idle > SUSPEND_VIDEO_AFTER && matches!(self.machine.state(), PlayerState::Playing) {
             // the clock is stamped per UI frame: a visible window over a stream that stopped
             // advancing stops repainting too
@@ -2101,6 +2112,10 @@ impl Controller {
         match ev {
             MpvEvent::StartFile { entry_id } => {
                 self.file_loaded = false;
+                if self.dv.file_started() {
+                    let _ = self.mpv.command("vf", &["remove", super::dolby_vision::LABEL]);
+                }
+                self.snap.dolby_vision = None;
                 if self.lease_redirected && self.lease.is_some() {
                     // the controller is the only playlist writer: the entry starting after a
                     // redirect is the expansion of our leased playlist
@@ -2122,6 +2137,7 @@ impl Controller {
                 // whatever order mpv delivers the `video-params` change in
                 self.read_video_size();
                 self.read_seekable();
+                self.dv.restart_window();
                 self.feed(Input::PlaybackRestart, now)
             }
             MpvEvent::EndFile { reason, error, entry_id, inserted } => {
@@ -2157,6 +2173,13 @@ impl Controller {
                 }
                 if mpv_log::is_internal_reconnect(&text) {
                     self.ffmpeg_reconnects += 1;
+                }
+                // the filter started, then failed on the picture's format (a hardware decoder's
+                // frames): mpv takes it out and the colours are wrong again
+                if self.dv.filter && text.contains("Disabling filter") && (text.contains("tuner-dv") || text.contains("libplacebo")) {
+                    self.dv.filter = false;
+                    tracing::warn!("{}: the Dolby Vision filter failed after it started: its colours are wrong", self.log);
+                    self.set_dolby_vision(DolbyVision::Unsupported);
                 }
                 self.log_mpv(&level, &prefix, &text, now);
                 false
@@ -2307,9 +2330,64 @@ impl Controller {
                     _ => None,
                 }
             }
+            // `file_loaded`: not the previous file's change, queued while a zap loads the next
+            PropId::DecColormatrix => {
+                if self.file_loaded && matches!(&v, PropValue::Str(m) if m == "dolbyvision") && self.snap.dolby_vision.is_none() {
+                    self.start_dolby_vision();
+                }
+            }
             PropId::CoreIdle | PropId::Aid | PropId::Sid | PropId::EofReached => {}
         }
         false
+    }
+
+    /// The decoder reports Dolby Vision profile 5: convert it to HDR10 (see [`DolbyVision`]),
+    /// or say that the colours will be wrong when the filter can't start.
+    fn start_dolby_vision(&mut self) {
+        let state = match self.mpv.command("vf", &["add", super::dolby_vision::FILTER]) {
+            Ok(()) => {
+                self.dv.filter = true;
+                tracing::info!("{}: Dolby Vision profile 5; converting it to HDR10 with libplacebo", self.log);
+                DolbyVision::Converted
+            }
+            Err(e) => {
+                let e = e.to_string();
+                let e = crate::redact::redact(&e);
+                tracing::warn!("{}: Dolby Vision profile 5 and the libplacebo filter couldn't start ({e}): its colours are wrong", self.log);
+                DolbyVision::Unsupported
+            }
+        };
+        self.set_dolby_vision(state);
+    }
+
+    /// Publish `state`; a problem is told to the app once per title.
+    fn set_dolby_vision(&mut self, state: DolbyVision) {
+        self.snap.dolby_vision = Some(state);
+        self.force_publish = true;
+        if state != DolbyVision::Converted && self.dv.should_warn(self.snap.playable.as_ref().map(|p| &p.media)) {
+            self.emit(PlayerEvent::DolbyVision(state));
+        }
+    }
+
+    /// While a converted Dolby Vision picture plays: frames dropping steadily mean the GPU
+    /// can't keep up with this copy ([`DolbyVision::Slow`]). The picture stays converted.
+    fn dolby_vision_tick(&mut self, now: Instant) {
+        if !self.dv.filter || self.snap.dolby_vision != Some(DolbyVision::Converted) {
+            return;
+        }
+        // a hidden window renders nothing and mpv counts every frame it skips as dropped
+        let last = self.render_clock.load(Ordering::Relaxed);
+        let hidden = last == 0 || self.render_idle(now, last) > Duration::from_secs(1);
+        if !matches!(self.machine.state(), PlayerState::Playing) || self.snap.paused || self.snap.video_suspended || hidden {
+            self.dv.restart_window();
+            return;
+        }
+        let count = |n: &str| self.mpv.get_property::<i64>(n).unwrap_or(0);
+        let drops = count("frame-drop-count") + count("decoder-frame-drop-count");
+        if let Some(n) = self.dv.tick(now, drops) {
+            tracing::warn!("{}: converting Dolby Vision can't keep up ({n} frames dropped in 10 s)", self.log);
+            self.set_dolby_vision(DolbyVision::Slow);
+        }
     }
 
     /// Persist progress of the current movie/episode at `pos` (catch-up items are channel refs

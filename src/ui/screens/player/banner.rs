@@ -224,7 +224,12 @@ fn local_lines(ctx: &UiCtx<'_>, snap: &PlayerSnapshot, i: &StreamInfo) -> Vec<St
     };
     let mut lines = vec![format!("Video    {} · {res} · {}", opt(&i.video_codec), i.fps.map_or_else(|| "–".into(), |f| format!("{f:.2} fps")))];
     lines.extend(provider_lines(ctx, snap, i));
-    lines.push(format!("Format   {}{}", opt(&i.pixel_format), if i.is_hdr() { " · HDR" } else { "" }));
+    let range = match snap.dolby_vision {
+        Some(dv) => format!(" · {}", dv.label()),
+        None if i.is_hdr() => " · HDR".into(),
+        None => String::new(),
+    };
+    lines.push(format!("Format   {}{range}", opt(&i.pixel_format)));
     lines.push(format!(
         "Audio    {} · {} · {}",
         opt(&i.audio_codec),

@@ -124,6 +124,11 @@ pub struct PictureHealth {
     pub video_codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<f64>,
+    /// The picture is Dolby Vision profile 5: `converted` (the colours are right), `slow`
+    /// (converted, but frames drop) or `unsupported` (green and purple). Another copy of the
+    /// title fixes the last two.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dolby_vision: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist: Option<String>,
 }
@@ -223,6 +228,7 @@ fn picture(q: &Q, tile: crate::model::TileId, s: &PlayerSnapshot) -> Option<Pict
         video: s.video_size.map(|(w, h)| format!("{w}x{h}")),
         video_codec: info.and_then(|i| i.video_codec.clone()),
         fps: info.and_then(|i| i.fps).map(|f| (f * 100.0).round() / 100.0),
+        dolby_vision: s.dolby_vision.map(crate::player::DolbyVision::as_str),
         playlist: s.claim.and_then(|src| q.lib.source(src)).map(|m| clean(&m.name)),
     })
 }

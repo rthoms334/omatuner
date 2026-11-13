@@ -380,11 +380,7 @@ impl PlayerScreen {
     /// Ctrl+O while a movie or episode plays: the title's other copies, each from where
     /// playback is now (a few indexed reads, once per press).
     fn play_from_menu(&mut self, ctx: &mut UiCtx<'_>) {
-        let snap = ctx.player.clone();
-        let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
-        let (db, lib, order, now) = (ctx.db, ctx.lib, ctx.config.interface.copy_order, ctx.now);
-        let plan_of = |movies: bool, item: u32| crate::store::copies::plan(db, &lib.vod, movies, item, unlocked, order, now).ok();
-        let copies = crate::ui::copies::other_copies(db, lib, plan_of, &snap);
+        let copies = crate::ui::copies::other_copies_now(ctx);
         if copies.is_empty() {
             ctx.toast(crate::msg::Toast::info("This title has no other copy"));
             return;

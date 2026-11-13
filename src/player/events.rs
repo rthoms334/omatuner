@@ -44,6 +44,8 @@ pub enum PropId {
     EofReached = 19,
     AudioDevice = 20,
     CurrentAo = 21,
+    /// The decoder's colour matrix, before any filter: `dolbyvision` is Dolby Vision profile 5.
+    DecColormatrix = 22,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,7 @@ const OBSERVED: &[(PropId, &str, Fmt)] = &[
     (PropId::EofReached, "eof-reached", Fmt::Flag),
     (PropId::AudioDevice, "audio-device", Fmt::Str),
     (PropId::CurrentAo, "current-ao", Fmt::Str),
+    (PropId::DecColormatrix, "video-dec-params/colormatrix", Fmt::Str),
 ];
 
 impl PropId {

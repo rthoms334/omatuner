@@ -981,6 +981,11 @@ impl TunerApp {
             AppEvent::Player(crate::player::PlayerEvent::FellBack { title, from, to, .. }) => {
                 self.toast(crate::ui::copies::fell_back_toast(&self.lib, title, *from, *to));
             }
+            // a Dolby Vision copy Tuner can't show well: offer the title's other copies
+            AppEvent::Player(crate::player::PlayerEvent::DolbyVision(state)) => {
+                let other = self.with_ctx(|ctx, _, _| !crate::ui::copies::other_copies_now(ctx).is_empty());
+                self.toast(crate::ui::copies::dolby_vision_toast(*state, other, None));
+            }
             // casting failed, or ended on the TV (DESIGN §40 §3.4): the alert goes where the
             // user is (§3.8)
             AppEvent::Player(crate::player::PlayerEvent::Failed(crate::player::PlayerError {
@@ -2364,6 +2369,15 @@ impl TunerApp {
                 self.toast(Toast::info("Rule removed"));
             }
             Action::OpenFollowing if crate::follow::ENABLED => self.open_following(egui_ctx),
+            // a Dolby Vision toast's button: the player's Ctrl+O menu, over the player (its choice
+            // goes back to the player screen)
+            Action::OtherCopies => {
+                if self.view_screen() != ScreenId::Player && self.has_media() {
+                    self.nav.push(NavRequest::Push(Route::Player));
+                }
+                let idx = self.screen_index(ScreenId::Player);
+                self.with_ctx(|ctx, screens, _| screens[idx].on_action(ctx, Action::PlayFrom));
+            }
             Action::NewEpisodes(act) if crate::new_episodes::ENABLED => self.on_new_episodes_act(act, egui_ctx),
             Action::UndoGuideFix(log @ Some(_)) if crate::guide_fix::ENABLED => {
                 let opts = crate::store::guide_fix::GuideOpts::from_config(&self.services().config());

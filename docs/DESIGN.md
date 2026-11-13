@@ -2141,7 +2141,14 @@ wheel scrolls, hovering moves the cursor only with real pointer motion, one clic
 keeps the panel open for the next channel. Stream info `I` (codec,
 resolution, fps, pixel format, HDR badge from gamma pq/hlg, audio codec/layout/rate, bitrates,
 hwdec, dropped frames, cache seconds), with **Copy stream info** to copy the displayed diagnostics
-and toast "Copied stream info". The panel's text lets the video's mouse handling through
+and toast "Copied stream info". Dolby Vision profile 5 (the decoder's colour matrix is
+`dolbyvision`: IPT colours, no HDR10 picture underneath) can't be shown by mpv's OpenGL
+renderer, the only one libmpv's render API has — it comes out green and purple. The controller
+adds FFmpeg's libplacebo filter (`vf add @tuner-dv:libplacebo=…`, Vulkan) for that file, which
+reshapes it to planar 10-bit HDR10 (a P010 picture comes out as noise through the render API), and removes it at the next file. The badge and panel say "Dolby
+Vision · converted"; when the filter can't start ("unsupported") or the picture drops more
+than 20 frames in 10 s of playback ("too slow"), a warning toast (once per title) says so,
+with **Other copies** (the player's Ctrl+O menu) when the title has another copy. The panel's text lets the video's mouse handling through
 (including wheel volume and double-click fullscreen); the Copy button takes its own clicks.
 Digits open numeric entry (`[NumericEntry, PlayerLive]`:
 digits, Enter = go now, Backspace = delete digit, Esc = cancel; auto-commit after 1.5 s).
