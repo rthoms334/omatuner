@@ -26,6 +26,11 @@ change Tuner's settings yourself (guide fixes go through `guide_fix`, with the u
 4. If every copy fails, say so and suggest the same programme on another channel or on
    catch-up later.
 "No sound": `status` (muted? volume?) then `control` `unmute` / `volume`.
+"Wrong colours" / "it's all green and purple": `diagnose`'s picture has `dolby_vision` when
+the copy is Dolby Vision profile 5. `converted`: Tuner shows it right (if the colours are
+still off, it isn't this). `unsupported` (the colours are wrong) or `slow` (converted, but
+frames drop): offer another copy of the title (`details` → `copies`, a copy without "DV" in
+its name) and `play` it with the user's yes.
 
 ## Casting ("it won't play on the TV", "the TV went blank")
 

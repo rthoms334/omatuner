@@ -41,6 +41,7 @@
 pub mod audio_output;
 pub mod budget;
 pub mod controller;
+mod dolby_vision;
 pub mod events;
 pub mod hls;
 pub mod mpv;
@@ -270,6 +271,41 @@ pub struct PlayerError {
     pub message: String,
 }
 
+/// Dolby Vision profile 5: the picture's colours are in Dolby's own IPT space, with no HDR10
+/// picture underneath, and only come out right after the reshaping its per-frame metadata
+/// describes. mpv's OpenGL renderer (the only one libmpv's render API offers) can't do that
+/// and shows it green and purple, so the controller converts it to HDR10 with FFmpeg's
+/// libplacebo filter (Vulkan) — and says when that fails or can't keep up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DolbyVision {
+    /// The filter converts it: the colours are right.
+    Converted,
+    /// Converted, but frames drop: the GPU can't keep up with this copy.
+    Slow,
+    /// The filter couldn't start (no Vulkan): the colours are wrong.
+    Unsupported,
+}
+
+impl DolbyVision {
+    /// How the info panel says it: "Dolby Vision · converted".
+    pub fn label(self) -> &'static str {
+        match self {
+            DolbyVision::Converted => "Dolby Vision · converted",
+            DolbyVision::Slow => "Dolby Vision · too slow",
+            DolbyVision::Unsupported => "Dolby Vision · unsupported",
+        }
+    }
+
+    /// The word the agent's diagnose uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DolbyVision::Converted => "converted",
+            DolbyVision::Slow => "slow",
+            DolbyVision::Unsupported => "unsupported",
+        }
+    }
+}
+
 /// Player lifecycle (DESIGN §11.3 state diagram).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerState {
@@ -402,6 +438,8 @@ pub struct PlayerSnapshot {
     /// The Play on switch (DESIGN §40 §3.9, [`PlayerCommand::SetPlayOn`]): the TV picture A's
     /// plays go to; `None` = this computer (and always for picture B).
     pub play_on: Option<crate::model::DeviceId>,
+    /// The picture is Dolby Vision profile 5 and how Tuner shows it (`None`: it isn't).
+    pub dolby_vision: Option<DolbyVision>,
 }
 
 impl Default for PlayerSnapshot {
@@ -440,6 +478,7 @@ impl Default for PlayerSnapshot {
             zap_anchor: None,
             cast: None,
             play_on: None,
+            dolby_vision: None,
         }
     }
 }
@@ -494,6 +533,9 @@ pub enum PlayerEvent {
     LiveSeekBoundary {
         oldest: bool,
     },
+    /// The picture is Dolby Vision profile 5 and Tuner can't show it well ([`DolbyVision::Slow`]
+    /// or [`DolbyVision::Unsupported`]): the app toasts "try another copy". Once per title.
+    DolbyVision(DolbyVision),
     /// Casting ended without the user asking in Tuner (DESIGN §40 §3.4, §3.8): `kind` is
     /// `StoppedOnTv` (the TV's remote stopped it, or another device took over). The output is
     /// local again and nothing plays; no error state. The app alerts where the user is (the
@@ -1259,7 +1301,7 @@ mod tests {
 
     /// Copies of one movie for the fallback tests: `Movie(1)` is a file that doesn't exist (in
     /// playlist 1), `Movie(2)` plays lavfi's test source (playlist 2), `Movie(3)` can't be
-    /// resolved.
+    /// resolved, `Movie(4)` is a second of Dolby Vision profile 5 (playlist 1).
     struct Copies;
 
     impl MediaResolver for Copies {
@@ -1268,6 +1310,9 @@ mod tests {
             let (id, url) = match media {
                 MediaRef::Movie(MovieId(1)) => (1, "/nonexistent/tuner-test/dune.mkv"),
                 MediaRef::Movie(MovieId(2)) => (2, "av://lavfi:testsrc2=size=160x90:rate=25"),
+                // x265's test pattern with dovi_tool's profile 5 RPU (assets/tests/profile5.bin)
+                // after every picture
+                MediaRef::Movie(MovieId(4)) => (1, concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/video/dv5.mkv")),
                 _ => return Err(PlayerError { kind: PlayerErrorKind::Resolve, message: "no such copy".into() }),
             };
             Ok(Playable {
@@ -1339,6 +1384,44 @@ mod tests {
         h.send(copy(3, None, None));
         assert!(wait_until(Duration::from_secs(5), || matches!(h.snapshot().last_error, Some(PlayerError { kind: PlayerErrorKind::Resolve, .. }))));
         assert_eq!(fell_back(), None);
+    }
+
+    /// Dolby Vision profile 5: the decoder's `dolbyvision` matrix starts the conversion
+    /// (converted where Vulkan works, else unsupported and the app is told), and the next file
+    /// that isn't Dolby Vision plays without it.
+    #[test]
+    fn dolby_vision_profile_5_is_converted_and_the_next_file_is_not() {
+        use crate::model::MovieId;
+        let (bus, events) = EventBus::new(None);
+        let deps = PlayerDeps { cache_dir: None, bus, store: Box::new(NullPlayerStore), resolver: Box::new(Copies), cast: None };
+        let p = Player::start(&headless_config(), deps).expect("headless mpv");
+        let h = p.handle();
+        let play = |id: i64| {
+            h.send(PlayerCommand::Play(PlayRequest {
+                media: MediaRef::Movie(MovieId(id)),
+                zap: None,
+                origin: PlayOrigin::Fullscreen,
+                resume: false,
+                immediate: true,
+            }))
+        };
+        play(4);
+        assert!(wait_until(Duration::from_secs(20), || h.snapshot().dolby_vision.is_some()), "{:?}", h.snapshot().state);
+        let told = || {
+            events.try_iter().find_map(|e| match e {
+                crate::msg::AppEvent::Player(PlayerEvent::DolbyVision(s)) => Some(s),
+                _ => None,
+            })
+        };
+        match h.snapshot().dolby_vision {
+            Some(DolbyVision::Unsupported) => assert_eq!(told(), Some(DolbyVision::Unsupported)),
+            state => assert_eq!((state, told()), (Some(DolbyVision::Converted), None)),
+        }
+        play(2);
+        let on_2 = || h.snapshot().playable.as_ref().is_some_and(|p| p.media == MediaRef::Movie(MovieId(2)));
+        assert!(wait_until(Duration::from_secs(20), || on_2() && h.snapshot().state == PlayerState::Playing));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(h.snapshot().dolby_vision, None);
     }
 
     /// Explicit channels (DESIGN §20.3): zapping and recall skip them while parental control

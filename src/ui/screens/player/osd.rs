@@ -986,7 +986,9 @@ impl PlayerScreen {
         if let Some(q) = snap.video_size.and_then(|(w, h)| Quality::of_video(w, h)) {
             labels.push(q.label().into());
         }
-        if snap.stream_info.as_ref().is_some_and(|i| i.is_hdr()) {
+        if snap.dolby_vision.is_some() {
+            labels.push("Dolby Vision".into());
+        } else if snap.stream_info.as_ref().is_some_and(|i| i.is_hdr()) {
             labels.push("HDR".into());
         }
         if let Some(chs) = snap.tracks.selected_audio().and_then(|a| a.channels) {

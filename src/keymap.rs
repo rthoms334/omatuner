@@ -273,6 +273,9 @@ pub enum Action {
     /// The Open button of Following's summary toast (never bound to a key): Settings ▸
     /// Following.
     OpenFollowing,
+    /// A Dolby Vision toast's "Other copies" button (never bound to a key): the player's
+    /// "Play from" menu of the title's other copies, in the player, whatever screen is showing.
+    OtherCopies,
     /// A new-episodes toast button or menu choice (never bound to a key; DESIGN §44).
     NewEpisodes(NewEpisodesAct),
     // ---- guide

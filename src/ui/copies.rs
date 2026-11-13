@@ -240,6 +240,33 @@ pub fn fell_back_toast(lib: &Library, title: &str, from: Option<SourceId>, to: O
     Toast { kind: ToastKind::Warning, text, action: None, also: None, ttl_ms: 5000 }
 }
 
+/// The toast of `PlayerEvent::DolbyVision`: a Dolby Vision copy Tuner can't show well, with
+/// "Other copies" (the player's Ctrl+O menu) when the title has `other` copies. `picture`:
+/// a multi-view picture that isn't the focused one ("Picture B: …", no button).
+pub fn dolby_vision_toast(state: crate::player::DolbyVision, other: bool, picture: Option<crate::model::TileId>) -> Toast {
+    use crate::player::DolbyVision;
+    let text = match (state, other) {
+        (DolbyVision::Slow, true) => "Dolby Vision on this copy is dropping frames — another copy may play smoothly",
+        (DolbyVision::Slow, false) => "Dolby Vision on this copy is dropping frames — this computer can't convert it fast enough",
+        (_, true) => "Tuner can't show this copy's Dolby Vision colours — try another copy",
+        (_, false) => "Tuner can't show this copy's Dolby Vision colours (Vulkan isn't available)",
+    };
+    let text = match picture {
+        Some(t) => format!("Picture {t}: {text}"),
+        None => text.to_owned(),
+    };
+    let action = (other && picture.is_none()).then(|| ("Other copies".to_owned(), Action::OtherCopies));
+    Toast { kind: ToastKind::Warning, text, action, also: None, ttl_ms: 10_000 }
+}
+
+/// The other copies of what plays now, as the player's Ctrl+O menu lists them.
+pub fn other_copies_now(ctx: &UiCtx<'_>) -> Vec<OtherCopy> {
+    let unlocked = ctx.parental.is_unlocked(&ctx.config.parental);
+    let (db, lib, order, now) = (ctx.db, ctx.lib, ctx.config.interface.copy_order, ctx.now);
+    let plan_of = |movies: bool, item: u32| copies::plan(db, &lib.vod, movies, item, unlocked, order, now).ok();
+    other_copies(db, lib, plan_of, ctx.player)
+}
+
 /// Another copy to offer on the player's error card after a failure mid-film.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OtherCopy {

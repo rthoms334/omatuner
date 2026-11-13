@@ -722,6 +722,9 @@ impl TunerApp {
             PlayerEvent::FellBack { title, from, to, .. } if t != self.mv.view.focus => {
                 self.toast(crate::ui::copies::fell_back_toast(&self.lib, title, *from, *to));
             }
+            PlayerEvent::DolbyVision(state) if t != self.mv.view.focus => {
+                self.toast(crate::ui::copies::dolby_vision_toast(*state, false, Some(t)));
+            }
             _ => {}
         }
     }
